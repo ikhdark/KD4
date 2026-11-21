@@ -104,8 +104,8 @@ async fn run_command_under_sandbox(
     )
     .await?;
 
-    // In practice, this should be `std::env::current_dir()` because this CLI
-    // does not support `--cwd`, but let's use the config value for consistency.
+    // The resolved config carries `-C`/`--cd` or the sandbox-state directory
+    // when one was given, and the current directory otherwise.
     let cwd = config.cwd.clone();
 
     let env = create_env(

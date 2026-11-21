@@ -117,6 +117,9 @@ async fn current_dynamic_tool_exposure_identity(
         windows_shell_guidance: crate::tools::spec_plan::requires_windows_shell_guidance(
             step_context,
         ),
+        shell_approval_surface: crate::tools::spec_plan::shell_approval_surface(
+            step_context.turn.as_ref(),
+        ),
     }
 }
 
@@ -417,6 +420,7 @@ fn derive_tool_exposure_identity(
         windows_shell_guidance: crate::tools::spec_plan::requires_windows_shell_guidance(
             step_context,
         ),
+        shell_approval_surface: crate::tools::spec_plan::shell_approval_surface(turn_context),
     }
 }
 

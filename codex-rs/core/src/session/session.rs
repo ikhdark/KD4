@@ -1215,10 +1215,13 @@ impl Session {
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
     ) -> anyhow::Result<Arc<Self>> {
+        // Provider settings can hold credentials (query parameters, headers, a
+        // bearer token) and this line is persisted in the log database.
         debug!(
-            "Configuring session: model={}; provider={:?}",
+            "Configuring session: model={}; provider={} ({:?})",
             session_configuration.collaboration_mode.model(),
-            session_configuration.provider
+            session_configuration.provider.name,
+            session_configuration.provider.wire_api
         );
         let forked_from_id = session_configuration
             .forked_from_thread_id

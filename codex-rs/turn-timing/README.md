@@ -82,9 +82,16 @@ Set `CODEX_RUNTIME_OBSERVATIONS=1` and `CODEX_RUNTIME_OBSERVATIONS_DIR` to an
 existing absolute private capture directory before launching the process.
 `protocol::timing::observations` retains content-free, sequence-numbered JSONL
 with exact identities and the process clock, independently of terminal snapshots.
-Each process creates a runtime journal (32 MiB) and separate `-mobile` (32 MiB)
-and `-lifecycle` (64 KiB retirement reserve) lanes, with a 1 MiB row limit and
-explicit overflow. Retain all available lane files. If a secondary lane cannot
+Each process creates a runtime journal (32 MiB) and separate `-mobile` (32 MiB),
+`-lifecycle` (64 KiB retirement reserve, `mobile_connection_retired`) and
+`-request` (4 MiB, `mobile_rpc_*` and `mobile_socket_*`) lanes, with a 1 MiB row
+limit and explicit overflow: a lane ends with one `capture_overflow` row whose
+reason is `row_too_large`, `byte_limit`, `segment_limit` or
+`rollover_create_failed`, then records nothing further. With
+`CODEX_RUNTIME_OBSERVATIONS_ROLLOVER=1` a full lane instead continues in
+`-partNNNNNN` files, each with the lane's limit, up to 128 segments per lane;
+rows then carry `journal_segment` and `previous_segment_last_id`. Retain all
+available lane and part files. If a secondary lane cannot
 open, its observations fall back to the runtime budget and rows identify
 `unavailable_journal_lanes`; lane isolation is then unavailable. The
 [journal owner](../protocol/src/timing/observations.rs) defines these limits.

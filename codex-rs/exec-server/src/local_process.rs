@@ -60,8 +60,9 @@ use crate::telemetry::ProcessMetricGuard;
 const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const RETAINED_STDIN_WRITE_IDS_PER_PROCESS: usize = 4096;
-// Together with the existing 128-item writer queue, cap accepted stdin at
-// 129 MiB including the currently blocked write. IDs retain at most 2 MiB.
+// Accepted but unwritten stdin is bounded by the writer's byte custody in
+// `codex_utils_pty` (8 MiB per process, 32 MiB across processes), not by the
+// writer queue length. IDs retain at most 2 MiB.
 const MAX_STDIN_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_STDIN_WRITE_ID_BYTES: usize = 256;
 const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);

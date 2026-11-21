@@ -112,6 +112,16 @@ class AgentMessageDeltaNotification(BaseModel):
     )
     delta: str
     item_id: Annotated[str, Field(alias="itemId")]
+    replayed: Annotated[
+        bool | None, Field(description="Active-prefix replay is not newly generated output.")
+    ] = None
+    source_occurrence: Annotated[
+        str | None,
+        Field(
+            alias="sourceOccurrence",
+            description="Optional live-emission journal identity, not a client receipt or clock.",
+        ),
+    ] = None
     thread_id: Annotated[str, Field(alias="threadId")]
     turn_id: Annotated[str, Field(alias="turnId")]
 
@@ -442,6 +452,26 @@ class ClientInfo(BaseModel):
     name: str
     title: str | None = None
     version: str
+
+
+class ClientOutputObservation(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    active_sessions: Annotated[int | None, Field(alias="activeSessions", ge=0)] = None
+    client_clock_id: Annotated[str, Field(alias="clientClockId")]
+    dequeued_at_ns: Annotated[int | None, Field(alias="dequeuedAtNs", ge=0)] = None
+    displayed_thread_id: Annotated[str | None, Field(alias="displayedThreadId")] = None
+    observation_id: Annotated[str, Field(alias="observationId")]
+    output_id: Annotated[str, Field(alias="outputId")]
+    painted_at_ns: Annotated[int | None, Field(alias="paintedAtNs", ge=0)] = None
+    received_at_ns: Annotated[int, Field(alias="receivedAtNs", ge=0)]
+    revision: str
+    scheduled_at_ns: Annotated[int | None, Field(alias="scheduledAtNs", ge=0)] = None
+    thread_id: Annotated[str, Field(alias="threadId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
+    ui_id: Annotated[str | None, Field(alias="uiId")] = None
 
 
 class CodexErrorInfoValue(str, Enum):
@@ -2564,6 +2594,7 @@ class NonSteerableTurnKind(Enum):
 
 class OverloadReason(Enum):
     transport_ingress = "transportIngress"
+    transport_egress = "transportEgress"
     serialized_request_queue = "serializedRequestQueue"
     in_process_request_queue = "inProcessRequestQueue"
     in_process_server_request_queue = "inProcessServerRequestQueue"
@@ -4015,11 +4046,45 @@ class OtherSubAgentSource(BaseModel):
     other: str
 
 
+class SubagentDefaults(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    model: Annotated[
+        str,
+        Field(
+            description="Preferred model before provider-catalog fallback or a per-spawn override."
+        ),
+    ]
+    reasoning_effort: Annotated[
+        ReasoningEffort,
+        Field(
+            alias="reasoningEffort",
+            description="Preferred effort before model-capability fallback or a per-spawn override.",
+        ),
+    ]
+
+
 class SubagentMigration(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     name: str
+
+
+class SubagentModelSettings(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    model: str
+    reasoning_effort: Annotated[ReasoningEffort, Field(alias="reasoningEffort")]
+    service_tier: Annotated[
+        str | None,
+        Field(
+            alias="serviceTier",
+            description="Omit to follow the root's live tier; `default` pins Standard independently.",
+        ),
+    ] = None
 
 
 class SurfacedToolResult(BaseModel):
@@ -4152,6 +4217,7 @@ class ThreadErrorReason(Enum):
     not_loaded = "notLoaded"
     not_materialized = "notMaterialized"
     ephemeral_turns_unavailable = "ephemeralTurnsUnavailable"
+    parent_not_loaded = "parentNotLoaded"
 
 
 class ThreadExtra(BaseModel):
@@ -4693,7 +4759,7 @@ class ThreadShellCommandParams(BaseModel):
     command: Annotated[
         str,
         Field(
-            description="Shell command string evaluated by the thread's configured shell. Unlike `command/exec`, this intentionally preserves shell syntax such as pipes, redirects, and quoting. This runs unsandboxed with full access rather than inheriting the thread sandbox policy."
+            description="Shell command string evaluated by the thread's configured shell. Unlike `command/exec`, this intentionally preserves shell syntax such as pipes, redirects, and quoting. Like other KD4 execution, this runs unsandboxed with full access."
         ),
     ]
     thread_id: Annotated[str, Field(alias="threadId")]
@@ -4902,17 +4968,17 @@ class ToolLifecycleContext(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    active_tool_count: Annotated[int | None, Field(alias="activeToolCount", ge=0)] = 0
+    active_tool_count: Annotated[int | None, Field(alias="activeToolCount", ge=0)] = None
     parallel_gate_waiter_count: Annotated[
         int | None, Field(alias="parallelGateWaiterCount", ge=0)
-    ] = 0
+    ] = None
     process_output_waiter_count: Annotated[
         int | None, Field(alias="processOutputWaiterCount", ge=0)
-    ] = 0
-    relay_queue_depth: Annotated[int | None, Field(alias="relayQueueDepth", ge=0)] = 0
+    ] = None
+    relay_queue_depth: Annotated[int | None, Field(alias="relayQueueDepth", ge=0)] = None
     sampling_gate_waiter_count: Annotated[
         int | None, Field(alias="samplingGateWaiterCount", ge=0)
-    ] = 0
+    ] = None
 
 
 class ToolLifecycleWakeReason(Enum):
@@ -5640,15 +5706,9 @@ class TurnTimingToolLifecycleEvent(BaseModel):
     )
     at_ms: Annotated[int, Field(alias="atMs", ge=0)]
     boundary: ToolLifecycleBoundary
-    context: Annotated[ToolLifecycleContext | None, Field()] = {
-        "activeToolCount": 0,
-        "parallelGateWaiterCount": 0,
-        "processOutputWaiterCount": 0,
-        "relayQueueDepth": 0,
-        "samplingGateWaiterCount": 0,
-    }
-    reentry_count: Annotated[int | None, Field(alias="reentryCount", ge=0)] = 0
-    retry_count: Annotated[int | None, Field(alias="retryCount", ge=0)] = 0
+    context: ToolLifecycleContext | None = {}
+    reentry_count: Annotated[int | None, Field(alias="reentryCount", ge=0)] = None
+    retry_count: Annotated[int | None, Field(alias="retryCount", ge=0)] = None
 
 
 class TurnTimingUnions(BaseModel):
@@ -5671,9 +5731,21 @@ class TurnValidationUncertainty(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    capture_incomplete: Annotated[bool, Field(alias="captureIncomplete")]
+    capture_incomplete: Annotated[
+        bool,
+        Field(
+            alias="captureIncomplete",
+            description="True only for observed capture loss; false is not proof of full capture.",
+        ),
+    ]
     failed_checks: Annotated[list[str], Field(alias="failedChecks")]
-    pending_checks: Annotated[list[str], Field(alias="pendingChecks")]
+    pending_checks: Annotated[
+        list[str],
+        Field(
+            alias="pendingChecks",
+            description="Checks with no terminal observation at settlement, not live operations.",
+        ),
+    ]
     version: Annotated[int, Field(ge=0)]
 
 
@@ -7205,6 +7277,13 @@ class ConfigWarningNotification(BaseModel):
     summary: Annotated[str, Field(description="Concise summary of the warning.")]
 
 
+class ConfigurationReasoning(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    effort: ReasoningEffort
+
+
 class InputImageContentItem(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7771,6 +7850,27 @@ class ModelListResponse(BaseModel):
             description="Opaque cursor to pass to the next call to continue after the last item. If None, there are no more items to return.",
         ),
     ] = None
+    subagent_defaults: Annotated[
+        SubagentDefaults | None,
+        Field(
+            alias="subagentDefaults",
+            description="Generic worker preferences, independent of the parent model/effort. Older servers omit this metadata; it is not the settings of every child.",
+        ),
+    ] = None
+    subagent_service_tier_supported: Annotated[
+        bool | None,
+        Field(
+            alias="subagentServiceTierSupported",
+            description="Whether subagentSettings.serviceTier is independently persisted and applied.",
+        ),
+    ] = False
+    subagent_settings_supported: Annotated[
+        bool | None,
+        Field(
+            alias="subagentSettingsSupported",
+            description="Whether thread/settings/update accepts and persists subagentSettings.",
+        ),
+    ] = False
 
 
 class NetworkRequirements(BaseModel):
@@ -8148,6 +8248,16 @@ class WebSearchCallResponseItem(BaseModel):
     internal_chat_message_metadata_passthrough: InternalChatMessageMetadataPassthrough | None = None
     status: str | None = None
     type: Annotated[Literal["web_search_call"], Field(title="WebSearchCallResponseItemType")]
+
+
+class ConfigurationUpdateResponseItem(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    reasoning: ConfigurationReasoning
+    type: Annotated[
+        Literal["configuration_update"], Field(title="ConfigurationUpdateResponseItemType")
+    ]
 
 
 class ThreadStatusChangedServerNotification(BaseModel):
@@ -8951,6 +9061,13 @@ class ThreadSettings(BaseModel):
     personality: Personality | None = None
     sandbox_policy: Annotated[SandboxPolicy, Field(alias="sandboxPolicy")]
     service_tier: Annotated[str | None, Field(alias="serviceTier")] = None
+    subagent_settings: Annotated[
+        SubagentModelSettings | None,
+        Field(
+            alias="subagentSettings",
+            description="Omitted on older servers; no selection means the SOL/high built-in default.",
+        ),
+    ] = None
     summary: ReasoningSummary | None = None
 
 
@@ -9169,7 +9286,7 @@ class TurnStartParams(BaseModel):
         SandboxPolicy | None,
         Field(
             alias="sandboxPolicy",
-            description="Override the sandbox policy for this turn and subsequent turns.",
+            description="Legacy compatibility selection; KD4 always executes with full access.",
         ),
     ] = None
     service_tier: Annotated[
@@ -9229,6 +9346,7 @@ class TurnTimingCounters(BaseModel):
             ge=0,
         ),
     ] = 0
+    batching_advice_count: Annotated[int | None, Field(alias="batchingAdviceCount", ge=0)] = 0
     clock_regression_count: Annotated[int, Field(alias="clockRegressionCount", ge=0)]
     continuation_after_truncation_count: Annotated[
         int | None,
@@ -9347,6 +9465,14 @@ class TurnTimingCounters(BaseModel):
     planning_semantic_effect_count: Annotated[
         int | None, Field(alias="planningSemanticEffectCount", ge=0)
     ] = 0
+    progress_assessment_count: Annotated[
+        int | None,
+        Field(
+            alias="progressAssessmentCount",
+            description="Cross-continuation guard notices; each is also a no-progress directive.",
+            ge=0,
+        ),
+    ] = 0
     projection_source_dependencies_fallback_count: Annotated[
         int | None, Field(alias="projectionSourceDependenciesFallbackCount", ge=0)
     ] = 0
@@ -9463,6 +9589,7 @@ class TurnTimingCounters(BaseModel):
     ] = 0
     tool_router_reuse_count: Annotated[int | None, Field(alias="toolRouterReuseCount", ge=0)] = 0
     user_input_wait_count: Annotated[int, Field(alias="userInputWaitCount", ge=0)]
+    wait_advice_count: Annotated[int | None, Field(alias="waitAdviceCount", ge=0)] = 0
     wait_generations_with_same_revision_count: Annotated[
         int | None,
         Field(
@@ -10509,6 +10636,7 @@ class ResponseItem(
         | WebSearchCallResponseItem
         | ImageGenerationCallResponseItem
         | CompactionResponseItem
+        | ConfigurationUpdateResponseItem
         | CompactionTriggerResponseItem
         | ContextCompactionResponseItem
         | OtherResponseItem
@@ -10531,6 +10659,7 @@ class ResponseItem(
         | WebSearchCallResponseItem
         | ImageGenerationCallResponseItem
         | CompactionResponseItem
+        | ConfigurationUpdateResponseItem
         | CompactionTriggerResponseItem
         | ContextCompactionResponseItem
         | OtherResponseItem
@@ -11810,7 +11939,7 @@ class ThreadListResponse(BaseModel):
         str | None,
         Field(
             alias="nextCursor",
-            description="Opaque cursor to pass to the next call to continue after the last item. if None, there are no more items to return.",
+            description="Opaque cursor to continue the listing. Follow a non-null cursor even when a filtered page is short or empty; null means the listing is exhausted.",
         ),
     ] = None
 
@@ -11866,6 +11995,9 @@ class ThreadResumeResponse(BaseModel):
         ),
     ]
     service_tier: Annotated[str | None, Field(alias="serviceTier")] = None
+    subagent_settings: Annotated[SubagentModelSettings | None, Field(alias="subagentSettings")] = (
+        None
+    )
     thread: Thread
 
 
@@ -11921,6 +12053,9 @@ class ThreadStartResponse(BaseModel):
         ),
     ]
     service_tier: Annotated[str | None, Field(alias="serviceTier")] = None
+    subagent_settings: Annotated[SubagentModelSettings | None, Field(alias="subagentSettings")] = (
+        None
+    )
     thread: Thread
 
 

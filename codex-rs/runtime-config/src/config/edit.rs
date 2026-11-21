@@ -550,7 +550,16 @@ impl ConfigDocument {
             if enabled {
                 if !existing_indices.is_empty() {
                     for index in existing_indices.into_iter().rev() {
-                        overrides.remove(index);
+                        // The entry also owns the user's catalog text. Enabling
+                        // must not delete it along with the disabled flag.
+                        match overrides.get_mut(index) {
+                            Some(table) if table.contains_key("description_override") => {
+                                table["enabled"] = value(true);
+                            }
+                            _ => {
+                                overrides.remove(index);
+                            }
+                        }
                     }
                     mutated = true;
                     if overrides.is_empty() {

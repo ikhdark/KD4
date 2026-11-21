@@ -377,7 +377,12 @@ impl Client {
         match serde_json::from_str::<T>(body) {
             Ok(v) => Ok(v),
             Err(e) => {
-                anyhow::bail!("Decode error for {url}: {e}; content-type={ct}; body={body}");
+                // Callers log this text and return it over RPC. The untyped
+                // body can hold account or managed-config data; keep its size.
+                anyhow::bail!(
+                    "Decode error for {url}: {e}; content-type={ct}; body_bytes={}",
+                    body.len()
+                );
             }
         }
     }
@@ -620,11 +625,15 @@ impl Client {
                     Ok(id.to_string())
                 } else {
                     anyhow::bail!(
-                        "POST {url} succeeded but no task id found; content-type={ct}; body={body}"
+                        "POST {url} succeeded but no task id found; content-type={ct}; body_bytes={}",
+                        body.len()
                     );
                 }
             }
-            Err(e) => anyhow::bail!("Decode error for {url}: {e}; content-type={ct}; body={body}"),
+            Err(e) => anyhow::bail!(
+                "Decode error for {url}: {e}; content-type={ct}; body_bytes={}",
+                body.len()
+            ),
         }
     }
 

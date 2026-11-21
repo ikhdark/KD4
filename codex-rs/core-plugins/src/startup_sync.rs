@@ -1308,6 +1308,14 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
         }
 
         let output_path = destination.join(&output_relative);
+        // A mid-path `C:name` segment passes `enclosed_name` as an ordinary
+        // segment but is a drive prefix once pushed, replacing `destination`.
+        if !output_path.starts_with(destination) {
+            return Err(format!(
+                "curated plugins zip entry `{}` escapes extraction root",
+                relative_path.display()
+            ));
+        }
         if entry.is_dir() {
             std::fs::create_dir_all(&output_path).map_err(|err| {
                 format!(

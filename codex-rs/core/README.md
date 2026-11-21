@@ -12,7 +12,9 @@ process boundaries, start with the [workspace map](../README.md).
    [CodexThread](src/codex_thread.rs) is the submission/event-facing handle.
 2. [session/session.rs](src/session/session.rs) drives the session;
    [session/handlers.rs](src/session/handlers.rs) dispatches operations.
-   [session/mod.rs](src/session/mod.rs) owns shared session state and services.
+   [session/mod.rs](src/session/mod.rs) holds session-wide operations (spawn,
+   events, approvals, history recording); [state/](src/state/) owns shared
+   session state and services.
 3. [tasks/](src/tasks/) selects the task, then
    [session/turn.rs](src/session/turn.rs) coordinates model sampling and results.
    [turn_execution.rs](src/session/turn_execution.rs) owns execution control and
@@ -35,7 +37,7 @@ process boundaries, start with the [workspace map](../README.md).
 | History reconstruction and compaction | [session/rollout_reconstruction.rs](src/session/rollout_reconstruction.rs), [compact.rs](src/compact.rs), [compact_provenance.rs](src/compact_provenance.rs) |
 | Live recovery evidence | [session/resume_inventory.rs](src/session/resume_inventory.rs), [unified_exec/process_inventory.rs](src/unified_exec/process_inventory.rs) |
 | Approval and full-access execution | [tools/orchestrator.rs](src/tools/orchestrator.rs), [tools/sandboxing.rs](src/tools/sandboxing.rs) (legacy compatibility names), [exec_policy.rs](src/exec_policy.rs) |
-| MCP session integration | [mcp.rs](src/mcp.rs), [mcp_tool_call.rs](src/mcp_tool_call.rs), [session/mcp_runtime.rs](src/session/mcp_runtime.rs) |
+| MCP session integration | [mcp.rs](src/mcp.rs), [mcp_tool_call.rs](src/mcp_tool_call.rs), [session/mcp.rs](src/session/mcp.rs) (start, refresh, publication), [session/mcp_runtime.rs](src/session/mcp_runtime.rs) (snapshots and lifecycle) |
 
 ## Focused modules behind the orchestration
 

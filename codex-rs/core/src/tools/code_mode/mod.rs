@@ -367,8 +367,8 @@ fn bounded_failed_nested_text(full: &str) -> (String, bool, usize) {
 /// Marks where the middle of a bounded failure message was removed.
 const ELISION: &str = "… [middle omitted; see nested_result_recovery_directory] …";
 
-/// `str::floor_char_boundary` is unstable, so bound the index by hand rather
-/// than risk splitting a multi-byte character.
+/// Clamp `index` to `text` and move it down to a character boundary, so a slice
+/// never splits a multi-byte character.
 fn floor_char_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     while index > 0 && !text.is_char_boundary(index) {

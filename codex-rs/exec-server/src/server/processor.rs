@@ -735,7 +735,7 @@ async fn run_connection_with_shutdown(
                             RpcServerOutboundMessage::Error {
                                 request_id: request.id,
                                 error: method_not_found(format!(
-                                    "exec-server stub does not implement `{}` yet",
+                                    "exec-server does not implement `{}`",
                                     request.method
                                 )),
                             },

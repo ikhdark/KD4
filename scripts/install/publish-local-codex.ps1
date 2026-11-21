@@ -92,7 +92,7 @@ function Get-FileSha256 {
 $script:LocalPublishContentHashCache = @{}
 # Git pathspec of the tracked publish inputs; the build fingerprint and the
 # embedded dirty flag must describe the same files.
-$script:LocalPublishBuildInputPathspec = @("codex-rs", "third_party/notify", "third_party/tungstenite", "scripts/install/publish-local-codex.ps1", "scripts/install/publish-local-codex-pgo.ps1", "scripts/build/common-rust-env.ps1", "justfile")
+$script:LocalPublishBuildInputPathspec = @("codex-rs", "third_party/notify", "third_party/tungstenite", "third_party/reqwest", "third_party/hyper-util", "third_party/hyper-rustls", "scripts/install/publish-local-codex.ps1", "scripts/install/publish-local-codex-pgo.ps1", "scripts/build/common-rust-env.ps1", "justfile")
 $script:LocalPublishBuildTargetCache = @{}
 
 function Get-TextSha256 {
@@ -621,6 +621,9 @@ function Test-LocalPublishBuildRelevantPath {
         $normalized -like "codex-rs/*" -or
         $normalized -like "third_party/notify/*" -or
         $normalized -like "third_party/tungstenite/*" -or
+        $normalized -like "third_party/reqwest/*" -or
+        $normalized -like "third_party/hyper-util/*" -or
+        $normalized -like "third_party/hyper-rustls/*" -or
         $normalized -eq "justfile" -or
         $normalized -eq "scripts/install/publish-local-codex.ps1" -or
         $normalized -eq "scripts/install/publish-local-codex-pgo.ps1" -or

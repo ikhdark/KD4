@@ -640,9 +640,9 @@ impl ContextManager {
     }
 
     /// Returns the history prepared for sending to the model. This applies a proper
-    /// normalization and drops un-suited items. When `input_modalities` does not
-    /// include `InputModality::Image`, images are stripped from messages and tool
-    /// outputs.
+    /// normalization and drops un-suited items. Images are not stripped here:
+    /// when `input_modalities` lacks `InputModality::Image`, turn admission and
+    /// request build reject a prompt that still carries required images.
     pub fn for_prompt(self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
         self.prepare_for_prompt(input_modalities).items().to_vec()
     }
@@ -838,7 +838,7 @@ impl ContextManager {
     }
 
     /// The local summarizer cannot recover artifacts. Keep acquired evidence
-    /// in its request and annotate freshness without substituting receipts.
+    /// in its request without substituting receipts.
     pub fn for_local_compaction_prompt(
         self,
         input_modalities: &[InputModality],
@@ -986,7 +986,7 @@ impl ContextManager {
         };
         let projection = project(Arc::clone(&items));
         // Most prompts have identical sampling and fallback input. Reuse this
-        // request's projection, including freshness checks and substitutions;
+        // request's projection, including its substitutions;
         // a distinct fallback must still be projected independently.
         let fallback_projection = if shares_input {
             projection.clone()

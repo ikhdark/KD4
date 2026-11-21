@@ -34,18 +34,56 @@ pub fn detect_implicit_skill_invocation_for_command(
     workdir: &AbsolutePathBuf,
 ) -> Option<SkillMetadata> {
     let workdir = canonicalize_if_exists(workdir);
-    let tokens = tokenize_command(command);
+    let detect = |tokens: Vec<String>| {
+        detect_skill_script_run(outcome, tokens.as_slice(), &workdir)
+            .or_else(|| detect_skill_doc_read(outcome, tokens.as_slice(), &workdir))
+    };
 
-    if let Some(candidate) = detect_skill_script_run(outcome, tokens.as_slice(), &workdir) {
-        return Some(candidate);
-    }
-
-    detect_skill_doc_read(outcome, tokens.as_slice(), &workdir)
+    detect(tokenize_command(command)).or_else(|| {
+        command
+            .contains('\\')
+            .then(|| detect(tokenize_keeping_backslashes(command)))
+            .flatten()
+    })
 }
 
 fn tokenize_command(command: &str) -> Vec<String> {
     shlex::split(command)
         .unwrap_or_else(|| command.split_whitespace().map(str::to_string).collect())
+}
+
+/// Splits on unquoted whitespace and drops the quotes. POSIX splitting treats a
+/// backslash as an escape, which consumes the separators of a Windows path in
+/// PowerShell script text such as `python .\scripts\run.py`.
+fn tokenize_keeping_backslashes(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut in_token = false;
+    for ch in command.chars() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '"' || ch == '\'' => {
+                quote = Some(ch);
+                in_token = true;
+            }
+            None if ch.is_whitespace() => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            }
+            None => {
+                current.push(ch);
+                in_token = true;
+            }
+        }
+    }
+    if in_token {
+        tokens.push(current);
+    }
+    tokens
 }
 
 fn script_run_token(tokens: &[String]) -> Option<&str> {

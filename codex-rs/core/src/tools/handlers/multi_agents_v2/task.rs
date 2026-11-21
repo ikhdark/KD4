@@ -2074,7 +2074,7 @@ fn submit_agent_receipt_spec() -> ToolSpec {
             (
                 "write_scope",
                 JsonSchema::array(
-                    architecture_scope,
+                    architecture_scope.clone(),
                     Some("Canonical worker write scope.".to_string()),
                 ),
             ),
@@ -2094,7 +2094,27 @@ fn submit_agent_receipt_spec() -> ToolSpec {
             ),
             (
                 "prohibited_changes",
-                string_array_schema("Canonical worker prohibitions."),
+                // The worker assignment must equal this sealed list, and a
+                // writable worker accepts typed prohibitions only.
+                JsonSchema::array(
+                    JsonSchema::one_of(
+                        vec![
+                            object_schema(
+                                [
+                                    ("kind", enum_schema(["paths"], "Prohibits changes under the listed scopes.")),
+                                    ("scopes", JsonSchema::array(architecture_scope, None)),
+                                ],
+                                &["kind", "scopes"],
+                            ),
+                            object_schema(
+                                [("kind", enum_schema(["create", "delete", "move"], "Prohibits this operation."))],
+                                &["kind"],
+                            ),
+                        ],
+                        None,
+                    ),
+                    Some("Canonical worker prohibitions. Typed entries only, e.g. [{\"kind\":\"delete\"}]; use [] for none. Free-text strings cannot authorize a writable worker.".to_string()),
+                ),
             ),
             (
                 "contract_claims",

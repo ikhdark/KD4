@@ -45,9 +45,11 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
         (&mut file)
             .take(MAX_INSTALLATION_ID_BYTES + 1)
             .read_to_end(&mut contents)?;
-        if contents.len() <= MAX_INSTALLATION_ID_BYTES as usize {
-            let contents = String::from_utf8(contents)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        // Text that is not UTF-8 (for example a UTF-16 file) is no more a valid
+        // ID than any other unusable content, so it is regenerated below too.
+        if contents.len() <= MAX_INSTALLATION_ID_BYTES as usize
+            && let Ok(contents) = std::str::from_utf8(&contents)
+        {
             let trimmed = contents.trim();
             if !trimmed.is_empty()
                 && let Ok(existing) = Uuid::parse_str(trimmed)

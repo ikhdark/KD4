@@ -1074,6 +1074,11 @@ impl ThreadQueueRequestProcessor {
             }
             None => item.input.clone(),
         };
+        let paused_before_claim = queue.paused;
+        let execution_started_before_claim = queue
+            .task_observations
+            .get(&item.id)
+            .and_then(|observation| observation.execution_started_at_unix_ms);
         queue.paused = false;
         if let Some(observation) = queue.task_observations.get_mut(&item.id) {
             observation
@@ -1145,6 +1150,34 @@ impl ThreadQueueRequestProcessor {
                 }))
             }
             Err(error) => {
+                // An active-turn refusal is decided before the reserved turn
+                // reaches core, so its outcome is certain: release the claim
+                // and leave the queue as it was. Holding it would block edits
+                // until the running turn ends and then pause the queue.
+                let refused_before_admission = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("activeTurnInProgress");
+                if refused_before_admission
+                    && queue
+                        .pending_start
+                        .as_ref()
+                        .is_some_and(|pending| pending.turn_id == turn_id)
+                {
+                    queue.pending_start = None;
+                    queue.paused = paused_before_claim;
+                    if let Some(observation) = queue.task_observations.get_mut(&item.id) {
+                        observation.execution_started_at_unix_ms = execution_started_before_claim;
+                    }
+                    if self.save(id, &mut queue).await.is_ok() {
+                        drop(guard);
+                        self.changed(id, queue.revision, publication).await;
+                        return Err(error);
+                    }
+                    // The release was not persisted; fall through to recovery.
+                }
                 // The acknowledgement can fail after installation. Recovery,
                 // not a blind retry, decides whether input was actually recorded.
                 drop(guard);

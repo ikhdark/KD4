@@ -1054,6 +1054,12 @@ async fn cli_main(
                 sandbox_setup::run(setup_cli).await?;
                 return Ok(());
             }
+            // The command would otherwise run in the current directory with no
+            // sign that the root-level directory was dropped.
+            anyhow::ensure!(
+                root.cwd.is_none(),
+                "`--cd` before `sandbox` is not supported; pass `-C DIR` after `sandbox` together with `--permission-profile`, or launch from the intended directory"
+            );
             let mut sandbox_cli = sandbox_cli.execution;
             let config_profile = sandbox_cli
                 .config_profile
@@ -1664,6 +1670,11 @@ fn validate_app_server_options(root: &RootOptions, command: &AppServerCommand) -
         Some((
             "--cd",
             "launch from the intended directory or specify `cwd` in the client request",
+        ))
+    } else if root.oss {
+        Some((
+            "--oss",
+            "use `-c model_provider=...` to set the server-wide default provider",
         ))
     } else {
         None

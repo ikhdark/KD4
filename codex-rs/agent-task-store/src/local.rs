@@ -1887,7 +1887,17 @@ LIMIT 1
             ordinal: current
                 .ordinal
                 .checked_add(1)
-                .ok_or(StoreError::AmendmentLimitReached(assignment_id))?,
+                .ok_or_else(|| {
+                    if host_legacy_followup {
+                        // Follow-ups are exempt from the one-correction rule
+                        // above; here they exhausted the attempt ordinal.
+                        StoreError::InvalidAssignment(
+                            "this agent's assignment has reached its 256-attempt limit; start a new agent to continue".to_string(),
+                        )
+                    } else {
+                        StoreError::AmendmentLimitReached(assignment_id)
+                    }
+                })?,
             amendment: Some(amendment),
             state: AttemptState::Active,
             created_at: Utc::now(),

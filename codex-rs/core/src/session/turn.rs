@@ -222,20 +222,6 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
-/// Takes initial turn input and runs a loop where, at each sampling request,
-/// the model replies with either:
-///
-/// - requested function calls
-/// - an assistant message
-///
-/// While it is possible for the model to return multiple of these items in a
-/// single sampling request, in practice, we generally one item per sampling request:
-///
-/// - If the model requests a function call, we execute it and send the output
-///   back to the model in the next sampling request.
-/// - If the model sends only an assistant message, we record it in the
-///   conversation history and consider the turn complete.
-///
 fn ordinary_continuation_cause(
     tool_result: bool,
     server_end_turn_false: bool,
@@ -317,6 +303,20 @@ async fn finish_stopped_session_start(
     }
 }
 
+/// Takes initial turn input and runs a loop where, at each sampling request,
+/// the model replies with either:
+///
+/// - requested function calls
+/// - an assistant message
+///
+/// While it is possible for the model to return multiple of these items in a
+/// single sampling request, in practice, we generally one item per sampling request:
+///
+/// - If the model requests a function call, we execute it and send the output
+///   back to the model in the next sampling request.
+/// - If the model sends only an assistant message, we record it in the
+///   conversation history and consider the turn complete.
+///
 pub(crate) fn run_turn<'a>(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -5141,7 +5141,7 @@ async fn retire_after_failed_local_compaction(
         }),
     )
     .await;
-    Ok(ContextPressureRelief::Compaction)
+    Ok(ContextPressureRelief::FallbackRetirement)
 }
 
 #[instrument(

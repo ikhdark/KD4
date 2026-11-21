@@ -4983,6 +4983,19 @@ impl Drop for TurnTimingGuard {
     }
 }
 
+/// Balances arrive as decimal strings but are held as `f64`; a raw difference
+/// prints binary noise ("0.20000000000000107"). Nine decimals keep any real
+/// credit amount and drop that noise.
+fn credit_delta_text(delta: f64) -> String {
+    let text = format!("{delta:.9}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text.is_empty() || text == "-0" {
+        "0".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 impl TurnTimingStateInner {
     fn record_model_retry(&mut self) {
         if self.next_attempt_kind != TurnTimingAttemptKind::Fallback {
@@ -5665,7 +5678,7 @@ impl TurnTimingStateInner {
             credit_delta: self
                 .starting_credit_balance
                 .zip(self.last_credit_balance)
-                .map(|(start, end)| (start - end).to_string()),
+                .map(|(start, end)| credit_delta_text(start - end)),
             started_at_unix_ms: started_sample.map(|started| started.time.wall_unix_ms),
             completed_at_unix_ms: started_sample.map(|_| sample.time.wall_unix_ms),
             completed_at_unix_secs: started_sample.map(|_| sample.time.wall_unix_ms / 1_000),

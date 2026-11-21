@@ -395,7 +395,10 @@ fn repair_powershell_rg_leaf_glob(
     let script = format!(
         "& {}",
         argv.iter()
-            .map(|arg| format!("'{}'", arg.replace('\'', "''")))
+            .map(|arg| format!(
+                "'{}'",
+                codex_shell_command::escape_powershell_single_quoted(arg)
+            ))
             .collect::<Vec<_>>()
             .join(" ")
     );
@@ -1274,7 +1277,10 @@ fn powershell_join_args(argv: &[String]) -> String {
             if is_bare_powershell_arg(arg) {
                 arg.clone()
             } else {
-                format!("'{}'", arg.replace('\'', "''"))
+                format!(
+                    "'{}'",
+                    codex_shell_command::escape_powershell_single_quoted(arg)
+                )
             }
         })
         .collect::<Vec<_>>()

@@ -2836,18 +2836,27 @@ def freeze_bundle(bundle_dir: Path, executables: Sequence[Path]) -> list[dict[st
     """Copy built executables into a new read-only bundle while the lane is held."""
     bundle_dir.mkdir(parents=True, exist_ok=False)
     frozen = []
-    for source in executables:
-        destination = bundle_dir / source.name
-        if destination.exists():
-            raise ValueError(f"bundle artifact name collision: {source.name}")
-        shutil.copyfile(source, destination)
-        frozen.append({
-            "name": source.name,
-            "sha256": _file_sha256(destination),
-            "bytes": destination.stat().st_size,
-            "cargoPath": str(source),
-        })
-        os.chmod(destination, stat.S_IREAD)
+    try:
+        for source in executables:
+            destination = bundle_dir / source.name
+            if destination.exists():
+                raise ValueError(f"bundle artifact name collision: {source.name}")
+            shutil.copyfile(source, destination)
+            frozen.append({
+                "name": source.name,
+                "sha256": _file_sha256(destination),
+                "bytes": destination.stat().st_size,
+                "cargoPath": str(source),
+            })
+            os.chmod(destination, stat.S_IREAD)
+    except BaseException:
+        # This call created the directory. A partial bundle has no receipt and
+        # would refuse a retry that names the same new directory.
+        try:
+            remove_tree_allow_readonly(bundle_dir)
+        except OSError:
+            pass
+        raise
     return frozen
 
 

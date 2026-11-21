@@ -148,6 +148,8 @@ export type CollabAgentStatus =
 
 /** Last known state of a collaboration agent. */
 export type CollabAgentState = {
+  /** Present when the agent was stopped instead of finishing on its own. */
+  stop_cause?: "subagent_context_budget";
   status: CollabAgentStatus;
   message: string | null;
   surfaced_result?: SurfacedToolResult;

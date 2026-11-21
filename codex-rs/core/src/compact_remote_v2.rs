@@ -203,6 +203,8 @@ pub(crate) async fn run_remote_compact_task(
         turn_context,
         input,
         initial_context_injection,
+        // The failed remote attempt above already passed this turn's gate.
+        /*run_pre_compact_hook*/ false,
         &mut recovery_wait,
         cancellation_token,
     )

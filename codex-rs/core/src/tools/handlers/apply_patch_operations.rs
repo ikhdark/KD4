@@ -22,7 +22,9 @@ fn unknown(message: impl Into<String>) -> FunctionCallError {
 /// Dedicated-tool headers are not part of the standalone/shell patch language.
 /// Strip only envelope headers, never hunk contents.
 pub(super) fn split(input: &str) -> Result<(Option<String>, String), FunctionCallError> {
-    let mut lines = input.split_inclusive('\n');
+    // The patch parser trims leading whitespace, so a nested call may send it
+    // before the envelope; headers must still be recognised there.
+    let mut lines = input.trim_start().split_inclusive('\n');
     let Some(first) = lines.next() else {
         return Ok((None, input.into()));
     };
@@ -60,7 +62,7 @@ pub(super) fn split(input: &str) -> Result<(Option<String>, String), FunctionCal
 
 /// Optional, untrusted self-report; malformed metadata must not reject an edit.
 pub(super) fn evidence_review(input: &str) -> Option<&str> {
-    let mut lines = input.lines();
+    let mut lines = input.trim_start().lines();
     if lines.next()? != "*** Begin Patch" { return None; }
     let mut next = lines.next()?;
     if next.starts_with("*** Operation ID: ") { next = lines.next()?; }

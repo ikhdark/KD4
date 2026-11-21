@@ -1215,9 +1215,9 @@ impl SamplingRequestSignalCollector {
         {
             state.record_validation_check(ordinal, tool_name, &canonical.value);
         }
-        if validation {
-            state.validation_ordinals.insert(ordinal);
-        }
+        // As in `record_failure`: a nested handler error has no native
+        // execution result, so it is a tool failure, not a failed check.
+        state.validation_ordinals.remove(&ordinal);
         state.accumulate_code_mode_source_dependencies(cell_id, source_dependencies);
         state.outcomes.push(outcome);
         if let Some(structured_action) = structured_action {

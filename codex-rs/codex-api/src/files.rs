@@ -521,7 +521,7 @@ fn request_error(url: &str, source: RouteAwareRequestError) -> OpenAiFileError {
     }
 }
 
-fn diagnostic_url(value: &str) -> String {
+pub(crate) fn diagnostic_url(value: &str) -> String {
     let Ok(mut url) = url::Url::parse(value) else {
         return "<invalid URL>".to_string();
     };

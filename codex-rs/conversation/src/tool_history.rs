@@ -2310,6 +2310,10 @@ impl ToolHistoryState {
         changed
     }
 
+    /// Returns the items unchanged. Freshness is carried by receipt and pin
+    /// metadata (`source_dependencies_current`), not by appended notices, so
+    /// nearby comments about freshness notices describe a retired mechanism;
+    /// the workspace arguments are kept for the callers' shared signature.
     pub fn project_workspace_freshness_with_cache(
         &self,
         items: Arc<[ResponseItem]>,
@@ -4180,7 +4184,11 @@ fn source_dependencies_from_arguments(
                 for index in 0..commands.len() {
                     // These parsers retain cmd expansions and bare POSIX word
                     // escapes rather than resolving them to literal paths.
-                    if commands[index].iter().any(|arg| match shell_type {
+                    // A `$` word, or `%` when the shell is unknown, may be a
+                    // variable; joining it to cwd would record a path no
+                    // mutation can ever invalidate.
+                    if commands[index].iter().any(|arg| arg.contains('$') || match shell_type {
+                        None => arg.contains('%'),
                         Some(codex_shell_command::shell_detect::ShellType::Cmd) => arg.contains(['%', '!']),
                         Some(
                             codex_shell_command::shell_detect::ShellType::Bash

@@ -8,7 +8,9 @@ def _split_user_agent(user_agent: str) -> tuple[str | None, str | None]:
     if not raw:
         return None, None
     if "/" in raw:
-        name, version = raw.split("/", 1)
+        name, rest = raw.split("/", 1)
+        # "name/1.2.3 (platform) terminal": the version ends at the first space.
+        version = rest.split(maxsplit=1)[0] if rest.strip() else ""
         return (name or None), (version or None)
     parts = raw.split(maxsplit=1)
     if len(parts) == 2:

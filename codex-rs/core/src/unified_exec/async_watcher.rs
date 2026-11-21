@@ -790,8 +790,9 @@ struct PendingOutput {
     stderr: Vec<u8>,
 }
 
-/// Emit an ExecCommandEnd event for a unified exec session, using the transcript
-/// as the primary source of aggregated_output and falling back to the provided
+/// Emit an ExecCommandEnd event for a unified exec session. When `process` is
+/// present its completion snapshot supplies aggregated_output, stdout and stderr;
+/// only without a process is the transcript used, falling back to the provided
 /// text when the transcript is empty.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn emit_exec_end_for_unified_exec(

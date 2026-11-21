@@ -2128,16 +2128,28 @@ impl ToolRegistry {
             return Err(err);
         }
 
-        if let Some(notice) = hook_input_notice {
-            record_additional_contexts(
+        if let Some(notice) = hook_input_notice
+            && let Err(error) = record_additional_contexts(
                 &invocation.session,
                 &invocation.step_context.turn,
                 vec![notice],
             )
             .await
-            .map_err(|error| {
-                FunctionCallError::Fatal(format!("Could not record hook input context: {error}"))
-            })?;
+        {
+            let error =
+                FunctionCallError::Fatal(format!("Could not record hook input context: {error}"));
+            // Start was already notified. Close the lifecycle like every other
+            // exit before the handler; the failure itself stays fatal.
+            let _ = notify_tool_finish_if_unclaimed(
+                &invocation,
+                dispatch_state.as_ref(),
+                &error,
+                ToolCallOutcome::Failed {
+                    handler_executed: false,
+                },
+            )
+            .await;
+            return Err(error);
         }
 
         // Prepared calls may have waited for workspace admission while another
@@ -2173,7 +2185,7 @@ impl ToolRegistry {
         if retry_memory["unchanged_unsuccessful_attempt_count"].as_u64().is_some_and(|count| count > 0) {
             // This is native retry context, not hook-authored text: preserve
             // the hook budget and keep owner observations explicitly data.
-            invocation.session.record_conversation_items_ordered(
+            if let Err(error) = invocation.session.record_conversation_items_ordered(
                 &invocation.step_context.turn,
                 &[ResponseItem::Message {
                     id: None,
@@ -2184,7 +2196,14 @@ impl ToolRegistry {
                     phase: None,
                     internal_chat_message_metadata_passthrough: None,
                 }],
-            ).await.map_err(|error| FunctionCallError::Fatal(format!("Could not record retry memory: {error}")))?;
+            ).await {
+                let error = FunctionCallError::Fatal(format!("Could not record retry memory: {error}"));
+                let _ = notify_tool_finish_if_unclaimed(
+                    &invocation, dispatch_state.as_ref(), &error,
+                    ToolCallOutcome::Failed { handler_executed: false },
+                ).await;
+                return Err(error);
+            }
         }
 
         let invocation_for_tool = invocation.clone();

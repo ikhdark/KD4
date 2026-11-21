@@ -1999,7 +1999,14 @@ async fn on_command_execution_request_approval_response(
                 .turn_summary_for(&event_turn_id)
                 .is_some_and(|summary| summary.command_execution_started.contains(&item_id))
         } else {
-            false
+            // Core already began this item, so its canonical completion
+            // reports the refusal; a placeholder would complete it twice.
+            let state = thread_state.lock().await;
+            state.turn_summary_for(&event_turn_id).is_some_and(|summary| {
+                summary
+                    .command_execution_canonical_started
+                    .contains(&item_id)
+            })
         }
     };
 

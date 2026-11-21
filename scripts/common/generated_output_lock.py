@@ -88,7 +88,11 @@ def repository_lock(
                 break
             except BlockingIOError as error:
                 try:
-                    holder = lock_path.read_text(encoding="utf-8").strip()
+                    # Byte 0 is the Windows lock range and cannot be read
+                    # while held; the holder record follows it.
+                    with open(lock_path, "rb") as reader:
+                        reader.seek(1)
+                        holder = reader.read().decode("utf-8", "replace").strip()
                 except OSError:
                     holder = "unreadable lock metadata"
                 remaining = deadline - time.monotonic()
@@ -110,6 +114,8 @@ def repository_lock(
 
     try:
         handle.seek(0)
+        # Keep the record out of the locked byte so a waiter can read it.
+        handle.write(" ")
         handle.write(payload)
         handle.write("\n")
         handle.flush()

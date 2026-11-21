@@ -191,6 +191,10 @@ impl SendMessageHandler {
 }
 
 impl CoreToolRuntime for SendMessageHandler {
+    // Same queue handoff as `followup_task`: a cancelled call settles its
+    // admission before answering, so a resend cannot deliver it twice.
+    fn waits_for_runtime_cancellation(&self) -> bool { true }
+    fn cancellation_requires_commit_barrier(&self) -> bool { true }
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

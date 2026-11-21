@@ -459,6 +459,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         reason,
         phase,
         emit_error_event,
+        /*run_pre_compact_hook*/ true,
         recovery_wait,
         cancellation_token,
     )
@@ -488,6 +489,7 @@ pub(crate) async fn run_compact_task(
         turn_context,
         input,
         InitialContextInjection::AtStart(world_state),
+        /*run_pre_compact_hook*/ true,
         &mut recovery_wait,
         cancellation_token,
     )
@@ -496,11 +498,14 @@ pub(crate) async fn run_compact_task(
 
 /// Continue a standalone compaction turn, including a failed remote attempt,
 /// without emitting another TurnStarted or recapturing its initial context.
+/// A caller whose earlier attempt in this turn already passed the PreCompact
+/// gate passes `run_pre_compact_hook: false` so the hook runs once per turn.
 pub(crate) async fn run_compact_task_with_initial_context(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    run_pre_compact_hook: bool,
     recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
@@ -517,6 +522,7 @@ pub(crate) async fn run_compact_task_with_initial_context(
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
         /*emit_error_event*/ true,
+        run_pre_compact_hook,
         recovery_wait,
         cancellation_token,
     )
@@ -536,6 +542,7 @@ async fn run_compact_task_inner(
     reason: CompactionReason,
     phase: CompactionPhase,
     emit_error_event: bool,
+    run_pre_compact_hook: bool,
     recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
@@ -550,7 +557,7 @@ async fn run_compact_task_inner(
         phase,
     )
     .await;
-    if run_pre_compact_hook_gate(&sess, &turn_context, trigger).await {
+    if run_pre_compact_hook && run_pre_compact_hook_gate(&sess, &turn_context, trigger).await {
         let error = CodexErr::TurnAborted;
         attempt
             .track(

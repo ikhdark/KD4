@@ -459,9 +459,9 @@ where
     }
     tokio::pin!(input_activity);
     tokio::pin!(steering_activity);
-    // The runtime retains a decision only while no observer holds it; one
-    // delivered to an observer that is then dropped is lost. Answer input that
-    // is already waiting before starting an observation.
+    // Answer input that is already waiting before starting an observation.
+    // Dropping an observation does not lose a decision: the process-owned
+    // session keeps its receiving future and hands the result to the next wait.
     if let Some(activity) = input_activity.as_mut().now_or_never() {
         if activity != InputQueueActivity::Mailbox {
             return Ok(steered(activity));

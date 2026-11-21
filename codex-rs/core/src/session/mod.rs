@@ -635,8 +635,9 @@ const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
 fn event_channel() -> (async_channel::Sender<Event>, async_channel::Receiver<Event>) {
-    // The shared producer admission caps each serialized event as well, giving
-    // the live queue a finite 256 MiB envelope without lossy terminal success.
+    // The queue bounds the event count. Only live-only offers are also capped
+    // at `MAX_EVENT_BYTES`; required events are never refused for size, so the
+    // queue has no fixed byte envelope.
     async_channel::bounded(codex_mcp::event_queue::EVENT_QUEUE_CAPACITY)
 }
 

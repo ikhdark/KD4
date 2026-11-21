@@ -175,13 +175,17 @@ class AsyncCodexClient:
                 else self._sync.config.operation_timeout_s
             )
             result = await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (asyncio.CancelledError, asyncio.TimeoutError) as error:
             cancelled.set()
             # Response waits detach independently; only an ambiguous in-progress
             # pipe write fails the shared transport. Workers still retain their
             # bounded slot until cancellation/late-start cleanup settles.
             operation.add_done_callback(_consume_background_future_result)
             wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            if isinstance(error, asyncio.TimeoutError) and not isinstance(error, TimeoutError):
+                # Before Python 3.11 asyncio's timeout is not the builtin class
+                # that every other SDK deadline raises.
+                raise TimeoutError(*error.args) from error
             raise
         else:
             # Commit delivery only if the worker has not claimed cleanup.

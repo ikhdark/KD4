@@ -322,7 +322,9 @@ fn normalized_label(value: &str, max_chars: usize) -> Option<String> {
 }
 
 fn normalized_description(value: &str) -> Option<String> {
-    // Bound normalization before allocating or escaping a potentially huge description.
+    // Bound normalization before allocating a potentially huge description.
+    // Keep the raw text: the catalog renderer escapes it once at the XML
+    // boundary, and `skills.list` returns and searches it as JSON text.
     let mut output = String::new();
     let mut pending_space = false;
     let mut count = 0;
@@ -334,13 +336,7 @@ fn normalized_description(value: &str) -> Option<String> {
         if ch.is_control() {
             return None;
         }
-        let escaped = match ch {
-            '&' => Some("&amp;"),
-            '<' => Some("&lt;"),
-            '>' => Some("&gt;"),
-            _ => None,
-        };
-        let added = escaped.map_or(1, str::len) + usize::from(pending_space);
+        let added = 1 + usize::from(pending_space);
         if count + added > 1_021 {
             output.push_str("...");
             break;
@@ -349,11 +345,7 @@ fn normalized_description(value: &str) -> Option<String> {
             output.push(' ');
             pending_space = false;
         }
-        if let Some(escaped) = escaped {
-            output.push_str(escaped);
-        } else {
-            output.push(ch);
-        }
+        output.push(ch);
         count += added;
     }
     Some(output)

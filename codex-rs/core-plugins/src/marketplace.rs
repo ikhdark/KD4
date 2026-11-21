@@ -159,8 +159,8 @@ impl MarketplacePluginSource {
 pub struct MarketplacePluginPolicy {
     pub installation: MarketplacePluginInstallPolicy,
     pub authentication: MarketplacePluginAuthPolicy,
-    // TODO: Surface or enforce product gating at the Codex/plugin consumer boundary instead of
-    // only carrying it through core marketplace metadata.
+    // Enforced when listing marketplace plugins and by the plugin manager's
+    // install, sync and load paths.
     pub products: Option<Vec<Product>>,
 }
 
@@ -787,6 +787,20 @@ fn normalize_relative_git_plugin_source_url(
         match segment {
             "" | "." => {}
             ".." => {
+                return Err(MarketplaceError::InvalidMarketplaceFile {
+                    path: marketplace_path.to_path_buf(),
+                    message: "relative git plugin source url must stay within the marketplace root"
+                        .to_string(),
+                });
+            }
+            // Pushed alone, a `C:` or `C:name` segment is a drive prefix and
+            // would replace the marketplace root instead of extending it.
+            segment
+                if !matches!(
+                    Path::new(segment).components().collect::<Vec<_>>().as_slice(),
+                    [std::path::Component::Normal(_)]
+                ) =>
+            {
                 return Err(MarketplaceError::InvalidMarketplaceFile {
                     path: marketplace_path.to_path_buf(),
                     message: "relative git plugin source url must stay within the marketplace root"

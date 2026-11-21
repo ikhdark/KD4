@@ -66,6 +66,9 @@ pub(crate) struct ToolExposureIdentity {
     pub(crate) environment_mode: EnvironmentSurfaceMode,
     pub(crate) environment_starting: bool,
     pub(crate) windows_shell_guidance: bool,
+    /// `spec_plan::shell_approval_surface`: the approval policy decides which
+    /// approval parameters the shell tools advertise.
+    pub(crate) shell_approval_surface: (bool, bool),
     pub(crate) native_environment_contract: NativeEnvironmentContract,
 }
 
@@ -80,6 +83,7 @@ pub(crate) struct DynamicToolExposureIdentity {
     pub(crate) environment_mode: EnvironmentSurfaceMode,
     pub(crate) environment_starting: bool,
     pub(crate) windows_shell_guidance: bool,
+    pub(crate) shell_approval_surface: (bool, bool),
     pub(crate) native_environment_contract: NativeEnvironmentContract,
 }
 
@@ -95,6 +99,7 @@ impl ToolExposureIdentity {
             environment_mode: self.environment_mode,
             environment_starting: self.environment_starting,
             windows_shell_guidance: self.windows_shell_guidance,
+            shell_approval_surface: self.shell_approval_surface,
             native_environment_contract: self.native_environment_contract,
         }
     }
@@ -116,6 +121,7 @@ impl Default for ToolExposureIdentity {
             environment_mode: EnvironmentSurfaceMode::One,
             environment_starting: false,
             windows_shell_guidance: true,
+            shell_approval_surface: (false, false),
             native_environment_contract: NativeEnvironmentContract::default(),
         }
     }

@@ -191,7 +191,10 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                         status,
                         user_message: api_error_user_message(status, &body_text),
                         body: body_text,
-                        url,
+                        // This text reaches clients and logs. Provider query
+                        // parameters and userinfo can be credentials; the
+                        // scheme, host and path are enough for diagnosis.
+                        url: url.as_deref().map(crate::files::diagnostic_url),
                         cf_ray: extract_header(headers.as_ref(), CF_RAY_HEADER),
                         request_id: extract_request_id(headers.as_ref()),
                         identity_authorization_error: extract_header(

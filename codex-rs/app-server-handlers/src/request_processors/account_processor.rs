@@ -620,9 +620,11 @@ impl AccountRequestProcessor {
     ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
         let config = self.current_config().await?;
         let mut guard = self.active_login.lock().await;
-        Self::cancel_active_login_locked(&mut guard).await;
+        // Validate first, as the other login flows do: a rejected request
+        // must not cancel the login already in flight.
         let opts =
             self.login_chatgpt_common(&config, codex_streamlined_login, login_success_page)?;
+        Self::cancel_active_login_locked(&mut guard).await;
         // Register immediately after startup, before yielding to another
         // transition; no admitted browser writer may be left unaccounted for.
         let server = run_login_server_async(opts)

@@ -235,6 +235,8 @@ pub(crate) fn build_tool_router(
     tool_search_handler_cache: &ToolSearchHandlerCache,
 ) -> Result<ToolRouter, String> {
     params.exposure_identity.windows_shell_guidance = requires_windows_shell_guidance(step_context);
+    params.exposure_identity.shell_approval_surface =
+        shell_approval_surface(step_context.turn.as_ref());
     params.exposure_identity.native_environment_contract =
         native_environment_contract(step_context);
     let exposure_identity = params.exposure_identity.clone();
@@ -1253,6 +1255,22 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
     }
 }
 
+/// The approval-derived inputs of the shell tool schemas: inline sandbox
+/// approval and exec permission approvals. The policy can change between turns
+/// without changing the turn `Config`, so the router identity carries it.
+pub(crate) fn shell_approval_surface(turn_context: &TurnContext) -> (bool, bool) {
+    let policy = turn_context.approval_policy.value();
+    (
+        allows_inline_sandbox_approval(policy),
+        turn_context
+            .config
+            .features
+            .get()
+            .enabled(Feature::ExecPermissionApprovals)
+            && !matches!(policy, AskForApproval::Never),
+    )
+}
+
 pub(crate) fn requires_windows_shell_guidance(step_context: &StepContext) -> bool {
     let environments = &step_context.environments.turn_environments;
     environments.is_empty()
@@ -1335,10 +1353,8 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
     }
 
     let allow_login_shell = turn_context.config.permissions.allow_login_shell;
-    let allow_escalated_sandbox_permissions =
-        allows_inline_sandbox_approval(turn_context.approval_policy.value());
-    let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals)
-        && !matches!(turn_context.approval_policy.value(), AskForApproval::Never);
+    let (allow_escalated_sandbox_permissions, exec_permission_approvals_enabled) =
+        shell_approval_surface(turn_context);
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
     let forward_shell_to_unified_exec = primary_environment_uses_foreign_cwd(context.step_context)
         || context.step_context.environments.primary()

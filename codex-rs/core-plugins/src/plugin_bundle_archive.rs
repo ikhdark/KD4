@@ -243,22 +243,36 @@ fn checked_tar_output_path(
 ) -> Result<PathBuf, PluginBundleUnpackError> {
     let mut output_path = destination.to_path_buf();
     let mut has_component = false;
+    let escapes = || {
+        PluginBundleUnpackError::InvalidBundle(format!(
+            "plugin bundle tar entry `{}` escapes extraction root",
+            entry_name.display()
+        ))
+    };
     for component in entry_name.components() {
         match component {
             std::path::Component::Normal(component) => {
+                // A drive prefix is only recognised at the start of a path, so
+                // a later `C:name` segment arrives here as Normal. Pushed on
+                // its own it is a prefix again and would replace the root.
+                let mut segment = Path::new(component).components();
+                if !matches!(
+                    (segment.next(), segment.next()),
+                    (Some(std::path::Component::Normal(_)), None)
+                ) {
+                    return Err(escapes());
+                }
                 has_component = true;
                 output_path.push(component);
             }
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir
             | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => {
-                return Err(PluginBundleUnpackError::InvalidBundle(format!(
-                    "plugin bundle tar entry `{}` escapes extraction root",
-                    entry_name.display()
-                )));
-            }
+            | std::path::Component::Prefix(_) => return Err(escapes()),
         }
+    }
+    if !output_path.starts_with(destination) {
+        return Err(escapes());
     }
     if !has_component {
         return Err(PluginBundleUnpackError::InvalidBundle(

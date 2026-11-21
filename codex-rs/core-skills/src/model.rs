@@ -80,8 +80,7 @@ impl SkillMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SkillPolicy {
     pub allow_implicit_invocation: Option<bool>,
-    // TODO: Enforce product gating in Codex skill selection/injection instead of only parsing and
-    // storing this metadata.
+    // Enforced at load and selection through `matches_product_restriction`.
     pub products: Vec<Product>,
 }
 

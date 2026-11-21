@@ -94,7 +94,10 @@ impl CoreToolRuntime for CargoWorkspaceHandler {
                         "manifest_path must be a nonempty literal path without NUL".into(),
                     ));
                 }
-                Some(path) => format!("'--manifest-path={}'", path.replace('\'', "''")),
+                Some(path) => format!(
+                    "'--manifest-path={}'",
+                    codex_shell_command::escape_powershell_single_quoted(&path)
+                ),
                 None => String::new(),
             };
             let offline = args.offline.unwrap_or(true);

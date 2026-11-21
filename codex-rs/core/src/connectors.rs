@@ -135,13 +135,21 @@ async fn list_cached_accessible_connectors_from_tools_cache(
         }
     };
     let mcp_config = mcp_manager.runtime_config(config).await;
+    // Snapshot tools are raw; resolve plugin provenance at read time like the
+    // fresh-snapshot reader below.
+    let tool_plugin_provenance = tool_plugin_provenance(&mcp_config);
     tools_cache
         .current_snapshot(
             config.codex_home.to_path_buf(),
             mcp_config.codex_apps_tools_cache_key(auth.as_ref()),
         )
         .await
-        .map(|snapshot| accessible_connectors_status_from_tools_snapshot(&snapshot).connectors)
+        .map(|snapshot| {
+            with_app_plugin_sources(
+                accessible_connectors_status_from_tools_snapshot(&snapshot).connectors,
+                &tool_plugin_provenance,
+            )
+        })
 }
 
 pub async fn list_accessible_connectors_from_mcp_tools_with_options(

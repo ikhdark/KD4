@@ -2652,7 +2652,20 @@ async fn reserve_native_stage_slot(
 > {
     // The worker, not its cancellable observer, owns admission while storage is blocked.
     tokio::task::spawn_blocking(move || {
-        NativeStageSlot::acquire(&home).map(|slot| (admission, slot))
+        // Another process sharing this home can hold every slot. Wait for a
+        // release within the in-process admission bound before giving up.
+        let deadline = std::time::Instant::now() + ARTIFACT_STAGE_ADMISSION_WAIT;
+        loop {
+            match NativeStageSlot::acquire(&home) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                result => return result.map(|slot| (admission, slot)),
+            }
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -5681,7 +5694,15 @@ impl ValidatedJsonPointers {
                         entry.range == actual.range
                             && entry.exact_bytes == actual.exact_bytes
                             && (targets.is_some_and(|targets| !targets.contains(key))
-                                || entry.direct_children == actual.direct_children)
+                                || {
+                                    // Same children, not same order: the producer lists
+                                    // them by raw key, the index by escaped pointer.
+                                    let mut expected = entry.direct_children.clone();
+                                    let mut found = actual.direct_children.clone();
+                                    expected.sort_unstable();
+                                    found.sort_unstable();
+                                    expected == found
+                                })
                     })
             };
             let mismatch = !metadata.json_pointers.is_empty()

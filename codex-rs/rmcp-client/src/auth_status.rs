@@ -45,8 +45,12 @@ impl DiscoveryHttpClient {
     fn new() -> Result<Self> {
         let builder = HttpClientBuilder::new().timeout(DISCOVERY_TIMEOUT);
         Ok(Self {
-            follow_redirects: builder.clone().build_direct()?,
-            stop_redirects: builder.without_redirects().build_direct()?,
+            // Discovery is ordinary outbound traffic to the user's MCP server:
+            // route it like the login that follows, which honours the proxy.
+            follow_redirects: builder.clone().build_with_transport_default_proxy()?,
+            stop_redirects: builder
+                .without_redirects()
+                .build_with_transport_default_proxy()?,
         })
     }
 }
@@ -372,8 +376,6 @@ async fn discover_streamable_http_oauth_with_headers(
     url: &str,
     default_headers: &HeaderMap,
 ) -> Result<Option<StreamableHttpOAuthDiscovery>> {
-    // Use no_proxy to avoid a bug in the system-configuration crate that
-    // can result in a panic. See #8912.
     let default_headers = default_headers.clone();
     let http_client = tokio::task::spawn_blocking(DiscoveryHttpClient::new).await??;
     let mut authorization_manager = AuthorizationManager::new_with_oauth_http_client(

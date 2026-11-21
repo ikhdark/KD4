@@ -109,9 +109,11 @@ pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionC
         CodexErr::InternalAgentDied => {
             FunctionCallError::RespondToModel(format!("agent with id {agent_id} is closed"))
         }
-        CodexErr::UnsupportedOperation(_) => {
+        CodexErr::UnsupportedOperation(message) if message == "thread manager dropped" => {
             FunctionCallError::RespondToModel("collab manager unavailable".to_string())
         }
+        // The control layer's own text carries the retry or ownership guidance.
+        CodexErr::UnsupportedOperation(message) => FunctionCallError::RespondToModel(message),
         err => FunctionCallError::RespondToModel(format!("collab tool failed: {err}")),
     }
 }
