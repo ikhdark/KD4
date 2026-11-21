@@ -364,10 +364,19 @@ fn split_prose(prose: &str) -> (String, Vec<(String, String)>) {
     let mut core = String::new();
     let mut details = String::new();
     let mut titled = Vec::new();
-    for paragraph in paragraphs(prose) {
+    let is_label = |paragraph: &str| {
+        !paragraph.contains('\n') && paragraph.trim_end().ends_with(':')
+            && section_title(paragraph).is_some()
+    };
+    let mut paragraphs = paragraphs(prose).into_iter().peekable();
+    while let Some(mut paragraph) = paragraphs.next() {
+        let has_body = is_label(&paragraph) && paragraphs.peek().is_some_and(|next| !is_label(next));
+        if has_body && let Some(body) = paragraphs.next() {
+            append_paragraph(&mut paragraph, &body);
+        }
         if core.len() + paragraph.len() + 2 <= CORE_PROSE_BYTES {
             append_paragraph(&mut core, &paragraph);
-        } else if core.is_empty() {
+        } else if core.is_empty() && !has_body {
             let (head, tail) = split_at_sentence(&paragraph, CORE_PROSE_BYTES);
             core.push_str(head.trim_end());
             append_paragraph(&mut details, tail.trim_start());
