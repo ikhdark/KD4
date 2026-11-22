@@ -216,6 +216,21 @@ impl AgentsMdManager {
     }
 
     fn project_root_markers(&self, config: &Config) -> Arc<[String]> {
+        {
+            let cache = self
+                .project_root_markers_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cache.as_ref()
+                && Arc::ptr_eq(&cached.config_layer_stack, &config.config_layer_stack)
+            {
+                return Arc::clone(&cached.markers);
+            }
+        }
+
+        // Config merging and invalid-marker diagnostics don't need the cache
+        // mutex; the immutable stack identifies exactly which result can win.
+        let markers: Arc<[String]> = effective_project_root_markers(config).into();
         let mut cache = self
             .project_root_markers_cache
             .lock()
@@ -225,12 +240,12 @@ impl AgentsMdManager {
         {
             return Arc::clone(&cached.markers);
         }
-
-        let markers: Arc<[String]> = effective_project_root_markers(config).into();
-        *cache = Some(ProjectRootMarkersCacheEntry {
+        let previous = cache.replace(ProjectRootMarkersCacheEntry {
             config_layer_stack: config.config_layer_stack.clone(),
             markers: Arc::clone(&markers),
         });
+        drop(cache);
+        drop(previous);
         markers
     }
 

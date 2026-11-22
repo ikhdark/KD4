@@ -1035,7 +1035,7 @@ mod worker {
         pub(super) fn try_claim(codex_home: &Path) -> io::Result<Option<Self>> {
             let marker_dir = codex_home.join(".tmp");
             std::fs::create_dir_all(&marker_dir)?;
-            let mut file = std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
@@ -1055,17 +1055,15 @@ mod worker {
             if metadata.len() > 0 && !stale {
                 return Ok(None);
             }
-            file.set_len(0)?;
+            let mut marker = Self { file, clear_on_drop: true };
+            marker.file.set_len(0)?;
             writeln!(
-                file,
+                marker.file,
                 "pid={} started_at={:?}",
                 std::process::id(),
                 SystemTime::now()
             )?;
-            Ok(Some(Self {
-                file,
-                clear_on_drop: true,
-            }))
+            Ok(Some(marker))
         }
 
         pub(super) fn persist(mut self) {
@@ -1736,8 +1734,15 @@ pub async fn existing_rollout_path(path: &Path) -> Option<PathBuf> {
     path::existing_rollout_path(path).await
 }
 
+/// Like [`existing_rollout_path`], but report filesystem errors if neither
+/// spelling could be selected rather than treating them as missing.
+pub async fn try_existing_rollout_path(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    path::try_existing_rollout_path(path).await
+}
+
 mod path {
     use std::ffi::OsStr;
+    use std::io;
     use std::path::Path;
     use std::path::PathBuf;
 
@@ -1776,17 +1781,26 @@ mod path {
     }
 
     pub(super) async fn existing_rollout_path(path: &Path) -> Option<PathBuf> {
+        try_existing_rollout_path(path).await.ok().flatten()
+    }
+
+    pub(super) async fn try_existing_rollout_path(path: &Path) -> io::Result<Option<PathBuf>> {
         let plain_path = plain_rollout_path(path);
-        if matches!(tokio::fs::metadata(plain_path.as_path()).await, Ok(metadata) if metadata.is_file())
-        {
-            return Some(plain_path);
+        let plain_error = match tokio::fs::metadata(&plain_path).await {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(plain_path)),
+            Ok(_) => None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => Some(error),
+        };
+        let compressed_path = compressed_rollout_path(&plain_path);
+        match tokio::fs::metadata(&compressed_path).await {
+            Ok(metadata) if metadata.is_file() => Ok(Some(compressed_path)),
+            Ok(_) => plain_error.map_or(Ok(None), Err),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                plain_error.map_or(Ok(None), Err)
+            }
+            Err(error) => Err(plain_error.unwrap_or(error)),
         }
-        let compressed_path = compressed_rollout_path(plain_path.as_path());
-        if matches!(tokio::fs::metadata(compressed_path.as_path()).await, Ok(metadata) if metadata.is_file())
-        {
-            return Some(compressed_path);
-        }
-        None
     }
 }
 

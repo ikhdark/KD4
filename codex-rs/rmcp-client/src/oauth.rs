@@ -184,8 +184,10 @@ pub struct WrappedOAuthTokenResponse(pub OAuthTokenResponse);
 
 impl PartialEq for WrappedOAuthTokenResponse {
     fn eq(&self, other: &Self) -> bool {
-        match (serde_json::to_string(self), serde_json::to_string(other)) {
-            (Ok(s1), Ok(s2)) => s1 == s2,
+        // Provider extra fields can be HashMaps. Object member order is not
+        // part of the token identity used for expiry and admitted writes.
+        match (serde_json::to_value(self), serde_json::to_value(other)) {
+            (Ok(left), Ok(right)) => left == right,
             _ => false,
         }
     }

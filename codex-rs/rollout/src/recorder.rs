@@ -219,6 +219,7 @@ struct RolloutWriterTask {
     // Clones share custody, not independent lease references. A stopped handle
     // must not keep a terminated writer's logical ownership alive.
     writer_lease: Mutex<Option<Arc<std::fs::File>>>,
+    lease_custody_released: tokio::sync::watch::Sender<bool>,
     lifecycle: AtomicU8,
     shutdown_confirmed: std::sync::atomic::AtomicBool,
     /// Serializes the lifecycle check with command enqueue across recorder
@@ -245,6 +246,7 @@ impl Drop for RolloutLeaseCustody {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        self.0.lease_custody_released.send_replace(true);
     }
 }
 
@@ -343,6 +345,7 @@ impl RolloutWriterTask {
             handle: Mutex::new(None),
             terminal_failure: Mutex::new(None),
             writer_lease: Mutex::new(None),
+            lease_custody_released: tokio::sync::watch::Sender::new(false),
             lifecycle: AtomicU8::new(WRITER_ACTIVE),
             shutdown_confirmed: std::sync::atomic::AtomicBool::new(false),
             enqueue_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -425,10 +428,11 @@ impl RolloutWriterTask {
 
     fn finish_shutdown(&self, succeeded: bool) {
         if succeeded {
-            self.writer_lease
+            let writer_lease = self.writer_lease
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
+            drop(writer_lease);
         }
         self.lifecycle.store(
             if succeeded {
@@ -670,6 +674,26 @@ impl RolloutRecorder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// On a terminal/closing writer, wait until its lease custody has unwound.
+    /// An active writer remains eligible for retry and must not be retired.
+    pub async fn wait_for_writer_retirement(&self) -> bool {
+        let phase = self.writer_task.lifecycle.load(Ordering::Acquire);
+        if phase == WRITER_ACTIVE {
+            return false;
+        }
+        if phase == WRITER_SHUT_DOWN {
+            // Successful shutdown releases the lease before publishing this phase.
+            return true;
+        }
+        let mut released = self.writer_task.lease_custody_released.subscribe();
+        if phase == WRITER_FAILED {
+            return released.wait_for(|released| *released).await.is_ok();
+        }
+        // A concurrent normal shutdown can fail and return to Active.
+        // Do not wait indefinitely for a writer that can still be reused.
+        *released.borrow_and_update()
     }
 
     /// Identity of the append owner, independent of path reuse or recorder clones.
@@ -1505,20 +1529,36 @@ impl RolloutRecorder {
         if self.writer_task.lifecycle.load(Ordering::Acquire) == WRITER_SHUT_DOWN {
             return Ok(());
         }
-        let permit = self.tx.reserve().await.map_err(|e| {
-            self.writer_task.terminal_failure().unwrap_or_else(|| {
-                IoError::other(format!("failed to reserve rollout discard command: {e}"))
-            })
-        })?;
+        let permit = match self.tx.reserve().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                drop(enqueue_guard);
+                self.wait_for_lost_discard_custody().await;
+                return Err(self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed to reserve rollout discard command: {error}"))
+                }));
+            }
+        };
         self.writer_task.begin_shutdown()?;
         let (ack, done) = oneshot::channel();
         permit.send(RolloutCmd::Discard { ack });
         drop(enqueue_guard);
-        done.await.map_err(|e| {
-            self.writer_task.terminal_failure().unwrap_or_else(|| {
-                IoError::other(format!("failed waiting for rollout discard: {e}"))
-            })
-        })
+        match done.await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.wait_for_lost_discard_custody().await;
+                Err(self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed waiting for rollout discard: {error}"))
+                }))
+            }
+        }
+    }
+
+    async fn wait_for_lost_discard_custody(&self) {
+        // The command receiver or its admitted reply was dropped. This can
+        // precede WRITER_FAILED; wait for the writer's actual unwind.
+        let mut released = self.writer_task.lease_custody_released.subscribe();
+        let _ = released.wait_for(|released| *released).await;
     }
 
     /// Drain pending items before stopping the writer task.

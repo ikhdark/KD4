@@ -106,7 +106,13 @@ fn completed_process_output(
 ) -> Box<dyn crate::tools::context::ToolOutput> {
     let retained_signal = result.as_object_mut().and_then(|result| result.remove("_sampling_request_signal"));
     let success = result["success"].as_bool();
-    let output = codex_tools::JsonToolOutput::with_success(result, success);
+    let output = if success.is_none() {
+        // Checkpoint-only recovery proves exit, not success or failure.
+        // Preserve the evidence as data without certifying the operation.
+        codex_tools::JsonToolOutput::skipped(result).with_code_mode_failure_as_data()
+    } else {
+        codex_tools::JsonToolOutput::with_success(result, success)
+    };
     if let Some(signal) = retained_signal {
         return boxed_tool_output(output.with_sampling_request_signal(signal));
     }

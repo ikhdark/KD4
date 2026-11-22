@@ -523,7 +523,10 @@ def run_npm_pack(
 
 def npm_tarball_manifest(tarball_path: Path) -> dict:
     with tarfile.open(tarball_path, "r:gz") as tarball:
-        manifest = tarball.extractfile("package/package.json")
+        try:
+            manifest = tarball.extractfile("package/package.json")
+        except KeyError as exc:
+            raise RuntimeError(f"npm tarball has no package.json: {tarball_path}") from exc
         if manifest is None:
             raise RuntimeError(f"npm tarball has no package.json: {tarball_path}")
         return json.load(manifest)

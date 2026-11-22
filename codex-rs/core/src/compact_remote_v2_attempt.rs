@@ -52,7 +52,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
     // The turn's own rendered instructions, so the compaction request shares its cached prefix.
-    let base_instructions = validation_mode_base_instructions(turn_context).as_ref().clone();
+    let base_instructions = validation_mode_base_instructions(turn_context).await.as_ref().clone();
     let tool_router = built_tools(sess.as_ref(), step_context, &[], cancellation_token).await?;
     let mut owned_client_session = None;
     let client_session = match client_session {

@@ -109,6 +109,10 @@ def _normalize_output_format(fmt: Optional[str]) -> str:
     fmt = fmt.lower()
     if fmt not in {"png", "jpeg", "jpg", "webp"}:
         _die("output-format must be png, jpeg, jpg, or webp.")
+    return _canonical_output_format(fmt)
+
+
+def _canonical_output_format(fmt: str) -> str:
     return "jpeg" if fmt == "jpg" else fmt
 
 
@@ -253,7 +257,7 @@ def _build_output_paths(
 
     if out_path.suffix == "":
         out_path = out_path.with_suffix(ext)
-    elif output_format and out_path.suffix.lstrip(".").lower() != output_format:
+    elif output_format and _canonical_output_format(out_path.suffix.lstrip(".").lower()) != output_format:
         _warn(
             f"Output extension {out_path.suffix} does not match output-format {output_format}."
         )
@@ -540,7 +544,7 @@ def _job_output_paths(
         base = Path(explicit_out)
         if base.suffix == "":
             base = base.with_suffix(ext)
-        elif base.suffix.lstrip(".").lower() != output_format:
+        elif _canonical_output_format(base.suffix.lstrip(".").lower()) != output_format:
             _warn(
                 f"Job {idx}: output extension {base.suffix} does not match output-format {output_format}."
             )

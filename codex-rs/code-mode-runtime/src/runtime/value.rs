@@ -701,8 +701,11 @@ pub(super) fn error_value<'s>(
         && let Some(json) = v8::String::new(scope, &failure.to_string())
         && let Some(value) = v8::json::parse(scope, json)
         && let Some(key) = v8::String::new(scope, "tool_failure")
+        && object.create_data_property(scope, key.into(), value) != Some(true)
+        && !scope.is_execution_terminating()
     {
-        object.set(scope, key.into(), value);
+        // The original textual envelope is retained even on allocation failure.
+        tracing::warn!("failed to attach typed tool failure to native error");
     }
     error
 }

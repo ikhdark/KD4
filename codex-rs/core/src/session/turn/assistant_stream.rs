@@ -35,6 +35,9 @@ use codex_utils_stream_parser::extract_proposed_plan_text;
 /// Tracks a single proposed plan item across a streaming response.
 struct ProposedPlanItemState {
     item_id: String,
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    runtime: tokio::runtime::Handle,
     started: bool,
     completed: bool,
     /// Text already delivered to clients, retained if the final item never arrives.
@@ -55,12 +58,12 @@ pub(super) struct PlanModeStreamState {
 }
 
 impl PlanModeStreamState {
-    pub(super) fn new(turn_id: &str) -> Self {
+    pub(super) fn new(session: &Arc<Session>, turn: &Arc<TurnContext>) -> Self {
         Self {
             pending_agent_message_items: HashMap::new(),
             started_agent_message_items: BTreeMap::new(),
             leading_whitespace_by_item: HashMap::new(),
-            plan_item_state: ProposedPlanItemState::new(turn_id),
+            plan_item_state: ProposedPlanItemState::new(session, turn),
         }
     }
 }
@@ -121,9 +124,12 @@ impl AssistantMessageStreamParsers {
 }
 
 impl ProposedPlanItemState {
-    fn new(turn_id: &str) -> Self {
+    fn new(session: &Arc<Session>, turn: &Arc<TurnContext>) -> Self {
         Self {
-            item_id: format!("{turn_id}-plan"),
+            item_id: format!("{}-plan", turn.sub_id),
+            session: Arc::clone(session),
+            turn: Arc::clone(turn),
+            runtime: tokio::runtime::Handle::current(),
             started: false,
             completed: false,
             streamed_text: String::new(),
@@ -134,12 +140,13 @@ impl ProposedPlanItemState {
         if self.started || self.completed {
             return;
         }
-        self.started = true;
+        // The first plan batch owns this state until ItemStarted is published.
         let item = TurnItem::Plan(PlanItem {
             id: self.item_id.clone(),
             text: String::new(),
         });
         sess.emit_turn_item_started(turn_context, &item).await;
+        self.started = true;
     }
 
     async fn push_delta(&mut self, sess: &Session, turn_context: &TurnContext, delta: &str) {
@@ -151,7 +158,6 @@ impl ProposedPlanItemState {
         if delta.is_empty() {
             return;
         }
-        self.streamed_text.push_str(delta);
         let event = PlanDeltaEvent {
             thread_id: sess.thread_id.to_string(),
             turn_id: turn_context.sub_id.clone(),
@@ -160,23 +166,72 @@ impl ProposedPlanItemState {
         };
         sess.send_event(turn_context, EventMsg::PlanDelta(event))
             .await;
+        self.streamed_text.push_str(delta);
     }
 
-    async fn complete_with_text(
+    async fn complete_with_text(&mut self, text: String, start_if_missing: bool) {
+        if let Some(publication) = self.queue_completion(text, start_if_missing)
+            && let Err(error) = publication.await
+        {
+            tracing::warn!(turn_id = %self.turn.sub_id, %error, "plan item publication failed");
+        }
+    }
+
+    fn queue_completion(
         &mut self,
-        sess: &Session,
-        turn_context: &TurnContext,
         text: String,
-    ) {
-        if self.completed || !self.started {
-            return;
+        start_if_missing: bool,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let publication = self.take_completion(text, start_if_missing)?;
+        self.queue_item_publications(vec![publication])
+    }
+
+    fn take_completion(
+        &mut self,
+        text: String,
+        start_if_missing: bool,
+    ) -> Option<(Option<TurnItem>, TurnItem)> {
+        if self.completed || (!self.started && !start_if_missing) {
+            return None;
         }
         self.completed = true;
+        let start = (!self.started).then(|| {
+            TurnItem::Plan(PlanItem {
+                id: self.item_id.clone(),
+                text: String::new(),
+            })
+        });
         let item = TurnItem::Plan(PlanItem {
             id: self.item_id.clone(),
             text,
         });
-        sess.emit_turn_item_completed(turn_context, item).await;
+        Some((start, item))
+    }
+
+    // The terminalizer must wait even if the sampling worker disappears while
+    // publishing a start or completion. One task owns the ordered item batch.
+    fn queue_item_publications(
+        &self,
+        publications: Vec<(Option<TurnItem>, TurnItem)>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if publications.is_empty() {
+            return None;
+        }
+        let session = Arc::clone(&self.session);
+        let turn = Arc::clone(&self.turn);
+        session.durable_history_commits_in_flight.fetch_add(1, Ordering::AcqRel);
+        let in_flight = crate::session::DurableHistoryCommitInFlight {
+            session: Arc::clone(&session),
+        };
+        Some(self.runtime.spawn(async move {
+            let _in_flight = in_flight;
+            for (start, completed) in publications {
+                if let Some(start) = start {
+                    session.emit_turn_item_started(&turn, &start).await;
+                }
+                session.emit_turn_item_completed(&turn, completed).await;
+            }
+        }))
     }
 }
 
@@ -210,13 +265,11 @@ fn agent_message_text(item: &codex_protocol::items::AgentMessageItem) -> String 
         .collect()
 }
 
-// A first prose batch can await ItemStarted publication after extracting buffered
-// whitespace. Retain that accepted batch across sampling-worker abort, including
-// the interval where its returned state is queued but the caller has not resumed.
+// A first prose or plan batch can await ItemStarted publication. Retain that
+// accepted batch across sampling-worker abort, including the interval where its
+// returned state is queued but the caller has not resumed.
 struct OwnedPlanStreamState {
     state: Option<PlanModeStreamState>,
-    session: Arc<Session>,
-    turn: Arc<TurnContext>,
     in_flight: Option<crate::session::DurableHistoryCommitInFlight>,
     runtime: tokio::runtime::Handle,
 }
@@ -226,33 +279,49 @@ impl Drop for OwnedPlanStreamState {
         let Some(mut state) = self.state.take() else {
             return;
         };
-        let session = Arc::clone(&self.session);
-        let turn = Arc::clone(&self.turn);
         let in_flight = self.in_flight.take();
         self.runtime.spawn(async move {
             let _in_flight = in_flight;
-            complete_partial_plan_items(&session, &turn, &mut state).await;
+            complete_partial_plan_items(&mut state).await;
         });
     }
 }
 
-pub(super) async fn complete_partial_plan_items(
-    sess: &Session,
-    turn_context: &TurnContext,
-    state: &mut PlanModeStreamState,
-) {
-    for (_, mut item) in std::mem::take(&mut state.started_agent_message_items) {
-        if let TurnItem::AgentMessage(message) = &mut item {
-            message.phase = None;
-            message.interruption = Some("Stream interrupted before provider item finalization".to_string());
+impl PlanModeStreamState {
+    fn queue_partial_completion(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let mut publications = Vec::new();
+        for (_, mut item) in std::mem::take(&mut self.started_agent_message_items) {
+            if let TurnItem::AgentMessage(message) = &mut item {
+                message.phase = None;
+                message.interruption =
+                    Some("Stream interrupted before provider item finalization".to_string());
+            }
+            publications.push((None, item));
         }
-        sess.emit_turn_item_completed(turn_context, item).await;
+        let plan_text = std::mem::take(&mut self.plan_item_state.streamed_text);
+        publications.extend(self.plan_item_state.take_completion(plan_text, false));
+        self.plan_item_state.queue_item_publications(publications)
     }
-    let plan_text = std::mem::take(&mut state.plan_item_state.streamed_text);
-    state
-        .plan_item_state
-        .complete_with_text(sess, turn_context, plan_text)
-        .await;
+
+    async fn wait_for_publication(&self, publication: Option<tokio::task::JoinHandle<()>>) {
+        if let Some(publication) = publication
+            && let Err(error) = publication.await
+        {
+            tracing::warn!(turn_id = %self.plan_item_state.turn.sub_id, %error, "plan-mode item publication failed");
+        }
+    }
+}
+
+impl Drop for PlanModeStreamState {
+    fn drop(&mut self) {
+        // Drop detaches the publication task; the turn barrier lives in it.
+        drop(self.queue_partial_completion());
+    }
+}
+
+pub(super) async fn complete_partial_plan_items(state: &mut PlanModeStreamState) {
+    let publication = state.queue_partial_completion();
+    state.wait_for_publication(publication).await;
 }
 
 #[expect(
@@ -271,7 +340,15 @@ async fn handle_plan_segments(
             matches!(segment,
             ProposedPlanSegment::Normal(delta) if delta.chars().any(|ch| !ch.is_whitespace()))
         });
-    if !starts_prose {
+    let starts_plan = !state.plan_item_state.started
+        && !state.plan_item_state.completed
+        && segments.iter().any(|segment| {
+            matches!(
+                segment,
+                ProposedPlanSegment::ProposedPlanStart | ProposedPlanSegment::ProposedPlanDelta(_)
+            )
+        });
+    if !starts_prose && !starts_plan {
         handle_plan_segments_inner(sess, turn_context, state, item_id, segments).await;
         return;
     }
@@ -280,10 +357,8 @@ async fn handle_plan_segments(
     let mut owned = OwnedPlanStreamState {
         state: Some(std::mem::replace(
             state,
-            PlanModeStreamState::new(&turn_context.sub_id),
+            PlanModeStreamState::new(sess, turn_context),
         )),
-        session: Arc::clone(sess),
-        turn: Arc::clone(turn_context),
         in_flight: Some(crate::session::DurableHistoryCommitInFlight {
             session: Arc::clone(sess),
         }),
@@ -481,12 +556,7 @@ pub(super) async fn flush_assistant_text_segments_all(
 }
 
 /// Emit completion for plan items by parsing the finalized assistant message.
-async fn maybe_complete_plan_item_from_message(
-    sess: &Session,
-    turn_context: &TurnContext,
-    state: &mut PlanModeStreamState,
-    item: &ResponseItem,
-) {
+async fn maybe_complete_plan_item_from_message(state: &mut PlanModeStreamState, item: &ResponseItem) {
     if let ResponseItem::Message { role, content, .. } = item
         && role == "assistant"
     {
@@ -497,12 +567,9 @@ async fn maybe_complete_plan_item_from_message(
             }
         }
         if let Some(plan_text) = extract_proposed_plan_text(&text) {
-            if !state.plan_item_state.started {
-                state.plan_item_state.start(sess, turn_context).await;
-            }
             state
                 .plan_item_state
-                .complete_with_text(sess, turn_context, plan_text)
+                .complete_with_text(plan_text, /*start_if_missing*/ true)
                 .await;
         }
     }
@@ -510,48 +577,34 @@ async fn maybe_complete_plan_item_from_message(
 
 /// Emit a completed agent message in plan mode, respecting deferred starts.
 async fn emit_agent_message_in_plan_mode(
-    sess: &Session,
-    turn_context: &TurnContext,
     agent_message: codex_protocol::items::AgentMessageItem,
     state: &mut PlanModeStreamState,
 ) {
-    let agent_message_id = agent_message.id.clone();
-    let text = agent_message_text(&agent_message);
-    if text.trim().is_empty() {
-        state.pending_agent_message_items.remove(&agent_message_id);
-        if let Some(started_item) = state.started_agent_message_items.remove(&agent_message_id) {
-            sess.emit_turn_item_completed(turn_context, started_item)
-                .await;
-        }
-        return;
-    }
-
-    maybe_emit_pending_agent_message_start(sess, turn_context, state, &agent_message_id).await;
-
-    if !state
-        .started_agent_message_items
-        .contains_key(&agent_message_id)
-    {
-        let start_item = state
-            .pending_agent_message_items
-            .remove(&agent_message_id)
-            .unwrap_or_else(|| {
-                TurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
-                    id: agent_message_id.clone(),
-                    content: Vec::new(),
-                    phase: None,
-                    interruption: None,
+    let agent_message_id = &agent_message.id;
+    let started = state.started_agent_message_items.remove(agent_message_id);
+    let publication = if agent_message_text(&agent_message).trim().is_empty() {
+        state.pending_agent_message_items.remove(agent_message_id);
+        started.and_then(|item| state.plan_item_state.queue_item_publications(vec![(None, item)]))
+    } else {
+        let start = started.is_none().then(|| {
+            state
+                .pending_agent_message_items
+                .remove(agent_message_id)
+                .unwrap_or_else(|| {
+                    TurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
+                        id: agent_message_id.clone(),
+                        content: Vec::new(),
+                        phase: None,
+                        interruption: None,
+                    })
                 })
-            });
-        sess.emit_turn_item_started(turn_context, &start_item).await;
-        state
-            .started_agent_message_items
-            .insert(agent_message_id.clone(), start_item);
-    }
-
-    sess.emit_turn_item_completed(turn_context, TurnItem::AgentMessage(agent_message))
-        .await;
-    state.started_agent_message_items.remove(&agent_message_id);
+        });
+        state.plan_item_state.queue_item_publications(vec![(
+            start,
+            TurnItem::AgentMessage(agent_message),
+        )])
+    };
+    state.wait_for_publication(publication).await;
 }
 
 /// Emit completion for a plan-mode turn item, handling agent messages specially.
@@ -564,7 +617,7 @@ async fn emit_turn_item_in_plan_mode(
 ) {
     match turn_item {
         TurnItem::AgentMessage(agent_message) => {
-            emit_agent_message_in_plan_mode(sess, turn_context, agent_message, state).await;
+            emit_agent_message_in_plan_mode(agent_message, state).await;
         }
         _ => {
             if previously_active_item.is_none() {
@@ -602,7 +655,7 @@ pub(super) async fn handle_assistant_item_done_in_plan_mode(
         record_completed_response_item_with_finalized_facts(
             sess, turn_context, item, finalized_facts.as_ref(),
         ).await?;
-        maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
+        maybe_complete_plan_item_from_message(state, item).await;
         if let Some(finalized_turn_item) = finalized_turn_item {
             emit_turn_item_in_plan_mode(
                 sess,

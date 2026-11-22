@@ -50,6 +50,7 @@ pub use codex_protocol::protocol::SessionMeta;
 pub use compression::RolloutCompressionWorker;
 pub use compression::RolloutLineReader;
 pub use compression::existing_rollout_path;
+pub use compression::try_existing_rollout_path;
 pub use compression::lock_rollout_moves;
 pub use compression::move_rollout_to_directory;
 pub use compression::move_rollout_to_directory_with_owner;

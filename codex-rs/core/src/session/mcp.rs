@@ -799,6 +799,20 @@ impl Session {
             return Ok(());
         }
 
+        {
+            let mut pending = self.pending_mcp_server_refresh_config.lock().await;
+            if let Some(current) = pending.as_ref() {
+                // Preserve the admitted catalog but give this capability
+                // change a new receipt; a worker may already hold the old one.
+                let refreshed = Arc::new((**current).clone());
+                self.services.supports_openai_form_elicitation.store(
+                    supported, std::sync::atomic::Ordering::Relaxed,
+                );
+                *pending = Some(refreshed);
+                return Ok(());
+            }
+        }
+        let runtime = self.services.latest_mcp_runtime();
         let config = self.get_config().await;
         let refresh_config = McpServerRefreshConfig {
             // The refresh replaces the whole catalog, so it needs the built-in, plugin and
@@ -809,10 +823,26 @@ impl Session {
             )?,
             auth_keyring_backend_kind: serde_json::to_value(config.auth_keyring_backend_kind())?,
         };
+        let mut pending = self.pending_mcp_server_refresh_config.lock().await;
+        let mut refresh_config = pending.as_deref().cloned().unwrap_or(refresh_config);
+        let current = self.services.latest_mcp_runtime();
+        if pending.is_none() && !Arc::ptr_eq(&current, &runtime) {
+            // A refresh was published while we were materializing the old
+            // view. Rebind to its server map and credential settings.
+            let config = current.config();
+            refresh_config.mcp_servers =
+                serde_json::to_value(codex_mcp::configured_mcp_servers(config))?;
+            refresh_config.mcp_oauth_credentials_store_mode =
+                serde_json::to_value(config.mcp_oauth_credentials_store_mode)?;
+            refresh_config.auth_keyring_backend_kind =
+                serde_json::to_value(config.auth_keyring_backend_kind)?;
+        }
         self.services
             .supports_openai_form_elicitation
             .store(supported, std::sync::atomic::Ordering::Relaxed);
-        *self.pending_mcp_server_refresh_config.lock().await = Some(Arc::new(refresh_config));
+        // Use a fresh identity even for the same pending payload. An older
+        // worker may already have captured the previous capability.
+        *pending = Some(Arc::new(refresh_config));
         Ok(())
     }
 

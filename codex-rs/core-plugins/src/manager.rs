@@ -1871,7 +1871,8 @@ impl PluginsManager {
                     plugin_install_error_type(&err),
                     plugin_install_sub_error_type(&err),
                     err.to_string(),
-                );
+                )
+                .await;
                 Err(err)
             }
         }
@@ -1972,13 +1973,16 @@ impl PluginsManager {
         })
         .await
         .map_err(PluginInstallError::join)?;
-        result.map_err(|err| {
-            self.track_plugin_install_resolution_failed(&err);
-            err.into()
-        })
+        match result {
+            Ok(resolved) => Ok(resolved),
+            Err(err) => {
+                self.track_plugin_install_resolution_failed(&err).await;
+                Err(err.into())
+            }
+        }
     }
 
-    fn track_plugin_install_resolution_failed(&self, err: &MarketplaceError) {
+    async fn track_plugin_install_resolution_failed(&self, err: &MarketplaceError) {
         let plugin_id = match err {
             MarketplaceError::PluginNotFound {
                 plugin_name,
@@ -2000,7 +2004,8 @@ impl PluginsManager {
                 marketplace_error_type(err),
                 /*sub_error_type*/ None,
                 err.to_string(),
-            );
+            )
+            .await;
         } else {
             tracing::warn!(
                 error_type = %marketplace_error_type(err),
@@ -2010,7 +2015,7 @@ impl PluginsManager {
         }
     }
 
-    fn track_plugin_install_failed(
+    async fn track_plugin_install_failed(
         &self,
         plugin_id: &PluginId,
         error_type: &'static str,
@@ -2030,7 +2035,7 @@ impl PluginsManager {
         };
         if let Some(analytics_events_client) = analytics_events_client {
             analytics_events_client.track_plugin_install_failed(
-                self.telemetry_metadata_for_plugin_id(plugin_id),
+                self.telemetry_metadata_for_plugin_id_async(plugin_id).await,
                 self.plugin_install_source,
                 error_type.to_string(),
             );
@@ -2795,11 +2800,20 @@ impl PluginsManager {
                     auth.clone(),
                     on_effective_plugins_changed.clone(),
                 );
-                manager.maybe_start_remote_installed_plugin_bundle_sync(
-                    &config_for_remote_sync,
-                    auth.clone(),
-                    on_effective_plugins_changed,
-                );
+                let bundle_manager = Arc::clone(&manager);
+                let bundle_config = config_for_remote_sync.clone();
+                let bundle_auth = auth.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    bundle_manager.maybe_start_remote_installed_plugin_bundle_sync(
+                        &bundle_config,
+                        bundle_auth,
+                        on_effective_plugins_changed,
+                    );
+                })
+                .await
+                {
+                    warn!(%error, "remote installed plugin startup worker failed");
+                }
                 if config_for_remote_sync.remote_plugin_enabled {
                     manager.schedule_global_remote_catalog_cache_refresh(
                         GlobalRemoteCatalogCacheRefreshRequest {

@@ -327,7 +327,7 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         Box::pin(
             async move {
                 let remote_models = self.get_remote_models().await;
-                construct_model_info_from_candidates(model, &remote_models, config)
+                construct_model_info_from_candidates(model, &remote_models, config).await
             }
             .instrument(tracing::info_span!("get_model_info", model = model)),
         )
@@ -728,13 +728,16 @@ impl ModelsManager for OpenAiModelsManager {
             async move {
                 self.note_catalog_activity(RefreshStrategy::Offline).await;
                 self.ensure_current_cache_identity().await;
-                let state = self.state.read().await;
-                let mut info = construct_model_info_with_rejections(
-                    model,
-                    &state.remote_models,
-                    &state.rejected_slugs,
-                    config,
-                );
+                let selected = {
+                    let state = self.state.read().await;
+                    select_model_info_with_rejections(
+                        model,
+                        &state.remote_models,
+                        &state.rejected_slugs,
+                    )
+                    .map(|info| info.cloned())
+                };
+                let mut info = construct_model_info_from_selected(model, selected, config).await;
                 if self.endpoint_client.has_authoritative_catalog()
                     && info.used_fallback_model_metadata
                 {
@@ -1581,12 +1584,10 @@ impl ModelsManager for StaticModelsManager {
         Box::pin(
             async move {
                 self.model_catalog_activity.note_activity().await;
-                construct_model_info_with_rejections(
-                    model,
-                    &self.remote_models,
-                    &self.rejected_slugs,
-                    config,
-                )
+                let selected =
+                    select_model_info_with_rejections(model, &self.remote_models, &self.rejected_slugs)
+                        .map(|info| info.cloned());
+                construct_model_info_from_selected(model, selected, config).await
             }
             .instrument(tracing::info_span!("get_model_info", model = model)),
         )
@@ -1671,12 +1672,11 @@ fn normalize_model_catalog_with_rejections(models: Vec<ModelInfo>) -> Normalized
     normalized
 }
 
-fn construct_model_info_with_rejections(
+fn select_model_info_with_rejections<'a>(
     model: &str,
-    candidates: &[ModelInfo],
+    candidates: &'a [ModelInfo],
     rejected_slugs: &std::collections::BTreeSet<String>,
-    config: &ModelsManagerConfig,
-) -> ModelInfo {
+) -> Result<Option<&'a ModelInfo>, ()> {
     // Resolve in normal lookup order. A rejected slug blocks a less
     // specific match, not an exact or longer surviving model slug.
     let lookup = |slug| {
@@ -1690,18 +1690,12 @@ fn construct_model_info_with_rejections(
             Ok(candidate)
         }
     };
-    let remote = lookup(model)
-        .and_then(|remote| {
-            if remote.is_some() {
-                return Ok(remote);
-            }
-            model_info::namespaced_model_suffix(model).map_or(Ok(None), lookup)
-        })
-        .unwrap_or_else(|()| {
-            tracing::warn!(%model, "using explicit fallback for quarantined model metadata");
-            None
-        });
-    construct_model_info_from_selected(model, remote, config)
+    lookup(model).and_then(|remote| {
+        if remote.is_some() {
+            return Ok(remote);
+        }
+        model_info::namespaced_model_suffix(model).map_or(Ok(None), lookup)
+    })
 }
 
 fn load_bundled_models() -> Result<Vec<ModelInfo>, std::io::Error> {
@@ -1748,38 +1742,54 @@ fn find_normalized_model_by_longest_prefix<'a>(
         .max_by_key(|candidate| candidate.slug.len())
 }
 
-pub(crate) fn construct_model_info_from_candidates(
+pub(crate) async fn construct_model_info_from_candidates(
     model: &str,
     candidates: &[ModelInfo],
     config: &ModelsManagerConfig,
 ) -> ModelInfo {
     let normalized = normalize_model_catalog_with_rejections(candidates.to_vec());
-    construct_model_info_with_rejections(
-        model,
-        &normalized.models,
-        &normalized.rejected_slugs,
-        config,
-    )
+    let selected =
+        select_model_info_with_rejections(model, &normalized.models, &normalized.rejected_slugs)
+            .map(|info| info.cloned());
+    construct_model_info_from_selected(model, selected, config).await
 }
 
-/// Copy only the descriptor selected from the validated snapshot.
-fn construct_model_info_from_selected(
+async fn construct_model_info_from_selected(
     model: &str,
-    remote: Option<&ModelInfo>,
+    remote: Result<Option<ModelInfo>, ()>,
     config: &ModelsManagerConfig,
 ) -> ModelInfo {
-    let mut model_info = if let Some(remote) = remote {
-        ModelInfo {
-            slug: model.to_string(),
-            ..remote.clone()
+    let remote = remote.unwrap_or_else(|()| {
+        tracing::warn!(%model, "using explicit fallback for quarantined model metadata");
+        None
+    });
+    // Fallback and default-backed descriptors read the live policy file. The
+    // worker receives only the selected model, never the catalog or its guard.
+    let mut info = match remote {
+        Some(mut remote) if !remote.uses_default_base_instructions => {
+            remote.slug = model.to_string();
+            remote
         }
-    } else {
-        model_info::model_info_from_slug(model)
+        remote => {
+            let model = model.to_string();
+            tokio::task::spawn_blocking(move || {
+                let mut info = remote.unwrap_or_else(|| model_info::model_info_from_slug(&model));
+                info.slug = model;
+                if info.uses_default_base_instructions {
+                    info.base_instructions = codex_protocol::models::default_base_instructions();
+                }
+                info
+            })
+            .await
+            .unwrap_or_else(|error| {
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+                panic!("model metadata worker stopped before producing a descriptor: {error}");
+            })
+        }
     };
-    if model_info.uses_default_base_instructions {
-        model_info.base_instructions = codex_protocol::models::default_base_instructions();
-    }
-    model_info::apply_local_personality_messages(&mut model_info, model);
-    model_info::with_config_overrides(model_info, config)
+    model_info::apply_local_personality_messages(&mut info, model);
+    model_info::with_config_overrides(info, config)
 }
 

@@ -250,6 +250,8 @@ async fn process_review_events(
     receiver: async_channel::Receiver<Event>,
 ) -> Option<ReviewOutputEvent> {
     let mut prev_agent_message: Option<codex_protocol::protocol::AgentMessageEvent> = None;
+    let mut mirrored_web_search_starts = HashSet::new();
+    let mut mirrored_web_search_ends = HashSet::new();
     while let Ok(event) = receiver.recv().await {
         match event.msg {
             EventMsg::AgentMessage(message) => {
@@ -351,7 +353,27 @@ async fn process_review_events(
                 // Cancellation or abort: consumer will finalize with None.
                 return None;
             }
+            // Parent dispatch generates a legacy mirror from each canonical
+            // item. Do not also forward the delegate's pre-namespace mirror.
+            // If no canonical item reached us, keep the standalone legacy event.
+            EventMsg::WebSearchBegin(event)
+                if mirrored_web_search_starts.remove(&event.call_id) => {}
+            EventMsg::WebSearchEnd(event)
+                if mirrored_web_search_ends.remove(&event.call_id) => {}
             mut other => {
+                match &other {
+                    EventMsg::ItemStarted(event) => {
+                        if let TurnItem::WebSearch(item) = &event.item {
+                            mirrored_web_search_starts.insert(item.id.clone());
+                        }
+                    }
+                    EventMsg::ItemCompleted(event) => {
+                        if let TurnItem::WebSearch(item) = &event.item {
+                            mirrored_web_search_ends.insert(item.id.clone());
+                        }
+                    }
+                    _ => {}
+                }
                 reparent_review_event(&mut other, session.thread_id, &ctx.sub_id);
                 session.send_event(ctx.as_ref(), other).await;
             }
@@ -408,6 +430,9 @@ fn reparent_review_event(event: &mut EventMsg, thread_id: codex_protocol::Thread
             event.call_id = format!("review-{turn_id}:{}", event.call_id)
         }
         EventMsg::McpToolCallBegin(event) => {
+            event.call_id = format!("review-{turn_id}:{}", event.call_id)
+        }
+        EventMsg::McpToolCallProgress(event) => {
             event.call_id = format!("review-{turn_id}:{}", event.call_id)
         }
         EventMsg::McpToolCallEnd(event) => {

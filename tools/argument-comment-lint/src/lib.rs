@@ -33,6 +33,7 @@ use rustc_span::Span;
 
 use crate::comment_parser::parse_argument_comment;
 use crate::comment_parser::parse_argument_comment_prefix;
+use crate::comment_parser::parse_argument_comment_within;
 
 dylint_linting::dylint_library!();
 
@@ -218,10 +219,19 @@ impl ArgumentCommentLint {
             let argument_comment = parse_argument_comment(gap_text.as_ref())
                 .or_else(|| {
                     let text = lookbehind_text.get_or_init(|| {
-                        let start = BytePos(arg_span.lo().0.saturating_sub(64));
-                        snippet(cx, arg_span.shrink_to_lo().with_lo(start), "")
+                        let file_start = cx.tcx.sess.source_map().lookup_source_file(arg_span.lo()).start_pos;
+                        let arg_start = arg_span.shrink_to_lo();
+                        let start = BytePos(arg_span.lo().0.saturating_sub(64).max(file_start.0));
+                        let lookbehind = snippet(cx, arg_start.with_lo(start), "");
+                        if lookbehind.contains("/*") && lookbehind.trim_end().ends_with("*/") {
+                            // The short window can start inside a comment or a string.
+                            // Lex from a source boundary, but retain the old candidate window.
+                            snippet(cx, arg_start.with_lo(file_start), "")
+                        } else {
+                            "".into()
+                        }
                     });
-                    parse_argument_comment(text.as_ref())
+                    parse_argument_comment_within(text.as_ref(), text.len().saturating_sub(64))
                 })
                 .or_else(|| {
                     let text = arg_text.get_or_init(|| snippet(cx, arg_span, ".."));

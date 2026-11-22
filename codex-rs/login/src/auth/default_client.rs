@@ -390,18 +390,21 @@ pub(crate) fn create_default_auth_client_pool(
 
 /// Builds a fixed client for an auth endpoint. Redirects are deliberately not followed;
 /// multi-request auth flows must use the route-aware pools above.
-pub(crate) fn create_raw_auth_client(
+pub(crate) async fn create_raw_auth_client(
     endpoint: &str,
     auth_route_config: &AuthRouteConfig,
-) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
-    HttpClientBuilder::new()
-        .without_request_logging()
-        .without_redirects()
-        .build_respecting_outbound_proxy_policy(
-            auth_route_config.http_client_factory(),
-            endpoint,
-            ClientRouteClass::Auth,
-        )
+) -> std::io::Result<HttpClient> {
+    let factory = auth_route_config.http_client_factory().clone();
+    let endpoint = endpoint.to_owned();
+    tokio::task::spawn_blocking(move || {
+        HttpClientBuilder::new()
+            .without_request_logging()
+            .without_redirects()
+            .build_respecting_outbound_proxy_policy(&factory, &endpoint, ClientRouteClass::Auth)
+            .map_err(std::io::Error::from)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Builds the default Codex HTTP client wrapper for an auth endpoint.

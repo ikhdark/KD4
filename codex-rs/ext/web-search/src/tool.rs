@@ -30,6 +30,7 @@ use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSearchSourceInfo;
 use http::HeaderMap;
 use std::sync::LazyLock;
+use std::time::Duration;
 use url::Url;
 
 use crate::history::recent_input;
@@ -43,6 +44,8 @@ const WEB_SOURCE_NAME: &str = "Web";
 /// The deferred catalog lists this source before its tools load. A bare
 /// `source:web` scope did not tell a research task that it can browse.
 const WEB_SOURCE_DESCRIPTION: &str = "Search the public web and open pages, PDFs and links: current facts, documentation, papers and other projects' source that the workspace does not contain.";
+// This read-only operation is finite; do not apply its deadline to streaming clients.
+const WEB_SEARCH_DEADLINE: Duration = Duration::from_secs(60);
 const WEB_SEARCH_CANCELLED_MESSAGE: &str = "web search cancelled";
 
 pub(crate) struct WebSearchTool {
@@ -164,7 +167,10 @@ impl WebSearchTool {
             .await;
         let search_result = call
             .cancellation_token
-            .run_until_cancelled(client.search(&request, HeaderMap::new()))
+            .run_until_cancelled(tokio::time::timeout(
+                WEB_SEARCH_DEADLINE,
+                client.search(&request, HeaderMap::new()),
+            ))
             .await;
         match search_result {
             None => {
@@ -177,7 +183,21 @@ impl WebSearchTool {
                 call.turn_item_emitter.emit_completed(terminal_item).await;
                 Err(cancelled_error())
             }
-            Some(Err(err)) => {
+            Some(Err(_)) => {
+                let error = FunctionCallError::RespondToModel(
+                    "Web search timed out before a complete response. No evidence was retrieved."
+                        .to_string(),
+                );
+                let terminal_item = completed_turn_item(
+                    &call.call_id,
+                    command_action,
+                    "failed",
+                    Some(error.to_string()),
+                );
+                call.turn_item_emitter.emit_completed(terminal_item).await;
+                Err(error)
+            }
+            Some(Ok(Err(err))) => {
                 let error = search_error(err);
                 let terminal_item = completed_turn_item(
                     &call.call_id,
@@ -188,7 +208,7 @@ impl WebSearchTool {
                 call.turn_item_emitter.emit_completed(terminal_item).await;
                 Err(error)
             }
-            Some(Ok(response)) => {
+            Some(Ok(Ok(response))) => {
                 let terminal_item =
                     completed_turn_item(&call.call_id, command_action, "completed", None);
                 call.turn_item_emitter.emit_completed(terminal_item).await;

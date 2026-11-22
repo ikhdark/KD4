@@ -46,6 +46,8 @@ use crate::session_runtime::ToolName as CellToolName;
 
 const STATE_CHANGE_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 const DECISION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+// Only one observer is active; bound queued arrival bursts independently of runtime events.
+const OBSERVATION_COMMAND_CAPACITY: usize = 16;
 
 pub(crate) struct CellActor;
 
@@ -68,7 +70,7 @@ impl CellActor {
     > {
         let default_tool_timeout_ms = request.default_tool_timeout_ms;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::channel(OBSERVATION_COMMAND_CAPACITY);
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
         let output_admission = Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES));
         let (runtime_tx, runtime_terminate_handle) = crate::runtime::spawn_runtime_with_catalog(
@@ -120,7 +122,7 @@ async fn run_cell<H: CellHost>(
     host: Arc<H>,
     context: CellContext,
     mut event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
-    command_rx: mpsc::UnboundedReceiver<CellCommand>,
+    command_rx: mpsc::Receiver<CellCommand>,
     initial_observer: Observer,
     task_failure_handler: Option<TaskFailureHandler>,
 ) {

@@ -367,7 +367,7 @@ impl CodexAppsStartupReconnect {
                 .map(|tools| filter_tools(tools, &reconnect.tool_filter));
             let result = pending_client.await;
             let startup_status_context = reconnect.startup_status_context.clone();
-            let recovered = {
+            let failure = {
                 let mut state = reconnect
                     .state
                     .lock()
@@ -385,23 +385,26 @@ impl CodexAppsStartupReconnect {
                         );
                         state.consecutive_failures = 0;
                         state.retry_not_before = None;
-                        true
+                        None
                     }
                     Err(error) => {
                         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
                         let retry_after = codex_apps_reconnect_backoff(state.consecutive_failures);
                         state.retry_not_before = Some(TokioInstant::now() + retry_after);
-                        warn!(
-                            error = %error,
-                            retry_after_ms = retry_after.as_millis(),
-                            "MCP startup reconnect failed; will retry after backoff"
-                        );
-                        false
+                        Some((error, retry_after))
                     }
                 }
             };
 
-            if recovered && let Some(context) = startup_status_context {
+            if let Some((error, retry_after)) = failure {
+                warn!(
+                    error = %error,
+                    retry_after_ms = retry_after.as_millis(),
+                    "MCP startup reconnect failed; will retry after backoff"
+                );
+                return;
+            }
+            if let Some(context) = startup_status_context {
                 let _ = crate::event_queue::send_event(
                     &context.tx_event,
                     Event {

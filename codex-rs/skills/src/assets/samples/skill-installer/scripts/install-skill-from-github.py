@@ -268,7 +268,7 @@ def _require_direct_checkout_tree(repo_root: str, relative: str) -> str:
     if os.altsep:
         relative = relative.replace(os.altsep, os.sep)
     parts = [part for part in relative.split(os.sep) if part not in ("", os.curdir)]
-    if not parts or os.pardir in parts:
+    if not relative or os.pardir in parts:
         raise InstallError(f"Invalid skill checkout path: {relative}")
 
     def reject_indirect(path: str) -> None:

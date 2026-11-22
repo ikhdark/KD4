@@ -275,7 +275,14 @@ impl RequestTracker {
     }
 
     pub(super) fn operation_count(&self) -> usize {
-        self.pending.len() + self.initial_responses.len() + self.deferred_waits.len()
+        // A started execute can have both an initial response and a claim
+        // outstanding. Count it once, until the last obligation is settled.
+        let claim_only = self
+            .unclaimed_executes
+            .keys()
+            .filter(|id| !self.initial_responses.contains_key(*id))
+            .count();
+        self.pending.len() + self.initial_responses.len() + self.deferred_waits.len() + claim_only
     }
 
     pub(super) fn fail_all(&mut self, reason: &str) {

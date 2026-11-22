@@ -626,13 +626,18 @@ pub(crate) async fn apply_bespoke_event_handling(
                         PathUri::from_abs_path(config_snapshot.cwd()),
                     _ => {
                         error!("permission request has no unambiguous environment working directory");
-                        let _ = conversation.submit(Op::RequestPermissionsResponse {
-                            id: request.call_id,
-                            response: CoreRequestPermissionsResponse {
-                                permissions: Default::default(),
-                                scope: CorePermissionGrantScope::Turn,
-                            },
-                        }).await;
+                        if let Err(err) = conversation
+                            .submit(Op::RequestPermissionsResponse {
+                                id: request.call_id,
+                                response: CoreRequestPermissionsResponse {
+                                    permissions: Default::default(),
+                                    scope: CorePermissionGrantScope::Turn,
+                                },
+                            })
+                            .await
+                        {
+                            error!("failed to submit RequestPermissionsResponse: {err}");
+                        }
                         return;
                     }
                 }

@@ -5595,6 +5595,51 @@ fn migrate_rollout_v0(fields: &mut serde_json::Map<String, Value>) -> Result<(),
         }
         Some("turn_context") => {
             payload.remove("summary");
+            if let Some(policy) = payload.get_mut("approval_policy").and_then(Value::as_object_mut)
+                && policy.len() == 1
+                && let Some(reject) = policy.get("reject")
+            {
+                // The historical policy encoded what to reject. Granular
+                // encodes what to allow, including the old optional fields.
+                #[derive(Deserialize)]
+                struct V0RejectPolicy {
+                    sandbox_approval: bool,
+                    rules: bool,
+                    #[serde(default)]
+                    skill_approval: bool,
+                    #[serde(default)]
+                    request_permissions: bool,
+                    mcp_elicitations: bool,
+                }
+                let reject: V0RejectPolicy = serde_json::from_value(reject.clone())
+                    .map_err(|err| format!("invalid v0 reject approval policy: {err}"))?;
+                let granular = GranularApprovalConfig {
+                    sandbox_approval: !reject.sandbox_approval,
+                    rules: !reject.rules,
+                    skill_approval: !reject.skill_approval,
+                    request_permissions: !reject.request_permissions,
+                    mcp_elicitations: !reject.mcp_elicitations,
+                };
+                let granular = serde_json::to_value(granular).map_err(|err| err.to_string())?;
+                policy.remove("reject");
+                policy.insert("granular".to_string(), granular);
+            }
+        }
+        Some("event_msg")
+            if payload.get("type").and_then(Value::as_str) == Some("entered_review_mode") =>
+        {
+            // The original review event stored an already-resolved prompt,
+            // not a branch/commit target. Preserve it as recorded instructions.
+            if !payload.contains_key("target")
+                && let Some(instructions) = payload.get("prompt").and_then(Value::as_str)
+            {
+                let target = serde_json::to_value(ReviewTarget::Custom {
+                    instructions: instructions.to_owned(),
+                })
+                .map_err(|err| err.to_string())?;
+                payload.insert("target".to_string(), target);
+                payload.remove("prompt");
+            }
         }
         Some("event_msg")
             if payload.get("type").and_then(Value::as_str) == Some("collab_agent_spawn_end") =>

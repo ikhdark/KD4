@@ -381,9 +381,12 @@ pub(crate) fn spawn_exit_watcher(
     let output_drained = process.output_drained_token();
     let terminal_completion = process.register_terminal_completion();
     tokio::spawn(async move {
-        turn_ref.turn_timing_state.record_tool_sample_block_reason(
-            codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
-        );
+        turn_ref
+            .turn_timing_state
+            .record_tool_sample_block_reason_async(
+                codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
+            )
+            .await;
         let exit_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
         wait_for_sticky_lifecycle_signal(&exit_token).await;
         // An observation-channel failure wakes cleanup but is not exit evidence.
@@ -446,9 +449,12 @@ pub(crate) fn spawn_exit_watcher(
             "stale process completion cannot own live command state"
         );
         let output_waiter_guard = ProcessOutputWaiterGuard::new(&turn_ref.turn_timing_state);
-        turn_ref.turn_timing_state.record_tool_sample_block_reason(
-            codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
-        );
+        turn_ref
+            .turn_timing_state
+            .record_tool_sample_block_reason_async(
+                codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
+            )
+            .await;
         let output_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
         let output_handles = process.output_handles();
         wait_for_process_output_finalization(

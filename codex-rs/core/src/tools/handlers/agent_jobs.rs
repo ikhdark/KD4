@@ -56,7 +56,6 @@ const MISSING_STATUS_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_AGENT_JOB_ITEM_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 const ORPHANED_AGENT_JOB_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const PARENT_TOOL_CANCELLATION_REASON: &str = "cancelled by parent tool request";
-const MAX_SCHEMA_VALIDATION_ERRORS: usize = 5;
 const AGENT_JOB_OUTPUT_COLUMNS: [&str; 10] = [
     "job_id",
     "item_id",
@@ -336,26 +335,13 @@ fn validate_agent_job_result(schema: &Value, result: &Value) -> Result<(), Funct
             "stored agent job output_schema could not be compiled: {error}"
         ))
     })?;
-    let mut errors = validator.iter_errors(result);
-    let mut messages = Vec::new();
-    for error in errors.by_ref().take(MAX_SCHEMA_VALIDATION_ERRORS) {
-        let pointer = error.instance_path().as_str();
-        let path = if pointer.is_empty() {
-            "$".to_string()
-        } else {
-            format!("${pointer}")
-        };
-        messages.push(format!("{path}: {error}"));
-    }
-    if messages.is_empty() {
+    let Some(failure) = crate::tools::registry::argument_schema_diagnostic(&validator, schema, result)
+    else {
         return Ok(());
-    }
-    if errors.next().is_some() {
-        messages.push("additional validation errors omitted".to_string());
-    }
+    };
     Err(FunctionCallError::RespondToModel(format!(
         "result does not match output_schema: {}",
-        messages.join("; ")
+        failure.message
     )))
 }
 

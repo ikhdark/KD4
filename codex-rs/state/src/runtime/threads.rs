@@ -700,7 +700,9 @@ ON CONFLICT(child_thread_id) DO NOTHING
         filters: ThreadFilterOptions<'_>,
         relation_filter: Option<crate::ThreadRelationFilter>,
     ) -> anyhow::Result<crate::ThreadsPage> {
-        let limit = page_size.saturating_add(1);
+        let limit = i64::try_from(page_size).ok()
+            .and_then(|size| size.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("thread page size leaves no room for the SQLite lookahead row"))?;
 
         let mut builder = QueryBuilder::<Sqlite>::new("");
         push_list_threads_query(&mut builder, filters, relation_filter, limit);
@@ -744,6 +746,8 @@ ON CONFLICT(child_thread_id) DO NOTHING
         model_providers: Option<&[String]>,
         archived_only: bool,
     ) -> anyhow::Result<Vec<ThreadId>> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| anyhow::anyhow!("thread ID query limit exceeds the SQLite integer range"))?;
         let mut builder = QueryBuilder::<Sqlite>::new("SELECT threads.id FROM threads");
         push_thread_filters(
             &mut builder,
@@ -1539,7 +1543,7 @@ fn push_list_threads_query(
     builder: &mut QueryBuilder<Sqlite>,
     filters: ThreadFilterOptions<'_>,
     relation_filter: Option<crate::ThreadRelationFilter>,
-    limit: usize,
+    limit: i64,
 ) {
     if let Some(crate::ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) = relation_filter {
         builder.push(
@@ -1794,7 +1798,7 @@ pub(super) fn push_thread_order_and_limit(
     sort_direction: SortDirection,
     order_by_index: OrderByIndex,
     include_thread_id_tiebreaker: bool,
-    limit: usize,
+    limit: i64,
 ) {
     let order_column = match sort_key {
         SortKey::CreatedAt => "threads.created_at_ms",
@@ -1820,7 +1824,7 @@ pub(super) fn push_thread_order_and_limit(
         builder.push(order_direction);
     }
     builder.push(" LIMIT ");
-    builder.push_bind(limit as i64);
+    builder.push_bind(limit);
 }
 
 fn metadata_preview(metadata: &crate::ThreadMetadata) -> &str {

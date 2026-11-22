@@ -351,16 +351,30 @@ impl Drop for RawOutputArtifactTask {
         if !self.finished {
             // Preserve an explicitly incomplete prefix even when the owner is
             // cancelled. No cancellation path publishes a complete transcript.
-            if let Some(writer) = self.writer.as_mut() { let _ = writer.flush(); }
+            // Keep the write handle through status publication so a reader
+            // can distinguish this in-flight finalization from an orphan.
+            let (write_handle, prefix_confirmed) = self.writer.take().map_or((None, false), |mut writer| {
+                let flushed = writer.flush().is_ok();
+                // Do not let BufWriter::drop retry buffered writes after the
+                // terminal status describes the retained prefix.
+                let (file, _) = writer.into_parts();
+                let confirmed =
+                    flushed && file.metadata().is_ok_and(|metadata| metadata.len() == self.bytes);
+                (Some(file), confirmed)
+            });
             // Producer bytes after this drop are unknown, so a ceiling gap
             // recorded here is a lower bound, never an exact total.
             self.incomplete = true;
-            let status = self.status(false);
+            let mut status = self.status(false);
+            if !prefix_confirmed {
+                status["sha256"] = serde_json::Value::Null;
+            }
             if self.handle.is_some()
                 && let Ok(bytes) = serde_json::to_vec(&status)
             {
                 let _ = codex_file_system::write_bytes_atomically(&self.path.with_extension("status"), &bytes);
             }
+            drop(write_handle);
             if let Ok(mut state) = self.state.try_lock() {
                 *state = self.failed("command output capture ended before finalization".into());
             }
@@ -510,10 +524,39 @@ pub async fn read_command_log(
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(super::ReadToolOutputError::Io("command log is not a regular file".into()));
         }
-        let (status_file, _) = super::open_regular_artifact(&path.with_extension("status"))
-            .map_err(|error| if matches!(error, super::ReadToolOutputError::Expired) {
-                super::ReadToolOutputError::StillWriting
-            } else { error })?;
+        let status_path = path.with_extension("status");
+        let (status_file, _) = match super::open_regular_artifact(&status_path) {
+            Ok(status) => status,
+            Err(super::ReadToolOutputError::Expired) => {
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+                use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+                // The producer keeps its write handle until it publishes the
+                // status. A write-excluding pin distinguishes an ended log
+                // from one with active writer custody.
+                let pin = OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+                    .open(&path);
+                if let Err(error) = pin.as_ref()
+                    && error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+                {
+                    return Err(super::ReadToolOutputError::StillWriting);
+                }
+                let _pin = pin.map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+                // The writer may have completed between the first read and
+                // the pin. Do not pronounce status missing without a reread.
+                super::open_regular_artifact(&status_path).map_err(|error| {
+                    if matches!(error, super::ReadToolOutputError::Expired) {
+                        super::ReadToolOutputError::Io(
+                            "command log is present but terminal capture status is unavailable"
+                                .into(),
+                        )
+                    } else { error }
+                })?
+            }
+            Err(error) => return Err(error),
+        };
         let mut status = Vec::new();
         status_file.take(4097).read_to_end(&mut status)
             .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
@@ -814,7 +857,11 @@ pub async fn read_command_log(
         if let Some(identity) = identity { retain_command_log_index(identity, line_index); }
         let mut response = serde_json::json!({
             "artifact_id":artifact_id,
-            "canonical_sha256":status["sha256"],
+            "canonical_sha256":if status["bytes"].as_u64() == Some(metadata.len()) {
+                status["sha256"].clone()
+            } else {
+                serde_json::Value::Null
+            },
             "canonical_bytes":metadata.len(),
             "historical_authenticity":"unverified",
             "complete":results.iter().all(|r| r["complete"] == true),

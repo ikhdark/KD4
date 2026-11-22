@@ -434,6 +434,11 @@ impl InMemoryThreadStore {
         let mut state = self.state.lock().await;
         state.calls.update_thread_metadata += 1;
         require_thread(&state, params.thread_id)?;
+        if let Some(path) = params.patch.rollout_path.as_ref() {
+            // Match resume: the new path and its reverse mapping publish under
+            // one guard; retain existing aliases until thread deletion.
+            state.rollout_paths.insert(path.clone(), params.thread_id);
+        }
         state
             .metadata_updates
             .entry(params.thread_id)

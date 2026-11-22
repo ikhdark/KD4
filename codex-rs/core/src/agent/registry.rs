@@ -597,6 +597,7 @@ impl AgentRegistry {
             .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reset_pool = false;
         let agent_nickname = if let Some(preferred) = preferred {
             preferred.to_string()
         } else {
@@ -613,13 +614,7 @@ impl AgentRegistry {
             } else {
                 active_agents.used_agent_nicknames.clear();
                 active_agents.nickname_reset_count += 1;
-                if let Some(metrics) = codex_otel::global() {
-                    let _ = metrics.counter(
-                        "codex.multi_agent.nickname_pool_reset",
-                        /*inc*/ 1,
-                        &[],
-                    );
-                }
+                reset_pool = true;
                 format_agent_nickname(
                     names.choose(&mut rand::rng())?,
                     active_agents.nickname_reset_count,
@@ -629,6 +624,10 @@ impl AgentRegistry {
         active_agents
             .used_agent_nicknames
             .insert(agent_nickname.clone());
+        drop(active_agents);
+        if reset_pool && let Some(metrics) = codex_otel::global() {
+            let _ = metrics.counter("codex.multi_agent.nickname_pool_reset", /*inc*/ 1, &[]);
+        }
         Some(agent_nickname)
     }
 

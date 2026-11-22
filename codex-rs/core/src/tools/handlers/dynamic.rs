@@ -319,12 +319,17 @@ async fn request_dynamic_tool(
     let terminal_session = Arc::clone(session);
     let terminal_turn = Arc::clone(turn_context);
     let mut terminal = session.terminal_tasks.spawn(async move {
-        let _ = tokio::time::timeout(
+        let item_id = item.id.clone();
+        if tokio::time::timeout(
             std::time::Duration::from_secs(30),
             terminal_session
                 .emit_turn_item_completed(&terminal_turn, TurnItem::DynamicToolCall(item)),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            tracing::warn!(%item_id, "dynamic tool completion timed out; publication may be partial");
+        }
     });
     tokio::select! {
         _ = &mut terminal => {},

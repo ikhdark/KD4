@@ -319,7 +319,7 @@ impl PlanHandler {
             // Even a no-op may retry an earlier failed publication or migrate a
             // legacy snapshot that had no requirement lineage.
             session
-                .persist_rollout_items_durable(&[
+                .persist_rollout_items_then_sync(&[
                     codex_protocol::protocol::RolloutItem::ResponseItem(
                         crate::plan_store::plan_snapshot_item(&response),
                     ),

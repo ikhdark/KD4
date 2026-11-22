@@ -1262,7 +1262,7 @@ pub(crate) async fn obtain_api_key(
         access_token: String,
     }
     let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
-    let client = create_raw_auth_client(&token_endpoint, auth_route_config)?;
+    let client = create_raw_auth_client(&token_endpoint, auth_route_config).await?;
     let resp = client
         .post(token_endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")

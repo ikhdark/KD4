@@ -135,7 +135,9 @@ pub(super) fn resolve_tool_response(
                     .ok_or_else(|| "failed to allocate late evidence key".to_string())?;
                 let object = value.to_object(&tc)
                     .ok_or_else(|| "failed to construct late tool error".to_string())?;
-                object.set(&tc, key.into(), results);
+                if object.create_data_property(&tc, key.into(), results) != Some(true) {
+                    return Err("failed to attach completed evidence to late tool error".to_string());
+                }
             }
             resolver.reject(&tc, value);
         }

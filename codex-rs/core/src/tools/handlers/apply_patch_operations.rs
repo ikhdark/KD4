@@ -6,14 +6,21 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const MAX_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
+const RECEIPT_STORAGE: &str = "owned-sha256-v1";
 
 pub(super) enum Admission {
     New(Operation),
     Recovered(Value),
 }
 
-pub(super) struct Operation(File);
+pub(super) struct Operation {
+    journal: File,
+    reservation_bytes: usize,
+    payload_path: PathBuf,
+}
 
 fn unknown(message: impl Into<String>) -> FunctionCallError {
     FunctionCallError::structured(ToolFailure::new(ToolFailureCode::UncertainEffects, message))
@@ -112,6 +119,7 @@ pub(super) fn begin(
     std::fs::create_dir_all(&directory)
         .map_err(|e| unknown(format!("Patch receipt directory unavailable: {e}")))?;
     let path = directory.join(key);
+    let payload_path = path.with_extension("receipt-v1");
     let created = match OpenOptions::new()
         .read(true)
         .append(true)
@@ -135,6 +143,12 @@ pub(super) fn begin(
     let expected = json!({"version":1, "operation_id":id, "binding":binding});
     if is_new {
         let mut bytes = serde_json::to_vec(&expected).map_err(|e| unknown(e.to_string()))?;
+        // Leave room for a terminal record even when the patch text nearly
+        // fills the inline journal. The hashed envelope binds the same inputs.
+        if bytes.len() >= MAX_JOURNAL_BYTES - 1024 {
+            bytes = serde_json::to_vec(&hashed_reservation(id, &bytes))
+                .map_err(|e| unknown(e.to_string()))?;
+        }
         bytes.push(b'\n');
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
@@ -143,15 +157,19 @@ pub(super) fn begin(
                     "Patch operation reservation was not durably confirmed: {e}"
                 ))
             })?;
-        return Ok(Admission::New(Operation(file)));
+        return Ok(Admission::New(Operation {
+            journal: file,
+            reservation_bytes: bytes.len(),
+            payload_path,
+        }));
     }
     // Bounded receipt acquisition. A torn/malformed journal always fails closed.
     let mut bytes = Vec::new();
     (&mut file)
-        .take(64 * 1024 * 1024 + 1)
+        .take(MAX_JOURNAL_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| unknown(format!("Cannot read patch receipt: {e}")))?;
-    if bytes.len() > 64 * 1024 * 1024 || !bytes.ends_with(b"\n") {
+    if bytes.len() > MAX_JOURNAL_BYTES || !bytes.ends_with(b"\n") {
         return Err(unknown(format!(
             "Patch operation {id} has an incomplete receipt; reconcile through its mutation owner. Do not reapply."
         )));
@@ -163,7 +181,13 @@ pub(super) fn begin(
                 "Patch operation {id} has an unreadable reservation: {e}"
             ))
         })?;
-    if original != expected {
+    let matches = if original["version"] == 2 {
+        let expected = serde_json::to_vec(&expected).map_err(|e| unknown(e.to_string()))?;
+        original == hashed_reservation(id, &expected)
+    } else {
+        original == expected
+    };
+    if !matches {
         return Err(FunctionCallError::structured(ToolFailure::no_effects(
             ToolFailureCode::InvalidInput,
             format!(
@@ -175,20 +199,73 @@ pub(super) fn begin(
         "Patch operation {id} has a durable pending reservation but no terminal receipt. Its effects are unknown; reconcile through the mutation owner, never apply it again.")))?;
     let receipt: Value = serde_json::from_slice(receipt)
         .map_err(|e| unknown(format!("Patch receipt is incomplete: {e}")))?;
-    if records.next().is_some() || !receipt["success"].is_boolean() || receipt["operation_id"] != id
-    {
-        return Err(unknown(
-            "Patch operation receipt failed identity verification; do not replay.",
-        ));
+    if records.next().is_some() || receipt["operation_id"] != id {
+        return Err(receipt_identity_error());
+    }
+    let receipt = if receipt["receipt_storage"] == RECEIPT_STORAGE {
+        read_receipt_payload(&payload_path, &receipt)?
+    } else {
+        receipt
+    };
+    if !receipt["success"].is_boolean() || receipt["operation_id"] != id {
+        return Err(receipt_identity_error());
     }
     Ok(Admission::Recovered(receipt))
+}
+
+fn hashed_reservation(id: &str, serialized: &[u8]) -> Value {
+    json!({
+        "version": 2,
+        "operation_id": id,
+        "binding_sha256": hex::encode(Sha256::digest(serialized)),
+    })
+}
+
+fn receipt_identity_error() -> FunctionCallError {
+    unknown("Patch operation receipt failed identity verification; do not replay.")
+}
+
+fn read_receipt_payload(path: &Path, reference: &Value) -> Result<Value, FunctionCallError> {
+    let length = reference["length"]
+        .as_u64()
+        .filter(|length| *length > 0 && *length < u64::MAX)
+        .ok_or_else(receipt_identity_error)?;
+    let digest = reference["sha256"].as_str().ok_or_else(receipt_identity_error)?;
+    let file = File::open(path)
+        .map_err(|e| unknown(format!("Cannot recover patch receipt payload: {e}. Do not reapply.")))?;
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file() && metadata.len() == length) {
+        return Err(receipt_identity_error());
+    }
+    let mut bytes = Vec::new();
+    file.take(length + 1).read_to_end(&mut bytes)
+        .map_err(|e| unknown(format!("Cannot read patch receipt payload: {e}. Do not reapply.")))?;
+    if bytes.len() as u64 != length || hex::encode(Sha256::digest(&bytes)) != digest {
+        return Err(receipt_identity_error());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| unknown(format!("Patch receipt payload is incomplete: {e}")))
 }
 
 impl Operation {
     pub(super) fn finish(mut self, receipt: &Value) -> Result<(), FunctionCallError> {
         let mut bytes = serde_json::to_vec(receipt).map_err(|e| unknown(e.to_string()))?;
+        let unconfirmed = |e| unknown(format!("Patch settled but durable receipt publication was not confirmed: {e}. Do not reapply; recover the same operation identity."));
+        if bytes.len() >= MAX_JOURNAL_BYTES - self.reservation_bytes {
+            // The owner holds the journal lock throughout both writes. The
+            // reference is never published before its complete payload.
+            codex_file_system::write_bytes_atomically(&self.payload_path, &bytes)
+                .map_err(unconfirmed)?;
+            bytes = serde_json::to_vec(&json!({
+                "receipt_storage": RECEIPT_STORAGE,
+                "operation_id": receipt["operation_id"],
+                "length": bytes.len(),
+                "sha256": hex::encode(Sha256::digest(&bytes)),
+            })).map_err(|e| unknown(e.to_string()))?;
+        }
+        if bytes.len() >= MAX_JOURNAL_BYTES - self.reservation_bytes {
+            return Err(unknown("Patch receipt reference exceeds the journal bound; do not reapply."));
+        }
         bytes.push(b'\n');
-        self.0.write_all(&bytes).and_then(|()| self.0.sync_all())
-            .map_err(|e| unknown(format!("Patch settled but durable receipt publication was not confirmed: {e}. Do not reapply; recover the same operation identity.")))
+        self.journal.write_all(&bytes).and_then(|()| self.journal.sync_all())
+            .map_err(unconfirmed)
     }
 }

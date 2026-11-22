@@ -250,6 +250,16 @@ impl HttpClientBuilder {
             .map(|inner| HttpClient::from_parts(inner, request_logging))
     }
 
+    /// Builds the same transport-default client without doing native TLS
+    /// initialization or reading process CA files on an async runtime worker.
+    pub async fn build_with_transport_default_proxy_async(
+        self,
+    ) -> Result<HttpClient, BuildCustomCaTransportError> {
+        tokio::task::spawn_blocking(move || self.build_with_transport_default_proxy())
+            .await
+            .map_err(BuildCustomCaTransportError::BuildWorker)?
+    }
+
     fn into_reqwest_parts(self) -> (reqwest::ClientBuilder, RequestLogging, CustomCaPolicy) {
         let request_logging = self.request_logging;
         let custom_ca_policy = self.custom_ca_policy();

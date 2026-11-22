@@ -193,6 +193,9 @@ fn enqueue_remote_installed_plugin_bundle_sync(mut request: RemoteInstalledPlugi
     };
     {
         let mut mutations_guard = lock_cache_mutations();
+        if request.completion.as_ref().is_some_and(tokio::sync::oneshot::Sender::is_closed) {
+            return;
+        }
         // Borrow the guarded fields disjointly so the entry stays live.
         let mutations = &mut *mutations_guard;
         let state = mutations.syncs.entry(key.clone()).or_default();
@@ -247,21 +250,24 @@ fn spawn_remote_installed_plugin_bundle_sync(
     let runtime = request.runtime.clone();
     runtime.spawn(async move {
         let _guard = guard;
-        let snapshot = {
-            let mutations = lock_cache_mutations();
-            mutations
-                .syncs
-                .get(&_guard.0)
-                .filter(|state| state.epoch == request.epoch)
-                .map(|_| {
-                    mutations
-                        .generations
-                        .get(&_guard.0.plugin_cache_root)
-                        .copied()
-                        .unwrap_or_default()
-                })
-        };
         let sync = async {
+            let registration = Arc::clone(&_guard);
+            let epoch = request.epoch;
+            let snapshot = tokio::task::spawn_blocking(move || {
+                let mutations = lock_cache_mutations();
+                mutations
+                    .syncs
+                    .get(&registration.0)
+                    .filter(|state| state.epoch == epoch)
+                    .map(|_| {
+                        mutations
+                            .generations
+                            .get(&registration.0.plugin_cache_root)
+                            .copied()
+                            .unwrap_or_default()
+                    })
+            })
+            .await?;
             match snapshot {
                 Some(generation) => {
                     sync_remote_installed_plugin_bundles_with_registration(
@@ -327,7 +333,7 @@ pub async fn sync_remote_installed_plugin_bundles_once(
 ) -> Result<RemoteInstalledPluginBundleSyncOutcome, RemoteInstalledPluginBundleSyncError> {
     let auth = ensure_chatgpt_auth(auth)?.clone();
     let (completion, result) = tokio::sync::oneshot::channel();
-    enqueue_remote_installed_plugin_bundle_sync(RemoteInstalledPluginBundleSyncRequest {
+    let request = RemoteInstalledPluginBundleSyncRequest {
         codex_home,
         config: config.clone(),
         auth,
@@ -335,7 +341,8 @@ pub async fn sync_remote_installed_plugin_bundles_once(
         on_local_cache_changed: None,
         completion: Some(completion),
         runtime: tokio::runtime::Handle::current(),
-    });
+    };
+    tokio::task::spawn_blocking(move || enqueue_remote_installed_plugin_bundle_sync(request)).await?;
     result.await.map_err(|_| {
         PluginStoreError::Invalid(
             "remote plugin bundle sync was superseded before execution".to_string(),

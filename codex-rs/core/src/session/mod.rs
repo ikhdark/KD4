@@ -174,6 +174,17 @@ pub(crate) struct DurableHistoryCommitInFlight {
     session: Arc<Session>,
 }
 
+impl DurableHistoryCommitInFlight {
+    pub(crate) fn begin(session: &Arc<Session>) -> Self {
+        session
+            .durable_history_commits_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        Self {
+            session: Arc::clone(session),
+        }
+    }
+}
+
 impl Drop for DurableHistoryCommitInFlight {
     fn drop(&mut self) {
         self.session
@@ -4575,8 +4586,8 @@ impl Session {
         item.set_id(Some(ResponseItemId::new(prefix)));
     }
 
-    fn record_model_visible_tool_outputs(turn_context: &TurnContext, items: &[ResponseItem]) {
-        for call_id in items.iter().filter_map(|item| match item {
+    async fn record_model_visible_tool_outputs(turn_context: &TurnContext, items: &[ResponseItem]) {
+        let call_ids = items.iter().filter_map(|item| match item {
             ResponseItem::FunctionCallOutput { call_id, .. }
             | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
             ResponseItem::ToolSearchOutput {
@@ -4584,11 +4595,11 @@ impl Session {
                 ..
             } => Some(call_id.as_str()),
             _ => None,
-        }) {
-            turn_context
-                .turn_timing_state
-                .record_tool_output_model_visible(call_id);
-        }
+        });
+        turn_context
+            .turn_timing_state
+            .record_tool_outputs_model_visible(call_ids)
+            .await;
     }
 
     pub(crate) async fn response_item_from_user_input(
@@ -4711,7 +4722,7 @@ impl Session {
             );
         }
         drop(commit_permit);
-        Self::record_model_visible_tool_outputs(turn_context, items);
+        Self::record_model_visible_tool_outputs(turn_context, items).await;
         drop(persistence_timing_guard);
         self.send_raw_response_items(turn_context, items).await;
         Ok(())
@@ -4986,7 +4997,7 @@ impl Session {
                     Ok(())
                 };
                 drop(commit_permit);
-                Self::record_model_visible_tool_outputs(&turn_context, &items);
+                Self::record_model_visible_tool_outputs(&turn_context, &items).await;
                 if wait_for_durability && durability_result.is_ok() {
                     turn_context
                         .turn_timing_state
@@ -6420,6 +6431,26 @@ impl Session {
             // Settings persistence may hold the session-state lock. Flush this
             // event's writer directly; the terminal barrier syncs tool artifacts.
             live_thread.flush().await.map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    /// Append items before acknowledging stable-storage publication to the caller.
+    /// Unlike the settings path this waits for the writer's durable barrier.
+    /// Ephemeral sessions still publish only to memory.
+    pub(crate) async fn persist_rollout_items_then_sync(
+        &self,
+        items: &[RolloutItem],
+    ) -> std::io::Result<()> {
+        if let Some(live_thread) = self.live_thread() {
+            live_thread
+                .append_items_ordered(items)
+                .await
+                .map_err(std::io::Error::other)?;
+            live_thread
+                .flush_durable()
+                .await
+                .map_err(std::io::Error::other)?;
         }
         Ok(())
     }

@@ -89,20 +89,23 @@ impl StateRuntime {
     /// call this first. Returns false when coverage is still uncertified at the bound.
     pub async fn await_thread_index(&self) -> bool {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            match self.get_backfill_state().await {
-                Ok(state) if state.coverage_certified() => return true,
-                Ok(_) => {}
-                Err(error) => {
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, self.get_backfill_state()).await {
+                Ok(Ok(state)) if state.coverage_certified() => {
+                    return tokio::time::Instant::now() < deadline;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
                     tracing::warn!(%error, "failed to read thread index coverage");
                     return false;
                 }
+                Err(_) => return false,
             }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let next_poll =
+                deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
+            tokio::time::sleep_until(next_poll).await;
         }
+        false
     }
 
     pub async fn claim_backfill(&self, lease_seconds: i64) -> anyhow::Result<Option<crate::BackfillClaim>> {

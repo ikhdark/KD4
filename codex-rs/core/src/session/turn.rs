@@ -837,7 +837,7 @@ pub(crate) fn run_turn<'a>(
             let sampling_request_result: CodexResult<_> = async {
                 // Resolve once: checkpoint references and this logical request
                 // must consume the same live policy, including explicit overrides.
-                let base_instructions = validation_mode_base_instructions(&turn_context);
+                let base_instructions = validation_mode_base_instructions(&turn_context).await;
                 // The partial/unavailable turn-diff warning tells the model not to claim
                 // unchanged files; deliver it once, at this request boundary, not only to the UI.
                 let (diff_warning, (file_edits, guidance_edits)) = {
@@ -2069,9 +2069,9 @@ pub(crate) fn run_turn<'a>(
                 Err(e) => {
                     info!("Turn error: {e:#}");
                     let error = e.to_codex_protocol_error();
+                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
                     sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                         .await;
-                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
                     let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                     sess.send_event(&turn_context, event).await;
                     // let the user continue the conversation
@@ -2103,7 +2103,7 @@ pub(crate) fn run_turn<'a>(
 
 /// Refresh the default policy for normal sampling and compaction alike. Explicit
 /// overrides and authored catalog policies retain their replacement semantics.
-pub(crate) fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions> {
+pub(crate) async fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions> {
     let directive = match turn.validation_mode {
         codex_protocol::validation::ValidationMode::Off =>
             "OFF: No validation or validation-only continuation.",
@@ -2116,7 +2116,10 @@ pub(crate) fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseI
     };
     let mut instructions = (*turn.base_instructions).clone();
     if turn.model_info.uses_default_base_instructions {
-        instructions.text = codex_protocol::models::default_base_instructions();
+        match tokio::task::spawn_blocking(codex_protocol::models::default_base_instructions).await {
+            Ok(text) => instructions.text = text,
+            Err(error) => tracing::warn!(%error, "retaining prepared default instructions after reload worker failure"),
+        }
     }
     instructions.text.push_str(&format!(
         "\n\n<validation_mode>\n{directive}\nFollow the base instructions for validation authorization, retry, evidence, and completion rules.\nThere is no validation attempt cap. When compilation is authorized, repair recompiles require changed relevant inputs. Explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
@@ -5920,7 +5923,8 @@ async fn drain_in_flight_with_buffer(
         );
         turn_context
             .turn_timing_state
-            .record_next_sample_block_reason(reason);
+            .record_next_sample_block_reason_async(reason)
+            .await;
         trace!(?reason, pending_tool_count, "tool relay reconciliation");
         let completion = if let Some(completion) = completed.pop_front() {
             completion
@@ -6020,7 +6024,7 @@ async fn drain_in_flight_with_buffer(
                 "failed to durably append tool output in order: {err}"
             )));
         }
-        record_reconciliation(
+        record_reconciliation_async(
             &turn_context.turn_timing_state,
             completed.len().saturating_add(in_flight.len()),
             &mut active_without_pending_passes,
@@ -6029,7 +6033,8 @@ async fn drain_in_flight_with_buffer(
             } else {
                 "relay delivery"
             },
-        );
+        )
+        .await;
         if first_error.is_none() {
             first_error = completion_error;
         }
@@ -6111,11 +6116,27 @@ fn record_reconciliation(
         active_without_pending_passes,
     );
     turn_timing_state.record_next_sample_block_reason(reason);
-    trace!(
-        ?reason,
-        pending_tool_count, event, "turn progress reconciled"
-    );
+    trace_reconciliation(reason, pending_tool_count, event);
     reason
+}
+
+async fn record_reconciliation_async(
+    turn_timing_state: &TurnTimingState,
+    pending_tool_count: usize,
+    active_without_pending_passes: &mut u8,
+    event: &'static str,
+) {
+    let reason = reconcile_turn_progress(
+        turn_timing_state,
+        pending_tool_count,
+        active_without_pending_passes,
+    );
+    turn_timing_state.record_next_sample_block_reason_async(reason).await;
+    trace_reconciliation(reason, pending_tool_count, event);
+}
+
+fn trace_reconciliation(reason: NextSampleBlockReason, pending_tool_count: usize, event: &'static str) {
+    trace!(?reason, pending_tool_count, event, "turn progress reconciled");
 }
 
 struct SamplingGateWaiterGuard {
@@ -6709,7 +6730,7 @@ fn try_run_sampling_request<'a>(
             ));
         turn_context
             .turn_timing_state
-            .record_next_sample_block_reason(next_sample_reason);
+            .record_next_sample_block_reason_async(next_sample_reason).await;
         trace!(?next_sample_reason, "sampling admission reconciliation");
         if !sess.has_reference_context_item().await {
             client_session.invalidate_provider_history_inheritance(
@@ -6727,7 +6748,7 @@ fn try_run_sampling_request<'a>(
         {
             turn_context
                 .turn_timing_state
-                .record_next_sample_block_reason(NextSampleBlockReason::WaitingForGate);
+                .record_next_sample_block_reason_async(NextSampleBlockReason::WaitingForGate).await;
             let wait_started_at_ms = turn_context.turn_timing_state.monotonic_offset_ms();
             let expected_generation = terminal.wake_generation_id();
             let _sampling_waiter =
@@ -6754,12 +6775,13 @@ fn try_run_sampling_request<'a>(
                     },
                     sequence: 0,
                 });
-            record_reconciliation(
+            record_reconciliation_async(
                 &turn_context.turn_timing_state,
                 0,
                 &mut active_without_pending_passes,
                 "sampling interrupt resolution",
-            );
+            )
+            .await;
             if terminal.interrupt_persistence_failed() {
                 return Err(CodexErr::Fatal(
                     "interrupted request_user_input output was not durably persisted".to_string(),
@@ -6906,7 +6928,7 @@ fn try_run_sampling_request<'a>(
                     .and_then(|active| active.terminal.clone());
                 let sampling_admission = if let Some(terminal) = terminal.as_ref() {
                     turn_timing_state
-                        .record_next_sample_block_reason(NextSampleBlockReason::WaitingForGate);
+                        .record_next_sample_block_reason_async(NextSampleBlockReason::WaitingForGate).await;
                     let wait_started_at_ms = turn_timing_state.monotonic_offset_ms();
                     let sampling_waiter =
                         SamplingGateWaiterGuard::new(Arc::clone(&turn_timing_state));
@@ -7087,7 +7109,7 @@ fn try_run_sampling_request<'a>(
                         ));
                 }
                 turn_timing_state
-                    .record_next_sample_block_reason(NextSampleBlockReason::ReadyToSample);
+                    .record_next_sample_block_reason_async(NextSampleBlockReason::ReadyToSample).await;
                 Ok(sampling_admission)
             })
         });
@@ -7151,7 +7173,7 @@ fn try_run_sampling_request<'a>(
             .unwrap_or_else(|| "default".to_string());
         let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
         let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
-        let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
+        let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&sess, &turn_context));
         // S1: only a contributor that may rewrite assistant text forces buffering. Contributors
         // that just annotate non-text fields keep true streaming, and buffered items still replay
         // their finalized text as a delta before completion.
@@ -7815,7 +7837,7 @@ fn try_run_sampling_request<'a>(
         // Close only items that were actually streamed. These partial snapshots close
         // the item stream; the unchanged turn result still reports failure or interruption.
         if let Some(state) = plan_mode_state.as_mut() {
-            complete_partial_plan_items(&sess, &turn_context, state).await;
+            complete_partial_plan_items(state).await;
         }
         if active_item_is_streaming_to_client
             && let Some(mut item) = active_item.take()

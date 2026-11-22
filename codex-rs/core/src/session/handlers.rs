@@ -998,8 +998,9 @@ async fn shutdown_thread_persistence(
                     },
                 };
                 if result.is_ok() {
-                    sess._storage_ownership.lock()
+                    let storage_ownership = sess._storage_ownership.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner).take();
+                    drop(storage_ownership);
                 }
                 *sess.persistence_retirement_result.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());

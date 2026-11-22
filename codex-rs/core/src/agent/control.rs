@@ -365,7 +365,7 @@ impl AgentControl {
         // storage I/O: interruption and terminal cleanup must remain available.
         let _start_guard = session.task_start_gate.acquire().await
             .map_err(|_| "validation root turn admission is closed".to_string())?;
-        let item = {
+        let root_turn = {
             let active = session.active_turn.lock().await;
             let root_turn = active.as_ref().and_then(|active| active.task.as_ref())
                 .map(|task| &task.turn_context)
@@ -375,8 +375,17 @@ impl AgentControl {
             {
                 return Err("validation belongs to a different root turn".to_string());
             }
-            root_turn.to_turn_context_item()
+            Arc::clone(root_turn)
         };
+        let item = root_turn.to_turn_context_item_async().await;
+        {
+            let active = session.active_turn.lock().await;
+            if !active.as_ref().and_then(|active| active.task.as_ref())
+                .is_some_and(|task| Arc::ptr_eq(&task.turn_context, &root_turn))
+            {
+                return Err("validation root turn is no longer active".to_string());
+            }
+        }
         session.persist_rollout_items_durable(&[RolloutItem::TurnContext(item)]).await
             .map_err(|error| format!("failed to checkpoint root validation admissions: {error}"))
     }
@@ -1809,9 +1818,17 @@ impl AgentControl {
                         AgentCommunicationKind::Result,
                         child_thread_id,
                     );
-                    let _ = control
+                    if let Err(error) = control
                         .send_inter_agent_communication(parent_thread_id, communication, context)
-                        .await;
+                        .await
+                    {
+                        warn!(
+                            %error,
+                            %parent_thread_id,
+                            %child_thread_id,
+                            "completion watcher could not deliver retained child report"
+                        );
+                    }
                     return;
                 }
                 let message =

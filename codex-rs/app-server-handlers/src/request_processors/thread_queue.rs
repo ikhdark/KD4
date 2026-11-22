@@ -432,24 +432,37 @@ impl ThreadQueueRequestProcessor {
             // payload gap never certifies, yet its readable rows are still indexed.
             if loaded.is_none() {
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let still_building = || internal_error("thread index is still being built; retry shortly");
                 loop {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(still_building());
+                    }
                     // Read coverage before the row: a row indexed just before
                     // certification is then visible, so certified absence is real.
-                    let certified = match db.get_backfill_state().await {
-                        Ok(state) => state.coverage_certified(),
-                        Err(error) => {
-                            tracing::warn!(%error, "failed to read thread index coverage");
-                            return Err(internal_error("thread index is still being built; retry shortly"));
-                        }
-                    };
-                    metadata = db.get_thread(id).await.map_err(queue_error)?;
+                    let (certified, row) = tokio::time::timeout_at(deadline, async {
+                        let certified = match db.get_backfill_state().await {
+                            Ok(state) => state.coverage_certified(),
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to read thread index coverage");
+                                return Err(still_building());
+                            }
+                        };
+                        let row = db.get_thread(id).await.map_err(queue_error)?;
+                        Ok((certified, row))
+                    })
+                    .await
+                    .map_err(|_| still_building())??;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(still_building());
+                    }
+                    metadata = row;
                     if metadata.is_some() || certified {
                         break;
                     }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(internal_error("thread index is still being built; retry shortly"));
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    let next_poll = deadline.min(
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+                    );
+                    tokio::time::sleep_until(next_poll).await;
                 }
             }
         }

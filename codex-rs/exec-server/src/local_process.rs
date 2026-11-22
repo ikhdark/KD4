@@ -514,8 +514,19 @@ impl LocalProcess {
                 Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
             ) {
                 drop(process_map);
-                let _ = spawned.session.terminate();
                 reservation.active = false;
+                let cleanup_process_id = process_id.clone();
+                let cleanup = tokio::task::spawn_blocking(move || {
+                    // This exact never-published session owns native custody.
+                    // Running cleanup remains owned if the RPC waiter is dropped.
+                    if let Err(error) = spawned.session.terminate() {
+                        tracing::warn!(process_id = %cleanup_process_id, %error,
+                            "termination of a cancelled process start could not be confirmed");
+                    }
+                });
+                if let Err(error) = cleanup.await {
+                    tracing::warn!(%process_id, %error, "cancelled process start cleanup worker failed");
+                }
                 return Err(invalid_request(format!(
                     "process {process_id} start was cancelled"
                 )));

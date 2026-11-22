@@ -75,13 +75,13 @@ pub(crate) trait CellHost: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub(crate) struct CellHandle {
-    command_tx: mpsc::UnboundedSender<CellCommand>,
+    command_tx: mpsc::Sender<CellCommand>,
     state: Arc<CellState>,
 }
 
 impl CellHandle {
     pub(super) fn new(
-        command_tx: mpsc::UnboundedSender<CellCommand>,
+        command_tx: mpsc::Sender<CellCommand>,
         state: Arc<CellState>,
     ) -> Self {
         Self { command_tx, state }
@@ -99,18 +99,36 @@ impl CellHandle {
                 .map_or_else(closed_event, ready_event);
         }
         let (response_tx, mut response_rx) = oneshot::channel();
-        if self
-            .command_tx
-            .send(CellCommand::Observe { mode, response_tx })
-            .is_err()
-        {
-            return self
-                .state
-                .terminal_event()
-                .map_or_else(closed_event, ready_event);
-        }
+        let pending = match self.command_tx.try_send(CellCommand::Observe { mode, response_tx }) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                Some((self.command_tx.clone(), command))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return self
+                    .state
+                    .terminal_event()
+                    .map_or_else(closed_event, ready_event);
+            }
+        };
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            if let Some((command_tx, command)) = pending {
+                // Until admission the caller still owns this command, and no
+                // observation packet could have been sent to its receiver.
+                let sent = if let Some(release) = &release {
+                    tokio::select! {
+                        biased;
+                        _ = release.cancelled() => return Err(CellError::ObservationReleased),
+                        sent = command_tx.send(command) => sent,
+                    }
+                } else {
+                    command_tx.send(command).await
+                };
+                if sent.is_err() {
+                    return state.terminal_event().ok_or(CellError::Closed);
+                }
+            }
             let event = if let Some(release) = release {
                 tokio::select! {
                     biased;

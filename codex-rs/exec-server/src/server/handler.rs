@@ -311,9 +311,11 @@ impl ExecServerHandler {
             .map_err(|error| invalid_params(error.to_string()))
     }
 
-    pub(crate) fn environment_info(&self) -> Result<EnvironmentInfo, JSONRPCErrorError> {
+    pub(crate) async fn environment_info(&self) -> Result<EnvironmentInfo, JSONRPCErrorError> {
         self.require_initialized_for("environment info")?;
-        Ok(EnvironmentInfo::local())
+        tokio::task::spawn_blocking(EnvironmentInfo::local)
+            .await
+            .map_err(|error| internal_error(format!("environment info worker failed: {error}")))
     }
 
     pub(crate) async fn lookup_executables(

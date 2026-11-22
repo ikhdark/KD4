@@ -1192,6 +1192,16 @@ impl ModelAttemptGuard {
             outcome == ModelAttemptOutcome::Success && self.fresh_response_id_established;
         let (request_construction_us, queue_us, transport_us) =
             model_attempt_phase_durations(&offsets);
+        debug_assert!(attempt_offsets_are_nondecreasing(&offsets, completed_us));
+        let connection_setup_us = offsets.connection_setup_us;
+        let dispatch_ready_us = offsets.dispatch_ready_us;
+        let stream_established_us = offsets.stream_established_us;
+        let first_provider_event_us = offsets.first_provider_event_us;
+        let first_model_output_us = offsets.first_model_output_us;
+        let first_actionable_output_us = offsets.first_actionable_output_us;
+        let first_visible_output_us = offsets.first_visible_output_us;
+        let stream_delivery_json = offsets.stream_delivery_json.clone();
+        drop(offsets);
         let producer_selected_context_tokens = self.measurements.producer_selected_context_tokens();
         let tool_schema_breakdown =
             selected_tool_schema_breakdown(&self.measurements.tool_schema_breakdown, output_items);
@@ -1204,7 +1214,6 @@ impl ModelAttemptGuard {
         let operational_relevance_proxy_tokens = producer_selected_context_tokens
             .saturating_add(observed_selected_tool_schema_tokens)
             .min(self.measurements.logical_prompt_tokens());
-        debug_assert!(attempt_offsets_are_nondecreasing(&offsets, completed_us));
         self.session_telemetry
             .model_attempt_completed(&ModelAttemptTelemetry {
                 details_only: self.details_only,
@@ -1304,15 +1313,15 @@ impl ModelAttemptGuard {
                 local_component_reuse_count: self.measurements.local_component_reuse_count,
                 request_construction_us,
                 queue_us,
-                connection_setup_us: offsets.connection_setup_us,
+                connection_setup_us,
                 transport_us,
-                dispatch_ready_us: offsets.dispatch_ready_us,
-                stream_established_us: offsets.stream_established_us,
-                first_provider_event_us: offsets.first_provider_event_us,
-                first_model_output_us: offsets.first_model_output_us,
-                first_actionable_output_us: offsets.first_actionable_output_us,
-                first_visible_output_us: offsets.first_visible_output_us,
-                stream_delivery_json: offsets.stream_delivery_json.clone(),
+                dispatch_ready_us,
+                stream_established_us,
+                first_provider_event_us,
+                first_model_output_us,
+                first_actionable_output_us,
+                first_visible_output_us,
+                stream_delivery_json,
                 completed_us,
             });
         if !self.session_telemetry.model_attempt_logging_enabled() {

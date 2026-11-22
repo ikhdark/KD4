@@ -190,13 +190,8 @@ impl AccountRequestProcessor {
             .await
             .map_err(|err| internal_error(format!("failed to load current account configuration: {err}")))?;
         let mut guard = self.active_login.lock().await;
-        self.config_manager.validate_policy_generation(generation)
-            .map_err(|err| internal_error(format!("account configuration changed: {err}")))?;
-        self.auth_manager.check_credential_store_config(&config)
-            .map_err(|err| internal_error(err.to_string()))?;
-        if self.auth_manager.set_login_restrictions(
-            config.forced_login_method,
-            config.forced_chatgpt_workspace_id.clone(),
+        if self.config_manager.publish_account_login_restrictions(
+            generation, &self.auth_manager, &config,
         ).map_err(|err| internal_error(format!("failed to update account login policy: {err}")))? {
             Self::cancel_active_login_locked(&mut guard).await;
             self.auth_manager.reload().await;
@@ -329,18 +324,34 @@ impl AccountRequestProcessor {
         Self::cancel_active_login_locked(&mut guard).await;
     }
 
-    pub(crate) fn clear_external_auth(&self) {
+    pub(crate) async fn clear_external_auth(&self) {
         self.auth_manager.clear_external_auth();
         let plugins_manager = self.thread_manager.plugins_manager();
         let auth_mode_changed =
             plugins_manager.set_auth_mode(self.auth_manager.get_api_auth_mode());
-        let remote_plugins_changed =
-            plugins_manager.invalidate_account_scoped_remote_plugin_caches();
+        let remote_plugins_changed = Self::invalidate_account_plugin_caches(&plugins_manager).await;
         if auth_mode_changed || remote_plugins_changed {
             Self::spawn_effective_plugins_changed_task(
                 Arc::clone(&self.thread_manager),
                 self.config_manager.clone(),
             );
+        }
+    }
+
+    async fn invalidate_account_plugin_caches(
+        manager: &Arc<codex_core_plugins::PluginsManager>,
+    ) -> bool {
+        let manager = Arc::clone(manager);
+        match tokio::task::spawn_blocking(move || {
+            manager.invalidate_account_scoped_remote_plugin_caches()
+        })
+        .await
+        {
+            Ok(changed) => changed,
+            Err(error) => {
+                tracing::warn!(%error, "remote plugin cache invalidation worker failed");
+                false
+            }
         }
     }
 
@@ -363,8 +374,7 @@ impl AccountRequestProcessor {
         let plugins_manager = thread_manager.plugins_manager();
         let auth_mode_changed =
             plugins_manager.set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
-        let remote_plugins_changed =
-            plugins_manager.invalidate_account_scoped_remote_plugin_caches();
+        let remote_plugins_changed = Self::invalidate_account_plugin_caches(&plugins_manager).await;
         if auth_mode_changed || remote_plugins_changed {
             Self::spawn_effective_plugins_changed_task(
                 Arc::clone(thread_manager),

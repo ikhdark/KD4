@@ -385,11 +385,9 @@ fn stdio_command_process(stdio_command: &StdioExecServerCommand) -> Command {
 async fn spawn_stdio_command(
     stdio_command: &StdioExecServerCommand,
 ) -> Result<(tokio::process::Child, Arc<ManagedRootProcess>), ExecServerError> {
-    let managed_root = Arc::new(
-        ManagedRootProcess::reserve_with_reclaim()
-            .await
-            .map_err(ExecServerError::Spawn)?,
-    );
+    let managed_root = ManagedRootProcess::reserve_with_reclaim()
+        .await
+        .map_err(ExecServerError::Spawn)?;
     let mut child = stdio_command_process(stdio_command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -404,12 +402,12 @@ async fn spawn_stdio_command(
         )));
     };
     if let Err(error) = managed_root.attach_and_resume(process_id) {
-        let _ = managed_root.terminate();
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        if let Err(cleanup_error) = managed_root.cleanup_after_failed_attach(child).await {
+            tracing::warn!(%cleanup_error, "exec-server attachment cleanup still unsettled");
+        }
         return Err(ExecServerError::Spawn(error));
     }
 
-    Ok((child, managed_root))
+    Ok((child, Arc::new(managed_root)))
 }
 

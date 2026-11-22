@@ -2078,16 +2078,25 @@ async fn nudge_stalled_assignments(
         else {
             continue;
         };
+        let release_undelivered_nudge = || async {
+            if let Err(error) = store.release_stalled_nudge(binding.assignment_id).await {
+                tracing::warn!(
+                    %error,
+                    assignment_id = %binding.assignment_id,
+                    "failed to release an undelivered stalled-task nudge"
+                );
+            }
+        };
         let Ok(receiver) = session.services.agent_control.ensure_agent_known(thread_id) else {
-            let _ = store.release_stalled_nudge(binding.assignment_id).await;
+            release_undelivered_nudge().await;
             continue;
         };
         let Some(receiver_path) = receiver.agent_path else {
-            let _ = store.release_stalled_nudge(binding.assignment_id).await;
+            release_undelivered_nudge().await;
             continue;
         };
         if !is_strict_agent_descendant(&author, receiver_path.as_ref()) {
-            let _ = store.release_stalled_nudge(binding.assignment_id).await;
+            release_undelivered_nudge().await;
             continue;
         }
         let communication = stalled_assignment_nudge(author.clone(), receiver_path);
@@ -2101,12 +2110,8 @@ async fn nudge_stalled_assignments(
             .is_ok()
         {
             nudged.push(binding.assignment_id.to_string());
-        } else if let Err(error) = store.release_stalled_nudge(binding.assignment_id).await {
-            tracing::warn!(
-                %error,
-                assignment_id = %binding.assignment_id,
-                "failed to release an undelivered stalled-task nudge"
-            );
+        } else {
+            release_undelivered_nudge().await;
         }
     }
     nudged

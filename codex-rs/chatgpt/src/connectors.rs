@@ -55,18 +55,7 @@ pub async fn list_cached_all_connectors(
 
     let auth = connector_auth(auth).ok()?;
     let cache_context = connector_directory_cache_context(config, &auth);
-    // A cold lookup reads and parses the disk cache before promoting it to memory.
-    let connectors = match tokio::task::spawn_blocking(move || {
-        codex_connectors::cached_directory_connectors(&cache_context)
-    })
-    .await
-    {
-        Ok(connectors) => connectors?,
-        Err(error) => {
-            tracing::warn!(%error, "connector directory cache lookup task failed");
-            return None;
-        }
-    };
+    let connectors = codex_connectors::cached_directory_connectors_async(cache_context).await?;
     Some(merge_directory_and_plugin_connectors(
         connectors,
         plugin_apps,

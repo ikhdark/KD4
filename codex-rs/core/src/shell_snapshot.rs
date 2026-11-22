@@ -41,7 +41,6 @@ use tokio::fs;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::timeout;
 use tokio::time::timeout_at;
 use tracing::Instrument;
 use tracing::info_span;
@@ -890,25 +889,10 @@ async fn run_script_with_timeout(
     let (status, stdout, stderr) = match output {
         Ok(Ok(output)) => output,
         failure => {
-            if let Err(job_err) = managed.terminate() {
-                tracing::warn!("Failed to kill timed-out snapshot process tree: {job_err:?}");
-                if let Err(err) = child.start_kill()
-                    && err.kind() != ErrorKind::InvalidInput
-                    && err.kind() != ErrorKind::NotFound
-                {
-                    tracing::warn!("Failed to kill timed-out snapshot shell: {err:?}");
-                }
-            }
             drop(stdout);
             drop(stderr);
-            match timeout(Duration::from_secs(5), child.wait()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!("Failed to reap timed-out snapshot shell: {err:?}");
-                }
-                Err(_) => {
-                    tracing::warn!("Timed out reaping killed snapshot shell");
-                }
+            if let Err(error) = managed.terminate_and_reap(child).await {
+                tracing::warn!("Failed to settle timed-out snapshot process tree: {error:?}");
             }
             return match failure {
                 Ok(Err(error)) => Err(error),

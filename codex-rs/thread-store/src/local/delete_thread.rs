@@ -216,13 +216,10 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                             .map_err(delete_recovery_error)?
                             .is_some()
                     }
-                    "unindexed" => !store
-                        .config
-                        .codex_home
-                        .join("tool-history")
-                        .join(format!("{id}.retired"))
-                        .try_exists()
-                        .map_err(delete_recovery_error)?,
+                    "unindexed" => {
+                        let marker = store.config.codex_home.join("tool-history").join(format!("{id}.retired"));
+                        !tokio::fs::try_exists(marker.as_path()).await.map_err(delete_recovery_error)?
+                    }
                     _ => false,
                 };
                 decisions.push((entry.path(), id, restore));
@@ -327,14 +324,14 @@ struct StagedRolloutFile {
 
 /// A rollback guard for one or more local thread rollout deletions.
 ///
-/// Dropping an uncommitted guard restores every staged rollout. Committing keeps the rollout paths
+/// Dropping an uncommitted guard schedules restoration of every staged rollout. Committing keeps the rollout paths
 /// undiscoverable, then performs compatibility-index and recorder cleanup on a best-effort basis.
 #[derive(Debug)]
 pub struct StagedThreadDelete<'a> {
     store: &'a LocalThreadStore,
     thread_ids: Vec<codex_protocol::ThreadId>,
     found_thread_ids: Vec<codex_protocol::ThreadId>,
-    files: StagedRolloutFiles,
+    files: StagingCustody,
 }
 
 // This guard owns every filesystem mutation, including while a blocking worker
@@ -353,35 +350,70 @@ struct StagedRolloutFiles {
     _moves: Option<std::fs::File>,
 }
 
+// Keep staging and its leases owned even if the async observer is cancelled.
+// Return this wrapper from blocking workers so dropping a completed but unread
+// result cannot run restoration or TempDir cleanup on an async worker.
+#[derive(Debug)]
+struct StagingCustody {
+    files: Option<StagedRolloutFiles>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl StagingCustody {
+    fn release(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let files = self.files.take()?;
+        Some(self.runtime.spawn_blocking(move || drop(files)))
+    }
+}
+
+impl Drop for StagingCustody {
+    fn drop(&mut self) {
+        if let Some(worker) = self.release() {
+            // Dropping the observer doesn't cancel an admitted blocking task.
+            drop(worker);
+        }
+    }
+}
+
 impl StagedThreadDelete<'_> {
     pub fn found_thread(&self, thread_id: codex_protocol::ThreadId) -> bool {
         self.found_thread_ids.contains(&thread_id)
     }
 
-    pub async fn commit(mut self) {
-        // SQLite is the commit witness for indexed threads. For SQLite-less
-        // files, move the existing staging subtree to its committed name.
-        if let Some(directory) = self.files.staging_dir.as_ref() {
-            let pending = directory.path().join("unindexed");
-            if pending.exists()
-                && let Err(err) = std::fs::rename(&pending, directory.path().join("committed"))
-            {
-                tracing::warn!(%err, "failed to mark SQLite-less staged deletion committed");
-            }
+    /// Wait for restoration before reporting an explicit pre-commit failure.
+    pub async fn rollback(mut self) {
+        if let Some(worker) = self.files.release()
+            && let Err(error) = worker.await
+        {
+            tracing::warn!(%error, "staged rollout rollback did not finish");
         }
-        self.files.committed = true;
-        // Keep the queue if cancellation drops this observer. The worker owns
-        // each nonblocking auxiliary lease through slow storage and unlink;
-        // it never blocks a Tokio worker waiting for filesystem completion.
-        self.files.retirement_pending = true;
+    }
+
+    pub async fn commit(self) {
         let home = self.store.config.codex_home.clone();
         let ids = self.thread_ids.clone();
-        let staging = self
-            .files
-            .staging_dir
-            .as_ref()
-            .map(|directory| directory.path().to_path_buf());
-        match tokio::task::spawn_blocking(move || {
+        let mut custody = self.files;
+        if let Some(files) = &mut custody.files {
+            files.committed = true;
+            files.retirement_pending = true;
+        }
+        // Once the database commit has succeeded, even a queued job must not
+        // restore the rollout if its observer disappears.
+        let mut committed = tokio::task::spawn_blocking(move || {
+            let Some(mut files) = custody.files.take() else {
+                return custody;
+            };
+            let staging = files.staging_dir.as_ref().map(|directory| directory.path().to_path_buf());
+            // SQLite is the commit witness for indexed threads. For SQLite-less
+            // files, move the existing staging subtree to its committed name.
+            if let Some(directory) = staging.as_ref() {
+                let pending = directory.join("unindexed");
+                if pending.exists()
+                    && let Err(err) = std::fs::rename(&pending, directory.join("committed"))
+                {
+                    tracing::warn!(%err, "failed to mark SQLite-less staged deletion committed");
+                }
+            }
             let mut incomplete = false;
             for id in ids {
                 let result = mark_storage_retired(&home, id)
@@ -403,11 +435,12 @@ impl StagedThreadDelete<'_> {
                     tracing::warn!(%error, thread_id = %id, "committed auxiliary retirement deferred until writers close");
                 }
             }
-            incomplete
-        }).await {
-            Ok(incomplete) => self.files.retirement_pending = incomplete,
-            Err(error) => tracing::warn!(%error, "auxiliary retirement worker incomplete; recovery queue retained"),
-        }
+            files.retirement_pending = incomplete;
+            custody.files = Some(files);
+            custody
+        }).await.map_err(|error| {
+            tracing::warn!(%error, "auxiliary retirement worker incomplete; recovery queue retained");
+        });
         if let Err(err) = remove_threads_name_entries(
             self.store.config.codex_home.as_path(),
             &self.thread_ids,
@@ -431,6 +464,12 @@ impl StagedThreadDelete<'_> {
             for thread_id in &self.thread_ids {
                 projections.remove(thread_id);
             }
+        }
+        if let Ok(staging) = &mut committed
+            && let Some(worker) = staging.release()
+            && let Err(error) = worker.await
+        {
+            tracing::warn!(%error, "committed staging cleanup did not finish");
         }
         // Payload blob collection is deferred by design, so deletion does not scan
         // `rollout-payloads`; the compression worker reclaims abandoned stages.
@@ -564,6 +603,7 @@ pub(super) async fn delete_thread(
     let thread_id = params.thread_id;
     let staged = stage_thread_deletes(store, &[thread_id]).await?;
     if !staged.found_thread(thread_id) {
+        staged.rollback().await;
         return Err(ThreadStoreError::ThreadNotFound { thread_id });
     }
     // Cancellation during staging still restores files. Once SQLite deletion
@@ -595,13 +635,13 @@ async fn commit_thread_delete(
     thread_id: codex_protocol::ThreadId,
 ) -> ThreadStoreResult<()> {
     // Recovery already ran before staging acquired rollout-moves.lock.
-    if let Some(state_db) = staged.store.state_db.as_ref() {
-        state_db
-            .delete_thread(thread_id)
-            .await
-            .map_err(|err| ThreadStoreError::Internal {
-                message: format!("failed to delete state for thread {thread_id}: {err}"),
-            })?;
+    if let Some(state_db) = staged.store.state_db.as_ref()
+        && let Err(err) = state_db.delete_thread(thread_id).await
+    {
+        staged.rollback().await;
+        return Err(ThreadStoreError::Internal {
+            message: format!("failed to delete state for thread {thread_id}: {err}"),
+        });
     }
     staged.commit().await;
     Ok(())
@@ -678,6 +718,7 @@ pub(super) async fn stage_thread_deletes<'a>(
         candidates.extend(paths.into_iter().map(|path| (*thread_id, indexed, path)));
     }
     let codex_home = store.config.codex_home.clone();
+    let runtime = tokio::runtime::Handle::current();
     let files =
         tokio::task::spawn_blocking(move || {
             // Own pauses and locks before any fallible filesystem work so every
@@ -808,7 +849,10 @@ pub(super) async fn stage_thread_deletes<'a>(
                     staged_path,
                 });
             }
-            Ok::<_, ThreadStoreError>(files)
+            Ok::<_, ThreadStoreError>(StagingCustody {
+                files: Some(files),
+                runtime,
+            })
         })
         .await
         .map_err(|err| ThreadStoreError::Internal {

@@ -1854,7 +1854,10 @@ LIMIT 1
         }
         if !current.state.is_terminal() {
             if host_legacy_followup {
-                return Ok((current, None));
+                let binding = legacy_attempt_binding_tx(
+                    &mut transaction, assignment_id, current.attempt_id,
+                ).await?;
+                return Ok((current, Some(binding)));
             }
             return Err(StoreError::InvalidAssignment(
                 "the original attempt must be sealed before amendment".to_string(),
@@ -1993,6 +1996,9 @@ LIMIT 1
             .await?
             .map(|row| binding_from_row(&row))
             .transpose()?;
+        if host_legacy_followup {
+            check_legacy_attempt_binding(binding.as_ref(), next.attempt_id)?;
+        }
         transaction.commit().await?;
         Ok((next, binding))
     }
@@ -3679,7 +3685,7 @@ impl LocalAgentTaskStore {
     pub fn begin_legacy_agent_turn(
         &self,
         assignment_id: AssignmentId,
-    ) -> TaskStoreFuture<'_, Attempt> {
+    ) -> TaskStoreFuture<'_, AgentTaskBinding> {
         Box::pin(async move {
             let result = self
                 .amend_agent_task_impl(
@@ -3698,7 +3704,9 @@ impl LocalAgentTaskStore {
             if result.is_ok() {
                 self.notify_wake_waiters();
             }
-            result.map(|(attempt, _)| attempt)
+            result.map(|(_, binding)| {
+                binding.expect("legacy attempt binding validated before success")
+            })
         })
     }
 
@@ -5436,7 +5444,7 @@ async fn selective_admission_tx(
     let observed = tracing::enabled!(target: "codex_storage_runtime", tracing::Level::TRACE)
         .then(std::time::Instant::now);
     let rows = sqlx::query(
-        "SELECT assignments.body_json,
+        "SELECT assignments.body_json, repositories.workspace_id AS bound_workspace_id,
                 attempts.attempt_id, attempts.amendment_json,
                 bindings.task_name, bindings.agent_path, bindings.thread_id
          FROM assignments
@@ -5504,7 +5512,7 @@ async fn selective_admission_tx(
         // Relative paths can still require integration across linked worktrees,
         // but they are not competing live writes to the same checkout.
         if let Some((existing_scope, requested_scope)) = intersecting_scopes
-            && existing.workspace_id == assignment.workspace_id
+            && row.get::<String, _>("bound_workspace_id") == assignment.workspace_id
         {
             let amendment: Option<crate::AttemptAmendment> = row
                 .get::<Option<String>, _>("amendment_json")
@@ -5586,7 +5594,36 @@ async fn transition_attempt_to_needs_main_tx(
     finish_task_actor(transaction, attempt.assignment_id).await
 }
 
-pub(crate) fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<AgentTaskBinding> {
+pub(crate) async fn legacy_attempt_binding_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment_id: AssignmentId,
+    attempt_id: AttemptId,
+) -> Result<AgentTaskBinding, StoreError> {
+    let binding = sqlx::query("SELECT assignment_id, attempt_id, root_session_id, agent_path, task_name, thread_id, bound_at, updated_at FROM agent_task_bindings WHERE assignment_id = ?")
+        .bind(assignment_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .map(|row| binding_from_row(&row))
+        .transpose()?;
+    check_legacy_attempt_binding(binding.as_ref(), attempt_id)?;
+    binding.ok_or_else(missing_legacy_attempt_binding)
+}
+
+fn check_legacy_attempt_binding(
+    binding: Option<&AgentTaskBinding>,
+    attempt_id: AttemptId,
+) -> Result<(), StoreError> {
+    if binding.is_none_or(|binding| binding.attempt_id != attempt_id) {
+        return Err(missing_legacy_attempt_binding());
+    }
+    Ok(())
+}
+
+fn missing_legacy_attempt_binding() -> StoreError {
+    StoreError::CorruptData("plain-message follow-up lost its durable binding".to_string())
+}
+
+fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<AgentTaskBinding> {
     Ok(AgentTaskBinding {
         assignment_id: AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?,
         attempt_id: AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?,

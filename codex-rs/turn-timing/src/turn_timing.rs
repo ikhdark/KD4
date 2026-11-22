@@ -3165,6 +3165,24 @@ impl TurnTimingState {
 
     /// Per-tool observers may outlive model work and cannot author the turn's live phase.
     pub fn record_tool_sample_block_reason(&self, reason: NextSampleBlockReason) {
+        detail_archive::write(self.reserve_sample_block_reason(reason));
+    }
+
+    pub async fn record_next_sample_block_reason_async(&self, reason: NextSampleBlockReason) {
+        self.set_live_sampling_phase(Some(reason));
+        self.record_tool_sample_block_reason_async(reason).await;
+    }
+
+    /// Record an async tool observer without changing the live sampling phase.
+    pub async fn record_tool_sample_block_reason_async(&self, reason: NextSampleBlockReason) {
+        if let Some(record) = self.reserve_sample_block_reason(reason)
+            && let Err(error) = tokio::task::spawn_blocking(move || record.write()).await
+        {
+            tracing::warn!(%error, "sample block timing archive worker failed");
+        }
+    }
+
+    fn reserve_sample_block_reason(&self, reason: NextSampleBlockReason) -> Option<detail_archive::PendingRecord> {
         let mut state = self.state();
         let record = state.archive_record(serde_json::json!({"kind":"sample_block_reason", "reason":reason}), false);
         let sample = self.clock.sample();
@@ -3182,8 +3200,7 @@ impl TurnTimingState {
             }
             tool_call.next_sample_block_reason = reason;
         }
-        drop(state);
-        detail_archive::write(record);
+        record
     }
 
     pub fn record_pending_tool_timer_wait(&self, wait: ToolLifecycleTimerWait) {
@@ -3207,12 +3224,37 @@ impl TurnTimingState {
     /// model-visible history. This is intentionally separate from durable
     /// rollout persistence.
     pub fn record_tool_output_model_visible(&self, call_id: &str) {
+        detail_archive::write(self.reserve_tool_output_model_visible(call_id));
+    }
+
+    pub async fn record_tool_outputs_model_visible<'a>(
+        &self,
+        call_ids: impl Iterator<Item = &'a str> + Send,
+    ) {
+        // Reserve every event before yielding, just as in the inline version.
+        // The worker owns the batch even if the history observer is dropped.
+        let records = call_ids
+            .filter_map(|call_id| self.reserve_tool_output_model_visible(call_id))
+            .collect::<Vec<_>>();
+        if !records.is_empty()
+            && let Err(error) = tokio::task::spawn_blocking(move || {
+                for record in records {
+                    record.write();
+                }
+            })
+            .await
+        {
+            tracing::warn!(%error, "model-visible tool timing archive worker failed");
+        }
+    }
+
+    fn reserve_tool_output_model_visible(&self, call_id: &str) -> Option<detail_archive::PendingRecord> {
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         if state.completed_snapshot.is_some() {
             state.invalid_transition();
-            return;
+            return None;
         }
         let model_visible_at_ms = state
             .elapsed_since_start(sample.time.monotonic_ns)
@@ -3242,12 +3284,11 @@ impl TurnTimingState {
                     && entry.identity.source == TurnTimingToolCallSource::Direct
                     && entry.identity.sampling_generation_id.0 == generation
             }).map(|entry| entry.identity.execution_id.clone());
-            let record = state.archive_record(serde_json::json!({
+            return state.archive_record(serde_json::json!({
                 "kind":"model_visible", "execution_id":execution_id, "at_ms":model_visible_at_ms,
             }), false);
-            drop(state);
-            detail_archive::write(record);
         }
+        None
     }
 
     /// Resolve wire IDs while their producing generation is still current, before
@@ -3693,7 +3734,10 @@ impl TurnTimingState {
         }) {
             request.request_diagnostics_status = TurnTimingRequestDiagnosticsStatus::Unavailable;
         }
-        if state.completed_snapshot.is_some() {
+        let late = state.completed_snapshot.is_some();
+        state.refresh_completed_request_diagnostics();
+        drop(state);
+        if late {
             tracing::info!(target: "codex_core::turn_timing",
                 sampling_request_id,
                 physical_attempt_id,
@@ -3701,7 +3745,6 @@ impl TurnTimingState {
                 "late model request diagnostics"
             );
         }
-        state.refresh_completed_request_diagnostics();
     }
 
     pub fn record_model_stream_delivery(
@@ -3751,13 +3794,15 @@ impl TurnTimingState {
                 .or_default()
                 .insert(stage.to_string(), observation.clone());
         }
-        if state.completed_snapshot.is_some() {
+        let late = state.completed_snapshot.is_some();
+        state.refresh_completed_request_diagnostics();
+        drop(state);
+        if late {
             tracing::info!(target: "codex_core::turn_timing", { event.name = "codex.response_queue_timing",
                 sampling_request_id, physical_attempt_id, stage,
                 timing_json = %serde_json::to_string(&observation).unwrap_or_default() },
                 "late response queue timing");
         }
-        state.refresh_completed_request_diagnostics();
     }
 
     pub fn record_model_request_token_categories(
@@ -3767,11 +3812,8 @@ impl TurnTimingState {
         categories: TurnTimingRequestTokenCategories,
     ) {
         let mut state = self.state();
-        if state.completed_snapshot.is_some() {
-            tracing::info!(target: "codex_core::turn_timing", sampling_request_id, physical_attempt_id,
-                request_token_categories = ?categories,
-                "late model request token categories");
-        }
+        let late_categories = state.completed_snapshot.is_some()
+            .then(|| categories.clone());
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
                 && request.diagnostics_owner_attempt_id.as_deref()
@@ -3783,6 +3825,12 @@ impl TurnTimingState {
             }
         }
         state.refresh_completed_request_diagnostics();
+        drop(state);
+        if let Some(categories) = late_categories {
+            tracing::info!(target: "codex_core::turn_timing", sampling_request_id, physical_attempt_id,
+                request_token_categories = ?categories,
+                "late model request token categories");
+        }
     }
 
     /// Records cache-reuse identity on the logical request once. HTTP retries
@@ -3814,22 +3862,26 @@ impl TurnTimingState {
         }
         request.prompt_cache_key_fingerprint =
             prompt_cache_key.map(|key| hex::encode(Sha256::digest(key.as_bytes())));
-        if state.completed_snapshot.is_some()
-            && let Some(request) = state
-                .model_requests
-                .iter()
+        let late_request = state.completed_snapshot.as_ref().and_then(|_| {
+            state.model_requests.iter()
                 .find(|request| request.sampling_request_id.as_deref() == Some(sampling_request_id))
-        {
+                .map(|request| (
+                    request.request_diagnostics_status,
+                    request.prompt_cache_key_fingerprint.clone(),
+                ))
+        });
+        state.refresh_completed_request_diagnostics();
+        drop(state);
+        if let Some((status, cache_fingerprint)) = late_request {
             tracing::info!(target: "codex_core::turn_timing",
                 sampling_request_id,
                 physical_attempt_id,
-                request_diagnostics_status = ?request.request_diagnostics_status,
+                request_diagnostics_status = ?status,
                 fixed_prefix_reuse_eligible,
-                prompt_cache_key_fingerprint = ?request.prompt_cache_key_fingerprint,
+                prompt_cache_key_fingerprint = ?cache_fingerprint,
                 "late model request cache identity"
             );
         }
-        state.refresh_completed_request_diagnostics();
     }
 
     pub fn record_accepted_deterministic_continuation_receipts(

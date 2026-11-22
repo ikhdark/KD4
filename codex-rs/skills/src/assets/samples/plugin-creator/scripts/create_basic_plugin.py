@@ -204,18 +204,22 @@ def write_json(path: Path, data: dict, force: bool) -> None:
     if path.exists() and not force:
         raise FileExistsError(f"{path} already exists. Use --force to overwrite.")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-        handle.write("\n")
+    try:
+        with path.open("w" if force else "x", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+    except FileExistsError as exc:
+        if force:
+            raise
+        raise FileExistsError(f"{path} already exists. Use --force to overwrite.") from exc
 
 
 def create_stub_file(path: Path, payload: dict, force: bool) -> None:
-    if path.exists() and not force:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
+    try:
+        write_json(path, payload, force)
+    except FileExistsError:
+        if force:
+            raise
 
 
 def parse_args() -> argparse.Namespace:

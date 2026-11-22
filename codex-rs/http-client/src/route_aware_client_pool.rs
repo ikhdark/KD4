@@ -763,12 +763,15 @@ impl RouteAwareClientPool {
         }
 
         let build_guard = Arc::clone(&self.client_build).lock_owned().await;
-        if let Some(client) = self
-            .clients
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&route)
-        {
+        let cached_client = {
+            let mut clients = self
+                .clients
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            clients.get(&route)
+        };
+        if let Some(client) = cached_client {
+            drop(build_guard);
             trace_client_selection(selection_start.elapsed(), true);
             return Ok((route, client));
         }

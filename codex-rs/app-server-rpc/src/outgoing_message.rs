@@ -1016,26 +1016,38 @@ impl OutgoingMessageSender {
         notification: &ServerNotification,
         force: bool,
     ) -> bool {
-        if connection_ids.is_empty() {
-            return false;
-        }
-        // Register every recipient before awaiting capacity. A later update to
-        // c2 supersedes this publication even if c1 stalls the fanout first.
-        let generation = self.component_notification_cache
-            .lock()
-            .await
-            .begin_publication(connection_ids, notification, force);
+        // Register every live recipient before awaiting capacity. A later update
+        // to c2 supersedes this publication even if c1 stalls the fanout first.
+        // Hold the active route fence through registration so teardown cannot
+        // purge a connection and then have its cache generation resurrected.
+        let (targets, generation) = {
+            let active = self.active_connections.lock().await;
+            let targets = connection_ids
+                .iter()
+                .filter_map(|id| {
+                    let connection = active.get(id)?;
+                    (!connection.delivery_failure.is_cancelled())
+                        .then(|| (id, connection.delivery_failure.clone()))
+                })
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                return false;
+            }
+            let active_ids = targets.iter().map(|(id, _)| **id).collect::<Vec<_>>();
+            let generation = self.component_notification_cache
+                .lock()
+                .await
+                .begin_publication(&active_ids, notification, force);
+            (targets, generation)
+        };
         let deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
         let mut published = false;
-        for connection_id in connection_ids {
+        for (connection_id, route_failed) in targets {
             if !self.component_notification_cache.lock().await
                 .should_publish(*connection_id, notification, &generation, force)
             {
                 continue;
             }
-            let route_failed = self.active_connections.lock().await
-                .get(connection_id).map(|connection| connection.delivery_failure.clone())
-                .unwrap_or_default();
             let permit = tokio::select! {
                 biased;
                 _ = route_failed.cancelled() => None,
@@ -1052,8 +1064,10 @@ impl OutgoingMessageSender {
                 self.fail_connection_delivery(*connection_id).await;
                 continue;
             };
+            let active = self.active_connections.lock().await;
             let mut cache = self.component_notification_cache.lock().await;
-            if !route_failed.is_cancelled() && !self.delivery_shutdown.is_cancelled()
+            if active.contains_key(connection_id)
+                && !route_failed.is_cancelled() && !self.delivery_shutdown.is_cancelled()
                 && cache.should_publish(*connection_id, notification, &generation, force)
             {
                 // The committed cache and synchronous enqueue share one short
@@ -1431,17 +1445,19 @@ impl OutgoingMessageSender {
             }
             entry.connection_ids.insert(connection_id);
             entry.delivered_connection_ids.insert(connection_id);
+            permit.send(OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::Request(entry.request.clone()),
+                write_complete_tx: None,
+            });
+            drop(request_id_to_callback);
+            drop(active_connections);
             if codex_protocol::timing::observations::enabled() {
                 let _ = codex_protocol::timing::observations::record("request_replay_enqueued",
                     &thread_id.to_string(), "", &connection_id.0.to_string(),
                     serde_json::json!({"request_id":request_id,
                         "boundary":"queue_commit_not_peer_receipt"}));
             }
-            permit.send(OutgoingEnvelope::ToConnection {
-                connection_id,
-                message: OutgoingMessage::Request(entry.request.clone()),
-                write_complete_tx: None,
-            });
         }
         observation.finish("enqueued", serde_json::Value::Null);
     }
@@ -2227,14 +2243,17 @@ impl OutgoingMessageSender {
         error: JSONRPCErrorError,
     ) {
         let context = self.request_context(&request_id).await;
+        let route_closed = self.active_connections.lock().await
+            .get(&request_id.connection_id).map(|connection| connection.delivery_failure.clone());
+        let Some(route_closed) = route_closed.filter(|token| !token.is_cancelled()) else {
+            self.finish_request_context(context.as_ref()).await;
+            return;
+        };
         let Ok(slot) = Arc::clone(&self.rejection_slots).try_acquire_owned() else {
             self.fail_connection_delivery(request_id.connection_id).await;
             self.finish_request_context(context.as_ref()).await;
             return;
         };
-        let route_closed = self.active_connections.lock().await
-            .get(&request_id.connection_id).map(|connection| connection.delivery_failure.clone())
-            .unwrap_or_default();
         {
             // Spawn under the admission lock so settlement cannot miss this task.
             let accepting = self.delivery_accepting.lock().await;
@@ -2316,10 +2335,14 @@ impl OutgoingMessageSender {
         message: OutgoingMessage,
         message_kind: &'static str,
     ) {
-        let (route_failed, remote_control) = self.active_connections.lock().await
+        let route = self.active_connections.lock().await
             .get(&connection_id)
-            .map(|connection| (connection.delivery_failure.clone(), connection.remote_control))
-            .unwrap_or_default();
+            .map(|connection| (connection.delivery_failure.clone(), connection.remote_control));
+        let Some((route_failed, remote_control)) = route.filter(|(token, _)| !token.is_cancelled())
+        else {
+            self.finish_request_context(request_context.as_ref()).await;
+            return;
+        };
         let message = match message {
             OutgoingMessage::Response(mut response) if remote_control => {
                 match codex_app_server_transport::remote_control_response_size_error(&mut response) {

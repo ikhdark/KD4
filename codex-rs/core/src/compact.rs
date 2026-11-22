@@ -800,6 +800,7 @@ async fn run_compact_task_inner_impl(
                     parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
                     tool_calls_disabled: true,
                     base_instructions: crate::session::turn::validation_mode_base_instructions(&turn_context)
+                        .await
                         .as_ref()
                         .clone(),
                     output_schema: local_compaction_output_schema(

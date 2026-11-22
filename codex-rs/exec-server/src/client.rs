@@ -1962,12 +1962,17 @@ impl Inner {
         {
             return;
         }
-        if records.len() == 128 {
-            records.pop_front();
+        let evicted = if records.len() == 128 {
             self.cleanup_records_evicted.fetch_add(1, Ordering::Relaxed);
+            records.pop_front()
+        } else {
+            None
+        };
+        records.push_back(ticket);
+        drop(records);
+        if evicted.is_some() {
             tracing::warn!("old process cleanup evidence evicted from bounded history");
         }
-        records.push_back(ticket);
     }
     fn get_session(&self, process_id: &str) -> Option<Arc<SessionState>> {
         self.sessions.load().get(process_id).cloned()

@@ -1070,7 +1070,7 @@ where
     let terminal_turn = Arc::clone(turn);
     let call_id = call_id.to_owned();
     let mut terminal = session.terminal_tasks.spawn(async move {
-        let _ = tokio::time::timeout(
+        if tokio::time::timeout(
             Duration::from_secs(30),
             emit_tool_call_end(
                 &terminal_session,
@@ -1081,7 +1081,11 @@ where
                 terminal_result,
             ),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            tracing::warn!(%call_id, "MCP resource completion timed out; publication may be partial");
+        }
     });
     tokio::select! {
         _ = &mut terminal => {},

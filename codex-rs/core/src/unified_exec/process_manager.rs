@@ -2855,15 +2855,17 @@ impl UnifiedExecProcessManager {
                         .as_ref()
                         .and_then(|timing| timing.turn_timing_state())
                     {
-                        turn_timing.record_tool_sample_block_reason(
-                            NextSampleBlockReason::WaitingForProcessCleanup,
-                        );
+                        turn_timing
+                            .record_tool_sample_block_reason_async(
+                                NextSampleBlockReason::WaitingForProcessCleanup,
+                            )
+                            .await;
                     }
                     let wake_reason = tokio::select! {
                         _ = Self::wait_for_interaction(handoff) => break ToolLifecycleWakeReason::Retry,
                         _ = &mut output_notified => ToolLifecycleWakeReason::Completed,
                         _ = &mut closed => ToolLifecycleWakeReason::Completed,
-                        _ = tokio::time::sleep(close_wait_remaining) => ToolLifecycleWakeReason::Timeout,
+                        _ = tokio::time::sleep_until(close_wait_deadline) => ToolLifecycleWakeReason::Timeout,
                         _ = Self::wait_for_pause_change(&mut pause_state) => ToolLifecycleWakeReason::Retry,
                     };
                     if let Some(timing) = tool_dispatch_timing.as_ref() {
@@ -2899,7 +2901,8 @@ impl UnifiedExecProcessManager {
                     .and_then(|timing| timing.turn_timing_state())
                 {
                     turn_timing
-                        .record_tool_sample_block_reason(NextSampleBlockReason::WaitingForTool);
+                        .record_tool_sample_block_reason_async(NextSampleBlockReason::WaitingForTool)
+                        .await;
                 }
                 let wake_reason = tokio::select! {
                         _ = Self::wait_for_interaction(handoff) => break ToolLifecycleWakeReason::Retry,
@@ -2908,7 +2911,7 @@ impl UnifiedExecProcessManager {
                         exit_signal_received = true;
                         ToolLifecycleWakeReason::Completed
                     },
-                    _ = tokio::time::sleep(remaining) => ToolLifecycleWakeReason::Timeout,
+                    _ = tokio::time::sleep_until(effective_deadline) => ToolLifecycleWakeReason::Timeout,
                     _ = Self::wait_for_pause_change(&mut pause_state) => ToolLifecycleWakeReason::Retry,
                 };
                 if let Some(timing) = tool_dispatch_timing.as_ref() {

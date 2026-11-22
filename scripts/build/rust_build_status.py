@@ -2848,7 +2848,11 @@ def freeze_bundle(bundle_dir: Path, executables: Sequence[Path]) -> list[dict[st
                 "bytes": destination.stat().st_size,
                 "cargoPath": str(source),
             })
-            os.chmod(destination, stat.S_IREAD)
+            mode = stat.S_IREAD
+            if os.name != "nt":
+                # Keep Cargo's execute permissions while freezing the bytes.
+                mode |= source.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            os.chmod(destination, mode)
     except BaseException:
         # This call created the directory. A partial bundle has no receipt and
         # would refuse a retry that names the same new directory.
@@ -3106,6 +3110,13 @@ def _verified_receipt(
                 _reuse_decision(decisions, gate, "mismatch", candidate=binary,
                                 expected=entry["sha256"], observed=actual_hash)
                 return None
+        if os.name != "nt":
+            for entry in receipt["binaries"]:
+                binary = bundle / entry["name"]
+                if not os.access(binary, os.X_OK):
+                    _reuse_decision(decisions, "binary_executable", "mismatch", candidate=binary,
+                                    expected="executable frozen binary", observed="not executable")
+                    return None
         _reuse_decision(decisions, "verified_bundle", "match", candidate=bundle, expected=key, observed=actual_key)
         return receipt
     except OSError as error:

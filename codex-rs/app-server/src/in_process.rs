@@ -676,7 +676,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         let processor_lifetime = delivery_failure.clone().drop_guard();
         let mut processor_handle = tokio::spawn(async move {
             let _worker_owner = processor_lifetime;
-            let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+            let processor_args = MessageProcessorArgs {
                 outgoing: Arc::clone(&processor_outgoing),
                 analytics_events_client,
                 arg0_paths: args.arg0_paths,
@@ -693,7 +693,9 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 rpc_transport: AppServerRpcTransport::InProcess,
                 remote_control_handle: None,
                 plugin_startup_tasks: crate::PluginStartupTasks::Start,
-            }));
+            };
+            let processor = tokio::task::spawn_blocking(move || Arc::new(MessageProcessor::new(processor_args)))
+                .await.expect("embedded message processor construction failed");
             let mut thread_created_rx = processor.subscribe_thread_created();
             let session = Arc::new(ConnectionSessionState::new());
             let mut listen_for_threads = true;
@@ -766,7 +768,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 }
             }
 
-            processor.clear_runtime_references();
+            processor.clear_runtime_references().await;
             thread_attachment_tasks.shutdown().await;
             processor.cancel_active_login().await;
             processor

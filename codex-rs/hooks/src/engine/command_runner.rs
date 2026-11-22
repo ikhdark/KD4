@@ -184,6 +184,11 @@ async fn run_owned_command(
         Err(_) => return finish_timeout(started_at, started, timeout_sec),
     };
 
+    #[cfg(windows)]
+    let mut managed = HookJobTermination::new(managed);
+    #[cfg(not(windows))]
+    let mut managed = managed;
+
     if tokio::time::Instant::now() >= timeout_deadline {
         return finish_timeout(started_at, started, timeout_sec);
     }
@@ -239,7 +244,7 @@ async fn run_owned_command(
     #[cfg(windows)]
     {
         let Some(process_id) = child.id() else {
-            terminate_command_tree(&mut child, &managed).await;
+            terminate_command_tree(&mut child, &mut managed).await;
             return finish_command_run(
                 started_at,
                 started,
@@ -252,8 +257,8 @@ async fn run_owned_command(
                 },
             );
         };
-        if let Err(err) = managed.attach_and_resume(process_id) {
-            terminate_command_tree(&mut child, &managed).await;
+        if let Err(err) = managed.root.attach_and_resume(process_id) {
+            terminate_command_tree(&mut child, &mut managed).await;
             return finish_command_run(
                 started_at,
                 started,
@@ -269,7 +274,7 @@ async fn run_owned_command(
     }
 
     if tokio::time::Instant::now() >= timeout_deadline {
-        terminate_command_tree(&mut child, &managed).await;
+        terminate_command_tree(&mut child, &mut managed).await;
         #[cfg(unix)]
         {
             cancellation_guard.0 = None;
@@ -279,7 +284,7 @@ async fn run_owned_command(
 
     let stdin = child.stdin.take();
     let Some(stdout) = child.stdout.take() else {
-        terminate_command_tree(&mut child, &managed).await;
+        terminate_command_tree(&mut child, &mut managed).await;
         #[cfg(unix)]
         {
             cancellation_guard.0 = None;
@@ -297,7 +302,7 @@ async fn run_owned_command(
         );
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_command_tree(&mut child, &managed).await;
+        terminate_command_tree(&mut child, &mut managed).await;
         #[cfg(unix)]
         {
             cancellation_guard.0 = None;
@@ -342,7 +347,7 @@ async fn run_owned_command(
             }
             let status = child.wait().await?;
             #[cfg(windows)]
-            managed.terminate()?;
+            managed.terminate().await?;
             Ok::<_, io::Error>(status)
         };
         let (status, (), (), ()) = tokio::try_join!(
@@ -402,7 +407,7 @@ async fn run_owned_command(
             )
         }
         Ok(Err(err)) => {
-            terminate_command_tree(&mut child, &managed).await;
+            terminate_command_tree(&mut child, &mut managed).await;
             let (error, outcome) = match err {
                 CommandRunError::Stdin(err) => {
                     (format!("failed to write hook stdin: {err}"), "stdin_error")
@@ -422,7 +427,7 @@ async fn run_owned_command(
             )
         }
         Err(_) => {
-            terminate_command_tree(&mut child, &managed).await;
+            terminate_command_tree(&mut child, &mut managed).await;
             let mut result = finish_timeout(started_at, started, timeout_sec);
             result.stdout = stdout_capture.into_string();
             result.stderr = stderr_capture.into_string();
@@ -452,13 +457,45 @@ impl Drop for HookProcessGroupGuard {
     }
 }
 
+// The normal wait and its timeout recovery must observe the same native
+// termination attempt. Dropping their wait future leaves the blocking owner
+// in custody of the job and its admission.
+#[cfg(windows)]
+struct HookJobTermination {
+    root: std::sync::Arc<codex_utils_pty::ManagedRootProcess>,
+    worker: Option<tokio::task::JoinHandle<io::Result<()>>>,
+}
+
+#[cfg(windows)]
+impl HookJobTermination {
+    fn new(root: codex_utils_pty::ManagedRootProcess) -> Self {
+        Self {
+            root: std::sync::Arc::new(root),
+            worker: None,
+        }
+    }
+
+    async fn terminate(&mut self) -> io::Result<()> {
+        let worker = self.worker.get_or_insert_with(|| {
+            let root = std::sync::Arc::clone(&self.root);
+            tokio::task::spawn_blocking(move || root.terminate())
+        });
+        let result = worker.await;
+        self.worker = None;
+        result.map_err(io::Error::other)?
+    }
+}
+
 async fn terminate_command_tree(
     child: &mut tokio::process::Child,
-    managed: &codex_utils_pty::ManagedRootProcess,
+    #[cfg(windows)] managed: &mut HookJobTermination,
+    #[cfg(not(windows))] managed: &mut codex_utils_pty::ManagedRootProcess,
 ) {
     #[cfg(windows)]
-    if let Err(err) = managed.terminate() {
-        tracing::warn!("failed to terminate hook process Job Object: {err:?}");
+    match terminate_with_timeout(HOOK_TERMINATION_TIMEOUT, managed.terminate()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!("failed to terminate hook process Job Object: {err:?}"),
+        Err(_) => tracing::warn!("timed out waiting for owned hook Job Object termination"),
     }
     #[cfg(not(windows))]
     let _ = managed;

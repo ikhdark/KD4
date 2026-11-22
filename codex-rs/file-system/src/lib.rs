@@ -276,7 +276,8 @@ pub struct WalkOptions {
     /// filters it instead bounds the matching files returned; examined entries
     /// then remain bounded by the walk's hard maximum.
     pub max_entries: usize,
-    /// Whether directory symlinks should be followed.
+    /// Whether directory symlinks should be followed; omitted by older clients.
+    #[serde(default)]
     pub follow_directory_symlinks: bool,
     /// Aggregate during traversal instead of retaining individual entry paths.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

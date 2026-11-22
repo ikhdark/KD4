@@ -367,6 +367,28 @@ impl ConfigManager {
         self.with_current_policy(generation, || ())
     }
 
+    /// Publish the restrictions read from one admitted configuration generation.
+    pub fn publish_account_login_restrictions(
+        &self,
+        generation: u64,
+        auth: &AuthManager,
+        config: &Config,
+    ) -> std::io::Result<bool> {
+        self.validate_policy_generation(generation)?;
+        auth.check_credential_store_config(config)?;
+        // Auth publication takes an auth write lock. Hold just the config
+        // publication fence here, not the auth read fence in with_current_policy.
+        let _policy = self.cloud_config_bundle.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.policy_generation() != generation {
+            return Err(std::io::Error::other(ConfigGenerationChanged));
+        }
+        auth.set_login_restrictions(
+            config.forced_login_method,
+            config.forced_chatgpt_workspace_id.clone(),
+        )
+    }
+
     /// Replaces a cloud-config loader that an auth change has retired. A change
     /// published outside an explicit auth transition (a credential reload, a
     /// load retry, a policy or persistent-failure logout) leaves the loader

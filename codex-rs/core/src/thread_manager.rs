@@ -1140,7 +1140,12 @@ impl ThreadManager {
             {
                 self.remove_thread_if_same(&new_thread.thread_id, &new_thread.thread)
                     .await;
-                let _ = new_thread.thread.shutdown_and_wait().await;
+                if let Err(shutdown_err) = new_thread.thread.shutdown_and_wait().await {
+                    warn!(
+                        "failed to shut down thread {} after cold descendant recovery failed: {shutdown_err}",
+                        new_thread.thread_id
+                    );
+                }
                 return Err(error);
             }
         }
@@ -2337,7 +2342,12 @@ impl ThreadManagerState {
         {
             self.remove_thread_if_same(&new_thread.thread_id, &new_thread.thread)
                 .await;
-            let _ = new_thread.thread.shutdown_and_wait().await;
+            if let Err(shutdown_err) = new_thread.thread.shutdown_and_wait().await {
+                warn!(
+                    "failed to shut down thread {} after settings reconstruction failed: {shutdown_err}",
+                    new_thread.thread_id
+                );
+            }
             return Err(error);
         }
         Ok(new_thread)

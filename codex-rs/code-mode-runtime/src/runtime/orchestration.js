@@ -262,6 +262,62 @@
     },
   });
 
+  // Route one explicit native selection before yielding to the caller. Keep
+  // raw read_tool_output and the checkpoint-based helper unchanged.
+  Object.defineProperty(globalThis, "select_output", {
+    value: async function select_output(
+      { artifact_id, source_thread_id, selectors, max_bytes: initial_max_bytes },
+      { expected_sha256, expected_bytes, max_calls, max_bytes } = {},
+    ) {
+      const isHash = (v) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
+      const isSize = (v) => Number.isSafeInteger(v) && v >= 0;
+      if (typeof artifact_id !== "string" || !artifact_id ||
+          (source_thread_id !== undefined && (typeof source_thread_id !== "string" || !source_thread_id)))
+        fail("select_output: missing or invalid artifact identity", { pages: [], selection_complete: false });
+      if (!nativeIsArray(selectors) || !selectors.length)
+        throw new TypeError("select_output: explicit selectors are required");
+      if ((expected_sha256 !== undefined && !isHash(expected_sha256)) ||
+          (expected_bytes !== undefined && !isSize(expected_bytes)))
+        throw new TypeError("select_output: invalid expected artifact identity");
+      if (max_calls !== undefined) integer(max_calls, 1, 64, "max_calls");
+      if (max_bytes !== undefined) integer(max_bytes, 1, 8 * 1024 * 1024, "max_bytes");
+
+      const initial = await capability("read_tool_output")({
+        artifact_id, source_thread_id, selectors, max_bytes: initial_max_bytes,
+      });
+      const evidence = { initial, pages: [], selection_complete: false };
+      const reject = (message) => fail(`select_output: ${message}`, evidence);
+      if (initial?.artifact_id !== artifact_id || initial.source_thread_id !== source_thread_id ||
+          !isHash(initial.canonical_sha256) || !isSize(initial.canonical_bytes) ||
+          (expected_sha256 !== undefined && initial.canonical_sha256 !== expected_sha256) ||
+          (expected_bytes !== undefined && initial.canonical_bytes !== expected_bytes))
+        reject("native selection has missing or mismatched identity");
+
+      if (initial.retained_artifact_complete !== true || initial.unavailable_ranges?.length ||
+          !nativeIsArray(initial.results) || !initial.results.length)
+        reject("selection evidence or retained capture is incomplete");
+
+      const authenticity = initial.historical_authenticity;
+      const stop = initial.continuation_stop;
+      if (!stop && initial.delivered_selection_complete === true &&
+          (authenticity === "authenticated" || authenticity === "unverified") &&
+          arrayEvery(initial.results, (result) => result.status === "ok" && result.complete === true)) {
+        // Keep the native authenticity label: a complete command-log selection
+        // bound to the requested artifact is not an authenticated snapshot.
+        evidence.selection_complete = true;
+        return evidence;
+      }
+      if (initial.delivered_selection_complete !== false || authenticity !== "authenticated" ||
+          stop?.resumable !== true || !["budget", "page_limit"].includes(stop.reason) ||
+          !nativeIsArray(stop.remaining_selectors) || !stop.remaining_selectors.length ||
+          !arrayEvery(initial.results, (result) => result.selector?.kind === "bytes") ||
+          !arrayEvery(stop.remaining_selectors, (selector) => selector.kind === "bytes"))
+        reject("selection needs its owner; no automatic continuation was dispatched");
+
+      return globalThis.recover_output(initial, { max_calls, max_bytes });
+    },
+  });
+
   Object.defineProperty(globalThis, "read_files", {
     value: (() => {
       const implementation = async function read_files(

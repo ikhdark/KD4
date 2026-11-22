@@ -482,7 +482,7 @@ def validate_skill_manifest(skill_root: Path, errors: list[str]) -> None:
     disable_model_invocation = frontmatter.get("disable-model-invocation")
     if disable_model_invocation is None:
         disable_model_invocation = frontmatter.get("disable_model_invocation")
-    if disable_model_invocation not in (None, False):
+    if disable_model_invocation is not None and disable_model_invocation is not False:
         errors.append(
             f"skill `{skill_root.name}` frontmatter field `disable-model-invocation` must be false"
         )

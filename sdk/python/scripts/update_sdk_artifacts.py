@@ -883,6 +883,85 @@ def generate_v2_all(schema_dir: Path) -> None:
     _preserve_open_error_enum(out_path, schema_dir)
     _discriminate_thread_items(out_path)
     _normalize_generated_timestamps(out_path)
+    _validate_generated_defaults(out_path)
+
+
+def _validate_generated_defaults(out_path: Path) -> None:
+    """Validate JSON defaults that stand in for generated models or enums."""
+    source = out_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    scalar_wrappers = {name for name, node in classes.items()
+                       if any(isinstance(base, ast.Name) and base.id == "Enum"
+                              or isinstance(base, ast.Subscript)
+                              and isinstance(base.value, ast.Name) and base.value.id == "RootModel"
+                              and isinstance(base.slice, ast.Subscript)
+                              and isinstance(base.slice.value, ast.Name) and base.slice.value.id == "Literal"
+                              for base in node.bases)}
+    models = {name for name, node in classes.items()
+              if any(isinstance(base, ast.Name) and base.id == "BaseModel" for base in node.bases)}
+    offsets = [0]
+    for line in source.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line.encode("utf-8")))
+    raw = source.encode("utf-8")
+    edits = []
+
+    def span(node: ast.AST) -> tuple[int, int]:
+        return (offsets[node.lineno - 1] + node.col_offset,
+                offsets[node.end_lineno - 1] + node.end_col_offset)
+
+    needs_wire_defaults = False
+    for node in classes.values():
+        if node.name not in models:
+            continue
+        wire_defaults = False
+        for field in node.body:
+            if not isinstance(field, ast.AnnAssign) or field.value is None:
+                continue
+            try:
+                value = ast.literal_eval(field.value)
+            except (ValueError, TypeError):
+                continue
+            hint = field.annotation
+            if (isinstance(hint, ast.Subscript)
+                    and isinstance(hint.value, ast.Name) and hint.value.id == "Annotated"):
+                hint = hint.slice.elts[0]
+            names = {item.id for item in ast.walk(hint) if isinstance(item, ast.Name)}
+            typed_mapping = isinstance(value, dict) and bool(names & models)
+            typed_enum = (isinstance(value, str)
+                          or isinstance(value, list) and all(isinstance(item, str) for item in value))
+            if not typed_mapping and not (typed_enum and names & scalar_wrappers):
+                continue
+            metadata = field.annotation
+            extra = None
+            if metadata is not hint:
+                extra = next((part for part in metadata.slice.elts[1:]
+                              if isinstance(part, ast.Call) and isinstance(part.func, ast.Name)
+                              and part.func.id == "Field" and not part.args and part.keywords), None)
+            if extra is None:
+                start, end = span(metadata)
+                edits.append((start, end, b"Annotated[" + raw[start:end] + b", Field(validate_default=True)]"))
+            else:
+                first = extra.keywords[0]
+                start, _ = span(first)
+                separator = (b"\n" + b" " * first.col_offset
+                             if first.lineno != extra.lineno else b" ")
+                edits.append((start, start, b"validate_default=True," + separator))
+            wire_defaults = True
+        if wire_defaults:
+            needs_wire_defaults = True
+            base = next(base for base in node.bases if isinstance(base, ast.Name) and base.id == "BaseModel")
+            start, end = span(base)
+            edits.append((start, end, b"_WireDefaultModel"))
+    if not edits:
+        return
+    if needs_wire_defaults:
+        first_class = min(node.lineno for node in classes.values())
+        start = offsets[first_class - 1]
+        edits.append((start, start, b"from .._wire_defaults import WireDefaultModel as _WireDefaultModel\n\n\n"))
+    for start, end, value in sorted(edits, reverse=True):
+        raw = raw[:start] + value + raw[end:]
+    out_path.write_bytes(raw)
 
 
 def _discriminate_thread_items(out_path: Path) -> None:

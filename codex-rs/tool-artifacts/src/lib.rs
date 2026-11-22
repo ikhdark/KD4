@@ -9916,17 +9916,12 @@ fn enforce_global_retention_scan_locked_blocking(
     reserved_bytes: u64,
     reserved_artifacts: usize,
 ) {
-    let Ok(mut thread_directories) = std::fs::read_dir(tool_output_root) else {
+    let Ok(thread_directories) = retention_thread_directories_blocking(tool_output_root) else {
         return;
     };
     let mut paths = Vec::new();
     let mut total_bytes = 0_u64;
-    loop {
-        let thread_directory = match thread_directories.next().transpose() {
-            Ok(Some(entry)) => entry.path(),
-            Ok(None) => break,
-            Err(_) => return,
-        };
+    for thread_directory in thread_directories {
         let Ok(family_sizes) = logical_artifact_sizes_in_directory(&thread_directory) else {
             return;
         };

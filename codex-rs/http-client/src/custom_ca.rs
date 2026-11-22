@@ -128,6 +128,10 @@ fn native_root_store() -> Cow<'static, RootCertStore> {
 /// distinction can rely on the `From<BuildCustomCaTransportError> for io::Error` conversion.
 #[derive(Debug, Error)]
 pub enum BuildCustomCaTransportError {
+    /// The blocking client builder worker did not return a client result.
+    #[error("HTTP client builder worker failed: {0}")]
+    BuildWorker(#[source] tokio::task::JoinError),
+
     /// Reading the selected CA file from disk failed before any PEM parsing could happen.
     #[error(
         "Failed to read CA certificate file {} selected by {}: {source}. {hint}",
@@ -215,7 +219,8 @@ impl From<BuildCustomCaTransportError> for io::Error {
             | BuildCustomCaTransportError::RegisterRustlsCertificate { .. } => {
                 io::Error::new(io::ErrorKind::InvalidData, error)
             }
-            BuildCustomCaTransportError::BuildClientWithCustomCa { .. }
+            BuildCustomCaTransportError::BuildWorker(_)
+            | BuildCustomCaTransportError::BuildClientWithCustomCa { .. }
             | BuildCustomCaTransportError::BuildClientWithSystemRoots(_)
             | BuildCustomCaTransportError::BuildClientWithExplicitRoots(_) => {
                 io::Error::other(error)
@@ -347,13 +352,17 @@ fn cached_reqwest_certificates(
 ) -> Result<Arc<Vec<reqwest::Certificate>>, BuildCustomCaTransportError> {
     let pem_data = bundle.read_pem_data()?;
     let key = CaBundleCacheKey::new(Some(bundle), Some(&pem_data));
-    let mut cached = REQWEST_CA_CERTIFICATES
+    if let Some(certificates) = REQWEST_CA_CERTIFICATES
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(certificates) = cached.get(&key) {
-        return Ok(certificates.clone());
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+    {
+        return Ok(certificates);
     }
 
+    // A cold or invalid bundle must not block hits for an existing bundle
+    // while parsing, converting certificates or emitting diagnostic events.
     let certificates = bundle
         .load_certificates_from_pem_data(&pem_data)?
         .into_iter()
@@ -377,6 +386,12 @@ fn cached_reqwest_certificates(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let certificates = Arc::new(certificates);
+    let mut cached = REQWEST_CA_CERTIFICATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = cached.get(&key) {
+        return Ok(existing.clone());
+    }
     cached.retain(|cached_key, _| cached_key.source_env != key.source_env);
     cached.insert(key, certificates.clone());
     Ok(certificates)

@@ -765,8 +765,22 @@ pub(super) fn with_ephemeral_auth_entry<T>(
     codex_home: &Path,
     action: impl FnOnce(std::collections::hash_map::Entry<'_, String, AuthDotJson>) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    EphemeralAuthStorage::new(codex_home.to_path_buf())
-        .with_store(|store, key| action(store.entry(key)))
+    with_keyed_ephemeral_auth_entry(ephemeral_auth_entry_key(codex_home)?, action)
+}
+
+pub(super) fn ephemeral_auth_entry_key(codex_home: &Path) -> std::io::Result<String> {
+    compute_store_key(codex_home)
+}
+
+/// Enter the same store transaction with a key already resolved by the caller.
+pub(super) fn with_keyed_ephemeral_auth_entry<T>(
+    key: String,
+    action: impl FnOnce(std::collections::hash_map::Entry<'_, String, AuthDotJson>) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut store = EPHEMERAL_AUTH_STORE
+        .lock()
+        .map_err(|_| std::io::Error::other("failed to lock ephemeral auth storage"))?;
+    action(store.entry(key))
 }
 
 pub(super) fn create_auth_storage(

@@ -552,8 +552,8 @@ impl MessageProcessor {
         }
     }
 
-    pub fn clear_runtime_references(&self) {
-        self.account_processor.clear_external_auth();
+    pub async fn clear_runtime_references(&self) {
+        self.account_processor.clear_external_auth().await;
         self.apps_processor.shutdown();
         self.models_refresh_worker.shutdown();
         self.skills_watcher.shutdown();
@@ -1109,10 +1109,14 @@ impl MessageProcessor {
             ClientRequest::ConfigValueWrite { .. } | ClientRequest::ConfigBatchWrite { .. }
             | ClientRequest::SkillsExtraRootsSet { .. } | ClientRequest::SkillsConfigWrite { .. }
             | ClientRequest::PluginInstall { .. } | ClientRequest::PluginUninstall { .. }
+            | ClientRequest::PluginShareCheckout { .. } | ClientRequest::PluginShareDelete { .. }
             | ClientRequest::MarketplaceRemove { .. }
             | ClientRequest::ThreadStart { .. } | ClientRequest::ThreadFork { .. }
             | ClientRequest::ThreadResume { .. } | ClientRequest::ThreadInjectItems { .. })
+            // Durable enable must settle live publication after committing.
             // Durable disable can retire this very connection before saving.
+            || matches!(&codex_request, ClientRequest::RemoteControlEnable { params, .. }
+                if !params.as_ref().is_some_and(|params| params.ephemeral))
             || matches!(&codex_request, ClientRequest::RemoteControlDisable { params, .. }
                 if !params.as_ref().is_some_and(|params| params.ephemeral));
         let processor = Arc::clone(self);

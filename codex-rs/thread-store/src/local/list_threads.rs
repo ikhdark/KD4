@@ -305,7 +305,9 @@ async fn list_state_threads_for_storage(
         .collect();
 
     Ok(SelectedRolloutThreads {
-        page: state_page.into(),
+        page: state_page.try_into().map_err(|error| ThreadStoreError::Internal {
+            message: format!("failed to build state DB thread-list page: {error}"),
+        })?,
         storage_path: ThreadListStoragePath::StateDb,
         state_metadata,
     })

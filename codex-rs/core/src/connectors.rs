@@ -459,7 +459,9 @@ async fn cached_directory_connectors_for_tool_suggest_with_auth(
         ),
     );
 
-    codex_connectors::cached_directory_connectors(&cache_context).unwrap_or_default()
+    codex_connectors::cached_directory_connectors_async(cache_context)
+        .await
+        .unwrap_or_default()
 }
 
 pub(crate) fn accessible_connectors_from_mcp_tools(mcp_tools: &[ToolInfo]) -> Vec<AppInfo> {

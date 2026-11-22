@@ -2067,22 +2067,39 @@ impl ToolRegistry {
         if hook_rewrote_input {
             parsed_function_arguments = ParsedFunctionArguments::from_payload(&invocation.payload);
             let name = flat_tool_name(&invocation.tool_name);
-            let native_cwd = crate::tools::parallel::native_workspace_analysis_cwd(
-                &invocation.step_context, &invocation.payload,
-            );
-            rewritten_source_dependencies =
-                crate::tool_history::tool_observes_workspace(name.as_ref()).then(|| {
-                    crate::tool_history::source_dependencies_for_tool_call_with_parsed_arguments(
-                        name.as_ref(),
+            if crate::tool_history::tool_observes_workspace(name.as_ref()) {
+                rewritten_source_dependencies = Some(
+                    if let Some(native_cwd) = crate::tools::parallel::native_workspace_analysis_cwd(
+                        &invocation.step_context,
                         &invocation.payload,
-                        parsed_function_arguments
-                            .as_ref()
-                            .and_then(|parsed| parsed.value().ok()),
-                        native_cwd.as_ref()
-                            .unwrap_or(&invocation.step_context.turn.config.cwd).as_path(),
-                        native_cwd.is_some(),
-                    )
-                });
+                    ) {
+                        let name = name.into_owned();
+                        let payload = invocation.payload.clone();
+                        let parsed_arguments = parsed_function_arguments.clone();
+                        match codex_command_analysis::run_blocking_command_analysis(move || {
+                            crate::tool_history::source_dependencies_for_tool_call_with_parsed_arguments(
+                                &name,
+                                &payload,
+                                parsed_arguments.as_ref().and_then(|parsed| parsed.value().ok()),
+                                native_cwd.as_path(),
+                                true,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(dependencies) => dependencies,
+                            Err(error) => {
+                                tracing::warn!(%error, "hook-rewritten workspace dependencies are unscoped");
+                                Default::default()
+                            }
+                        }
+                    } else {
+                        // No host-native read authority: keep an authoritative,
+                        // unscoped override rather than reusing the old payload.
+                        Default::default()
+                    },
+                );
+            }
         }
         // Recorded after PreToolUse hooks so a hook sees only earlier dispatches.
         invocation
@@ -3195,18 +3212,43 @@ pub(crate) fn argument_schema_diagnostic(
 ) -> Option<codex_protocol::tool_failure::ToolFailure> {
     use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode, ToolFieldError};
 
-    fn member_path(parent: &str, name: &str) -> String {
-        format!("{parent}/{}", name.replace('~', "~0").replace('/', "~1"))
+    const MAX_FIELD_PATH_BYTES: usize = 1_024;
+
+    // Do not put a truncated (and potentially different) JSON Pointer on the
+    // wire. Compute the escaped length before copying any caller-provided key.
+    fn member_path(parent: &str, name: &str) -> Option<String> {
+        let remaining = MAX_FIELD_PATH_BYTES.checked_sub(parent.len().checked_add(1)?)?;
+        if name.len() > remaining {
+            return None;
+        }
+        let extra = name.bytes().filter(|byte| matches!(byte, b'~' | b'/')).count();
+        if name.len() + extra > remaining {
+            return None;
+        }
+        Some(format!("{parent}/{}", name.replace('~', "~0").replace('/', "~1")))
     }
 
-    fn field_errors(error: &jsonschema::ValidationError<'_>, schema: &Value) -> Vec<ToolFieldError> {
+    fn field_errors(
+        error: &jsonschema::ValidationError<'_>,
+        schema: &Value,
+    ) -> (Vec<ToolFieldError>, bool) {
         use jsonschema::error::ValidationErrorKind;
         let pointer = error.instance_path().as_str();
+        if pointer.len() > MAX_FIELD_PATH_BYTES {
+            return (Vec::new(), true);
+        }
+        let mut omitted = false;
         let node = validation_schema(error, schema);
         let (paths, expected, correction) = match error.kind() {
             ValidationErrorKind::Required { property } => {
-                let path = property.as_str().map(|name| member_path(pointer, name))
-                    .unwrap_or_else(|| pointer.to_string());
+                let path = if let Some(name) = property.as_str() {
+                    let Some(path) = member_path(pointer, name) else {
+                        return (Vec::new(), true);
+                    };
+                    path
+                } else {
+                    pointer.to_string()
+                };
                 let property_schema = node.and_then(|node| node.get("properties"))
                     .and_then(|properties| properties.get(property.as_str()?))
                     .or_else(|| schema_at(schema, &path));
@@ -3217,7 +3259,11 @@ pub(crate) fn argument_schema_diagnostic(
             }
             ValidationErrorKind::AdditionalProperties { unexpected }
             | ValidationErrorKind::UnevaluatedProperties { unexpected } => (
-                unexpected.iter().take(13).map(|name| member_path(pointer, name)).collect(),
+                unexpected.iter().take(13).filter_map(|name| {
+                    let path = member_path(pointer, name);
+                    omitted |= path.is_none();
+                    path
+                }).collect(),
                 node.and_then(accepted_shape).unwrap_or_else(|| "only properties accepted by the advertised schema".into()),
                 "Remove this unsupported field; use an advertised property instead.",
             ),
@@ -3243,9 +3289,9 @@ pub(crate) fn argument_schema_diagnostic(
             _ => (vec![pointer.to_string()], bounded_preflight_diagnostic(error.masked()),
                 "Set this field to a value satisfying the stated constraint."),
         };
-        paths.into_iter().map(|path| ToolFieldError {
+        (paths.into_iter().map(|path| ToolFieldError {
             path, expected: expected.clone(), correction: correction.into(),
-        }).collect()
+        }).collect(), omitted)
     }
 
     fn describe(error: &jsonschema::ValidationError<'_>, schema: &Value) -> String {
@@ -3285,8 +3331,8 @@ pub(crate) fn argument_schema_diagnostic(
         }
         *remaining -= 1;
         messages.push(describe(error, schema));
-        let rejected_fields = field_errors(error, schema);
-        let omitted = fields.len() + rejected_fields.len() > 12;
+        let (rejected_fields, incomplete_paths) = field_errors(error, schema);
+        let mut omitted = incomplete_paths || fields.len() + rejected_fields.len() > 12;
         fields.extend(rejected_fields.into_iter().take(12_usize.saturating_sub(fields.len())));
         if let ValidationErrorKind::AnyOf { context }
         | ValidationErrorKind::OneOfNotValid { context } = error.kind()
@@ -3295,9 +3341,10 @@ pub(crate) fn argument_schema_diagnostic(
             // or a guessed choice of the caller's intended branch.
             for branch in context {
                 for error in branch {
-                    if append(error, schema, messages, fields, remaining) {
+                    if *remaining == 0 {
                         return true;
                     }
+                    omitted |= append(error, schema, messages, fields, remaining);
                 }
             }
         }

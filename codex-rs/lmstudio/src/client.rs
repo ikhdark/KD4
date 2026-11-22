@@ -33,7 +33,7 @@ fn error_with_sources(err: &dyn std::error::Error) -> String {
 
 impl LMStudioClient {
     pub async fn try_from_provider(config: &Config) -> std::io::Result<Self> {
-        let client = Self::from_provider(config)?;
+        let client = Self::from_provider(config).await?;
         client.check_server().await?;
         Ok(client)
     }
@@ -41,13 +41,13 @@ impl LMStudioClient {
     pub(crate) async fn try_from_provider_with_models(
         config: &Config,
     ) -> io::Result<(Self, Vec<String>)> {
-        let client = Self::from_provider(config)?;
+        let client = Self::from_provider(config).await?;
         let response = client.check_server().await?;
         let models = Self::models_from_response(response).await?;
         Ok((client, models))
     }
 
-    fn from_provider(config: &Config) -> io::Result<Self> {
+    async fn from_provider(config: &Config) -> io::Result<Self> {
         let provider = config
             .model_providers
             .get(LMSTUDIO_OSS_PROVIDER_ID)
@@ -66,7 +66,8 @@ impl LMStudioClient {
 
         let client = HttpClientBuilder::new()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .build_with_transport_default_proxy()
+            .build_with_transport_default_proxy_async()
+            .await
             .map_err(io::Error::other)?;
 
         let client = LMStudioClient {

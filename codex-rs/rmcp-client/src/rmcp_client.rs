@@ -189,13 +189,15 @@ impl ElicitationPauseRegistry {
         // when the dialog arrives. Each receives at most five minutes of this
         // ambiguous pause over its entire lifetime; later work is never paused.
         let bounded = operations.len() > 1;
+        let paused = operations.iter().map(|state| state.enter(bounded)).collect();
+        drop(operations);
         if bounded {
             warn!(
                 max_pause_sec = MAX_UNCORRELATED_ELICITATION_PAUSE.as_secs(),
                 "concurrent MCP elicitation has no parent identity; applying a bounded pause to outstanding request budgets"
             );
         }
-        operations.iter().map(|state| state.enter(bounded)).collect()
+        paused
     }
 }
 

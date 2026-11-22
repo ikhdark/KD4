@@ -124,15 +124,15 @@ impl ThreadRequestProcessor {
                 .stage_thread_deletes(delete_order.as_slice())
                 .await
                 .map_err(thread_store_delete_error)?;
-            if let Some(state_db) = self.state_db.as_ref() {
-                state_db
+            if let Some(state_db) = self.state_db.as_ref()
+                && let Err(err) = state_db
                     .delete_thread_subtree_strict(thread_id, delete_order.as_slice())
                     .await
-                    .map_err(|err| {
-                        internal_error(format!(
-                            "failed to delete app-server state for {thread_id}: {err}"
-                        ))
-                    })?;
+            {
+                staged_delete.rollback().await;
+                return Err(internal_error(format!(
+                    "failed to delete app-server state for {thread_id}: {err}"
+                )));
             }
             // Primary commit is irreversible; preserve the in-process retirement
             // fence even if the originating RPC disappears during live cleanup.

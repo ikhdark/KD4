@@ -107,7 +107,7 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
     );
     router.request(
         ENVIRONMENT_INFO_METHOD,
-        |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.environment_info() },
+        |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.environment_info().await },
     );
     router.request(
         crate::protocol::CAPABILITY_MANIFEST_METHOD,

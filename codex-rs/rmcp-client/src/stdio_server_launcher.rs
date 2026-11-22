@@ -342,15 +342,16 @@ impl LocalProcessTerminator {
     }
 
     fn terminate(&self) -> io::Result<()> {
-        let mut managed = self
+        let root = self
             .managed
             .lock()
-            .map_err(|_| io::Error::other("failed to lock MCP process terminator"))?;
-        let Some(root) = managed.as_ref() else {
+            .map_err(|_| io::Error::other("failed to lock MCP process terminator"))?
+            .clone();
+        let Some(root) = root else {
             return Ok(());
         };
         root.terminate()?;
-        managed.take();
+        drop(self.take_managed());
         Ok(())
     }
 
@@ -388,7 +389,7 @@ impl StdioServerProcessHandle {
 
 
     pub(crate) async fn terminate(&self) -> io::Result<()> {
-        let _termination_permit = Arc::clone(&self.inner.termination_gate)
+        let termination_permit = Arc::clone(&self.inner.termination_gate)
             .acquire_owned()
             .await
             .map_err(|_| io::Error::other("MCP process termination gate was closed"))?;
@@ -397,7 +398,21 @@ impl StdioServerProcessHandle {
         }
 
         let result = match &self.inner.kind {
-            StdioServerProcessKind::Local(terminator) => terminator.terminate(),
+            StdioServerProcessKind::Local(_) => {
+                let inner = Arc::clone(&self.inner);
+                return run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
+                    // Keep both native ownership and gate custody if the async
+                    // observer is cancelled before the job is confirmed empty.
+                    let _termination_permit = termination_permit;
+                    let StdioServerProcessKind::Local(terminator) = &inner.kind else {
+                        return Err(io::Error::other("MCP process kind changed during termination"));
+                    };
+                    terminator.terminate()?;
+                    inner.terminated.store(true, Ordering::Release);
+                    Ok(())
+                })
+                .await;
+            }
             StdioServerProcessKind::Executor(process) => {
                 process.terminate().await.map_err(io::Error::other)
             }
@@ -405,6 +420,7 @@ impl StdioServerProcessHandle {
         if result.is_ok() {
             self.inner.terminated.store(true, Ordering::Release);
         }
+        drop(termination_permit);
         result
     }
 
@@ -428,11 +444,19 @@ impl Drop for StdioServerProcessHandleInner {
 
         match &self.kind {
             StdioServerProcessKind::Local(terminator) => {
-                if let Err(error) = terminator.terminate() {
-                    warn!(
-                        "Failed to terminate local MCP server process on drop ({}): {error}",
-                        self.program_name
-                    );
+                let Some(root) = terminator.take_managed() else {
+                    return;
+                };
+                let program_name = self.program_name.clone();
+                let terminate = move || {
+                    if let Err(error) = root.terminate() {
+                        warn!("Failed to terminate local MCP server process on drop ({program_name}): {error}");
+                    }
+                };
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    drop(runtime.spawn_blocking(terminate));
+                } else {
+                    terminate();
                 }
             }
             StdioServerProcessKind::Executor(process) => {

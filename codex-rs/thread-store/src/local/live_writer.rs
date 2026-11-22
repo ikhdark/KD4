@@ -43,11 +43,9 @@ impl Drop for InitializationGuard {
             return;
         };
         runtime.spawn(async move {
-            if let Err(error) = recorder.discard_owned().await {
+            if let Err(error) = discard_and_retire(&store, thread_id, &recorder).await {
                 warn!(%thread_id, %error, "failed to discard unclaimed recorder initialization");
-                return;
             }
-            remove_current_recorder(&store, thread_id, &recorder).await;
         });
     }
 }
@@ -413,6 +411,19 @@ async fn shutdown_thread_owned(
     Ok(())
 }
 
+async fn discard_and_retire(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    recorder: &RolloutRecorder,
+) -> ThreadStoreResult<()> {
+    let result = recorder.discard_owned().await;
+    if result.is_ok() || recorder.wait_for_writer_retirement().await {
+        remove_current_recorder(store, thread_id, recorder).await;
+    }
+    // Retiring an already failed writer does not turn the failure into success.
+    result.map_err(thread_store_io_error)
+}
+
 pub(super) async fn discard_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
@@ -420,12 +431,7 @@ pub(super) async fn discard_thread(
     let store = store.clone();
     let completion = tokio::spawn(async move {
         let recorder = store.live_recorder(thread_id).await?;
-        recorder
-            .discard_owned()
-            .await
-            .map_err(thread_store_io_error)?;
-        remove_current_recorder(&store, thread_id, &recorder).await;
-        Ok(())
+        discard_and_retire(&store, thread_id, &recorder).await
     });
     // Timing out only the observer keeps eventual terminal/map settlement owned.
     tokio::time::timeout(std::time::Duration::from_secs(30), completion)

@@ -774,8 +774,13 @@ fn failure_message(failure: &std::sync::Mutex<Option<String>>) -> String {
         .unwrap_or_else(|| "code-mode host connection closed".to_string())
 }
 
-async fn kill_and_reap(child: &mut Child, managed: &ManagedRootProcess) {
-    let _ = managed.terminate();
+async fn kill_and_reap(child: &mut Child, managed: &Arc<ManagedRootProcess>) {
+    let owner = Arc::clone(managed);
+    let _ = codex_utils_pty::run_windows_process_operation(
+        codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT,
+        move || owner.terminate(),
+    )
+    .await;
 
     let _ = child.start_kill();
     let _ = child.wait().await;

@@ -583,7 +583,10 @@ impl OauthLoginFlow {
         let bind_host = callback_bind_host(callback_url);
         let callback_port = resolve_callback_port(callback_port)?;
         let bind_addr = SocketAddr::new(bind_host, callback_port.unwrap_or(0));
-        let server = Arc::new(Server::http(bind_addr).map_err(|err| anyhow!(err))?);
+        let server = Arc::new(
+            tokio::task::spawn_blocking(move || Server::http(bind_addr).map_err(|err| anyhow!(err)))
+                .await??,
+        );
         let guard = CallbackServerGuard {
             server: Arc::clone(&server),
         };

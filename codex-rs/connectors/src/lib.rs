@@ -169,6 +169,24 @@ pub fn cached_directory_connectors(
     ))
 }
 
+/// Looks up the directory without doing cold cache I/O on an async worker.
+pub async fn cached_directory_connectors_async(
+    cache_context: ConnectorDirectoryCacheContext,
+) -> Option<Vec<AppInfo>> {
+    if let Some(connectors) = cached_directory_connectors_in_memory(&cache_context.cache_key) {
+        return Some(connectors);
+    }
+    // The blocking worker rechecks memory before reading disk; a concurrent
+    // refresh may have populated it since this caller observed a miss.
+    match tokio::task::spawn_blocking(move || cached_directory_connectors(&cache_context)).await {
+        Ok(connectors) => connectors,
+        Err(error) => {
+            tracing::warn!(%error, "connector directory cache lookup task failed");
+            None
+        }
+    }
+}
+
 fn promote_disk_directory_connectors(
     cache_key: &ConnectorDirectoryCacheKey,
     connectors: Vec<AppInfo>,

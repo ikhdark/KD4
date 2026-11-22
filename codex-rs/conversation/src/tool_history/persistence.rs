@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::value::RawValue;
 
 use super::ArtifactOrigin;
 use super::ToolHistoryMutation;
@@ -53,11 +54,17 @@ struct ToolHistoryJournalRecordRef<'a> {
 }
 
 #[derive(Serialize)]
-struct ToolHistoryJournalChecksumRef<'a> {
+struct ToolHistoryJournalChecksumRef<'a, M: ?Sized> {
     version: u8,
     writer_id: &'a str,
     sequence: u64,
-    mutation: &'a ToolHistoryMutation,
+    mutation: &'a M,
+}
+
+#[derive(Deserialize)]
+struct ToolHistoryJournalMutationRef<'a> {
+    #[serde(borrow)]
+    mutation: &'a RawValue,
 }
 
 #[derive(Debug)]
@@ -451,7 +458,8 @@ fn replay_tool_history_journal_bytes(
             &record.mutation,
         )
         .map_err(ToolHistoryJournalLoadError::Corrupt)?;
-        if checksum != record.checksum_sha256 {
+        if checksum != record.checksum_sha256 && !matches_legacy_scope_checksum(line, &record)
+        {
             return Err(ToolHistoryJournalLoadError::Corrupt(format!(
                 "journal checksum mismatch for writer {} sequence {}",
                 record.writer_id, record.sequence
@@ -493,10 +501,38 @@ fn replay_tool_history_journal_bytes(
     Ok(())
 }
 
+fn matches_legacy_scope_checksum(line: &[u8], record: &ToolHistoryJournalRecord) -> bool {
+    // Older v1 workspace evidence recorded success but had no scope version.
+    // Check what the writer hashed without widening compatibility to records
+    // that lack an outcome or to other, unrecognized mutation shapes.
+    if !matches!(record.mutation, ToolHistoryMutation::RegisterWorkspaceEvidence { .. }) {
+        return false;
+    }
+    let Ok(original) = serde_json::from_slice::<ToolHistoryJournalMutationRef<'_>>(line) else {
+        return false;
+    };
+    #[derive(Deserialize)]
+    struct ObservationFields {
+        successful: Option<bool>,
+        source_scope_version: Option<u8>,
+    }
+    #[derive(Deserialize)]
+    struct WorkspaceMutation {
+        observation: ObservationFields,
+    }
+    let Ok(legacy) = serde_json::from_str::<WorkspaceMutation>(original.mutation.get()) else {
+        return false;
+    };
+    legacy.observation.successful.is_some()
+        && legacy.observation.source_scope_version.is_none()
+        && tool_history_journal_checksum(&record.writer_id, record.sequence, original.mutation)
+            .is_ok_and(|checksum| checksum == record.checksum_sha256)
+}
+
 fn tool_history_journal_checksum(
     writer_id: &str,
     sequence: u64,
-    mutation: &ToolHistoryMutation,
+    mutation: &(impl Serialize + ?Sized),
 ) -> Result<String, String> {
     let bytes = serde_json::to_vec(&ToolHistoryJournalChecksumRef {
         version: JOURNAL_VERSION,

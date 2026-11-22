@@ -77,7 +77,7 @@ async fn release_turn_start_for_event(
 struct EligibleThread {
     sequence: u64,
     listener_generation: u64,
-    evict_tx: mpsc::UnboundedSender<EvictionRequest>,
+    evict_tx: mpsc::Sender<EvictionRequest>,
 }
 
 enum ThreadConnectionAdmission<T> {
@@ -253,7 +253,7 @@ impl PendingThreadUnloads {
         thread_id: ThreadId,
         listener_generation: u64,
         eligible: bool,
-        evict_tx: &mpsc::UnboundedSender<EvictionRequest>,
+        evict_tx: &mpsc::Sender<EvictionRequest>,
     ) {
         let evict_tx = {
             let mut state = self.state.lock().await;
@@ -306,7 +306,8 @@ impl PendingThreadUnloads {
             state.take_oldest_eligible()
         };
         if let Some((thread_id, entry)) = evict_tx
-            && entry.evict_tx.send(EvictionRequest::default()).is_err()
+            && matches!(entry.evict_tx.try_send(EvictionRequest::default()),
+            Err(mpsc::error::TrySendError::Closed(_)))
         {
             self.unregister_eligibility(thread_id, entry.listener_generation)
                 .await;
@@ -331,11 +332,14 @@ impl PendingThreadUnloads {
             return;
         };
         let (completion_tx, completion_rx) = oneshot::channel();
+        // Root admission needs completion of its attempt, not just a full
+        // listener queue. Wait for queue capacity outside the authority lock.
         if entry
             .evict_tx
             .send(EvictionRequest {
                 completion: Some(completion_tx),
             })
+            .await
             .is_ok()
         {
             let _ = completion_rx.await;
@@ -374,8 +378,8 @@ struct UnloadingState {
     has_subscribers: (bool, Instant),
     thread_status_rx: ThreadStatusSubscription,
     is_active: (bool, Instant),
-    evict_tx: mpsc::UnboundedSender<EvictionRequest>,
-    evict_rx: mpsc::UnboundedReceiver<EvictionRequest>,
+    evict_tx: mpsc::Sender<EvictionRequest>,
+    evict_rx: mpsc::Receiver<EvictionRequest>,
     listener_generation: Option<u64>,
 }
 
@@ -403,7 +407,8 @@ impl UnloadingState {
             matches!(*thread_status_rx.borrow(), ThreadStatus::Active { .. }),
             Instant::now(),
         );
-        let (evict_tx, evict_rx) = mpsc::unbounded_channel();
+        // A pending request already attempts eviction of this listener.
+        let (evict_tx, evict_rx) = mpsc::channel(1);
         let state = Self {
             thread_id,
             authority: listener_task_context.pending_thread_unloads.clone(),

@@ -569,7 +569,9 @@ async fn run_main_owned(
             format!("error parsing -c overrides: {e}"),
         )
     })?;
-    let codex_home = find_codex_home()?;
+    let codex_home = tokio::task::spawn_blocking(find_codex_home)
+        .await
+        .map_err(std::io::Error::other)??;
     let ignore_user_config = loader_overrides.ignore_user_config;
     let config_manager = ConfigManager::new(
         codex_home.to_path_buf(),
@@ -667,7 +669,9 @@ async fn run_main_owned(
 
     let mut websocket_auth_policy = match &transport {
         AppServerTransport::WebSocket { bind_address } => {
-            let policy = policy_from_settings(&auth)?;
+            let policy = tokio::task::spawn_blocking(move || policy_from_settings(&auth))
+                .await
+                .map_err(std::io::Error::other)??;
             validate_websocket_listener(*bind_address, &policy)?;
             Some(policy)
         }
@@ -1023,7 +1027,7 @@ async fn run_main_owned(
         ));
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
-        let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        let processor_args = MessageProcessorArgs {
             outgoing: outgoing_message_sender,
             analytics_events_client,
             arg0_paths,
@@ -1040,7 +1044,9 @@ async fn run_main_owned(
             rpc_transport: analytics_rpc_transport(&transport),
             remote_control_handle: Some(remote_control_handle.clone()),
             plugin_startup_tasks: runtime_options.plugin_startup_tasks,
-        }));
+        };
+        let processor = tokio::task::spawn_blocking(move || Arc::new(MessageProcessor::new(processor_args)))
+            .await.map_err(std::io::Error::other)?;
         let mut thread_created_rx = processor.subscribe_thread_created();
         let mut running_turn_count_rx = processor.subscribe_running_turn_count();
         let mut connections = HashMap::<ConnectionId, Arc<ConnectionState>>::new();
@@ -1360,7 +1366,7 @@ async fn run_main_owned(
             };
 
             init_watchdog_shutdown.cancel();
-            processor.clear_runtime_references();
+            processor.clear_runtime_references().await;
             thread_attachment_tasks.shutdown().await;
             let disconnect_all = shutdown_state.requested();
             shutdown_state

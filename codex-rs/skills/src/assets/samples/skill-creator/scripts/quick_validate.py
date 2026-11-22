@@ -7,13 +7,19 @@ import re
 import sys
 from pathlib import Path
 
-import yaml
 
 MAX_SKILL_NAME_LENGTH = 64
 
 
 def validate_skill(skill_path):
     """Basic validation of a skill"""
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        if exc.name != "yaml":
+            raise
+        return False, "PyYAML is required; run quick_validate.py with a Python environment that has PyYAML installed."
+
     skill_path = Path(skill_path)
 
     skill_md = skill_path / "SKILL.md"

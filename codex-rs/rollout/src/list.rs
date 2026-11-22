@@ -299,14 +299,21 @@ impl<'de> serde::Deserialize<'de> for Cursor {
     }
 }
 
-impl From<codex_state::Anchor> for Cursor {
-    fn from(anchor: codex_state::Anchor) -> Self {
+impl TryFrom<codex_state::Anchor> for Cursor {
+    type Error = io::Error;
+
+    fn try_from(anchor: codex_state::Anchor) -> io::Result<Self> {
         let nanos = i128::from(anchor.ts.timestamp()) * 1_000_000_000
             + i128::from(anchor.ts.timestamp_subsec_nanos());
         let ts = OffsetDateTime::from_unix_timestamp_nanos(nanos)
-            .ok()
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        Self { ts, id: anchor.id }
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if !(0..=9999).contains(&ts.year()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "thread listing cursor timestamp is outside the RFC 3339 year range",
+            ));
+        }
+        Ok(Self { ts, id: anchor.id })
     }
 }
 

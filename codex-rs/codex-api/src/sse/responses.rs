@@ -272,7 +272,11 @@ async fn process_sse_with_metadata(
     let mut progress_deadline = Instant::now() + idle_timeout;
 
     loop {
-        if Instant::now() >= progress_deadline {
+        let poll_started = Instant::now();
+        if poll_started >= progress_deadline {
+            if let Some(t) = telemetry.as_ref() {
+                t.on_sse_cleanup(SseCleanupOutcome::IdleTimeout, Duration::ZERO);
+            }
             let _ = tx_event
                 .send(Err(ApiError::Stream(
                     "model progress timeout waiting for SSE".into(),
@@ -280,7 +284,7 @@ async fn process_sse_with_metadata(
                 .await;
             return;
         }
-        let start = telemetry.as_ref().map(|_| Instant::now());
+        let start = telemetry.as_ref().map(|_| poll_started);
         let response = tokio::select! {
             _ = tx_event.closed() => {
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {

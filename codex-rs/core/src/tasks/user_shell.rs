@@ -591,7 +591,9 @@ async fn retry_remote_user_shell_termination(process: Arc<dyn ExecProcess>) {
             warn!(process_id = %process.process_id(), "{reason}");
             return;
         }
-        match tokio::time::timeout(Duration::from_secs(1), process.terminate()).await {
+        let attempt_deadline =
+            deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
+        match tokio::time::timeout_at(attempt_deadline, process.terminate()).await {
             Ok(Ok(())) => return,
             result => {
                 warn!(
@@ -599,7 +601,8 @@ async fn retry_remote_user_shell_termination(process: Arc<dyn ExecProcess>) {
                     error = ?result,
                     "remote user shell cleanup termination retry failed"
                 );
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let wake_at = deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
+                tokio::time::sleep_until(wake_at).await;
             }
         }
     }

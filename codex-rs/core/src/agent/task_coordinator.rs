@@ -39,6 +39,7 @@ use std::sync::RwLock;
 use tokio::sync::OnceCell;
 use tracing::warn;
 
+use super::task_metrics::MetricsError;
 use super::task_metrics::TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC;
 use super::task_metrics::TaskMetricRuntime;
 use super::task_metrics::terminal_metrics_ready;
@@ -846,7 +847,9 @@ impl AgentTaskCoordinator {
         let Some(runtime) = metrics.runtimes.get_mut(&binding.assignment_id) else {
             return false;
         };
-        if let Err(error) = runtime.record_usage(tokens, calls) {
+        let result = runtime.record_usage(tokens, calls);
+        drop(metrics);
+        if let Err(error) = result {
             warn!(
                 assignment_id = %binding.assignment_id,
                 ?error,
@@ -939,26 +942,31 @@ impl AgentTaskCoordinator {
             metrics.runtimes.insert(assignment_id, runtime);
             return;
         }
-        if metrics.active.remove(&assignment_id) {
-            transition_metric_runtimes(&mut metrics);
-        }
-        match runtime.finish(task) {
-            Ok(Some(finalized)) => {
+        let transition_errors = if metrics.active.remove(&assignment_id) {
+            transition_metric_runtimes(&mut metrics)
+        } else {
+            Vec::new()
+        };
+        let result = runtime.finish(task);
+        match &result {
+            Ok(Some(_)) => {
                 metrics.host_terminal_attempts.remove(&assignment_id);
-                drop(metrics);
-                finalized.emit(session_telemetry);
             }
-            Ok(None) => {
-                warn!(%assignment_id, "typed-task metrics were already terminal");
-            }
-            Err(error) => {
-                warn!(
-                    %assignment_id,
-                    ?error,
-                    "failed to emit terminal typed-task metrics"
-                );
+            Err(_) => {
                 metrics.runtimes.insert(assignment_id, runtime);
             }
+            Ok(None) => {}
+        }
+        drop(metrics);
+        warn_metric_transition_errors(transition_errors);
+        match result {
+            Ok(Some(finalized)) => finalized.emit(session_telemetry),
+            Ok(None) => warn!(%assignment_id, "typed-task metrics were already terminal"),
+            Err(error) => warn!(
+                %assignment_id,
+                ?error,
+                "failed to emit terminal typed-task metrics"
+            ),
         }
     }
 
@@ -991,8 +999,11 @@ impl AgentTaskCoordinator {
             && authorization.current_attempt.state == AttemptState::Active
         {
             if !self.has_task_metric_runtime(binding.assignment_id) {
-                let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
-                self.activate_task_metric_attempt(&task, true);
+                match store.get_agent_task(binding.assignment_id, Some(0)).await {
+                    Ok(task) => self.activate_task_metric_attempt(&task, true),
+                    Err(error) => warn!(?error, assignment_id = %binding.assignment_id,
+                        "active agent attempt is bound but task metrics could not be restored"),
+                }
             }
             return Ok(());
         }
@@ -1007,18 +1018,13 @@ impl AgentTaskCoordinator {
                 binding.assignment_id
             )));
         }
-        store.begin_legacy_agent_turn(binding.assignment_id).await?;
-        let renewed = store
-            .get_agent_task_binding(binding.assignment_id)
-            .await?
-            .ok_or_else(|| {
-                StoreError::CorruptData(
-                    "plain-message follow-up lost its durable binding".to_string(),
-                )
-            })?;
+        let renewed = store.begin_legacy_agent_turn(binding.assignment_id).await?;
         self.remember_binding(renewed);
-        let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
-        self.activate_task_metric_attempt(&task, false);
+        match store.get_agent_task(binding.assignment_id, Some(0)).await {
+            Ok(task) => self.activate_task_metric_attempt(&task, false),
+            Err(error) => warn!(?error, assignment_id = %binding.assignment_id,
+                "plain-message follow-up committed but task metrics could not be restored"),
+        }
         Ok(())
     }
 
@@ -1039,6 +1045,7 @@ impl AgentTaskCoordinator {
                     entry.insert(runtime);
                 }
                 Err(error) => {
+                    drop(metrics);
                     warn!(?error, "failed to recreate task metrics");
                     return;
                 }
@@ -1050,7 +1057,9 @@ impl AgentTaskCoordinator {
         runtime.minimum_attempt_ordinal = task.current_attempt.ordinal;
         runtime.usage_history_partial |= restored_active_attempt;
         if metrics.active.insert(task.assignment.assignment_id) {
-            transition_metric_runtimes(&mut metrics);
+            let errors = transition_metric_runtimes(&mut metrics);
+            drop(metrics);
+            warn_metric_transition_errors(errors);
         }
     }
 
@@ -1326,6 +1335,7 @@ impl AgentTaskCoordinator {
                 metrics.runtimes.insert(assignment.assignment_id, runtime);
             }
             Err(error) => {
+                drop(metrics);
                 warn!(
                     assignment_id = %assignment.assignment_id,
                     ?error,
@@ -1349,22 +1359,34 @@ impl AgentTaskCoordinator {
             metrics.active.remove(&assignment_id)
         };
         if changed {
-            transition_metric_runtimes(&mut metrics);
+            let errors = transition_metric_runtimes(&mut metrics);
+            drop(metrics);
+            warn_metric_transition_errors(errors);
         }
     }
 }
 
-fn transition_metric_runtimes(metrics: &mut TaskMetricIndex) {
+fn transition_metric_runtimes(metrics: &mut TaskMetricIndex) -> Vec<(AssignmentId, MetricsError)> {
     let active_turns = saturating_active_turns(metrics.active.len());
     let capacity = metric_capacity(metrics, active_turns);
-    for (assignment_id, runtime) in &mut metrics.runtimes {
-        if let Err(error) = runtime.transition_concurrency(active_turns, capacity) {
-            warn!(
-                %assignment_id,
-                ?error,
-                "failed to update typed-task concurrency metrics"
-            );
-        }
+    metrics
+        .runtimes
+        .iter_mut()
+        .filter_map(|(assignment_id, runtime)| {
+            runtime.transition_concurrency(active_turns, capacity)
+                .err()
+                .map(|error| (*assignment_id, error))
+        })
+        .collect()
+}
+
+fn warn_metric_transition_errors(errors: Vec<(AssignmentId, MetricsError)>) {
+    for (assignment_id, error) in errors {
+        warn!(
+            %assignment_id,
+            ?error,
+            "failed to update typed-task concurrency metrics"
+        );
     }
 }
 

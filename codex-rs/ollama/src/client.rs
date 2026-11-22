@@ -60,7 +60,7 @@ impl OllamaClient {
     async fn try_from_provider_with_models(
         provider: &ModelProviderInfo,
     ) -> io::Result<(Self, io::Result<Vec<String>>)> {
-        let client = Self::from_provider(provider)?;
+        let client = Self::from_provider(provider).await?;
         let response = client.probe_server().await?;
         let models = if client.uses_openai_compat {
             let _ = response.bytes().await;
@@ -71,7 +71,7 @@ impl OllamaClient {
         Ok((client, models))
     }
 
-    fn from_provider(provider: &ModelProviderInfo) -> io::Result<Self> {
+    async fn from_provider(provider: &ModelProviderInfo) -> io::Result<Self> {
         let base_url = provider.base_url.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -82,7 +82,8 @@ impl OllamaClient {
         let host_root = ollama_host_root(base_url).to_owned();
         let client = HttpClientBuilder::new()
             .connect_timeout(Duration::from_secs(5))
-            .build_with_transport_default_proxy()
+            .build_with_transport_default_proxy_async()
+            .await
             .map_err(io::Error::other)?;
         let client = Self {
             client,
@@ -280,11 +281,19 @@ impl OllamaClient {
 
     /// Pull a model while reporting progress to the CLI.
     pub(crate) async fn pull_with_cli_progress(&self, model: &str) -> io::Result<()> {
-        let mut reporter = CliProgressReporter::new();
-        reporter.on_event(&PullEvent::Status(format!("Pulling model {model}...")))?;
+        let mut reporter = publish_cli_progress(
+            CliProgressReporter::new(),
+            PullEvent::Status(format!("Pulling model {model}...")),
+        )
+        .await?;
         let mut stream = self.pull_model_stream(model).await?;
         while let Some(event) = stream.next().await {
-            reporter.on_event(&event)?;
+            // Preserve the parser's event order and original result. Await each
+            // publication before fetching another event so stderr cannot
+            // accumulate an unbounded queue on a slow reader.
+            if !matches!(event, PullEvent::Error(_)) {
+                reporter = publish_cli_progress(reporter, event.clone()).await?;
+            }
             match event {
                 PullEvent::Success => {
                     return Ok(());
@@ -308,6 +317,17 @@ impl OllamaClient {
             "Pull stream ended unexpectedly without success.",
         ))
     }
+}
 
+async fn publish_cli_progress(
+    mut reporter: CliProgressReporter,
+    event: PullEvent,
+) -> io::Result<CliProgressReporter> {
+    tokio::task::spawn_blocking(move || {
+        reporter.on_event(&event)?;
+        Ok(reporter)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 

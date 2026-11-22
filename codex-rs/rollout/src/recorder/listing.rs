@@ -212,7 +212,7 @@ impl RolloutRecorder {
             )
             .await
             .ok_or_else(|| std::io::Error::other("state DB unavailable for thread listing"))?;
-            return Ok(page.into());
+            return page.try_into();
         }
         if cwd_filters.is_some_and(<[std::path::PathBuf]>::is_empty) {
             return Ok(ThreadsPage::default());
@@ -781,8 +781,10 @@ fn cursor_from_thread_item(item: &ThreadItem, sort_key: ThreadSortKey) -> Option
     ))
 }
 
-impl From<codex_state::ThreadsPage> for ThreadsPage {
-    fn from(db_page: codex_state::ThreadsPage) -> Self {
+impl TryFrom<codex_state::ThreadsPage> for ThreadsPage {
+    type Error = IoError;
+
+    fn try_from(db_page: codex_state::ThreadsPage) -> std::io::Result<Self> {
         let codex_state::ThreadsPage {
             items,
             parent_thread_ids,
@@ -796,12 +798,12 @@ impl From<codex_state::ThreadsPage> for ThreadsPage {
                 thread_item_from_state_metadata(item, parent_thread_id)
             })
             .collect();
-        Self {
+        Ok(Self {
             items,
-            next_cursor: next_anchor.map(Into::into),
+            next_cursor: next_anchor.map(Cursor::try_from).transpose()?,
             num_scanned_files: num_scanned_rows,
             reached_scan_cap: false,
-        }
+        })
     }
 }
 

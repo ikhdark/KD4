@@ -1000,15 +1000,26 @@ impl PluginRequestProcessor {
             || include_shared_with_me
             || include_global_remote
         {
-            plugins_manager.maybe_start_plugin_list_background_tasks_for_config(
-                &plugins_input,
-                auth.clone(),
-                &scopes,
-                PluginListBackgroundTaskOptions {
-                    refresh_global_remote_catalog_cache,
-                },
-                Some(self.effective_plugins_changed_callback()),
-            );
+            let manager = Arc::clone(&plugins_manager);
+            let input = plugins_input.clone();
+            let background_auth = auth.clone();
+            let background_scopes = scopes.clone();
+            let callback = self.effective_plugins_changed_callback();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                manager.maybe_start_plugin_list_background_tasks_for_config(
+                    &input,
+                    background_auth,
+                    &background_scopes,
+                    PluginListBackgroundTaskOptions {
+                        refresh_global_remote_catalog_cache,
+                    },
+                    Some(callback),
+                );
+            })
+            .await
+            {
+                warn!(%error, "plugin list background registration worker failed");
+            }
         }
 
         let needs_featured_ids = data.iter().any(|marketplace| {
@@ -1090,11 +1101,21 @@ impl PluginRequestProcessor {
         let plugins_input = config.plugins_config_input();
         let remote_installed_plugin_visible_marketplaces =
             remote_installed_plugin_visible_marketplaces(&config);
-        plugins_manager.maybe_start_remote_installed_plugin_bundle_sync(
-            &plugins_input,
-            auth.clone(),
-            Some(self.effective_plugins_changed_callback()),
-        );
+        let manager = Arc::clone(&plugins_manager);
+        let input = plugins_input.clone();
+        let background_auth = auth.clone();
+        let callback = self.effective_plugins_changed_callback();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            manager.maybe_start_remote_installed_plugin_bundle_sync(
+                &input,
+                background_auth,
+                Some(callback),
+            );
+        })
+        .await
+        {
+            warn!(%error, "installed plugin list registration worker failed");
+        }
 
         let ((mut data, mut marketplace_load_errors), remote) = join_plugin_listing_reads(
             self.load_local_installed_and_suggested_plugins(
@@ -2398,26 +2419,31 @@ impl PluginRequestProcessor {
         if committed {
             self.analytics_events_client
                 .track_plugin_uninstalled(plugin_telemetry);
-            let cache_changed = self
-                .auth_manager
-                .with_policy_identity(|identity| {
+            let auth_manager = Arc::clone(&self.auth_manager);
+            let input = config.plugins_config_input();
+            let callback = self.effective_plugins_changed_callback();
+            let cache_changed = tokio::task::spawn_blocking(move || {
+                auth_manager.with_policy_identity(|identity| {
                     if identity.current_epoch != auth_epoch {
                         return false;
                     }
                     let cache_changed = plugins_manager.clear_remote_installed_plugins_cache();
                     plugins_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
-                        &config.plugins_config_input(),
+                        &input,
                         auth.clone(),
-                        Some(self.effective_plugins_changed_callback()),
+                        Some(Arc::clone(&callback)),
                     );
                     plugins_manager.maybe_start_remote_installed_plugin_bundle_sync(
-                        &config.plugins_config_input(),
-                        auth.clone(),
-                        Some(self.effective_plugins_changed_callback()),
+                        &input,
+                        auth,
+                        Some(callback),
                     );
                     cache_changed
                 })
-                .map_err(|error| internal_error(error.to_string()))?;
+            })
+            .await
+            .map_err(|error| internal_error(error.to_string()))?
+            .map_err(|error| internal_error(error.to_string()))?;
             // Config publication takes its loader lock before entering the auth
             // fence. Invalidate only after releasing the auth guard above.
             if cache_changed {

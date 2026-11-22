@@ -660,7 +660,7 @@ impl ExecInterrupts {
     async fn wait_for<T>(
         &mut self,
         operation: impl std::future::Future<Output = T>,
-        interrupt_rx: &mut mpsc::UnboundedReceiver<()>,
+        interrupt_rx: &mut mpsc::Receiver<()>,
         mut request_interrupt: impl FnMut() -> PendingInterrupt,
     ) -> Result<T, String> {
         tokio::pin!(operation);
@@ -889,13 +889,15 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
     }
     info!("Codex initialized with event: {session_configured:?}");
 
-    let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+    // Only the first and second pending signals change shutdown behavior.
+    let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(2);
     tokio::spawn(
         async move {
             while tokio::signal::ctrl_c().await.is_ok() {
                 tracing::debug!("Keyboard interrupt");
-                if interrupt_tx.send(()).is_err() {
-                    break;
+                match interrupt_tx.try_send(()) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+                    Err(mpsc::error::TrySendError::Closed(())) => break,
                 }
             }
         }

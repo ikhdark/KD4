@@ -113,14 +113,19 @@ impl Drop for AdmittedLaunchGuard {
                 }
             }
             if let (Some(store), Ok(actor)) = (coordinator.store(), coordinator.root_actor()) {
-                let _ = store
+                if let Err(error) = store
                     .abandon_agent_task(
                         actor,
                         assignment_id,
                         "spawn observer ended before launch committed; no work was replayed".into(),
                     )
-                    .await;
-                let _ = coordinator.remove_agent_task_binding(assignment_id).await;
+                    .await
+                {
+                    tracing::warn!(%error, %assignment_id, "failed to settle cancelled agent launch");
+                }
+                if let Err(error) = coordinator.remove_agent_task_binding(assignment_id).await {
+                    tracing::warn!(%error, %assignment_id, "failed to remove cancelled agent launch binding");
+                }
                 coordinator
                     .maybe_emit_terminal_metrics(assignment_id, &telemetry)
                     .await;

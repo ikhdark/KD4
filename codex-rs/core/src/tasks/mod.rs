@@ -499,9 +499,15 @@ impl Session {
         };
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        let _ = self
+        let turn_id = turn_context.sub_id.clone();
+        if let Err(error) = self
             .start_task_locked(/*reservation*/ None, turn_context, input, task)
-            .await;
+            .await
+        {
+            // The execution guard reports its own protocol error. Record
+            // rejection here without double-publishing that event.
+            tracing::warn!(%error, %turn_id, "session task was not admitted");
+        }
     }
 
 

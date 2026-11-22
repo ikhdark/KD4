@@ -794,7 +794,9 @@ async fn query_logs(pool: &SqlitePool, query: &LogQuery) -> anyhow::Result<Vec<L
         builder.push(" ORDER BY id ASC");
     }
     if let Some(limit) = query.limit {
-        builder.push(" LIMIT ").push_bind(limit as i64);
+        let limit = i64::try_from(limit)
+            .map_err(|_| anyhow::anyhow!("log query limit exceeds the SQLite integer range"))?;
+        builder.push(" LIMIT ").push_bind(limit);
     }
 
     let rows = builder.build_query_as::<LogRow>().fetch_all(pool).await?;

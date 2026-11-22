@@ -545,7 +545,7 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
     fn handle(&self, mut invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async move {
             let ToolPayload::Custom { input } = &invocation.payload else {
-                return self.handle_call(invocation).await.map(boxed_tool_output);
+                return self.handle_call(invocation, &mut false).await.map(boxed_tool_output);
             };
             let original = input.clone();
             let review = apply_patch_operations::evidence_review(input).map(str::to_owned);
@@ -557,54 +557,76 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
             let home = invocation.step_context.turn.config.codex_home.clone();
             let thread = invocation.session.thread_id.to_string();
             let id = operation_id.clone();
-            let admission = tokio::task::spawn_blocking(move || apply_patch_operations::begin(&home, &thread, &id, binding))
-                .await.map_err(|e| FunctionCallError::Fatal(format!("Patch operation admission failed: {e}")))??;
-            let operation = match admission {
-                apply_patch_operations::Admission::Recovered(mut receipt) => {
-                    receipt["historical_receipt"] = serde_json::json!(true);
-                    receipt["current_freshness_verified"] = serde_json::json!(false);
-                    let success = receipt["success"].as_bool();
-                    return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(receipt, success)
-                        .with_code_mode_failure_as_data()));
-                }
-                apply_patch_operations::Admission::New(operation) => operation,
-            };
-            invocation.payload = ToolPayload::Custom { input: patch };
             let terminal_tasks = invocation.session.terminal_tasks.clone();
             let handler = Self::new(self.multi_environment);
-            // The tracked owner outlives observer cancellation, including the
-            // durable receipt write after filesystem finalization.
+            // The tracked owner holds the reservation from admission through
+            // filesystem finalization and the durable receipt write.
             terminal_tasks.spawn(async move {
-            let cancellation = invocation.cancellation_token.clone();
-            // Capture before dispatch, never while holding a workspace/mutation gate.
-            // Missing or invalid self-reports affect diagnostics only.
-            let review = super::evidence_memory::before_patch(&invocation, review.as_deref()).await;
-            let result = match handler.handle_call(invocation).await {
-                Err(FunctionCallError::Structured(failure)) if !cancellation.is_cancelled() => {
-                    Ok(ApplyPatchToolOutput::from_delta(
-                        failure.message.clone(), false, &Default::default(), operation_id.clone(), None,
-                    ).with_failure(*failure))
+                let admission = tokio::task::spawn_blocking(move || apply_patch_operations::begin(&home, &thread, &id, binding))
+                    .await.map_err(|e| FunctionCallError::Fatal(format!("Patch operation admission failed: {e}")))??;
+                let operation = match admission {
+                    apply_patch_operations::Admission::Recovered(mut receipt) => {
+                        receipt["historical_receipt"] = serde_json::json!(true);
+                        receipt["current_freshness_verified"] = serde_json::json!(false);
+                        let success = receipt["success"].as_bool();
+                        return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(receipt, success)
+                            .with_code_mode_failure_as_data()));
+                    }
+                    apply_patch_operations::Admission::New(operation) => operation,
+                };
+                invocation.payload = ToolPayload::Custom { input: patch };
+                let cancellation = invocation.cancellation_token.clone();
+                // Capture before dispatch, never while holding a workspace/mutation gate.
+                // Missing or invalid self-reports affect diagnostics only.
+                let review = super::evidence_memory::before_patch(&invocation, review.as_deref()).await;
+                let mut cancelled_waiting_for_workspace = false;
+                let result = match handler.handle_call(invocation, &mut cancelled_waiting_for_workspace).await {
+                    Err(FunctionCallError::Structured(failure)) if !cancellation.is_cancelled() => {
+                        Ok(ApplyPatchToolOutput::from_delta(
+                            failure.message.clone(), false, &Default::default(), operation_id.clone(), None,
+                        ).with_failure(*failure))
+                    }
+                    Err(FunctionCallError::RespondToModel(text)) if !cancellation.is_cancelled() => {
+                        Ok(ApplyPatchToolOutput::from_delta(
+                            text,
+                            false,
+                            &Default::default(),
+                            operation_id.clone(),
+                            None,
+                        ))
+                    }
+                    result => result,
+                };
+                let mut result = result;
+                let receipt = match &mut result {
+                    Ok(output) => {
+                        output.operation_id = operation_id;
+                        output.diagnostics.insert(0, review);
+                        Some(output.structured_result())
+                    }
+                    Err(_) if cancelled_waiting_for_workspace => {
+                        // No workspace permit was acquired, so no file mutation
+                        // was possible. Preserve the live cancellation result.
+                        let mut no_effect = ApplyPatchToolOutput::from_delta(
+                            PATCH_WORKSPACE_CANCELLED.to_string(),
+                            false,
+                            &Default::default(),
+                            operation_id,
+                            None,
+                        ).with_failure(codex_protocol::tool_failure::ToolFailure::new(
+                            codex_protocol::tool_failure::ToolFailureCode::Cancelled,
+                            PATCH_WORKSPACE_CANCELLED,
+                        ));
+                        no_effect.diagnostics.insert(0, review);
+                        Some(no_effect.structured_result())
+                    }
+                    Err(_) => None,
+                };
+                if let Some(receipt) = receipt {
+                    tokio::task::spawn_blocking(move || operation.finish(&receipt)).await
+                        .map_err(|e| FunctionCallError::Fatal(format!("Patch receipt owner failed: {e}")))??;
                 }
-                Err(FunctionCallError::RespondToModel(text)) if !cancellation.is_cancelled() => {
-                    Ok(ApplyPatchToolOutput::from_delta(
-                        text,
-                        false,
-                        &Default::default(),
-                        operation_id.clone(),
-                        None,
-                    ))
-                }
-                result => result,
-            };
-            let mut result = result;
-            if let Ok(output) = &mut result {
-                output.operation_id = operation_id;
-                output.diagnostics.insert(0, review);
-                let receipt = output.structured_result();
-                tokio::task::spawn_blocking(move || operation.finish(&receipt)).await
-                    .map_err(|e| FunctionCallError::Fatal(format!("Patch receipt owner failed: {e}")))??;
-            }
-            result.map(boxed_tool_output)
+                result.map(boxed_tool_output)
             }).await.map_err(|e| FunctionCallError::Fatal(format!("Patch operation owner failed: {e}")))?
         })
     }
@@ -614,6 +636,7 @@ impl ApplyPatchHandler {
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
+        cancelled_waiting_for_workspace: &mut bool,
     ) -> Result<ApplyPatchToolOutput, FunctionCallError> {
         let ToolInvocation {
             session,
@@ -739,7 +762,7 @@ impl ApplyPatchHandler {
                 /*additional_permissions*/ None,
                 turn_environment.cwd(),
             );
-            let workspace_operation_permit = acquire_patch_workspace(
+            let workspace_operation_permit = match acquire_patch_workspace(
                 turn_environment,
                 turn_environment.cwd(),
                 native_addition_paths(&args.hunks).as_deref(),
@@ -750,7 +773,14 @@ impl ApplyPatchHandler {
                     call_id: call_id.clone(),
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    *cancelled_waiting_for_workspace = matches!(error, PatchWorkspaceWaitError::Cancelled);
+                    return Err(error.into());
+                }
+            };
             if let Some(id) = &retry_id {
                 session.services.retained_patches.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1138,6 +1168,22 @@ impl CoreToolRuntime for ApplyPatchHandler {
     }
 }
 
+const PATCH_WORKSPACE_CANCELLED: &str = "apply_patch cancelled while waiting for the workspace";
+
+enum PatchWorkspaceWaitError {
+    Cancelled,
+    Admission(String),
+}
+
+impl From<PatchWorkspaceWaitError> for FunctionCallError {
+    fn from(error: PatchWorkspaceWaitError) -> Self {
+        Self::RespondToModel(match error {
+            PatchWorkspaceWaitError::Cancelled => PATCH_WORKSPACE_CANCELLED.to_string(),
+            PatchWorkspaceWaitError::Admission(error) => error,
+        })
+    }
+}
+
 async fn acquire_patch_workspace(
     environment: &TurnEnvironment,
     cwd: &PathUri,
@@ -1145,7 +1191,7 @@ async fn acquire_patch_workspace(
     cancellation_token: &tokio_util::sync::CancellationToken,
     turn_timing_state: &Arc<crate::turn_timing::TurnTimingState>,
     holder: crate::scoped_workspace_gate::WorkspaceGateCall,
-) -> Result<Option<crate::scoped_workspace_gate::WorkspaceLease>, FunctionCallError> {
+) -> Result<Option<crate::scoped_workspace_gate::WorkspaceLease>, PatchWorkspaceWaitError> {
     // Waiting for another patch is tool activity, not model orchestration or
     // executor setup. Validation has a separate gate.
     let _tool_wait = turn_timing_state.begin_tool_execution();
@@ -1162,10 +1208,8 @@ async fn acquire_patch_workspace(
     );
     tokio::select! {
         biased;
-        _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel(
-            "apply_patch cancelled while waiting for the workspace".to_string(),
-        )),
-        permit = acquisition => permit.map(Some).map_err(FunctionCallError::RespondToModel),
+        _ = cancellation_token.cancelled() => Err(PatchWorkspaceWaitError::Cancelled),
+        permit = acquisition => permit.map(Some).map_err(PatchWorkspaceWaitError::Admission),
     }
 }
 
@@ -1588,7 +1632,7 @@ pub(crate) async fn intercept_apply_patch(
                 call_id: call_id.to_string(),
             },
         )
-        .await?
+        .await.map_err(FunctionCallError::from)?
     } else {
         None
     };

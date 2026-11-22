@@ -360,12 +360,19 @@ pub(crate) async fn policy_attempt_not_started(ctx: &ToolCtx) {
     ctx.turn.full_suite_budget.acknowledge_not_spawned(
         &owner,
     );
-    let _ = persist_policy_checkpoint(&ctx.session, &ctx.turn).await;
+    if let Err(error) = persist_policy_checkpoint(&ctx.session, &ctx.turn).await {
+        tracing::warn!(
+            %error,
+            call_id = %ctx.call_id,
+            "failed to persist the validation attempt as not spawned"
+        );
+    }
 }
 
-async fn persist_policy_checkpoint(session: &Session, turn: &TurnContext) -> Result<(), String> {
+async fn persist_policy_checkpoint(session: &Session, turn: &std::sync::Arc<TurnContext>) -> Result<(), String> {
     session.services.agent_control.persist_root_validation_checkpoint(turn).await?;
+    let item = turn.to_turn_context_item_async().await;
     session.persist_rollout_items_durable(&[
-        codex_protocol::protocol::RolloutItem::TurnContext(turn.to_turn_context_item()),
+        codex_protocol::protocol::RolloutItem::TurnContext(item),
     ]).await.map_err(|error| format!("validation admission checkpoint failed before launch: {error}"))
 }

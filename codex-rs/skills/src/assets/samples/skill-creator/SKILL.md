@@ -59,6 +59,8 @@ Validate that UI metadata still matches on updates. Include other optional inter
 
 ### Validation
 
+Use a Python environment with PyYAML available for this validator.
+
 ```bash
 python scripts/quick_validate.py <path/to/skill-folder>
 ```

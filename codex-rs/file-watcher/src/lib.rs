@@ -158,6 +158,10 @@ impl Receiver {
             let notified = self.inner.notify.notified();
             {
                 let mut changed_paths = self.inner.changed_paths.lock().await;
+                // Closing publishes its final rescan before setting closed.
+                // Observe terminal state first, then drain all prior events.
+                let terminal = self.inner.closed.load(Ordering::Acquire)
+                    || self.inner.sender_count.load(Ordering::Acquire) == 0;
                 let rescan_required = self.inner.rescan_required.swap(false, Ordering::AcqRel);
                 if rescan_required || !changed_paths.is_empty() {
                     return Some(FileWatcherEvent {
@@ -165,9 +169,7 @@ impl Receiver {
                         rescan_required,
                     });
                 }
-                if self.inner.closed.load(Ordering::Acquire)
-                    || self.inner.sender_count.load(Ordering::Acquire) == 0
-                {
+                if terminal {
                     return None;
                 }
             }

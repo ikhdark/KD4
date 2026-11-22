@@ -7,6 +7,9 @@ from typing import Annotated, Any, Literal
 from enum import Enum
 
 
+from .._wire_defaults import WireDefaultModel as _WireDefaultModel
+
+
 class CodexAppServerProtocolV2(BaseModel):
     pass
     model_config = ConfigDict(
@@ -3612,11 +3615,11 @@ class ReadOnlySandboxPolicy(BaseModel):
     type: Annotated[Literal["readOnly"], Field(title="ReadOnlySandboxPolicyType")]
 
 
-class ExternalSandboxSandboxPolicy(BaseModel):
+class ExternalSandboxSandboxPolicy(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    network_access: Annotated[NetworkAccess | None, Field(alias="networkAccess")] = "restricted"
+    network_access: Annotated[NetworkAccess | None, Field(validate_default=True, alias="networkAccess")] = "restricted"
     type: Annotated[Literal["externalSandbox"], Field(title="ExternalSandboxSandboxPolicyType")]
 
 
@@ -5700,13 +5703,13 @@ class TurnTimingToolCallSource(Enum):
     code_mode = "code_mode"
 
 
-class TurnTimingToolLifecycleEvent(BaseModel):
+class TurnTimingToolLifecycleEvent(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     at_ms: Annotated[int, Field(alias="atMs", ge=0)]
     boundary: ToolLifecycleBoundary
-    context: ToolLifecycleContext | None = {}
+    context: Annotated[ToolLifecycleContext | None, Field(validate_default=True)] = {}
     reentry_count: Annotated[int | None, Field(alias="reentryCount", ge=0)] = None
     retry_count: Annotated[int | None, Field(alias="retryCount", ge=0)] = None
 
@@ -6028,12 +6031,12 @@ class ChatgptAccount(BaseModel):
     type: Annotated[Literal["chatgpt"], Field(title="ChatgptAccountType")]
 
 
-class AmazonBedrockAccount(BaseModel):
+class AmazonBedrockAccount(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     credential_source: Annotated[
-        AmazonBedrockCredentialSource | None, Field(alias="credentialSource")
+        AmazonBedrockCredentialSource | None, Field(validate_default=True, alias="credentialSource")
     ] = "awsManaged"
     type: Annotated[Literal["amazonBedrock"], Field(title="AmazonBedrockAccountType")]
 
@@ -7603,7 +7606,7 @@ class HookOutputEntry(BaseModel):
     text: str
 
 
-class HookRunSummary(BaseModel):
+class HookRunSummary(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -7616,7 +7619,7 @@ class HookRunSummary(BaseModel):
     handler_type: Annotated[HookHandlerType, Field(alias="handlerType")]
     id: str
     scope: HookScope
-    source: HookSource | None = "unknown"
+    source: Annotated[HookSource | None, Field(validate_default=True)] = "unknown"
     source_path: Annotated[AbsolutePathBuf, Field(alias="sourcePath")]
     started_at: Annotated[int, Field(alias="startedAt")]
     status: HookRunStatus
@@ -7802,7 +7805,7 @@ class MigrationDetails(BaseModel):
     subagents: list[SubagentMigration] | None = []
 
 
-class Model(BaseModel):
+class Model(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -7823,7 +7826,7 @@ class Model(BaseModel):
     display_name: Annotated[str, Field(alias="displayName")]
     hidden: bool
     id: str
-    input_modalities: Annotated[list[InputModality] | None, Field(alias="inputModalities")] = [
+    input_modalities: Annotated[list[InputModality] | None, Field(validate_default=True, alias="inputModalities")] = [
         "text",
         "image",
     ]
@@ -8682,7 +8685,7 @@ class UserMessageThreadItem(BaseModel):
     type: Annotated[Literal["userMessage"], Field(title="UserMessageThreadItemType")]
 
 
-class CommandExecutionThreadItem(BaseModel):
+class CommandExecutionThreadItem(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -8751,7 +8754,7 @@ class CommandExecutionThreadItem(BaseModel):
             description="Runtime invocation id within the owning code-mode cell.",
         ),
     ] = None
-    source: CommandExecutionSource | None = "agent"
+    source: Annotated[CommandExecutionSource | None, Field(validate_default=True)] = "agent"
     status: CommandExecutionStatus
     stderr: str | None = None
     stdout: str | None = None
@@ -9032,7 +9035,7 @@ class ThreadResumeInitialTurnsPageParams(BaseModel):
     ] = None
 
 
-class ThreadSettings(BaseModel):
+class ThreadSettings(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -9043,6 +9046,7 @@ class ThreadSettings(BaseModel):
     approvals_reviewer: Annotated[
         ApprovalsReviewer | None,
         Field(
+            validate_default=True,
             alias="approvalsReviewer",
             description="Reviewer currently used for approval requests on this thread.",
         ),
@@ -9126,7 +9130,7 @@ class TokenUsageBreakdown(BaseModel):
     total_tokens: Annotated[int, Field(alias="totalTokens")]
 
 
-class ToolLifecycleTimerWait(BaseModel):
+class ToolLifecycleTimerWait(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -9135,7 +9139,7 @@ class ToolLifecycleTimerWait(BaseModel):
     requested_timeout_ms: Annotated[int | None, Field(alias="requestedTimeoutMs", ge=0)] = None
     sequence: Annotated[int | None, Field(ge=0)] = 0
     wait_kind: Annotated[str, Field(alias="waitKind")]
-    wake_reason: Annotated[ToolLifecycleWakeReason | None, Field(alias="wakeReason")] = "completed"
+    wake_reason: Annotated[ToolLifecycleWakeReason | None, Field(validate_default=True, alias="wakeReason")] = "completed"
 
 
 class ToolsV2(BaseModel):
@@ -9330,13 +9334,13 @@ class TurnTimingBlockingEvidence(BaseModel):
     version: Annotated[int, Field(ge=0)]
 
 
-class TurnTimingCounters(BaseModel):
+class TurnTimingCounters(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     approval_wait_count: Annotated[int, Field(alias="approvalWaitCount", ge=0)]
     attempts_by_kind: Annotated[
-        TurnTimingAttemptKindCounts | None, Field(alias="attemptsByKind")
+        TurnTimingAttemptKindCounts | None, Field(validate_default=True, alias="attemptsByKind")
     ] = {"fallback": 0, "primary": 0, "retry": 0}
     attributable_recovery_generation_count: Annotated[
         int | None,
@@ -9377,10 +9381,10 @@ class TurnTimingCounters(BaseModel):
     failure_diagnosis_count: Annotated[int | None, Field(alias="failureDiagnosisCount", ge=0)] = 0
     failure_signature_count: Annotated[int | None, Field(alias="failureSignatureCount", ge=0)] = 0
     generations_by_disposition: Annotated[
-        TurnTimingGenerationDispositionCounts | None, Field(alias="generationsByDisposition")
+        TurnTimingGenerationDispositionCounts | None, Field(validate_default=True, alias="generationsByDisposition")
     ] = {"decisionBearing": 0, "deterministic": 0, "unknown": 0}
     generations_by_purpose: Annotated[
-        TurnTimingGenerationPurposeCounts | None, Field(alias="generationsByPurpose")
+        TurnTimingGenerationPurposeCounts | None, Field(validate_default=True, alias="generationsByPurpose")
     ] = {
         "artifactContinuation": 0,
         "compactionRecovery": 0,
@@ -9394,7 +9398,7 @@ class TurnTimingCounters(BaseModel):
         "wait": 0,
     }
     generations_by_reason: Annotated[
-        TurnTimingGenerationReasonCounts | None, Field(alias="generationsByReason")
+        TurnTimingGenerationReasonCounts | None, Field(validate_default=True, alias="generationsByReason")
     ] = {"compaction": 0, "initial": 0, "other": 0, "subagent": 0, "toolContinuation": 0}
     internally_drained_wait_count: Annotated[
         int | None, Field(alias="internallyDrainedWaitCount", ge=0)
@@ -9624,12 +9628,12 @@ class TurnTimingDependencyNode(BaseModel):
     work_identity: Annotated[str | None, Field(alias="workIdentity")] = None
 
 
-class TurnTimingRequestTokenCategories(BaseModel):
+class TurnTimingRequestTokenCategories(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     accounting_basis: Annotated[
-        TurnTimingTokenCategoryBasis | None, Field(alias="accountingBasis")
+        TurnTimingTokenCategoryBasis | None, Field(validate_default=True, alias="accountingBasis")
     ] = "full_logical_prompt"
     base_instructions: Annotated[int | None, Field(alias="baseInstructions", ge=0)] = 0
     conversation_history: Annotated[int | None, Field(alias="conversationHistory", ge=0)] = 0
@@ -9814,7 +9818,7 @@ class TurnTimingTimeline(BaseModel):
     version: Annotated[int, Field(ge=0)]
 
 
-class TurnTimingToolCall(BaseModel):
+class TurnTimingToolCall(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -9870,7 +9874,7 @@ class TurnTimingToolCall(BaseModel):
         ),
     ] = None
     next_sample_block_reason: Annotated[
-        NextSampleBlockReason | None, Field(alias="nextSampleBlockReason")
+        NextSampleBlockReason | None, Field(validate_default=True, alias="nextSampleBlockReason")
     ] = "ready_to_sample"
     outcome: Annotated[
         str | None,
@@ -9942,7 +9946,7 @@ class TurnTimingToolCall(BaseModel):
         ),
     ] = None
     sampling_generation_id: Annotated[str | None, Field(alias="samplingGenerationId")] = ""
-    source: TurnTimingToolCallSource | None = "direct"
+    source: Annotated[TurnTimingToolCallSource | None, Field(validate_default=True)] = "direct"
     timer_waits: Annotated[list[ToolLifecycleTimerWait] | None, Field(alias="timerWaits")] = []
     tool_name: Annotated[str, Field(alias="toolName")]
     total_duration_ms: Annotated[int | None, Field(alias="totalDurationMs", ge=0)] = None
@@ -9968,7 +9972,7 @@ class TurnTimingToolCall(BaseModel):
     ] = []
 
 
-class TurnTimingToolCallIdentity(BaseModel):
+class TurnTimingToolCallIdentity(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -9976,7 +9980,7 @@ class TurnTimingToolCallIdentity(BaseModel):
     execution_id: Annotated[str, Field(alias="executionId")]
     parent_call_id: Annotated[str | None, Field(alias="parentCallId")] = None
     sampling_generation_id: Annotated[str | None, Field(alias="samplingGenerationId")] = ""
-    source: TurnTimingToolCallSource | None = "direct"
+    source: Annotated[TurnTimingToolCallSource | None, Field(validate_default=True)] = "direct"
 
 
 class TurnTimingToolClosure(BaseModel):
@@ -10548,14 +10552,14 @@ class PluginShareSaveParams(BaseModel):
     share_targets: Annotated[list[PluginShareTarget] | None, Field(alias="shareTargets")] = None
 
 
-class PluginSummary(BaseModel):
+class PluginSummary(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     auth_policy: Annotated[PluginAuthPolicy, Field(alias="authPolicy")]
     availability: Annotated[
         PluginAvailability | None,
-        Field(description="Availability state for installing and using the plugin."),
+        Field(validate_default=True, description="Availability state for installing and using the plugin."),
     ] = "AVAILABLE"
     enabled: bool
     id: str
@@ -10852,11 +10856,11 @@ class TurnTimingDependencyGraph(BaseModel):
     unavailable_reasons: Annotated[list[str], Field(alias="unavailableReasons")]
 
 
-class TurnTimingModelRequest(BaseModel):
+class TurnTimingModelRequest(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    attempt_kind: Annotated[TurnTimingAttemptKind | None, Field(alias="attemptKind")] = "primary"
+    attempt_kind: Annotated[TurnTimingAttemptKind | None, Field(validate_default=True, alias="attemptKind")] = "primary"
     cache_comparison_key: Annotated[
         str | None,
         Field(
@@ -10874,7 +10878,7 @@ class TurnTimingModelRequest(BaseModel):
         ),
     ] = None
     dispatch_ms: Annotated[int | None, Field(alias="dispatchMs", ge=0)] = None
-    disposition: TurnTimingGenerationDisposition | None = "unknown"
+    disposition: Annotated[TurnTimingGenerationDisposition | None, Field(validate_default=True)] = "unknown"
     executor_admitted_tool_call_count: Annotated[
         int | None,
         Field(
@@ -10918,7 +10922,7 @@ class TurnTimingModelRequest(BaseModel):
         ),
     ] = None
     generation_reason: Annotated[
-        TurnTimingGenerationReason | None, Field(alias="generationReason")
+        TurnTimingGenerationReason | None, Field(validate_default=True, alias="generationReason")
     ] = "other"
     is_continuation: Annotated[bool, Field(alias="isContinuation")]
     logical_context_sha256: Annotated[
@@ -10980,6 +10984,7 @@ class TurnTimingModelRequest(BaseModel):
     request_diagnostics_status: Annotated[
         TurnTimingRequestDiagnosticsStatus | None,
         Field(
+            validate_default=True,
             alias="requestDiagnosticsStatus",
             description="Optional diagnostics can finish after the turn. Late diagnostic records use sampling_request_id and physical_attempt_id to update this row.",
         ),
@@ -11231,7 +11236,7 @@ class ThreadTokenUsageUpdatedServerNotification(BaseModel):
     params: ThreadTokenUsageUpdatedNotification
 
 
-class TurnTiming(BaseModel):
+class TurnTiming(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -11328,6 +11333,7 @@ class TurnTiming(BaseModel):
     observational_nonprogress_latency: Annotated[
         TurnTimingDiagnosticLatencyAggregate | None,
         Field(
+            validate_default=True,
             alias="observationalNonprogressLatency",
             description="Latency observed on the same no-recorded-progress, unchanged-state generations as `observational_nonprogress_tokens`. Model-stream wait remains a model-side wall-clock measurement; `decision_latency_ns` narrows that to dispatch-to-first-actionable-output where observable.",
         ),
@@ -11343,6 +11349,7 @@ class TurnTiming(BaseModel):
     observational_nonprogress_tokens: Annotated[
         TurnTimingDiagnosticTokenAggregate | None,
         Field(
+            validate_default=True,
             alias="observationalNonprogressTokens",
             description="Provider usage observed on generations with no recorded progress kinds and unchanged relevant state. A changed next action alone is not progress under this predicate; useful inference or diagnosis may still occur. Final-answer publication is excluded. This observational diagnostic is neither measured avoidable savings nor authority to stop a turn.",
         ),
@@ -11414,6 +11421,7 @@ class TurnTiming(BaseModel):
     tool_closure: Annotated[
         TurnTimingToolClosure | None,
         Field(
+            validate_default=True,
             alias="toolClosure",
             description="Exact accepted-call closure ledger. A terminal event is publishable only when every accepted direct and nested execution has timing, a terminal outcome, and exactly one persisted projection.",
         ),
@@ -11668,7 +11676,7 @@ class PluginListResponse(BaseModel):
     marketplaces: list[PluginMarketplaceEntry]
 
 
-class Turn(BaseModel):
+class Turn(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -11697,6 +11705,7 @@ class Turn(BaseModel):
     items_view: Annotated[
         TurnItemsView | None,
         Field(
+            validate_default=True,
             alias="itemsView",
             description="Describes how much of `items` has been loaded for this turn.",
         ),
@@ -11890,7 +11899,7 @@ class Thread(BaseModel):
     ]
 
 
-class ThreadForkResponse(BaseModel):
+class ThreadForkResponse(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -11898,6 +11907,7 @@ class ThreadForkResponse(BaseModel):
     approvals_reviewer: Annotated[
         ApprovalsReviewer | None,
         Field(
+            validate_default=True,
             alias="approvalsReviewer",
             description="Reviewer currently used for approval requests on this thread.",
         ),
@@ -11965,7 +11975,7 @@ class ThreadReadResponse(BaseModel):
     thread: Thread
 
 
-class ThreadResumeResponse(BaseModel):
+class ThreadResumeResponse(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -11973,6 +11983,7 @@ class ThreadResumeResponse(BaseModel):
     approvals_reviewer: Annotated[
         ApprovalsReviewer | None,
         Field(
+            validate_default=True,
             alias="approvalsReviewer",
             description="Reviewer currently used for approval requests on this thread.",
         ),
@@ -12023,7 +12034,7 @@ class ThreadSearchResult(BaseModel):
     thread: Thread
 
 
-class ThreadStartResponse(BaseModel):
+class ThreadStartResponse(_WireDefaultModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -12031,6 +12042,7 @@ class ThreadStartResponse(BaseModel):
     approvals_reviewer: Annotated[
         ApprovalsReviewer | None,
         Field(
+            validate_default=True,
             alias="approvalsReviewer",
             description="Reviewer currently used for approval requests on this thread.",
         ),

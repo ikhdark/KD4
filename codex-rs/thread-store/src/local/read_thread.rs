@@ -53,6 +53,10 @@ pub(super) async fn read_thread_with_payload_versions(
                 payload_versions.as_deref_mut(),
             )
             .await
+            // Even an unreadable SQLite hint may point to a relocated rollout.
+            // Preserve the diagnostic on the final read of the resolved path.
+            .ok()
+            .flatten()
         } else {
             None
         };
@@ -162,32 +166,29 @@ async fn read_thread_from_resolved_rollout(
     Ok(thread)
 }
 
-async fn load_history_items_for_thread(
-    path: &std::path::Path,
-    thread_id: codex_protocol::ThreadId,
-) -> Option<Vec<codex_protocol::protocol::RolloutItem>> {
-    codex_rollout::existing_rollout_path(path).await?;
-    let (items, loaded_thread_id, _) = RolloutRecorder::load_rollout_items(path).await.ok()?;
-    (loaded_thread_id == Some(thread_id)).then_some(items)
-}
-
 async fn load_history_items_for_thread_with_versions(
     path: &std::path::Path,
     thread_id: codex_protocol::ThreadId,
     payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
-) -> Option<Vec<codex_protocol::protocol::RolloutItem>> {
+) -> std::io::Result<Option<Vec<codex_protocol::protocol::RolloutItem>>> {
     if let Some(versions) = payload_versions {
         *versions = None;
-        codex_rollout::existing_rollout_path(path).await?;
+        if codex_rollout::try_existing_rollout_path(path).await?.is_none() {
+            return Ok(None);
+        }
         let (items, loaded_thread_id, _, observed) =
-            RolloutRecorder::load_rollout_items_with_payload_versions(path).await.ok()?;
+            RolloutRecorder::load_rollout_items_with_payload_versions(path).await?;
         if loaded_thread_id != Some(thread_id) {
-            return None;
+            return Ok(None);
         }
         *versions = Some(observed);
-        return Some(items);
+        return Ok(Some(items));
     }
-    load_history_items_for_thread(path, thread_id).await
+    if codex_rollout::try_existing_rollout_path(path).await?.is_none() {
+        return Ok(None);
+    }
+    let (items, loaded_thread_id, _) = RolloutRecorder::load_rollout_items(path).await?;
+    Ok((loaded_thread_id == Some(thread_id)).then_some(items))
 }
 
 pub(super) async fn read_thread_by_rollout_path(
@@ -248,7 +249,7 @@ async fn resolve_requested_rollout_path(
     } else {
         rollout_path
     };
-    match tokio::fs::metadata(path.as_path()).await {
+    let requested_error = match tokio::fs::metadata(path.as_path()).await {
         Ok(metadata) if metadata.is_dir() => {
             return Err(ThreadStoreError::RolloutNotMaterialized {
                 path,
@@ -261,11 +262,22 @@ async fn resolve_requested_rollout_path(
                 reason: "path is not a file".to_string(),
             });
         }
-        _ => {}
-    }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Some(error),
+        _ => None,
+    };
     let mut retries = 3;
     loop {
-        let Some(resolved_path) = codex_rollout::existing_rollout_path(path.as_path()).await else {
+        let Some(resolved_path) = codex_rollout::try_existing_rollout_path(path.as_path())
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("failed to resolve rollout path {}: {error}", path.display()),
+            })?
+        else {
+            if let Some(error) = requested_error {
+                return Err(ThreadStoreError::Internal {
+                    message: format!("failed to examine rollout path {}: {error}", path.display()),
+                });
+            }
             return Err(ThreadStoreError::RolloutNotMaterialized {
                 path,
                 reason: "file does not exist".to_string(),
@@ -278,10 +290,18 @@ async fn resolve_requested_rollout_path(
                 // Resolve the logical rollout again instead of retrying the vanished file.
                 retries -= 1;
             }
-            Err(err) => {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ThreadStoreError::RolloutNotMaterialized {
                     path: resolved_path,
                     reason: err.to_string(),
+                });
+            }
+            Err(error) => {
+                return Err(ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to canonicalize rollout path {}: {error}",
+                        resolved_path.display(),
+                    ),
                 });
             }
         }
@@ -304,6 +324,9 @@ async fn attach_history_if_requested(
     };
     let items = load_history_items_for_thread_with_versions(&path, thread_id, payload_versions)
         .await
+        .map_err(|error| ThreadStoreError::Internal {
+            message: format!("failed to load thread history {} for {thread_id}: {error}", path.display()),
+        })?
         .ok_or_else(|| ThreadStoreError::Internal {
             message: format!(
                 "failed to load matching thread history {} for {thread_id}",

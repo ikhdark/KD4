@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::FunctionCallError;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecApprovalRequest;
+use crate::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
@@ -742,13 +743,20 @@ async fn run_exec_like_with_exit_code_inner(
     .with_model_command_text(hook_command.clone())
     .with_captured_environment(&turn_environment)
     .with_max_output_tokens(max_output_tokens);
-    let event_tracker = Some(&tracker);
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
-        .with_call_source(&tool_call_source);
-    emitter
-        .begin(event_ctx)
-        .await
-        .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
+    let shell_events = ShellEventPublication {
+        session: Arc::clone(&session),
+        turn: Arc::clone(&turn),
+        tracker: tracker.clone(),
+        call_id: call_id.clone(),
+        call_source: tool_call_source.clone(),
+        execution_id: crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
+            .map(|timing| timing.execution_id().0.clone()),
+        emitter: Some(emitter),
+        started: false,
+        runtime: tokio::runtime::Handle::current(),
+    }
+    .begin()
+    .await?;
 
     // This is a preliminary resolution used only for the policy compatibility check. The runtime
     // re-proves the inspectable safety projection against its final cwd and child environment
@@ -1013,11 +1021,7 @@ async fn run_exec_like_with_exit_code_inner(
     } else {
         shell_tool_outcome(&out)
     };
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
-        .with_call_source(&tool_call_source);
-    let finish_result = emitter
-        .finish(event_ctx, out, /*applied_patch_delta*/ None)
-        .await;
+    let finish_result = shell_events.finish(out).await;
     let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
     session
         .services
@@ -1127,6 +1131,100 @@ async fn run_exec_like_with_exit_code_inner(
         canonical_output,
         canonical_complete,
     })
+}
+
+// Own the item separately from the abortable shell handler. Native process
+// custody and the tool result remain with the existing execution owners.
+struct ShellEventPublication {
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    tracker: crate::tools::context::SharedTurnDiffTracker,
+    call_id: String,
+    call_source: ToolCallSource,
+    execution_id: Option<String>,
+    emitter: Option<crate::tools::events::ToolEmitter>,
+    started: bool,
+    runtime: tokio::runtime::Handle,
+}
+
+impl ShellEventPublication {
+    fn context(&self) -> ToolEventCtx<'_> {
+        let mut ctx = ToolEventCtx::new(
+            &self.session,
+            &self.turn,
+            &self.call_id,
+            Some(&self.tracker),
+        )
+        .with_call_source(&self.call_source);
+        ctx.execution_id = self.execution_id.as_deref();
+        ctx
+    }
+
+    async fn begin(mut self) -> Result<Self, FunctionCallError> {
+        let in_flight = crate::session::DurableHistoryCommitInFlight::begin(&self.session);
+        let runtime = self.runtime.clone();
+        let (delivery, receipt) = tokio::sync::oneshot::channel();
+        runtime.spawn(async move {
+            let _in_flight = in_flight;
+            let result = self.emitter.as_ref().expect("unstarted shell emitter")
+                .begin(self.context()).await;
+            self.started = result.is_ok();
+            let result = result
+                .map(|()| self)
+                .map_err(|error| FunctionCallError::Fatal(error.to_string()));
+            // If cancellation already won, dropping the returned owner here
+            // settles the started item before the original barrier is released.
+            drop(delivery.send(result));
+        });
+        receipt.await.map_err(|error| FunctionCallError::Fatal(error.to_string()))?
+    }
+
+    async fn finish(mut self, result: Result<ExecToolCallOutput, ToolError>) -> Result<String, FunctionCallError> {
+        let emitter = self.emitter.take().expect("started shell emitter");
+        let in_flight = crate::session::DurableHistoryCommitInFlight::begin(&self.session);
+        let runtime = self.runtime.clone();
+        runtime.spawn(async move {
+            let _in_flight = in_flight;
+            emitter.finish(self.context(), result, /*applied_patch_delta*/ None).await
+        }).await.map_err(|error| FunctionCallError::Fatal(error.to_string()))?
+    }
+}
+
+impl Drop for ShellEventPublication {
+    fn drop(&mut self) {
+        if !self.started {
+            return;
+        }
+        let Some(emitter) = self.emitter.take() else {
+            return;
+        };
+        let in_flight = crate::session::DurableHistoryCommitInFlight::begin(&self.session);
+        let retired = Self {
+            session: Arc::clone(&self.session),
+            turn: Arc::clone(&self.turn),
+            tracker: self.tracker.clone(),
+            call_id: self.call_id.clone(),
+            call_source: self.call_source.clone(),
+            execution_id: self.execution_id.clone(),
+            emitter: None,
+            started: false,
+            runtime: self.runtime.clone(),
+        };
+        // No exit code, process state, or canonical output is inferred here.
+        self.runtime.spawn(async move {
+            let _in_flight = in_flight;
+            if let Err(error) = emitter.emit(
+                retired.context(),
+                crate::tools::events::ToolEventStage::Failure(
+                    crate::tools::events::ToolEventFailure::Message(
+                        "Command handling was interrupted before the execution outcome was confirmed.".to_string(),
+                    ),
+                ),
+            ).await {
+                tracing::warn!(call_id = %retired.call_id, %error, "interrupted shell item publication failed");
+            }
+        });
+    }
 }
 
 fn recover_output_bearing_shell_content(
