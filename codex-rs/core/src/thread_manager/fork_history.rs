@@ -8,6 +8,7 @@ use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
+use codex_protocol::protocol::DiagnosticOrigins;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
@@ -56,6 +57,7 @@ fn truncate_before_nth_user_message(
     history: InitialHistory,
     n: usize,
     snapshot_state: &SnapshotTurnState,
+    origins: &mut DiagnosticOrigins,
 ) -> InitialHistory {
     let items = history.get_rollout_items();
     let user_positions = truncation::user_message_positions_in_rollout(items);
@@ -69,7 +71,7 @@ fn truncate_before_nth_user_message(
     } else {
         items.len()
     };
-    truncate_owned_initial_history(history, cut)
+    truncate_owned_initial_history(history, cut, origins)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -223,6 +225,7 @@ pub fn interrupted_fork_history_for_display(history: InitialHistory) -> InitialH
         ForkSnapshot::Interrupted,
         history,
         InterruptedTurnHistoryMarker::Disabled,
+        &mut DiagnosticOrigins::new(),
     )
 }
 
@@ -230,12 +233,13 @@ pub(super) fn fork_history_from_snapshot(
     snapshot: ForkSnapshot,
     history: InitialHistory,
     interrupted_marker: InterruptedTurnHistoryMarker,
+    origins: &mut DiagnosticOrigins,
 ) -> InitialHistory {
     match snapshot {
-        ForkSnapshot::TruncateToLastSamplingBoundary => truncate_to_last_sampling_boundary(history),
+        ForkSnapshot::TruncateToLastSamplingBoundary => truncate_to_last_sampling_boundary(history, origins),
         ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
             let snapshot_state = snapshot_turn_state(&history);
-            truncate_before_nth_user_message(history, nth_user_message, &snapshot_state)
+            truncate_before_nth_user_message(history, nth_user_message, &snapshot_state, origins)
         }
         ForkSnapshot::Interrupted => {
             let snapshot_state = snapshot_turn_state(&history);
@@ -260,13 +264,16 @@ pub(super) fn fork_history_from_snapshot(
     }
 }
 
-fn truncate_to_last_sampling_boundary(history: InitialHistory) -> InitialHistory {
+fn truncate_to_last_sampling_boundary(
+    history: InitialHistory,
+    origins: &mut DiagnosticOrigins,
+) -> InitialHistory {
     let items = history.get_rollout_items();
     if let Some(boundary) = items
         .iter()
         .rposition(|item| matches!(item, RolloutItem::SamplingBoundary(_)))
     {
-        return truncate_owned_initial_history(history, boundary + 1);
+        return truncate_owned_initial_history(history, boundary + 1, origins);
     }
     let snapshot_state = snapshot_turn_state(&history);
     let items = history.get_rollout_items();
@@ -282,12 +289,17 @@ fn truncate_to_last_sampling_boundary(history: InitialHistory) -> InitialHistory
     } else {
         items.len()
     };
-    truncate_owned_initial_history(history, cut)
+    truncate_owned_initial_history(history, cut, origins)
 }
 
-fn truncate_owned_initial_history(history: InitialHistory, cut: usize) -> InitialHistory {
+fn truncate_owned_initial_history(
+    history: InitialHistory,
+    cut: usize,
+    origins: &mut DiagnosticOrigins,
+) -> InitialHistory {
     let source = history.get_rollout_items();
     let cut = cut.min(source.len());
+    origins.retain(|index, _| *index < cut);
     // Capture only authenticated global notices from the discarded suffix.
     let notices = if cut == 0 || cut == source.len() {
         Vec::new()

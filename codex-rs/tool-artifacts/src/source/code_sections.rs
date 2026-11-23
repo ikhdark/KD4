@@ -470,19 +470,41 @@ pub fn compilation_module_paths(path: &Path, source: &str, crate_root: bool) -> 
     (paths, complete)
 }
 
+/// Why a completion-time outline could not establish existing-test changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExistingTestAnalysisGap {
+    SharedBudgetExhausted,
+    SyntaxRecovery,
+    UnsupportedOutline,
+    OutlineUnavailable,
+}
+
+impl ExistingTestAnalysisGap {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SharedBudgetExhausted => "shared_analysis_budget_exhausted",
+            Self::SyntaxRecovery => "parser_recovery",
+            Self::UnsupportedOutline => "unsupported_outline",
+            Self::OutlineUnavailable => "outline_unavailable",
+        }
+    }
+}
+
 /// Whether `after` removes or rewrites a test item of `before`: an item under
 /// a test attribute or `#[cfg(test)]` (every item when `whole_file_is_test`),
 /// compared by qualified name, occurrence count, exact text and enclosing
 /// execution-policy headers. Non-declaration test-scope statements retain
 /// fixtures/oracles without treating a new sibling test as an existing edit.
-/// `None` when a side cannot be parsed in time.
+/// A gap is not evidence about whether a test was changed.
 pub fn existing_tests_changed(
     path: &str,
     before: &str,
     after: Option<&str>,
     whole_file_is_test: bool,
     deadline: Instant,
-) -> Option<bool> {
+) -> Result<bool, ExistingTestAnalysisGap> {
+    use ExistingTestAnalysisGap::*;
+
     // Test fingerprint (identity, text, enclosing headers) -> occurrence count.
     type TestOccurrences<'a> =
         std::collections::HashMap<(String, Vec<&'a str>, Vec<&'a str>), usize>;
@@ -492,7 +514,7 @@ pub fn existing_tests_changed(
         source: &'a str,
         whole_file_is_test: bool,
         deadline: Instant,
-    ) -> Option<TestOccurrences<'a>> {
+    ) -> Result<TestOccurrences<'a>, ExistingTestAnalysisGap> {
         struct Scope<'a> {
             end: usize,
             cursor: usize,
@@ -527,17 +549,30 @@ pub fn existing_tests_changed(
             active: whole_file_is_test,
             statements: Vec::new(),
         }];
-        let (items, complete) = parse_with_completeness(path, source, "", deadline)?;
+        if !path.ends_with(".rs") && !path.ends_with(".py") {
+            return Err(UnsupportedOutline);
+        }
+        let (items, complete) = parse_with_completeness(path, source, "", deadline)
+            .ok_or_else(|| {
+                if Instant::now() >= deadline {
+                    SharedBudgetExhausted
+                } else {
+                    OutlineUnavailable
+                }
+            })?;
         if !complete {
-            return None;
+            return Err(SyntaxRecovery);
         }
         for item in items {
-            if Instant::now() >= deadline || item.syntax_error {
-                return None;
+            if Instant::now() >= deadline {
+                return Err(SharedBudgetExhausted);
             }
-            while owners.len() > 1 && owners.last()?.end <= item.start {
-                let mut owner = owners.pop()?;
-                owner.collect(source, owner.end, deadline)?;
+            if item.syntax_error {
+                return Err(SyntaxRecovery);
+            }
+            while owners.len() > 1 && owners.last().ok_or(OutlineUnavailable)?.end <= item.start {
+                let mut owner = owners.pop().ok_or(OutlineUnavailable)?;
+                owner.collect(source, owner.end, deadline).ok_or(SharedBudgetExhausted)?;
                 if owner.active && !owner.statements.is_empty() {
                     let headers = owners
                         .iter()
@@ -549,13 +584,13 @@ pub fn existing_tests_changed(
                         .or_insert(0) += 1;
                 }
             }
-            let owner = owners.last_mut()?;
+            let owner = owners.last_mut().ok_or(OutlineUnavailable)?;
             // A leaf is fingerprinted in full; do not separately traverse its
             // nested declarations or use their offsets as occurrence identity.
             if item.start < owner.cursor {
                 continue;
             }
-            owner.collect(source, item.start, deadline)?;
+            owner.collect(source, item.start, deadline).ok_or(SharedBudgetExhausted)?;
             owner.cursor = item.end;
             if matches!(item.kind, "mod" | "impl" | "trait" | "class" | "extern") {
                 owners.push(Scope {
@@ -577,7 +612,7 @@ pub fn existing_tests_changed(
             }
         }
         while let Some(mut owner) = owners.pop() {
-            owner.collect(source, owner.end, deadline)?;
+            owner.collect(source, owner.end, deadline).ok_or(SharedBudgetExhausted)?;
             if owner.active && !owner.statements.is_empty() {
                 let headers = owners
                     .iter()
@@ -589,14 +624,14 @@ pub fn existing_tests_changed(
                     .or_insert(0) += 1;
             }
         }
-        Some(tests)
+        Ok(tests)
     }
     let before = tests(path, before, whole_file_is_test, deadline)?;
     let after = match after {
         Some(after) => tests(path, after, whole_file_is_test, deadline)?,
         None => std::collections::HashMap::new(),
     };
-    Some(
+    Ok(
         before
             .iter()
             .any(|(evidence, count)| after.get(evidence).copied().unwrap_or(0) < *count),

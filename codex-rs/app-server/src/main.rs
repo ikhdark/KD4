@@ -45,6 +45,13 @@ struct AppServerArgs {
     /// Enable remote control for this app-server process without changing persistence.
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
+
+    /// Arm one content-free stall sample for 90 seconds (private stdio dev only).
+    /// Run from a private CODEX_HOME subdirectory next to this executable.
+    /// At most one record is written to a new stall-capture.jsonl.
+    #[cfg(debug_assertions)]
+    #[arg(long, conflicts_with = "remote_control")]
+    dev_stall_capture: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -57,11 +64,17 @@ fn main() -> anyhow::Result<()> {
             auth,
             strict_config,
             remote_control,
+            #[cfg(debug_assertions)]
+            dev_stall_capture,
         } = AppServerArgs::parse();
         let loader_overrides = LoaderOverrides::default();
         let transport = listen;
         let auth = auth.try_into_settings()?;
+        #[cfg(debug_assertions)]
+        let remote_control_disabled = remote_control_disabled || dev_stall_capture;
         let runtime_options = AppServerRuntimeOptions {
+            #[cfg(debug_assertions)]
+            dev_stall_capture,
             remote_control_startup_mode: match (remote_control, remote_control_disabled) {
                 (true, _) => codex_app_server::RemoteControlStartupMode::EnabledEphemeral,
                 (false, true) => codex_app_server::RemoteControlStartupMode::DisabledEphemeral,

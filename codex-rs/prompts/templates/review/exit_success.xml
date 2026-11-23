@@ -1,5 +1,5 @@
 <user_action>
-  <context>User initiated a review task. Here's the full review output from reviewer model. Each finding stays open until it is fixed and verified or disproved with evidence; the verdict is not task completion.</context>
+  <context>User initiated a review task. Here's the full review output from reviewer model. The parent owns each finding's disposition under the original task: finish obtainable repairs and verification, and distinguish unverified behavior from verified fixes. The review verdict is not task completion.</context>
   <action>review</action>
   <results>
   {{results}}

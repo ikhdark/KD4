@@ -2,7 +2,7 @@
 
 import argparse
 import ast
-import importlib.util
+import importlib
 import json
 import os
 import re
@@ -14,10 +14,13 @@ import tarfile
 import tempfile
 import types
 import typing
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence, get_args, get_origin
+from uuid import uuid4
 
 SDK_DISTRIBUTION_NAME = "openai-codex"
 RUNTIME_DISTRIBUTION_NAME = "openai-codex-cli-bin"
@@ -1391,18 +1394,24 @@ def _load_public_fields(
     return fields
 
 
-def _load_generated_v2_all_module() -> types.ModuleType:
-    """Import the freshly generated v2_all module without importing package init."""
-    module_name = "_openai_codex_generated_v2_all_for_artifacts"
-    sys.modules.pop(module_name, None)
-    module_path = sdk_root() / "src" / "openai_codex" / "generated" / "v2_all.py"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load generated module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+@contextmanager
+def _load_generated_v2_all_module() -> Iterator[types.ModuleType]:
+    """Load fresh models and their relative imports without executing the SDK init."""
+    package_name = f"_openai_codex_artifacts_{uuid4().hex}"
+    package_dir = sdk_root() / "src" / "openai_codex"
+    try:
+        for name, path in (
+            (package_name, package_dir),
+            (f"{package_name}.generated", package_dir / "generated"),
+        ):
+            package = types.ModuleType(name)
+            package.__path__ = [str(path)]
+            sys.modules[name] = package
+        yield importlib.import_module(f"{package_name}.generated.v2_all")
+    finally:
+        for name in tuple(sys.modules):
+            if name == package_name or name.startswith(f"{package_name}."):
+                sys.modules.pop(name, None)
 
 
 def _kw_signature_lines(fields: list[PublicFieldSpec]) -> list[str]:
@@ -1724,18 +1733,17 @@ def _render_async_thread_block(
 
 def generate_public_api_flat_methods() -> None:
     """Regenerate the public convenience methods from generated protocol models."""
-    src_dir = sdk_root() / "src"
-    public_api_path = src_dir / "openai_codex" / "api.py"
+    public_api_path = sdk_root() / "src" / "openai_codex" / "api.py"
     if not public_api_path.exists():
         # PR2 can run codegen before the ergonomic public API layer is added.
         return
-    src_dir_str = str(src_dir)
-    if src_dir_str not in sys.path:
-        sys.path.insert(0, src_dir_str)
 
-    # One fresh module per generation, not five rebuilds of every Pydantic model.
-    # Do not cache across invocations: the generated file may have changed.
-    module = _load_generated_v2_all_module()
+    # Keep the fresh models importable until public API rendering is complete.
+    with _load_generated_v2_all_module() as module:
+        _render_public_api_flat_methods(public_api_path, module)
+
+
+def _render_public_api_flat_methods(public_api_path: Path, module: types.ModuleType) -> None:
     approval_fields = {"approval_policy"}
     thread_start_fields = _load_public_fields(
         module,
@@ -1881,17 +1889,18 @@ def generate_types_from_schema_dir(schema_dir: Path) -> None:
             (staged_sdk / api_relative).write_bytes(original[2])
         if (destination / "pyproject.toml").is_file():
             shutil.copy2(destination / "pyproject.toml", staged_sdk / "pyproject.toml")
+        # The temporary generation tree does not otherwise contain SDK helpers.
+        wire_defaults = destination / "src" / "openai_codex" / "_wire_defaults.py"
+        if wire_defaults.is_file():
+            shutil.copy2(wire_defaults, staged_package / wire_defaults.name)
         token = _generation_root.set(staged_sdk)
-        old_sys_path = sys.path[:]
         try:
             prepare_generated_package()
             generate_v2_all(schema_dir)
             generate_notification_registry(schema_dir)
             generate_public_api_flat_methods()
         finally:
-            sys.path[:] = old_sys_path
             _generation_root.reset(token)
-            sys.modules.pop("_openai_codex_generated_v2_all_for_artifacts", None)
         pairs = [(staged_package / "generated", destination / "src/openai_codex/generated")]
         if has_api:
             pairs.append((staged_sdk / api_relative, destination / api_relative))

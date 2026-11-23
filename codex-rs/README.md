@@ -29,6 +29,7 @@ not another instruction source.
 | Resolved runtime configuration | [runtime-config](runtime-config/); [config](config/) owns configuration support and the [layer loader](config/src/loader/README.md) |
 | Session persistence | [rollout](rollout/README.md) |
 | Timing records and dispatch tracing | [turn-timing](turn-timing/README.md); core emits runtime observations |
+| Turn analytics | [analytics reducer](analytics/src/reducer.rs); completed turns awaiting enrichment use the same fallback at queue drain and before bounded FIFO eviction |
 | Execution service and process transport | [exec-server](exec-server/README.md), [exec-server-protocol](exec-server-protocol/) |
 | Extension interfaces and built-ins | [ext](ext/), starting with the [extension API](ext/extension-api/src/lib.rs) |
 | Shared utilities | [utils](utils/); use a specific utility crate rather than a core facade |

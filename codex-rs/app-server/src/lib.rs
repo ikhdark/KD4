@@ -107,6 +107,8 @@ fn emit_startup_warning(warning: &ConfigWarningNotification) {
 mod analytics_utils;
 mod connection_cleanup;
 pub mod in_process;
+#[cfg(debug_assertions)]
+mod stall_capture;
 mod transport;
 
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
@@ -500,6 +502,9 @@ pub struct AppServerRuntimeOptions {
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
     pub install_shutdown_signal_handler: bool,
+    /// Private standalone diagnostic; off for ordinary app-server callers.
+    #[cfg(debug_assertions)]
+    pub dev_stall_capture: bool,
 }
 
 impl Default for AppServerRuntimeOptions {
@@ -508,6 +513,8 @@ impl Default for AppServerRuntimeOptions {
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
             install_shutdown_signal_handler: true,
+            #[cfg(debug_assertions)]
+            dev_stall_capture: false,
         }
     }
 }
@@ -572,6 +579,20 @@ async fn run_main_owned(
     let codex_home = tokio::task::spawn_blocking(find_codex_home)
         .await
         .map_err(std::io::Error::other)??;
+    #[cfg(debug_assertions)]
+    let stall_capture = if runtime_options.dev_stall_capture {
+        if !matches!(&transport, AppServerTransport::Stdio)
+            || runtime_options.remote_control_startup_mode != RemoteControlStartupMode::DisabledEphemeral
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "dev stall capture requires stdio and disabled remote control",
+            ));
+        }
+        Some(stall_capture::Capture::start(codex_home.as_path())?)
+    } else {
+        None
+    };
     let ignore_user_config = loader_overrides.ignore_user_config;
     let config_manager = ConfigManager::new(
         codex_home.to_path_buf(),
@@ -634,6 +655,16 @@ async fn run_main_owned(
             (default_config, auth_manager, false)
         }
     };
+
+    #[cfg(debug_assertions)]
+    if stall_capture.is_some()
+        && config.sqlite_home.canonicalize()? != codex_home.as_path().canonicalize()?
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "dev stall capture requires SQLite state in the private CODEX_HOME",
+        ));
+    }
 
     set_default_client_residency_requirement(config.enforce_residency.value());
 
@@ -732,7 +763,13 @@ async fn run_main_owned(
         _ => None,
     };
     let state_db_init_result = tokio::select! {
-        result = tokio::time::timeout_at(startup_deadline, init_sqlite_state_db_with_fresh_start_on_corruption(&config)) =>
+        result = tokio::time::timeout_at(startup_deadline, async {
+            #[cfg(debug_assertions)]
+            let _wait = stall_capture
+                .as_ref()
+                .map(|capture| capture.enter(stall_capture::Phase::SqliteAdmission));
+            init_sqlite_state_db_with_fresh_start_on_corruption(&config).await
+        }) =>
             result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server database admission timed out"))?,
         _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
     };
@@ -824,7 +861,13 @@ async fn run_main_owned(
         emit_startup_warning(warning);
     }
     let installation_id = tokio::select! {
-        result = tokio::time::timeout_at(startup_deadline, resolve_installation_id(&config.codex_home)) =>
+        result = tokio::time::timeout_at(startup_deadline, async {
+            #[cfg(debug_assertions)]
+            let _wait = stall_capture
+                .as_ref()
+                .map(|capture| capture.enter(stall_capture::Phase::InstallationIdentity));
+            resolve_installation_id(&config.codex_home).await
+        }) =>
             result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server identity admission timed out"))??,
         _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
     };
@@ -906,6 +949,22 @@ async fn run_main_owned(
             },
         ));
     }
+
+    codex_app_server_handlers::record_native_capture_admission(
+        &config,
+        codex_app_server_handlers::NativeCaptureAdmission {
+            transport: &transport,
+            remote_control_mode: remote_control_startup_mode,
+            remote_control_policy,
+            config_resolved,
+            state_db_available: state_db.is_some(),
+            ignore_user_config,
+            start_plugins: runtime_options.plugin_startup_tasks == PluginStartupTasks::Start,
+            default_analytics_enabled,
+        },
+        startup_deadline,
+    )
+    .await;
 
     let (remote_control_accept_handle, remote_control_handle) = start_remote_control(
         RemoteControlStartConfig {

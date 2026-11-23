@@ -584,10 +584,13 @@ impl MessageProcessor {
                     | "thread/read"
                     | "thread/resume"
                     | "thread/turns/list"
+                    | "thread/items/list"
                     | "thread/queue/list"
+                    | "thread/queue/add"
                     | "thread/metadata/update"
                     | "turn/start"
                     | "config/read"
+                    | "hooks/list"
                     | "fs/getMetadata"
             );
         let mobile_observation_id = if remote_observation || local_observation {
@@ -1498,7 +1501,7 @@ impl MessageProcessor {
                             client_version.clone(),
                             /*supports_openai_form_elicitation*/
                             supports_openai_form_elicitation,
-                            mobile_observation_id.as_deref().filter(|id| id.starts_with("local:")),
+                            mobile_observation_id.as_deref(),
                         ))
                         .await
                         .map(|()| None)
@@ -1694,9 +1697,10 @@ impl MessageProcessor {
                     ClientRequest::SkillsExtraRootsSet { params, .. } => {
                         self.catalog_processor.skills_extra_roots_set(params).await
                     }
-                    ClientRequest::HooksList { params, .. } => {
-                        self.catalog_processor.hooks_list(params).await
-                    }
+                    ClientRequest::HooksList { params, .. } => self
+                        .catalog_processor
+                        .hooks_list(params, mobile_observation_id.as_deref())
+                        .await,
                     ClientRequest::MarketplaceAdd { params, .. } => {
                         self.marketplace_processor.marketplace_add(params).await
                     }

@@ -551,9 +551,8 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
             let review = apply_patch_operations::evidence_review(input).map(str::to_owned);
             let (declared_id, patch) = apply_patch_operations::split(input)?;
             let operation_id = declared_id.unwrap_or_else(|| invocation.call_id.clone());
-            let scope = invocation.step_context.environments.turn_environments.iter().map(|e|
-                serde_json::json!({"id":e.environment_id, "owner":e.owner_id(), "cwd":e.cwd()})).collect::<Vec<_>>();
-            let binding = serde_json::json!({"patch":original, "environments":scope});
+            let binding =
+                apply_patch_operations::binding(original, &invocation.step_context.environments);
             let home = invocation.step_context.turn.config.codex_home.clone();
             let thread = invocation.session.thread_id.to_string();
             let id = operation_id.clone();

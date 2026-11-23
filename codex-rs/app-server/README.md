@@ -29,12 +29,25 @@ consumers do not depend on that tooling facade.
 The [thread follow-up queue contract](THREAD_QUEUE.md) is implemented by the
 handlers crate.
 
+`thread/rollback` returns the durable post-rollback history. Its turn statuses
+use the same stale-turn projection as history reads: only the matching live
+turn can remain `inProgress`. Completed and failed turns, items, and ordering
+are unchanged by that status projection.
+
 ## MCP OAuth completion correlation
 
 Explicit `mcpServer/oauth/login` responses include an optional `loginId`, echoed
 by `mcpServer/oauthLogin/completed`. Match attempts by this ID rather than server
 name or arrival order; overlapping attempts can finish out of order. Older peers
 and automatic plugin logins may omit it. Existing server/thread fields remain.
+
+## Opt-in hooks listing diagnostics
+
+In the bounded runtime journal, stdio and remote-control `hooks/list` ingress
+and the catalog owner phases share one operation ID. Use the typed request
+hash on ingress to match the client call. Other transports keep catalog phases
+without claiming an ingress join. This does not record cwd strings, change
+hook discovery or imply client consumption.
 
 ## Mobile RPC boundaries
 
@@ -55,6 +68,9 @@ the backend's launch environment with `CODEX_RUNTIME_OBSERVATIONS=1` and
 directory (normally under `KDR/captures/`). Publishing alone does not enable it.
 These launch-time settings require a new backend process; do not interrupt a
 running app or chat without authorization. No phone-app replacement is needed.
+The [native admission receipt](../turn-timing/README.md#mobile-backend-admission)
+identifies the producer and its resolved startup-policy projection, not the live
+Desktop connection or the complete backend configuration.
 
 Reopen the phone's Git panel and switch workspaces. The journal correlates
 `mobile_rpc_received`, admission/handler outcomes, `mobile_directory_path_decoded`

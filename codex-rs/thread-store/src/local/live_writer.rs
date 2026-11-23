@@ -343,12 +343,23 @@ pub(super) async fn append_persisted_items_ordered(
     thread_id: ThreadId,
     items: &[RolloutItem],
 ) -> ThreadStoreResult<()> {
+    append_persisted_items_ordered_with_origins(
+        store, thread_id, items, &codex_rollout::DiagnosticOriginSource::Unknown,
+    ).await
+}
+
+pub(super) async fn append_persisted_items_ordered_with_origins(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    items: &[RolloutItem],
+    origins: &codex_rollout::DiagnosticOriginSource,
+) -> ThreadStoreResult<()> {
     if items.is_empty() {
         return Ok(());
     }
     let recorder = store.live_recorder(thread_id).await?;
     recorder
-        .record_canonical_items_ordered(items)
+        .record_canonical_items_ordered_with_origins(items, origins)
         .await
         .map_err(thread_store_io_error)
 }

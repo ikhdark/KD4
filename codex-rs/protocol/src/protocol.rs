@@ -4447,11 +4447,36 @@ pub struct ImageGenerationEndEvent {
     pub saved_path: Option<AbsolutePathBuf>,
 }
 
+/// Exact identity of one warning, error, or stream error first admitted by the
+/// native writer. Physical record timestamps on forks are independent of it.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct DiagnosticOrigin {
+    #[schemars(with = "String")]
+    pub id: uuid::Uuid,
+    pub thread_id: ThreadId,
+    #[schemars(with = "String")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+impl DiagnosticOrigin {
+    pub fn new(thread_id: ThreadId, timestamp: chrono::DateTime<chrono::Utc>) -> Self {
+        Self { id: uuid::Uuid::new_v4(), thread_id, timestamp }
+    }
+}
+
+/// Sparse provenance keyed by zero-based index in the associated replay items.
+/// Synthetic notices and unknown or malformed origins do not occupy entries.
+pub type DiagnosticOrigins = BTreeMap<usize, DiagnosticOrigin>;
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ResumedHistory {
     pub conversation_id: ThreadId,
     pub history: Arc<Vec<RolloutItem>>,
     pub rollout_path: Option<PathBuf>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub diagnostic_origins: DiagnosticOrigins,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -5492,6 +5517,12 @@ impl Mul<f64> for TruncationPolicy {
     }
 }
 
+impl RolloutItem {
+    pub fn is_origin_diagnostic(&self) -> bool {
+        matches!(self, Self::EventMsg(EventMsg::Warning(_) | EventMsg::Error(_) | EventMsg::StreamError(_)))
+    }
+}
+
 pub const CURRENT_ROLLOUT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone)]
@@ -5504,6 +5535,8 @@ pub struct RolloutLine {
 struct RolloutLineSchema<'a> {
     pub timestamp: &'a str,
     pub format_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_origin: Option<&'a DiagnosticOrigin>,
     #[serde(flatten)]
     pub item: &'a RolloutItem,
 }
@@ -5526,6 +5559,7 @@ impl Serialize for RolloutLine {
         RolloutLineSchema {
             timestamp: &self.timestamp,
             format_version: CURRENT_ROLLOUT_FORMAT_VERSION,
+            diagnostic_origin: None,
             item: &self.item,
         }
         .serialize(serializer)

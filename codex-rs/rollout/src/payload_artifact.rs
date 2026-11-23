@@ -8,6 +8,12 @@ use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
+
+mod collection;
+mod plain_replay;
+pub use collection::{collect_home_payloads, home_retention_enabled};
 
 const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const INLINE_BYTES: usize = 8 * 1024;
@@ -401,7 +407,15 @@ pub(crate) fn lock_publication(path: &Path) -> io::Result<std::fs::File> {
         .create(true)
         .truncate(false)
         .open(directory.join(".retention.lock"))?;
-    file.lock_shared()?;
+    match file.try_lock_shared() {
+        Ok(()) => (),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            // Do not leave a foreground writer behind a multi-GiB inventory.
+            let _ = std::fs::File::create_new(directory.join(".retention-yield"));
+            file.lock_shared()?;
+        }
+        Err(err) => return Err(err.into()),
+    }
     Ok(file)
 }
 
@@ -409,7 +423,7 @@ pub(crate) fn lock_publication(path: &Path) -> io::Result<std::fs::File> {
 /// participates in retention ownership. Explicit resume paths can live outside
 /// the session directories, and older writers do not take the retention lock.
 /// Neither a bounded directory scan nor an age cutoff proves a blob is unused.
-/// Blobs are therefore retained by design, which is not a failure. Only
+/// Without explicit home-authoritative cutover, blobs are retained by design. Only
 /// abandoned private stage files are reclaimed; returns how many were removed.
 pub async fn reclaim_payload_artifacts(home: &Path) -> io::Result<usize> {
     let directory = home.join("rollout-payloads");
@@ -687,7 +701,7 @@ fn publish_payload(
         Ok::<_, io::Error>(staged)
     };
     if destination.exists() {
-        if read_payload(&directory, sha256, bytes).is_err() {
+        if read_payload(&directory, sha256, bytes, None).is_err() {
             stage()?.persist(&destination).map_err(|error| error.error)?;
         }
     } else {
@@ -695,7 +709,7 @@ fn publish_payload(
             // The destination is exactly the complete temporary file we wrote.
             Ok(_) => {}
             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                if read_payload(&directory, sha256, bytes).is_err() {
+                if read_payload(&directory, sha256, bytes, None).is_err() {
                     error
                         .file
                         .persist(&destination)
@@ -737,13 +751,70 @@ fn payload_reference(
     Ok(serialized)
 }
 
-fn read_payload(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8>> {
+/// Per-append aggregate only; blocking hydrators return their local contribution.
+#[derive(Default)]
+pub(crate) struct AppendPayloadTiming {
+    pub(crate) candidates: usize,
+    pub(crate) bytes_read: u64,
+    pub(crate) read: Duration,
+    pub(crate) sha256: Duration,
+    pub(crate) parse: Duration,
+    pub(crate) plain_replay_projected: usize,
+    pub(crate) enroll: Duration,
+    pub(crate) envelope: Duration,
+}
+
+impl AppendPayloadTiming {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.candidates += other.candidates;
+        self.bytes_read += other.bytes_read;
+        self.read += other.read;
+        self.sha256 += other.sha256;
+        self.parse += other.parse;
+        self.plain_replay_projected += other.plain_replay_projected;
+        self.enroll += other.enroll;
+        self.envelope += other.envelope;
+    }
+}
+
+pub(crate) fn time_append_stage<T>(elapsed: Option<&mut Duration>, run: impl FnOnce() -> T) -> T {
+    if let Some(elapsed) = elapsed {
+        let start = Instant::now();
+        let result = run();
+        *elapsed += start.elapsed();
+        result
+    } else {
+        run()
+    }
+}
+
+fn read_payload(
+    directory: &Path,
+    sha256: &str,
+    bytes: u64,
+    mut timing: Option<&mut AppendPayloadTiming>,
+) -> io::Result<Vec<u8>> {
     if sha256.len() != 64
         || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
         || bytes > MAX_PAYLOAD_BYTES
     {
         return Err(io::Error::other("invalid rollout payload reference"));
     }
+    let payload = time_append_stage(timing.as_mut().map(|t| &mut t.read), || {
+        read_payload_bytes(directory, sha256, bytes)
+    })?;
+    if let Some(timing) = timing.as_mut() {
+        timing.bytes_read += payload.len() as u64;
+    }
+    if payload.len() as u64 != bytes
+        || time_append_stage(timing.map(|t| &mut t.sha256), || digest(&payload)) != sha256
+    {
+        return Err(io::Error::other("rollout payload checksum mismatch"));
+    }
+    Ok(payload)
+}
+
+fn read_payload_bytes(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8>> {
     let path = directory.join(format!("{sha256}.json"));
     let metadata = std::fs::symlink_metadata(&path)?;
     if !metadata.file_type().is_file() || metadata.len() != bytes {
@@ -755,9 +826,6 @@ fn read_payload(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8
     std::fs::File::open(path)?
         .take(bytes.saturating_add(1))
         .read_to_end(&mut payload)?;
-    if payload.len() as u64 != bytes || digest(&payload) != sha256 {
-        return Err(io::Error::other("rollout payload checksum mismatch"));
-    }
     Ok(payload)
 }
 
@@ -775,8 +843,9 @@ pub(crate) fn hydrate_record(
     line: String,
     enroll: bool,
     decode_value: bool,
+    timing: Option<&mut AppendPayloadTiming>,
 ) -> io::Result<HydratedRecord> {
-    hydrate_record_with_limit(path, line, enroll, decode_value, u64::MAX)
+    hydrate_record_with_limit(path, line, enroll, decode_value, u64::MAX, timing)
 }
 
 pub(crate) fn hydrate_line_bounded(
@@ -793,7 +862,7 @@ fn hydrate_line_with_limit(
     enroll: bool,
     max_bytes: u64,
 ) -> io::Result<String> {
-    match hydrate_record_with_limit(path, line, enroll, false, max_bytes)? {
+    match hydrate_record_with_limit(path, line, enroll, false, max_bytes, None)? {
         HydratedRecord::Text(line) => Ok(line),
         HydratedRecord::Parsed(_) => unreachable!("text-only hydration"),
     }
@@ -805,11 +874,18 @@ fn hydrate_record_with_limit(
     enroll: bool,
     decode_value: bool,
     max_bytes: u64,
+    mut timing: Option<&mut AppendPayloadTiming>,
 ) -> io::Result<HydratedRecord> {
     if !may_be_reference(&line) {
         return Ok(HydratedRecord::Text(line));
     }
-    let mut reference: serde_json::Value = match serde_json::from_str(&line) {
+    if let Some(timing) = timing.as_mut() {
+        timing.candidates += 1;
+    }
+    let mut reference: serde_json::Value = match time_append_stage(
+        timing.as_mut().map(|t| &mut t.parse),
+        || serde_json::from_str(&line),
+    ) {
         Ok(value) => value,
         Err(_) => return Ok(HydratedRecord::Text(line)), // Preserve torn-line handling.
     };
@@ -830,9 +906,24 @@ fn hydrate_record_with_limit(
     // Keep large nested bodies as borrowed JSON. Materializing a diagnostic
     // snapshot here only to serialize it for the canonical decoder duplicates
     // its entire object tree on every history read and cold resume.
-    let payload = read_payload(&root(path), sha256, bytes)?;
-    if decode_value
-        && let Ok(serde_json::Value::Object(mut item)) = serde_json::from_slice(&payload)
+    let payload = read_payload(&root(path), sha256, bytes, timing.as_deref_mut())?;
+    let mut projected_plain_replay = false;
+    let append_value = decode_value.then(|| {
+        time_append_stage(timing.as_mut().map(|t| &mut t.parse), || {
+            if enroll
+                && reference["payload"]["item_type"].as_str() == Some("context_replay")
+                && let Some(projected) = plain_replay::try_project(&line, &payload)
+            {
+                projected_plain_replay = true;
+                return Ok(projected);
+            }
+            serde_json::from_slice(&payload)
+        })
+    });
+    if let Some(timing) = timing.as_mut() {
+        timing.plain_replay_projected += usize::from(projected_plain_replay);
+    }
+    if let Some(Ok(serde_json::Value::Object(mut item))) = append_value
         && item.len() == 2
         && item.contains_key("payload")
         && item.contains_key("type")
@@ -840,34 +931,47 @@ fn hydrate_record_with_limit(
         let item_type = item.get("type").unwrap_or(&serde_json::Value::Null);
         check_payload_type(item_type, &reference["payload"]["item_type"])?;
         if enroll {
-            enroll_payload_for_sync(path, sha256);
+            time_append_stage(timing.as_mut().map(|t| &mut t.enroll), || {
+                enroll_payload_for_sync(path, sha256);
+            });
         }
         // Same precedence as text hydration: record metadata belongs to
         // the reference, which can share one body across multiple records.
-        item.insert("timestamp".to_owned(), reference["timestamp"].take());
-        item.insert("format_version".to_owned(), reference["format_version"].take());
-        return Ok(HydratedRecord::Parsed(serde_json::Value::Object(item)));
+        return time_append_stage(timing.map(|t| &mut t.envelope), || {
+            item.insert("timestamp".to_owned(), reference["timestamp"].take());
+            item.insert("format_version".to_owned(), reference["format_version"].take());
+            Ok(HydratedRecord::Parsed(serde_json::Value::Object(item)))
+        });
     }
     // For noncanonical bodies keep text hydration's normalization and error
     // classification (including serde_json's reserved first-key handling).
-    let mut item: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
-        serde_json::from_slice(&payload)?;
-    let item_type: serde_json::Value = item
-        .get("type")
-        .map(|value| serde_json::from_str(value.get()))
-        .transpose()?
-        .unwrap_or(serde_json::Value::Null);
+    let (item, item_type) =
+        time_append_stage(timing.as_mut().map(|t| &mut t.parse), || {
+            let item: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+                serde_json::from_slice(&payload)?;
+            let item_type: serde_json::Value = item
+                .get("type")
+                .map(|value| serde_json::from_str(value.get()))
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null);
+            Ok::<_, io::Error>((item, item_type))
+        })?;
     check_payload_type(&item_type, &reference["payload"]["item_type"])?;
     if enroll {
-        enroll_payload_for_sync(path, sha256);
+        time_append_stage(timing.as_mut().map(|t| &mut t.enroll), || {
+            enroll_payload_for_sync(path, sha256);
+        });
     }
-    let timestamp = serde_json::value::to_raw_value(&reference["timestamp"])?;
-    let format_version = serde_json::value::to_raw_value(&reference["format_version"])?;
-    item.insert("timestamp".to_owned(), &timestamp);
-    item.insert("format_version".to_owned(), &format_version);
-    serde_json::to_string(&item)
-        .map(HydratedRecord::Text)
-        .map_err(io::Error::other)
+    time_append_stage(timing.map(|t| &mut t.envelope), move || {
+        let mut item = item;
+        let timestamp = serde_json::value::to_raw_value(&reference["timestamp"])?;
+        let format_version = serde_json::value::to_raw_value(&reference["format_version"])?;
+        item.insert("timestamp".to_owned(), &timestamp);
+        item.insert("format_version".to_owned(), &format_version);
+        serde_json::to_string(&item)
+            .map(HydratedRecord::Text)
+            .map_err(io::Error::other)
+    })
 }
 
 fn check_payload_type(

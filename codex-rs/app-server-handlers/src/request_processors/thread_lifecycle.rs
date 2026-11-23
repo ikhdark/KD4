@@ -892,7 +892,7 @@ async fn process_thread_listener_event(
             if completed.error.is_some())
             || queue_completed && summary_failed);
     if queue_paused && let Some(queue) = &context.thread_queue_processor {
-        queue.pause(conversation_id).await;
+        queue.pause(conversation_id, &event.id).await;
     }
     let (active_turn_id, raw_events_enabled, reconciled_wait_items) = {
         let mut state = thread_state.lock().await;

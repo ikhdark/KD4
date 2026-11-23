@@ -4,6 +4,7 @@ use crate::DeletedProject;
 use crate::ListProjectsParams;
 use crate::MoveProjectParams;
 use crate::ProjectMoveOutcome;
+mod archive_retention;
 mod archive_thread;
 mod create_thread;
 mod delete_thread;
@@ -18,6 +19,7 @@ mod unarchive_thread;
 mod update_thread_metadata;
 
 pub use delete_thread::StagedThreadDelete;
+pub use delete_thread::thread_mailbox_path;
 
 
 
@@ -32,6 +34,8 @@ use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+use codex_rollout::DiagnosticOriginSource;
 
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
@@ -80,6 +84,7 @@ pub struct LocalThreadStore {
     deletion_recovery: Arc<tokio::sync::OnceCell<()>>,
     metadata_update_slots: Arc<tokio::sync::Semaphore>,
     metadata_update_order: Arc<std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<Mutex<()>>>>>,
+    archive_retention: Option<Arc<tokio::sync::watch::Sender<()>>>,
     compression_worker: Option<Arc<codex_rollout::RolloutCompressionWorker>>,
 }
 
@@ -160,8 +165,29 @@ impl LocalThreadStore {
             deletion_recovery: Arc::new(tokio::sync::OnceCell::new()),
             metadata_update_slots: Arc::new(tokio::sync::Semaphore::new(32)),
             metadata_update_order: Default::default(),
+            archive_retention: None,
             compression_worker: None,
         }
+    }
+
+    /// Bound to a private opt-in marker, not enabled for other Codex homes.
+    pub async fn run_archive_retention(&self) -> ThreadStoreResult<()> {
+        if codex_rollout::home_retention_enabled(&self.config.codex_home) {
+            let tmp = self.config.codex_home.join(".tmp");
+            tokio::fs::create_dir_all(&tmp).await.map_err(delete_thread::delete_recovery_error)?;
+            let guard = std::fs::File::options().read(true).write(true).create(true).truncate(false)
+                .open(tmp.join("archive-retention.worker.lock")).map_err(delete_thread::delete_recovery_error)?;
+            match guard.try_lock() {
+                Ok(()) => (),
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+                Err(err) => return Err(delete_thread::delete_recovery_error(err)),
+            }
+            let maintenance = Self::new(self.config.clone(), self.state_db.clone());
+            delete_thread::expire_archives(&maintenance, chrono::Utc::now().timestamp()-7*86400).await?;
+            codex_rollout::collect_home_payloads(&self.config.codex_home).await
+                .map_err(|err| ThreadStoreError::Internal { message: err.to_string() })?;
+        }
+        Ok(())
     }
 
     /// Retain shared maintenance for exactly this store's lifetime.
@@ -525,6 +551,15 @@ impl ThreadStore for LocalThreadStore {
         thread_id: ThreadId,
         items: &'a [RolloutItem],
     ) -> ThreadStoreFuture<'a, ()> {
+        self.append_persisted_items_ordered_with_origins(thread_id, items, DiagnosticOriginSource::Unknown)
+    }
+
+    fn append_persisted_items_ordered_with_origins<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+        origins: DiagnosticOriginSource,
+    ) -> ThreadStoreFuture<'a, ()> {
         Box::pin(async move {
             if items.is_empty() {
                 return Ok(());
@@ -537,7 +572,9 @@ impl ThreadStore for LocalThreadStore {
             // Cancellation may drop the observer, never the queue/projection handoff.
             tokio::spawn(async move {
                 let _operation = _operation;
-                live_writer::append_persisted_items_ordered(&store, thread_id, &items).await?;
+                live_writer::append_persisted_items_ordered_with_origins(
+                    &store, thread_id, &items, &origins,
+                ).await?;
                 projection.append_pending(items).await;
                 Ok(())
             })

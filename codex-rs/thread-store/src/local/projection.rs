@@ -614,6 +614,9 @@ pub(super) async fn initialize_deferred(
 ) -> ThreadStoreResult<()> {
     let projection = projection_entry(store, thread_id).await;
     let _operation = projection.acquire_operation().await?;
+    // A new writer seed is not the snapshot authenticated by an earlier read.
+    *projection.source_version.lock().await = None;
+    *projection.gap_source_version.lock().await = None;
     let history = history.map(|history| {
         if history
             .iter()
@@ -645,10 +648,29 @@ pub(super) async fn initialize_from_store(
 ) -> ThreadStoreResult<(SharedLocalThreadProjection, OwnedSemaphorePermit)> {
     let projection = projection_entry(store, thread_id).await;
     let operation = projection.acquire_operation().await?;
-    if !store.live_recorders.lock().await.contains_key(&thread_id) {
-        // Unloaded rollouts may be appended, rolled back, or compressed by another process.
-        // Compare the durable source (the physical plain or compressed file) before reusing its
-        // pagination projection.
+    let has_live_recorder = store.live_recorders.lock().await.contains_key(&thread_id);
+    let rollout_path = if has_live_recorder {
+        initialize_entry_from_store(store, thread_id, include_archived, &projection).await?;
+        let can_revalidate = {
+            let state = projection.state.lock().await;
+            // A healthy writer projection is maintained incrementally. A degraded
+            // resume seed can outlive a repaired payload, but only rebase after
+            // the writer's barrier has settled its pending projection items.
+            // An ordered append may already be on disk; including that tail here
+            // could expose it early or replay it again at the next barrier.
+            state.source_partial && state.pending_items.is_empty()
+        };
+        if !can_revalidate {
+            return Ok((projection, operation));
+        }
+        Some(super::live_writer::rollout_path(store, thread_id).await?)
+    } else {
+        rollout_path
+    };
+    {
+        // Compare the durable source (physical plain or compressed file).
+        // An unloaded rollout may have changed externally; a known live gap may
+        // have been repaired while the writer and its projection stayed loaded.
         let source_path = match rollout_path {
             Some(path) => codex_rollout::existing_rollout_path(&path).await,
             None => None,
@@ -685,6 +707,11 @@ pub(super) async fn initialize_from_store(
                     Some(&mut dependencies),
                 )
                 .await?;
+            if has_live_recorder && history.thread_id != thread_id {
+                return Err(projection_invariant_error(
+                    "live projection recovery loaded a different thread",
+                ));
+            }
             let degraded = history.items.iter().any(|item| match item {
                 RolloutItem::ResponseItem(item) => {
                     codex_rollout::is_rollout_reconstruction_notice(item)
@@ -698,7 +725,6 @@ pub(super) async fn initialize_from_store(
                 }
                 _ => false,
             });
-            projection.initialize(history.items).await?;
             // Metadata stamps cannot prove content readability. Even confirmed
             // gaps must retry periodically after transient sharing/I/O failures.
             *projection.gap_retry_after.lock().await = degraded.then(||
@@ -724,13 +750,20 @@ pub(super) async fn initialize_from_store(
                 }
                 _ => false,
             };
+            // Keep the live conflict until canonical replay is complete and its
+            // payloads stayed unchanged. Do not rebuild the same partial index.
+            if !has_live_recorder || (!degraded && cacheable) {
+                projection.initialize(history.items).await?;
+            }
             *projection.payload_versions.lock().await = dependencies.unwrap_or_default();
             *projection.source_version.lock().await = if cacheable { source_version } else { None };
         }
+    }
+    if !has_live_recorder {
         projection.mark_unloaded_read();
         evict_least_recent_unloaded_projections(store).await;
+        initialize_entry_from_store(store, thread_id, include_archived, &projection).await?;
     }
-    initialize_entry_from_store(store, thread_id, include_archived, &projection).await?;
     Ok((projection, operation))
 }
 

@@ -58,10 +58,23 @@ impl Session {
                 None
             };
         let mut world_state = WorldState::default();
-        if let Some(section) = crate::tools::handlers::evidence_memory::ledger_context(step_context).await {
-            let previous = previous_world_state.as_ref()
-                .and_then(|state| state.rendered_extension("verification_ledger"));
-            world_state.add_extension_section_with_previous(section, previous);
+        if let Some(section) =
+            crate::tools::handlers::evidence_memory::ledger_context(step_context).await
+        {
+            let id = section.id();
+            let previous = previous_world_state.as_ref();
+            let rendering = previous.and_then(|state| state.rendered_extension(id));
+            if section.is_unavailable() {
+                if let Some(snapshot) = previous.and_then(|state| state.section(id)) {
+                    world_state.add_preserved_extension_section(
+                        id,
+                        snapshot.clone(),
+                        rendering.cloned(),
+                    );
+                }
+            } else {
+                world_state.add_extension_section_with_previous(section, rendering);
+            }
         }
         world_state.add_section(
             agents_md_state(

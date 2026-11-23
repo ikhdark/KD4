@@ -360,6 +360,56 @@ function ConvertTo-BundleIdentityJsonString {
     return $encoded.ToString()
 }
 
+function Resolve-ManifestBuildReceipt {
+    param(
+        [object]$Entry,
+        [hashtable]$RoleDigests,
+        [hashtable]$RoleSizes
+    )
+
+    # Keep the managed producer's receipt unchanged. An inventory digest binds
+    # the sidecar bytes; both output rows must also bind to the files we stage.
+    $stream = [IO.File]::OpenRead($Entry.Path)
+    try {
+        if ($stream.Length -gt 4MB) {
+            throw "Source bundle build receipt exceeds the 4 MiB read bound."
+        }
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $digest = [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace("-", "").ToLowerInvariant() }
+        finally { $sha256.Dispose() }
+        if ($digest -cne $Entry.Sha256) {
+            throw "Source bundle build receipt changed after manifest verification."
+        }
+        $stream.Position = 0
+        $reader = [IO.StreamReader]::new($stream)
+        try { $receipt = $reader.ReadToEnd() | ConvertFrom-Json }
+        finally { $reader.Dispose() }
+    }
+    finally {
+        $stream.Dispose()
+    }
+
+    if ([string]$receipt.version -cne "1" -or [string]$receipt.exitCode -cne "0" -or
+        -not (Test-Sha256Text $receipt.sourceManifest.sha256) -or
+        -not $receipt.buildContext -or -not $receipt.rustc -or -not $receipt.command) {
+        throw "Source bundle build receipt is missing successful managed build identities."
+    }
+    $installedNames = @{
+        "entrypoint" = "codex.exe"
+        "code-mode-host" = "codex-code-mode-host.exe"
+    }
+    foreach ($role in $installedNames.Keys) {
+        $name = $installedNames[$role]
+        $matchesByName = @($receipt.binaries | Where-Object { $_.name -ieq $name })
+        if ($matchesByName.Count -ne 1 -or
+            [string]$matchesByName[0].sha256 -cne $RoleDigests[$role] -or
+            [long]$matchesByName[0].bytes -ne $RoleSizes[$role]) {
+            throw "Source bundle build receipt does not name the verified publication bytes of $name."
+        }
+    }
+    return $Entry
+}
+
 function Resolve-SourceBundleManifest {
     param([string]$ManifestPath)
 
@@ -389,6 +439,8 @@ function Resolve-SourceBundleManifest {
 
     $rolePaths = @{}
     $roleDigests = @{}
+    $roleSizes = @{}
+    $receiptEntries = @{}
     $canonicalInventory = @()
     foreach ($file in @($metadata.files)) {
         $relative = [string]$file.path
@@ -414,6 +466,14 @@ function Resolve-SourceBundleManifest {
             }
             $rolePaths[$role] = $path
             $roleDigests[$role] = [string]$file.sha256
+            $roleSizes[$role] = [long]$file.size
+        }
+        if ([IO.Path]::GetFileName($path) -ieq "build-receipt.json") {
+            $receiptPath = [IO.Path]::GetFullPath($path)
+            if ($receiptEntries.ContainsKey($receiptPath)) {
+                throw "Source bundle manifest contains a duplicate build receipt entry: $relative"
+            }
+            $receiptEntries[$receiptPath] = [pscustomobject]@{ Path = $receiptPath; Sha256 = $digest }
         }
         $canonicalInventory += '{"path":' + (ConvertTo-BundleIdentityJsonString $relative) +
             ',"role":' + (ConvertTo-BundleIdentityJsonString $role) +
@@ -436,11 +496,16 @@ function Resolve-SourceBundleManifest {
             throw "Source bundle manifest is missing required role: $role"
         }
     }
+    $receiptPath = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($rolePaths["entrypoint"]))) "build-receipt.json"
+    $buildReceipt = if ($receiptEntries.ContainsKey($receiptPath)) {
+        Resolve-ManifestBuildReceipt -Entry $receiptEntries[$receiptPath] -RoleDigests $roleDigests -RoleSizes $roleSizes
+    }
     return [pscustomobject]@{
         Version = [string]$metadata.version
         Target = [string]$metadata.target
         BundleId = [string]$metadata.bundleId
         RoleDigests = $roleDigests
+        BuildReceipt = $buildReceipt
         Codex = $rolePaths["entrypoint"]
         CodeModeHost = $rolePaths["code-mode-host"]
     }
@@ -3322,7 +3387,9 @@ function New-CodexRuntimeBundleTransaction {
     param(
         [string]$JournalPath,
         [string]$InstallDir,
-        [object[]]$Entries
+        [object[]]$Entries,
+        [AllowNull()]
+        [object]$BuildReceipt
     )
 
     $installFullPath = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
@@ -3330,6 +3397,13 @@ function New-CodexRuntimeBundleTransaction {
     $installLeaf = Split-Path -Leaf $installFullPath
     if ([string]::IsNullOrWhiteSpace($installParent) -or [string]::IsNullOrWhiteSpace($installLeaf)) {
         throw "Runtime bundle install directory must not be a filesystem root: $InstallDir"
+    }
+    $receiptTargetPath = Join-Path $installFullPath "build-receipt.json"
+    if ($null -ne $BuildReceipt) {
+        $Entries += [pscustomobject]@{
+            Name = "buildReceipt"; SourcePath = $BuildReceipt.Path; ExpectedSha256 = $BuildReceipt.Sha256
+            TargetPath = $receiptTargetPath; BackupPath = $null; HadPreviousTarget = $false; Changed = $true
+        }
     }
     $transactionId = [Guid]::NewGuid().ToString("N")
     $stageRoot = Join-Path $installParent (".$installLeaf.bundle.$transactionId")
@@ -3376,6 +3450,11 @@ function New-CodexRuntimeBundleTransaction {
                     if ($item.PSIsContainer) {
                         throw "Runtime bundle file target is an existing directory: $sourcePath"
                     }
+                    continue
+                }
+                # Never carry forward an old receipt into a changed runtime
+                # bundle. An exact sidecar above is repopulated by staging.
+                if (-not $item.PSIsContainer -and $sourcePath -ieq $receiptTargetPath) {
                     continue
                 }
                 if ($item.PSIsContainer -and $managedAncestors.Contains($sourcePath)) {
@@ -3844,6 +3923,9 @@ if (-not [string]::IsNullOrWhiteSpace($SourceBundleManifest)) {
     Write-ProofLine "sourceBundleId" $sourceBundle.BundleId
     Write-ProofLine "sourceBundleVersion" $sourceBundle.Version
     Write-ProofLine "sourceBundleTarget" $sourceBundle.Target
+    if ($null -ne $sourceBundle.BuildReceipt) {
+        Write-ProofLine "sourceBuildReceiptSha256" $sourceBundle.BuildReceipt.Sha256
+    }
 }
 
 if ($null -eq $sourceBundle) {
@@ -4429,7 +4511,9 @@ if ($sourceBuildFreshnessProvenByStamp) {
 }
 try {
     Initialize-CodexBackupRoot -BackupDir $BackupDir
+    $sourceBuildReceipt = if ($null -ne $sourceBundle) { $sourceBundle.BuildReceipt }
     $publishTransaction = New-CodexRuntimeBundleTransaction `
+        -BuildReceipt $sourceBuildReceipt `
         -JournalPath $publishTransactionJournalPath `
         -InstallDir $InstallDir `
         -Entries @(
@@ -4465,6 +4549,13 @@ try {
         throw "Published code-mode host failed SHA-256 verification."
     }
     Write-ProofLine "codeModeHostPostPublishVerify" "sha256 ok"
+    if ($null -ne $sourceBuildReceipt) {
+        $targetReceiptSha256 = Get-FileSha256 (Join-Path $InstallDir "build-receipt.json")
+        if ($targetReceiptSha256 -cne $sourceBuildReceipt.Sha256) {
+            throw "Published build receipt failed SHA-256 verification."
+        }
+        Write-ProofLine "targetBuildReceiptSha256" $targetReceiptSha256
+    }
     Write-ProofLine "targetSha256" $targetSha256
     Write-ProofLine "codeModeHostTargetSha256" $codeModeHostTargetSha256
     if (-not $codexBinaryChanged) {

@@ -18,6 +18,8 @@ use codex_agent_task_store::WakeReadStatus;
 use codex_protocol::protocol::DeterministicContinuationClass;
 use codex_protocol::protocol::DeterministicContinuationHostAction;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
+use codex_protocol::tool_failure::ToolFailure;
+use codex_protocol::tool_failure::ToolFailureCode;
 use codex_tools::ToolSpec;
 use serde_json::json;
 use sha2::Digest;
@@ -90,24 +92,30 @@ impl Handler {
             || args.dependency_cursor.is_some()))
             || (args.acceptance_cursor.is_some() && args.acceptance.is_none())
         {
-            return Err(FunctionCallError::RespondToModel(
-                "acceptance selects a separate wait mode; only acceptance_cursor and timeout_ms may accompany it".into(),
-            ));
+            return Err(FunctionCallError::structured(ToolFailure::handler_refusal(
+                ToolFailureCode::InvalidInput,
+                "acceptance selects a separate wait mode; only acceptance_cursor and timeout_ms may accompany it",
+                "wait_agent_arguments",
+            )));
         }
         if (args.dependencies_only && (args.mailbox_only || args.targets.is_some() || args.cursor.is_some() || args.completion_mode.is_some()))
             || (args.dependency_cursor.is_some() && !args.dependencies_only)
         {
-            return Err(FunctionCallError::RespondToModel(
-                "dependencies_only cannot combine with mailbox_only, targets, completion_mode or cursor; dependency_cursor requires dependencies_only".into(),
-            ));
+            return Err(FunctionCallError::structured(ToolFailure::handler_refusal(
+                ToolFailureCode::InvalidInput,
+                "dependencies_only cannot combine with mailbox_only, targets, completion_mode or cursor; dependency_cursor requires dependencies_only",
+                "wait_agent_arguments",
+            )));
         }
         if (args.targets.is_some() && (args.mailbox_only || args.cursor.is_some()))
             || (args.completion_mode.is_some() && args.targets.is_none())
             || args.targets.as_ref().is_some_and(Vec::is_empty)
         {
-            return Err(FunctionCallError::RespondToModel(
-                "wait_agent: nonempty targets selects completion waiting; do not combine it with mailbox_only or cursor. completion_mode requires targets".into(),
-            ));
+            return Err(FunctionCallError::structured(ToolFailure::handler_refusal(
+                ToolFailureCode::InvalidInput,
+                "wait_agent: nonempty targets selects completion waiting; do not combine it with mailbox_only or cursor. completion_mode requires targets",
+                "wait_agent_arguments",
+            )));
         }
         let min_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;
         let max_timeout_ms = turn.config.multi_agent_v2.max_wait_timeout_ms;

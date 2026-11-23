@@ -57,10 +57,11 @@ pub fn require_write_contract(assignment: &Assignment, amendment: Option<&Attemp
         return Ok(());
     }
     let invalid = |reason: &str| StoreError::InvalidAssignment(reason.into());
-    if assignment.admission_origin != AssignmentAdmissionOrigin::Typed
-        || assignment.write_scope.is_empty()
-    {
+    if assignment.admission_origin != AssignmentAdmissionOrigin::Typed {
         return Err(invalid("writable workers require an explicit typed assignment and write_scope; create a replacement assignment"));
+    }
+    if assignment.write_scope.is_empty() {
+        return Err(invalid("writable assignment has an empty write_scope (typed role defaults to worker); declare the intended write_scope, or select role explorer for read-only work"));
     }
     if assignment.prohibited_changes.iter().any(|value| matches!(value, WriteProhibition::Legacy(_))) {
         return Err(invalid("free-text prohibited_changes cannot authorize a writable worker; use typed operation/path prohibitions"));
@@ -148,10 +149,14 @@ pub fn capture_source_manifest(root: &Path, scopes: &[RepoScope]) -> StoreResult
     let mut total = 0_u64;
     let mut buffer = [0_u8; 65536];
     while let Some((path, recursive, depth)) = pending.pop() {
-        if depth > 64 || pending.len() + entries.len() >= FILE_LIMIT
-            || path.split('/').any(|part| part.eq_ignore_ascii_case(".git"))
-        {
-            return Err(StoreError::InvalidScope("source manifest exceeds bounded scope; declare narrower scopes excluding repository administration".into()));
+        if depth > 64 {
+            return Err(StoreError::InvalidScope("source manifest exceeds the maximum depth of 64; declare narrower scopes".into()));
+        }
+        if pending.len() + entries.len() >= FILE_LIMIT {
+            return Err(StoreError::InvalidScope("source manifest exceeds bounded file count".into()));
+        }
+        if path.split('/').any(|part| part.eq_ignore_ascii_case(".git")) {
+            return Err(StoreError::InvalidScope("source manifest includes a repository administration directory (.git); declare scopes that exclude it".into()));
         }
         if entries.contains_key(&path) { continue; }
         let target = root.join(&path);

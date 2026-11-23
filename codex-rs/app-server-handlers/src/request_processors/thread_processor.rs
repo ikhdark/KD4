@@ -4377,7 +4377,6 @@ impl ThreadRequestProcessor {
         let history = stored_thread
             .history
             .take()
-            .map(|history| history.items)
             .ok_or_else(|| {
                 internal_error(format!(
                     "thread {thread_id} did not include persisted history"
@@ -4385,8 +4384,9 @@ impl ThreadRequestProcessor {
             })?;
         Ok(InitialHistory::Resumed(ResumedHistory {
             conversation_id: thread_id,
-            history: Arc::new(history),
+            history: Arc::new(history.items),
             rollout_path: stored_thread.rollout_path.clone(),
+            diagnostic_origins: history.diagnostic_origins,
         }))
     }
 
@@ -4658,23 +4658,24 @@ impl ThreadRequestProcessor {
             .name
             .as_deref()
             .and_then(codex_thread_store::normalize_thread_name);
-        let history_items = source_thread
+        let mut source_history = source_thread
             .history
             .take()
-            .map(|history| history.items)
             .ok_or_else(|| {
                 internal_error(format!(
                     "thread {source_thread_id} did not include persisted history"
                 ))
             })?;
-        let history_items = if let Some(last_turn_id) = last_turn_id.as_deref() {
-            Arc::new(
-                truncate_rollout_after_turn_id(&history_items, last_turn_id)
-                    .map_err(|err| core_thread_write_error("truncate thread for fork", err))?,
-            )
-        } else {
-            Arc::new(history_items)
-        };
+        if let Some(last_turn_id) = last_turn_id.as_deref() {
+            source_history.items = truncate_rollout_after_turn_id(&source_history.items, last_turn_id)
+                .map_err(|err| core_thread_write_error("truncate thread for fork", err))?;
+            // Selection preserves a prefix and only appends synthetic response
+            // notices. No diagnostic can move into a discarded index.
+            source_history.diagnostic_origins.retain(|index, _| {
+                source_history.items.get(*index).is_some_and(RolloutItem::is_origin_diagnostic)
+            });
+        }
+        let history_items = Arc::new(source_history.items);
         let persisted_fallback = if use_head_metadata_fallback {
             persisted_settings_fallback(&source_thread)
         } else {
@@ -4743,6 +4744,7 @@ impl ThreadRequestProcessor {
                     conversation_id: source_thread_id,
                     history: Arc::clone(&history_items),
                     rollout_path: source_thread.rollout_path.clone(),
+                    diagnostic_origins: source_history.diagnostic_origins,
                 }),
                 thread_source,
                 self.request_trace_context(&request_id).await,
@@ -4841,6 +4843,7 @@ impl ThreadRequestProcessor {
                             conversation_id: source_thread_id,
                             history: Arc::clone(&history_items),
                             rollout_path: source_thread.rollout_path.clone(),
+                            diagnostic_origins: Default::default(),
                         }),
                     );
                     super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
@@ -5168,8 +5171,16 @@ impl ThreadRequestProcessor {
 }
 
 fn request_phase_observation(operation: Option<&str>, phase: &str) -> Option<codex_protocol::timing::observations::Span> {
-    operation.map(|operation| codex_protocol::timing::observations::Span::start(
-        phase, "", "", operation, serde_json::Value::Null))
+    operation.map(|operation| {
+        if phase.starts_with("thread_resume_") && !operation.starts_with("local:") {
+            // Use the bounded mobile lane; a busy runtime lane must not hide remote resume phases.
+            codex_protocol::timing::observations::Span::start(
+                &format!("mobile_{phase}"), "", "", operation, serde_json::Value::Null,
+            )
+        } else {
+            codex_protocol::timing::observations::Span::start(phase, "", "", operation, serde_json::Value::Null)
+        }
+    })
 }
 
 fn record_resume_restart(operation: Option<&str>, reason: &str) {
@@ -5465,7 +5476,7 @@ fn apply_thread_turns_items_view(turns: &mut [Turn], items_view: TurnItemsView) 
 }
 
 
-pub(super) fn normalize_thread_turns_status(
+pub(crate) fn normalize_thread_turns_status(
     turns: &mut [Turn],
     live_turn_id: Option<&str>,
 ) {

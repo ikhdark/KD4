@@ -29,6 +29,7 @@ mod thread_state;
 mod thread_status;
 
 pub use message_processor::{MessageProcessor, MessageProcessorArgs};
+pub use runtime_provenance::{NativeCaptureAdmission, record_native_capture_admission};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginStartupTasks {

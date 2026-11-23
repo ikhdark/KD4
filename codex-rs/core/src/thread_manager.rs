@@ -47,6 +47,7 @@ use codex_protocol::persisted_thread_settings::PersistedThreadSettings;
 use codex_protocol::persisted_thread_settings::PersistedThreadSettingsOverrideMask;
 use codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings;
 use codex_protocol::protocol::Event;
+use codex_protocol::protocol::DiagnosticOrigins;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpServerRefreshConfig;
@@ -347,7 +348,8 @@ pub fn thread_store_from_config(
     match &config.experimental_thread_store {
         ThreadStoreConfig::Local => {
             let store =
-                LocalThreadStore::new(LocalThreadStoreConfig::from_config(config), state_db);
+                LocalThreadStore::new(LocalThreadStoreConfig::from_config(config), state_db)
+                    .with_archive_retention();
             Arc::new(
                 if config
                     .features
@@ -908,14 +910,19 @@ impl ThreadManager {
         &self,
         options: StartThreadOptions,
     ) -> CodexResult<NewThread> {
-        self.start_thread_with_options_and_fork_source(options, /*forked_from_thread_id*/ None)
-            .await
+        self.start_thread_with_options_and_fork_source(
+            options,
+            /*forked_from_thread_id*/ None,
+            DiagnosticOrigins::new(),
+        )
+        .await
     }
 
     async fn start_thread_with_options_and_fork_source(
         &self,
         options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
+        diagnostic_origins: DiagnosticOrigins,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control();
         let (resumed_session_source, resumed_thread_source) = options
@@ -927,6 +934,7 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread_with_source(
             options.config,
             options.initial_history,
+            diagnostic_origins,
             options.history_mode,
             options.allow_provider_model_fallback,
             Arc::clone(&self.state.auth_manager),
@@ -969,7 +977,11 @@ impl ThreadManager {
                     "failed to read subagent fork source {forked_from_thread_id}: {err}"
                 ))
             })?;
-        let history = stored_thread_to_initial_history(stored_thread, fork_source.rollout_path())?;
+        let mut history = stored_thread_to_initial_history(stored_thread, fork_source.rollout_path())?;
+        let mut fork_origins = match &mut history {
+            InitialHistory::Resumed(resumed) => std::mem::take(&mut resumed.diagnostic_origins),
+            _ => DiagnosticOrigins::new(),
+        };
         let inherited_multi_agent_version = fork_source
             .multi_agent_version()
             .unwrap_or(MultiAgentVersion::V2)
@@ -981,9 +993,14 @@ impl ThreadManager {
                 &options.config,
                 inherited_multi_agent_version,
             ),
+            &mut fork_origins,
         );
-        self.start_thread_with_options_and_fork_source(options, Some(forked_from_thread_id))
-            .await
+        self.start_thread_with_options_and_fork_source(
+            options,
+            Some(forked_from_thread_id),
+            fork_origins,
+        )
+        .await
     }
 
     pub async fn resume_thread_from_rollout(
@@ -1079,6 +1096,7 @@ impl ThreadManager {
         let new_thread = Box::pin(self.state.spawn_thread_with_source(
             config,
             initial_history,
+            DiagnosticOrigins::new(),
             /*history_mode*/ None,
             /*allow_provider_model_fallback*/ false,
             auth_manager,
@@ -1446,7 +1464,7 @@ impl ThreadManager {
         &self,
         snapshot: ForkSnapshot,
         config: Config,
-        history: InitialHistory,
+        mut history: InitialHistory,
         thread_source: Option<ThreadSource>,
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
@@ -1471,7 +1489,12 @@ impl ThreadManager {
             .await;
         let interrupted_marker =
             InterruptedTurnHistoryMarker::from_config_and_version(&config, multi_agent_version);
-        let history = fork_history_from_snapshot(snapshot, history, interrupted_marker);
+        let mut fork_origins = match &mut history {
+            InitialHistory::Resumed(resumed) => std::mem::take(&mut resumed.diagnostic_origins),
+            _ => DiagnosticOrigins::new(),
+        };
+        let history =
+            fork_history_from_snapshot(snapshot, history, interrupted_marker, &mut fork_origins);
         let mut config = config;
         let mut persisted_settings =
             resolve_persisted_thread_settings(&history, &mut reconstruction);
@@ -1496,6 +1519,7 @@ impl ThreadManager {
         let new_thread = Box::pin(self.state.spawn_thread(
             config,
             history,
+            fork_origins,
             Arc::clone(&self.state.auth_manager),
             agent_control,
             /*parent_thread_id*/ None,
@@ -1557,7 +1581,7 @@ impl ThreadManagerState {
     pub(crate) async fn enqueue_queue_only_communication(
         &self,
         _thread_id: ThreadId,
-        queue: &crate::session::InputQueue,
+        queue: &Arc<crate::session::InputQueue>,
         communication: codex_protocol::protocol::InterAgentCommunication,
     ) -> CodexResult<String> {
         debug_assert!(!communication.trigger_turn);
@@ -2177,6 +2201,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             InitialHistory::New,
+            DiagnosticOrigins::new(),
             /*history_mode*/ None,
             /*allow_provider_model_fallback*/ false,
             Arc::clone(&self.auth_manager),
@@ -2309,6 +2334,7 @@ impl ThreadManagerState {
         let new_thread = Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
+            DiagnosticOrigins::new(),
             /*history_mode*/ None,
             /*allow_provider_model_fallback*/ false,
             Arc::clone(&self.auth_manager),
@@ -2358,6 +2384,7 @@ impl ThreadManagerState {
         &self,
         config: Config,
         initial_history: InitialHistory,
+        fork_origins: DiagnosticOrigins,
         agent_control: AgentControl,
         session_source: SessionSource,
         thread_source: Option<ThreadSource>,
@@ -2374,6 +2401,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
+            fork_origins,
             /*history_mode*/ None,
             /*allow_provider_model_fallback*/ false,
             Arc::clone(&self.auth_manager),
@@ -2401,6 +2429,7 @@ impl ThreadManagerState {
         &self,
         config: Config,
         initial_history: InitialHistory,
+        fork_origins: DiagnosticOrigins,
         auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         parent_thread_id: Option<ThreadId>,
@@ -2417,6 +2446,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
+            fork_origins,
             /*history_mode*/ None,
             /*allow_provider_model_fallback*/ false,
             auth_manager,
@@ -2443,6 +2473,7 @@ impl ThreadManagerState {
         &self,
         config: Config,
         initial_history: InitialHistory,
+        fork_origins: DiagnosticOrigins,
         history_mode: Option<ThreadHistoryMode>,
         allow_provider_model_fallback: bool,
         auth_manager: Arc<AuthManager>,
@@ -2552,7 +2583,7 @@ impl ThreadManagerState {
         );
         let CodexSpawnOk {
             codex, thread_id, ..
-        } = Box::pin(Codex::spawn(CodexSpawnArgs {
+        } = Box::pin(Codex::spawn_with_fork_origins(CodexSpawnArgs {
             config,
             allow_provider_model_fallback,
             user_instructions,
@@ -2586,7 +2617,7 @@ impl ThreadManagerState {
             thread_store: Arc::clone(&self.thread_store),
             attestation_provider: self.attestation_provider.clone(),
             inherited_multi_agent_version: multi_agent_version,
-        }))
+        }, fork_origins))
         .await?;
         let new_thread = self
             .finalize_thread_spawn(
@@ -2733,6 +2764,7 @@ fn stored_thread_to_initial_history(
         conversation_id: thread_id,
         history: Arc::new(history.items),
         rollout_path: rollout_path.or(stored_thread.rollout_path),
+        diagnostic_origins: history.diagnostic_origins,
     }))
 }
 

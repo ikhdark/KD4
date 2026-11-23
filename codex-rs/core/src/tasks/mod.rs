@@ -51,6 +51,7 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
@@ -494,14 +495,21 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
-        let Ok(_task_start_permit) = self.task_start_gate.acquire().await else {
+        let Ok(task_start_permit) = self.task_start_gate.acquire().await else {
             unreachable!("session-owned task-start semaphore is never closed");
         };
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
         let turn_id = turn_context.sub_id.clone();
         if let Err(error) = self
-            .start_task_locked(/*reservation*/ None, turn_context, input, task)
+            .start_task_locked(
+                &task_start_permit,
+                /*reservation*/ None,
+                turn_context,
+                input,
+                task,
+                /*pending_work_start*/ false,
+            )
             .await
         {
             // The execution guard reports its own protocol error. Record
@@ -513,13 +521,20 @@ impl Session {
 
     pub(crate) async fn start_task_with_admission<T: SessionTask>(
         self: &Arc<Self>,
-        _task_start_permit: &tokio::sync::SemaphorePermit<'_>,
+        task_start_permit: &tokio::sync::SemaphorePermit<'_>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) -> CodexResult<()> {
-        self.start_task_locked(/*reservation*/ None, turn_context, input, task)
-            .await
+        self.start_task_locked(
+            task_start_permit,
+            /*reservation*/ None,
+            turn_context,
+            input,
+            task,
+            /*pending_work_start*/ false,
+        )
+        .await
     }
 
     /// Installs a task only into the taskless reservation its caller published.
@@ -528,28 +543,41 @@ impl Session {
     /// new reservation for work the interrupt already returned to the queue.
     pub(crate) async fn start_reserved_task_with_admission<T: SessionTask>(
         self: &Arc<Self>,
-        _task_start_permit: &tokio::sync::SemaphorePermit<'_>,
+        task_start_permit: &tokio::sync::SemaphorePermit<'_>,
         reservation: &Arc<tokio::sync::Mutex<TurnState>>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) -> CodexResult<()> {
-        self.start_task_locked(Some(reservation), turn_context, input, task)
-            .await
+        self.start_task_locked(
+            task_start_permit,
+            Some(reservation),
+            turn_context,
+            input,
+            task,
+            /*pending_work_start*/ false,
+        )
+        .await
     }
 
     #[expect(
         clippy::await_holding_invalid_type,
-        reason = "Reservation validation, initial-input ownership and task installation stay atomic in active-turn -> turn-state lock order"
+        reason = "Reservation validation, initial-input ownership and validation publication stay atomic with task installation"
     )]
     async fn start_task_locked<T: SessionTask>(
         self: &Arc<Self>,
+        _task_start_permit: &tokio::sync::SemaphorePermit<'_>,
         reservation: Option<&Arc<tokio::sync::Mutex<TurnState>>>,
-        turn_context: Arc<TurnContext>,
+        mut turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
+        pending_work_start: bool,
     ) -> CodexResult<()> {
         let explicit_input = !input.is_empty();
+        let start_fence = input
+            .iter()
+            .find_map(TurnInput::start_fence)
+            .map(|fence| fence.cancellation.clone());
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
             match active_turn.as_ref() {
@@ -636,18 +664,33 @@ impl Session {
             Arc::clone(&turn_context.tool_call_acceptance),
         );
 
-        let reservation_is_current = self
-            .input_queue
-            .transfer_pending_input_to_turn_state(&self.active_turn, &turn_state)
-            .await;
-        if !reservation_is_current {
+        let regular = task_kind == TaskKind::Regular;
+        let child = turn_context.session_source.is_non_root_agent();
+        let Some(selected) = self.input_queue
+            .transfer_pending_input_to_turn_state(
+                &self.active_turn,
+                &turn_state,
+                /*select_validation_origin*/ pending_work_start && regular && child,
+            )
+            .await
+        else {
             self.recover_cancelled_taskless_placeholder(&turn_state)
                 .await;
             startup_guard.disarm();
             return Err(CodexErr::Fatal(
                 "turn start reservation was lost before task installation".to_string(),
             ));
-        }
+        };
+        // Root lookup must not hold the child's active-turn or queue locks.
+        // If cancellation removes the reservation during lookup, the final
+        // identity check below drops this provisional context without a write.
+        let rebind = self
+            .rebind_selected_start_validation(&mut turn_context, selected.validation_origin.as_ref())
+            .await?;
+        let publish_validation = rebind
+            || (regular && !child && explicit_input
+                && turn_context.validation_root_turn
+                    == (self.thread_id.to_string(), turn_context.sub_id.clone()));
         let start_tx = {
             let mut active = self.active_turn.lock().await;
             let reservation_is_current = active.as_ref().is_some_and(|turn| {
@@ -659,9 +702,12 @@ impl Session {
                         .shutting_down
                         .load(std::sync::atomic::Ordering::Acquire)
             });
-            if !reservation_is_current {
-                None
-            } else {
+            'install: {
+                if !reservation_is_current {
+                    break 'install Err(CodexErr::Fatal(
+                        "turn start reservation was lost before task installation".into(),
+                    ));
+                }
                 let Some(turn) = active.as_mut() else {
                     unreachable!("validated taskless turn reservation must remain present");
                 };
@@ -677,6 +723,20 @@ impl Session {
                 } else {
                     input
                 };
+                // Take session state last; no queue locks or cross-session
+                // lookup occur while it is held. Publish after both task slots
+                // are installed and before the worker can observe the context.
+                let commit_validation = if publish_validation {
+                    Some(self.lock_turn_start_validation().await)
+                } else {
+                    None
+                };
+                if start_fence.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                    break 'install Err(CodexErr::TurnAborted);
+                }
+                if self.shutting_down.load(Ordering::Acquire) {
+                    break 'install Err(CodexErr::InvalidRequest("the thread is shutting down".into()));
+                }
                 let task_cancellation_token = cancellation_token.child_token();
                 let lifecycle_token_usage = token_usage_at_turn_start.clone();
                 let (start_tx, start_rx) = oneshot::channel::<()>();
@@ -751,16 +811,19 @@ impl Session {
                 };
                 turn.task = Some(running_task);
                 turn.terminal = Some(terminal);
-                Some(start_tx)
+                if let Some(commit_validation) = commit_validation {
+                    commit_validation(&turn_context);
+                }
+                Ok(start_tx)
             }
         };
-        let Some(start_tx) = start_tx else {
-            self.recover_cancelled_taskless_placeholder(&turn_state)
-                .await;
-            startup_guard.disarm();
-            return Err(CodexErr::Fatal(
-                "turn start reservation was lost before task installation".to_string(),
-            ));
+        let start_tx = match start_tx {
+            Ok(start_tx) => start_tx,
+            Err(error) => {
+                self.recover_cancelled_taskless_placeholder(&turn_state).await;
+                startup_guard.disarm();
+                return Err(error);
+            }
         };
         startup_guard.disarm();
         if explicit_input {
@@ -814,7 +877,10 @@ impl Session {
             }) {
                 let recovered_work = self
                     .input_queue
-                    .recover_pending_input_for_turn_state(expected_turn_state.as_ref())
+                    .recover_pending_input_for_turn_state(
+                        expected_turn_state.as_ref(),
+                        /*suppress_mail_start*/ false,
+                    )
                     .await;
                 *active_turn = None;
                 Some((recovered_work, true))
@@ -825,7 +891,10 @@ impl Session {
             } else {
                 Some((
                     self.input_queue
-                        .recover_pending_input_for_turn_state(expected_turn_state.as_ref())
+                        .recover_pending_input_for_turn_state(
+                            expected_turn_state.as_ref(),
+                            /*suppress_mail_start*/ false,
+                        )
                         .await,
                     false,
                 ))
@@ -835,16 +904,17 @@ impl Session {
             return;
         };
         if cleared_placeholder && !recovered_work {
-            // Startup callers may hold admission and extension transaction permits.
-            // Idle contributors can start another turn and reacquire those permits,
-            // so their notification must not be awaited by the recovering caller.
-            // Only the owner that removed this placeholder publishes the transition;
-            // a stale startup guard may recover input but must not notify again.
-            let session = Arc::clone(self);
-            self.terminal_tasks.spawn(async move {
-                session.emit_thread_idle_lifecycle_if_idle().await;
-            });
+            self.notify_taskless_turn_cleared();
         }
+    }
+
+    fn notify_taskless_turn_cleared(self: &Arc<Self>) {
+        // Startup callers may hold admission and extension transaction permits.
+        // Notify asynchronously so idle contributors can reacquire them.
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            session.emit_thread_idle_lifecycle_if_idle().await;
+        });
     }
 
     async fn on_task_finished(
@@ -932,29 +1002,37 @@ impl Session {
         let turn_context = self.new_default_admitted_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        let retry_context = Arc::clone(&turn_context);
+        let retry_turn_id = turn_context.sub_id.clone();
+        let retry_version = turn_context.multi_agent_version;
+        let retry_source = turn_context.session_source.clone();
         // Context construction can outlive an interrupt that clears this wakeup's
         // placeholder; installation stays bound to the original reservation.
         let result = self
-            .start_reserved_task_with_admission(
+            .start_task_locked(
                 &task_start_permit,
-                &turn_state,
+                Some(&turn_state),
                 turn_context,
                 Vec::new(),
                 RegularTask::new(),
+                /*pending_work_start*/ true,
             )
             .await;
         startup_guard.disarm();
         if matches!(result, Err(CodexErr::AgentLimitReached { .. })) {
-            self.schedule_pending_work_capacity_retry(retry_context);
+            self.schedule_pending_work_capacity_retry(retry_turn_id, retry_version, retry_source);
         }
     }
 
-    fn schedule_pending_work_capacity_retry(self: &Arc<Self>, context: Arc<TurnContext>) {
+    fn schedule_pending_work_capacity_retry(
+        self: &Arc<Self>,
+        turn_id: String,
+        multi_agent_version: MultiAgentVersion,
+        session_source: SessionSource,
+    ) {
         if self.pending_work_retry.swap(true, Ordering::AcqRel) {
             return;
         }
-        tracing::debug!(target: "codex_input_custody", phase = "capacity_wait", thread_id = %self.thread_id, turn_id = %context.sub_id, "input custody boundary");
+        tracing::debug!(target: "codex_input_custody", phase = "capacity_wait", thread_id = %self.thread_id, turn_id = %turn_id, "input custody boundary");
         let pending = Arc::clone(&self.pending_work_retry);
         let session = Arc::downgrade(self);
         let control = self.services.agent_control.clone();
@@ -968,17 +1046,17 @@ impl Session {
             let guard = tokio::select! {
                 biased;
                 _ = cancelled.cancelled() => return,
-                guard = control.wait_for_execution_capacity(context.multi_agent_version, &context.session_source) => guard,
+                guard = control.wait_for_execution_capacity(multi_agent_version, &session_source) => guard,
             };
             let Some(session) = session.upgrade() else { return; };
-            tracing::debug!(target: "codex_input_custody", phase = "capacity_wake", thread_id = %session.thread_id, turn_id = %context.sub_id, "input custody boundary");
+            tracing::debug!(target: "codex_input_custody", phase = "capacity_wake", thread_id = %session.thread_id, turn_id = %turn_id, "input custody boundary");
             // Registration holds the acquired permit until exactly this retry
             // consumes it, or drops it if the input/turn/shutdown state changed.
             let Ok(_registration) = control.register_execution_permit(
-                session.thread_id, &context.sub_id, guard,
+                session.thread_id, &turn_id, guard,
             ) else { return; };
             drop(reset);
-            Box::pin(session.maybe_start_turn_for_pending_work_with_sub_id(context.sub_id.clone())).await;
+            Box::pin(session.maybe_start_turn_for_pending_work_with_sub_id(turn_id)).await;
         });
     }
 
@@ -1023,13 +1101,17 @@ impl Session {
         Ok(matched)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "A taskless cancellation must recover input before releasing the reservation"
+    )]
     fn schedule_turn_terminal<'a>(
         self: &'a Arc<Self>,
         expected_turn_id: Option<&'a str>,
         outcome: TurnTerminalOutcome,
     ) -> BoxFuture<'a, TerminalSchedule> {
         Box::pin(async move {
-            let scheduling = {
+            let (task, turn_state, permit, coordinator) = {
                 let mut active = self.active_turn.lock().await;
                 let Some(active_turn) = active.as_mut() else {
                     return TerminalSchedule::NotFound;
@@ -1058,29 +1140,34 @@ impl Session {
                         coordinator.seal_tool_call_acceptance(&task.turn_context.turn_timing_state);
                         self.terminal_interaction_pending
                             .store(true, Ordering::Release);
-                        Ok((
+                        (
                             task,
                             Arc::clone(&active_turn.turn_state),
                             permit,
                             coordinator,
-                        ))
+                        )
                     }
-                    None => Err((expected_turn_id.is_none() && active_turn.task.is_none())
-                        .then(|| Arc::clone(&active_turn.turn_state))),
-                }
-            };
-            let scheduling = match scheduling {
-                Ok(scheduling) => scheduling,
-                Err(taskless_turn_state) => {
-                    if let Some(taskless_turn_state) = taskless_turn_state {
-                        self.recover_cancelled_taskless_placeholder(&taskless_turn_state)
-                            .await;
+                    None => {
+                        if expected_turn_id.is_none() && active_turn.task.is_none() {
+                            // Claim a taskless interruption under the same lock
+                            // used for installation, without leaving a gap in
+                            // which this reservation could become a running task.
+                            let recovered = self.input_queue
+                                .recover_pending_input_for_turn_state(
+                                    &active_turn.turn_state,
+                                    /*suppress_mail_start*/ true,
+                                )
+                                .await;
+                            *active = None;
+                            if !recovered {
+                                self.notify_taskless_turn_cleared();
+                            }
+                        }
+                        return TerminalSchedule::NotFound;
                     }
-                    return TerminalSchedule::NotFound;
                 }
             };
 
-            let (task, turn_state, permit, coordinator) = scheduling;
             // Shutdown cancels running turns through the interrupt path, and a
             // worker can observe that cancellation before the shutdown abort
             // claims the terminal. Report either as the shutdown it was.
@@ -1514,7 +1601,7 @@ impl Session {
                 false
             } else {
                 self.input_queue
-                    .recover_pending_input_for_turn_state(finalization.turn_state.as_ref())
+                    .recover_pending_input_for_turn_state(finalization.turn_state.as_ref(), /*suppress_mail_start*/ false)
                     .await
             };
 
@@ -1637,7 +1724,9 @@ impl Session {
             _ => last_agent_message,
         };
         // Freeze only after execution-affecting cleanup and result preparation.
-        let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
+        let timing_snapshot = turn_context
+            .turn_timing_state
+            .complete_snapshot(&self.thread_id.to_string(), &turn_context.sub_id);
         tracing::info!(target: "codex_task_observation", schema_version = 1,
             thread_id = %self.thread_id, turn_id = %turn_context.sub_id,
             phase = "core_terminal_ready", clock = "unix_wall_ms",
@@ -2050,7 +2139,7 @@ impl Session {
         if !matches!(finalization.outcome, TurnTerminalOutcome::Aborted(_)) {
             finalization.restart_for_pending_input |= self
                 .input_queue
-                .recover_pending_input_for_turn_state(finalization.turn_state.as_ref())
+                .recover_pending_input_for_turn_state(finalization.turn_state.as_ref(), /*suppress_mail_start*/ false)
                 .await;
         }
         if AssertUnwindSafe(self.dispatch_terminal_lifecycle(finalization))
@@ -2061,7 +2150,9 @@ impl Session {
             warn!(turn_id = %turn_context.sub_id, "turn lifecycle observer panicked during fail-safe cleanup");
         }
         turn_context.turn_timing_state.begin_finalization();
-        let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
+        let timing_snapshot = turn_context
+            .turn_timing_state
+            .complete_snapshot(&self.thread_id.to_string(), &turn_context.sub_id);
         let mut archived_timing = timing_snapshot.protocol_timing();
         turn_context.turn_timing_state.retain_overflow_details(&mut archived_timing, turn_context.config.ephemeral).await;
         let timing = crate::turn_timing::retain_turn_timing_details(
@@ -2095,10 +2186,10 @@ impl Session {
                 timing: Some(timing),
             })
         };
-        let cleared_active_turn = self.publish_terminal_outcome(finalization, event).await;
         self.input_queue
             .clear_pending_for_turn_state(finalization.turn_state.as_ref())
             .await;
+        let cleared_active_turn = self.publish_terminal_outcome(finalization, event).await;
 
         let _ = self.flush_rollout().await;
         if cleared_active_turn {

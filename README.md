@@ -76,6 +76,16 @@ Local publishing is a separate, explicitly authorized operation: it can replace
 the installed bundle, change Desktop routing, and restart processes. Ordinary
 builds and documentation updates do not publish.
 
+For the [external package lane](scripts/install/README.md#local-publishing)
+(`-SkipBuild -SourceBundleManifest`), an inventory-listed `build-receipt.json`
+beside the package entrypoint travels unchanged with a replaced local bundle
+when its managed build records match both executable names, sizes, and hashes.
+An unlisted sidecar is not trusted, and an old receipt is not carried into a
+changed bundle. An already-current bundle is still a no-op. Dry runs validate
+the input without staging or activation. The local Cargo lane still uses its
+content-bound stamp; that stamp is not a managed build receipt or a record of
+the instructions selected by a running session.
+
 Saved-session analysis belongs in the sibling KDR project. Historical reports,
 source snapshots, receipts, and third-party licenses are retained records, not
 current task instructions or material to rewrite during a documentation refresh.

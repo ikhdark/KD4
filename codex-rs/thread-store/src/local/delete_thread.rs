@@ -21,12 +21,18 @@ use codex_rollout::RECOVERABLE_DELETE_PREFIX;
 const MAX_RECOVERY_BATCHES: usize = 128;
 const MAX_RECOVERY_ENTRIES: usize = 4096;
 
-fn auxiliary_paths(id: codex_protocol::ThreadId) -> [PathBuf; 4] {
+/// Receiver mail is retired under the existing per-thread storage owner.
+pub fn thread_mailbox_path(home: &Path, id: codex_protocol::ThreadId) -> PathBuf {
+    home.join("agent-mailbox").join(format!("{id}.json"))
+}
+
+fn auxiliary_paths(id: codex_protocol::ThreadId) -> [PathBuf; 5] {
     [
         PathBuf::from("tool-history").join(format!("{id}.json")),
         PathBuf::from("tool-history").join(format!("{id}.journal.jsonl")),
         PathBuf::from("command-execution-cache").join(format!("{id}.json")),
         PathBuf::from("code-mode-state").join(format!("{id}.json")),
+        thread_mailbox_path(Path::new(""), id),
     ]
 }
 
@@ -97,7 +103,7 @@ fn retire_auxiliary_storage(home: &Path, id: codex_protocol::ThreadId) -> std::i
 
 const AUXILIARY_RETIREMENT_PENDING: &str = ".auxiliary-retirement.pending";
 
-fn delete_recovery_error(error: impl std::fmt::Display) -> ThreadStoreError {
+pub(super) fn delete_recovery_error(error: impl std::fmt::Display) -> ThreadStoreError {
     ThreadStoreError::Internal {
         message: format!("staged thread deletion: {error}"),
     }
@@ -651,6 +657,14 @@ pub(super) async fn stage_thread_deletes<'a>(
     store: &'a LocalThreadStore,
     thread_ids: &[codex_protocol::ThreadId],
 ) -> ThreadStoreResult<StagedThreadDelete<'a>> {
+    stage_thread_deletes_inner(store, thread_ids, None).await
+}
+
+async fn stage_thread_deletes_inner<'a>(
+    store: &'a LocalThreadStore,
+    thread_ids: &[codex_protocol::ThreadId],
+    archive_cutoff: Option<i64>,
+) -> ThreadStoreResult<StagedThreadDelete<'a>> {
     // Retry recovery even if initialization skipped a then-live owner.
     if !recover_staged_deletes(store).await? {
         return Err(ThreadStoreError::Conflict {
@@ -693,6 +707,14 @@ pub(super) async fn stage_thread_deletes<'a>(
                 delete_recovery_error(error)
             }
         })?;
+    if let Some(cutoff) = archive_cutoff {
+        for lease in &writer_leases {
+            let modified: chrono::DateTime<chrono::Utc> = lease.metadata().and_then(|m|m.modified()).map_err(delete_recovery_error)?.into();
+            if modified.timestamp() > cutoff {
+                return Err(ThreadStoreError::Conflict {message: "recent archive or newly observed writer lease".into()});
+            }
+        }
+    }
     let mut found_thread_ids = Vec::new();
     let mut candidates = Vec::new();
     let mut auxiliary_threads = Vec::new();
@@ -701,6 +723,9 @@ pub(super) async fn stage_thread_deletes<'a>(
     ).await;
     for thread_id in &requested_ids {
         let paths = inventory.take_paths(*thread_id).await.map_err(delete_recovery_error)?;
+        if archive_cutoff.is_some() && (paths.is_empty() || paths.iter().any(|p| p.parent() != Some(store.config.codex_home.join(ARCHIVED_SESSIONS_SUBDIR).as_path()))) {
+            return Err(ThreadStoreError::Conflict {message: "archive has no unique archived location".into()});
+        }
         if !paths.is_empty() {
             found_thread_ids.push(*thread_id);
         }
@@ -864,6 +889,57 @@ pub(super) async fn stage_thread_deletes<'a>(
         found_thread_ids,
         files,
     })
+}
+
+/// Use a maintenance-only store (no process-local recorder to pause). A live
+/// writer in any store therefore conflicts instead of being quiesced for expiry.
+pub(super) async fn expire_archives(store: &LocalThreadStore, cutoff: i64) -> ThreadStoreResult<()> {
+    let Some(db) = store.state_db.as_ref() else { return Ok(()) };
+    let archive = store.config.codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
+    let archive = match tokio::fs::canonicalize(archive).await {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(delete_recovery_error(error)),
+    };
+    // The index can outlive a rollout. Do not rescan all active histories for
+    // each stale row or create writer leases for conversations with no archive.
+    let mut physical = std::collections::HashSet::new();
+    let mut entries = tokio::fs::read_dir(&archive).await.map_err(delete_recovery_error)?;
+    while let Some(entry) = entries.next_entry().await.map_err(delete_recovery_error)? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let name = name.strip_suffix(".zst").unwrap_or(name);
+        if let Some(stem) = name.strip_suffix(".jsonl")
+            && let Some(id) = stem.get(stem.len().saturating_sub(36)..)
+            && let Ok(id) = codex_protocol::ThreadId::from_string(id) {
+            physical.insert(id);
+        }
+    }
+    if archive != tokio::fs::canonicalize(&store.config.codex_home).await.map_err(delete_recovery_error)?.join(ARCHIVED_SESSIONS_SUBDIR) {
+        return Err(delete_recovery_error("archive root is redirected"));
+    }
+    for id in db.expired_archive_ids(cutoff).await.map_err(delete_recovery_error)? {
+        if !physical.contains(&id) {continue}
+        let Some(indexed) = db.get_thread(id).await.map_err(delete_recovery_error)? else {continue};
+        let Some(parent) = indexed.rollout_path.parent() else {continue};
+        if tokio::fs::canonicalize(parent).await.ok().as_ref() != Some(&archive) {continue}
+        let indexed_name = codex_rollout::plain_rollout_path(&indexed.rollout_path);
+        let staged = match stage_thread_deletes_inner(store, &[id], Some(cutoff)).await {
+            Ok(staged) => staged,
+            Err(err) => { tracing::warn!(%id, %err, "archive expiry deferred"); continue }
+        };
+        // Filesystem wins over a stale index. No active alias may be retired.
+        let only_archived = staged.files.files.as_ref().is_some_and(|files|
+            !files.staged_files.is_empty() && files.staged_files.iter().all(|file|
+                file.original_path.parent() == Some(archive.as_path()) &&
+                codex_rollout::plain_rollout_path(&file.original_path).file_name() == indexed_name.file_name()));
+        if !only_archived { staged.rollback().await; continue }
+        match db.delete_expired_archive(id, cutoff, &indexed.rollout_path).await {
+            Ok(_) => staged.commit().await,
+            Err(err) => { staged.rollback().await; tracing::warn!(%id, %err, "archive expiry deferred"); }
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn preflight_delete_thread(

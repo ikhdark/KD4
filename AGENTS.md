@@ -20,7 +20,7 @@ every guide or run a blanket scan as a routine prerequisite.
 | KDR scanner, diagnostics and verification | [KDR documentation](../KDR/docs/README.md) |
 | Reusable offline tools and workloads | [KDR scripts](../KDR/scripts/README.md) |
 | Binary reuse, isolated builds and execution safeguards | [Managed builds](../KDR/scripts/build/README.md) |
-| Audit cases, live findings and closure | [KDR audit library](../KDR/audits/README.md), [KDA audit library](../KDA/audits/README.md) |
+| Audit cases, findings and closure | [KD4/KDR closure commands](../KDR/audits/README.md#check-close-and-inspect-status); [KDA checklist](../KDA/audits/README.md#closure-checklist) |
 | Benchmark evidence and reusable infrastructure | [KDR benchmark library](../KDR/benchmarks/README.md), [KDA benchmark library](../KDA/benchmarks/README.md) |
 | Implementation intent, changes, method and verification | [Implementation library](../KDR/implementation/README.md) |
 | Storage, learning and cache owners | [Storage layout](../KDR/docs/operations/STORAGE_LAYOUT.md) |
@@ -45,6 +45,8 @@ concurrency boundaries. For each material change, verify the intended outcome
 and representative previously valid paths against the final implementation
 using permitted checks. A successful new path does not prove older paths still
 work. Record which inventoried paths passed and which remain unverified.
+When changing code, update the affected documentation and documentation links
+in the same change. Verify that updated links resolve to the intended targets.
 
 **Guidance preservation:** Treat existing instructions as requirements to preserve, not text to freely rewrite. When adding or updating guidance, make the smallest change necessary. Do not remove, replace, or weaken existing instructions merely because new guidance addresses a related subject. Replacement is justified only when explicitly requested, when existing guidance is demonstrably obsolete, or when a concrete incompatibility requires it. Before completing, inspect the diff and restore any unrelated or unjustified changes.
 A conflicting exception or a change in precedence, applicability or defaults
@@ -55,8 +57,10 @@ wording is untouched.
   benefit, fix the owning component, then verify the requested outcome and
   affected valid behavior. Trace callers and consumers; fix implementation bugs
   in code, not prompt workarounds.
-- Cover the full requested scope of reviews and audits and fix every verified
-  defect in it unless the user explicitly requests read-only work.
+- Cover the full requested review. Unless it is explicitly read-only, reproduce,
+  fix and verify confirmed defects in the original repair scope. A defect found
+  during proposal evaluation joins that scope only if it materially affects the
+  requested outcome, preserved behavior or required verification.
   Prioritize repairs for defects that block the requested outcome, break valid
   behavior or undermine required verification. Lower priority changes the order,
   not the obligation. When useful, recommend a narrower audit or explicitly
@@ -81,7 +85,8 @@ wording is untouched.
   acceptance criteria.
 - List the requested claims, findings and acceptance criteria at the start, one
   plan item each where a plan tool exists, and keep each active until it is
-  satisfied or the user explicitly supersedes it; blocked items stay open.
+  satisfied or the user explicitly supersedes it. Blocked requirements stay
+  open; a justified decision not to adopt satisfies a proposal-only item.
   You may recommend priorities, but do not narrow or downgrade an explicit
   requirement without the user's authorization. Status questions and compaction
   do not cancel unfinished work. Diagnose, fix and verify each required failure
@@ -133,8 +138,10 @@ wording is untouched.
   and valid behavior from both versions; explain material choices.
 - Repair in-scope workflow blockers in their existing owner, including missing
   reusable KDR diagnostics/capture/replay support, then resume the original task.
-  If an existing bench or replay cannot exercise the affected path or state,
-  extend that owner and run it; "the bench doesn't cover X" is unfinished work.
+  If a required repair or explicitly requested workload needs a path the bench
+  cannot exercise, extend its owner and run it. For a proposal-only evaluation,
+  use bounded adaptations; do not start a separate infrastructure project to
+  qualify a candidate. Record the unavailable capability or evaluation limit.
   Difficulty is not a reason to stop or seek renewed permission. A genuinely
   independent infrastructure project, destructive change, material tradeoff or
   significant new operational commitment requires a user decision; finish the
@@ -149,21 +156,23 @@ wording is untouched.
   retain a material regression only with explicit user acceptance. Beyond the
   affected behavior above, add verification only for a concrete unresolved risk.
   Stopping one fix does not end the remaining requested work.
-- Before handoff reconcile every required item against evidence. Hand off only
-  when each is verified, closed as no-defect/not-applicable with evidence,
-  withdrawn by the user, or genuinely blocked. Within required scope, candidates,
-  coverage gaps, unknown outcomes and incomplete recovery are unfinished work,
-  not report categories or passes: identify the missing observation and next
-  permitted action, then perform it. A caveat, needs-review label, report or
-  promise to continue is not a substitute for obtainable work, and asking
-  whether to continue is not a stopping point. Never invent causes, fixes or
-  passes to clear findings. After finishing independent work, report a genuine
-  blocker with its verified cause, remaining scope, attempted repairs and the
-  exact unavailable input or authority; blocked work remains unfinished. If the
-  user stops the task first, report what remains as unfinished, never as done.
-  A blocker needs evidence of the missing prerequisite or conflicting
-  requirements and why available authorized alternatives cannot advance the
-  affected item. Continue any permitted action that can materially advance it.
+- Reconcile each item at handoff: verified, evidence-backed no-defect or
+  not-applicable, justified proposal disposition, user withdrawal, exhausted
+  historical recovery, or genuine blocker. Implement and verify adopted changes;
+  reject unsupported, inconclusive or non-improving proposals without adoption.
+  For missing historical recordings, source versions, artifacts or reproduction
+  conditions, make a bounded recovery or reproduction attempt with existing
+  resources. If exhausted, stop. Record exactly what was missing, what was
+  tried, which checks could not run and which defects remain unresolved. Mark
+  implemented repairs with unverified behavior as such. Do not build new
+  infrastructure, substitute proof or reopen unrelated work to reconstruct history.
+  This ends the historical check, not obtainable repairs or current verification.
+  Finish all obtainable work, then close the original case on those dispositions.
+  For other work still owed, take the next permitted action; caveats, promises
+  and asking whether to continue do not replace it. Never invent causes or passes.
+  Report a genuine blocker only after independent work, with its cause, attempted
+  repairs, remaining scope, exact missing input or authority and why authorized
+  alternatives cannot advance it. If the user stops work, report it unfinished.
 
 ## Evidence and validation
 
@@ -179,9 +188,9 @@ wording is untouched.
   usability and maintenance cost as relevant; retain evidence and tradeoffs.
   An inconclusive comparison is not evidence of improvement. If a valid
   comparison cannot be obtained within applicable permissions and limits,
-  identify the blocker and leave the candidate unimplemented beyond a
-  permitted isolated prototype. Infeasibility does not waive the requirement;
-  continue independent work, including separable correctness repairs.
+  record the limit and leave the candidate unimplemented beyond a permitted
+  isolated prototype. This blocks adoption, not a justified decision against
+  adoption. Continue independent work, including separable correctness repairs.
   Classify changes by effect: restoring established behavior is a repair;
   added behavior or optimization beyond that contract is a candidate change,
   even when bundled with a repair. Ordinary correctness repairs do not require
@@ -197,11 +206,11 @@ wording is untouched.
   selectively retained results.
   Benchmark the proposed mechanism through the path it is meant to change, not
   a weaker substitute. Keep proxy and partial results scoped to what they
-  exercised. If a required scenario is missing, correct the prototype or
-  workload and run the missing comparison in the same task unless genuinely
-  blocked. A negative
-  result rules out only the measured candidate; carry an applicable result
-  through the original request and any authorized implementation and verification.
+  exercised. Correct the workload and run missing scenarios needed to adopt
+  the proposal or independently requested by the user, unless genuinely blocked.
+  Once bounded evidence settles non-adoption, identify unrun scenarios; do not
+  run them solely to reject the proposal again. A negative result rules out
+  only the measured candidate, not an underlying repair obligation.
 - For executable-obligation proposals, exercise the real stopping decision:
   observe permitted ready work execute and advance the obligation, an owned
   operation resume without relaunch, and a failed diagnostic enter bounded
@@ -220,8 +229,8 @@ wording is untouched.
   that the relevant source or binary, inputs, settings and exercised path still
   apply. Similar request wording and run summaries do not establish a match.
   A prior run can reduce what you rerun, not what the current request requires.
-  Keep unmatched or unmeasured criteria open and do the missing work in this
-  task unless genuinely blocked. Distinguish reused results from new ones;
+  Complete unmatched criteria still required for the requested outcome unless
+  genuinely blocked. Distinguish reused results from new ones;
   prior evidence does not replace an explicitly requested fresh run.
 - "Verify with KDR" means verify the changed behavior using an applicable
   workload, not a successful session scan or receipt-file hash check. Follow the
@@ -236,9 +245,14 @@ wording is untouched.
   recovery or interruption when the affected contract requires them, not by default.
   Verify the final edited source through the binary or analyzer that actually
   contains the edit, not a stale build or frozen snapshot. Before closure,
-  reassess previously verified obligations against the final source, binary,
-  configuration and relevant dependencies. Reopen and reverify obligations
-  whose evidence no longer applies; retain unaffected proof.
+  reassess proof for affected claims against the final source, binary,
+  configuration and dependencies on the exercised path. Reverify only claims
+  whose evidence no longer applies, not unrelated checkout changes. A decision not
+  to adopt a proposal describes the evaluated revision and environment, not
+  the performance of today's checkout. A new session or later revision alone
+  does not reopen it. Revisit it only on request or when concrete evidence
+  calls the original decision into question. Verify retained changes and
+  repairs against the final implementation as usual.
 - Inspect what evidence actually exercised and consumed. Mocks do not verify a
   real service; archive equality does not prove native retrieval or consumption;
   partial reads do not prove full recovery; metadata does not prove enforcement.
@@ -283,10 +297,9 @@ wording is untouched.
   KD4 and KDR are test-free: never create or restore tests, and run tests
   only where the active validation mode explicitly authorizes existing ones.
   KDA follows its [test-free development workflow](../KDA/README.md#authorized-development-checks).
-  Source-only verification
-  suffices for documentation or a claim it directly proves, not runtime
-  behavior. A restriction changes the method, not the obligation: verify with
-  other permitted execution, or keep the item unverified and open.
+  Source alone proves documentation or source claims, not runtime behavior.
+  Use permitted alternatives for restricted checks. After bounded historical
+  recovery is exhausted, record checks as unperformed or inconclusive, not passed.
 - When offline evidence cannot settle an in-scope issue, necessary bounded
   task-scoped live runs are authorized, including application interaction and
   paid provider/model calls. Use the smallest representative workload, track
@@ -359,22 +372,33 @@ of downstream behavior. Preserve the live installation, credentials and active c
 
 ## Reporting and organization
 
-The KDR audit and benchmark paths below apply to KD4 and KDR. KDA follows
-the same case lifecycle in its own [audit library](../KDA/audits/README.md)
-and retains run evidence in its [benchmark library](../KDA/benchmarks/README.md).
+KD4/KDR use KDR’s audits and benchmarks. KDA follows the same lifecycle in its
+[audit](../KDA/audits/README.md) and [benchmark](../KDA/benchmarks/README.md) libraries.
 
-- The audit case folder locates the work; KDR closure also requires the
-  [authoritative receipt](../KDR/audits/README.md#managed-case-closure).
-  Unfinished work lives in
-  `KDR/audits/active-cases/<frontend|backend>/<task>/` (mixed UI/backend
-  acceptance uses `frontend`), one folder per task even for one report. Track
-  each item's status with its evidence or exact blocker in the plan or existing
-  case record.
-  Move the intact folder to `KDR/audits/closed-cases/` only when no item is open
-  or blocked, through the [closure checklist](../KDR/audits/README.md#closure-checklist);
-  a read-only review is complete when its assigned coverage is verified.
-  That does not close an existing case with open or blocked work. A label,
-  status edit or folder move never completes repairs or verification.
+- Give every original finding a justified disposition. For a fixed list of A/B
+  comparisons, the list is the audit: run every requested comparison. Implement
+  and verify only material gains that preserve correctness. Discard the other
+  changes, not their evidence. Record unsupported or inconclusive items honestly;
+  never count an unrun comparison as run. Close without adding more candidates.
+  Fix confirmed in-scope defects; verify affected behavior. Mark unrun checks
+  unrun and unresolved defects unresolved. A workflow audit neither finishes
+  nor waits for a separate product scan.
+  Missing optional checks are not missing repairs. Do not add closure criteria
+  or block on unchanged conclusions or review suggestions. Track unrelated work separately.
+- State status; link the required KDR [receipt](../KDR/audits/README.md#managed-case-closure).
+  Unfinished work: `KDR/audits/active-cases/<frontend|backend>/<task>/`
+  (mixed UI/backend acceptance: `frontend`), one folder per task, even for one report.
+  Track each item's status and evidence or exact blocker in the plan or case record.
+  When obtainable work is done, use the [closure checklist](../KDR/audits/README.md#closure-checklist)
+  to move the intact original into `closed-cases/`. Preserve findings, evidence
+  references and receipts. Fix move blockers without reopening completed findings.
+  Missing historical evidence, optional verification or an unavailable external
+  capability does not by itself keep the case active. Once no actionable work
+  remains, close the original case with explicit dispositions for unresolved
+  defects, unverified repairs and checks not run.
+  A disposition receipt does not resolve a defect or verify a repair. Read-only
+  reviews do not close other open or blocked work. Labels, status edits and moves
+  prove neither repair nor verification.
 - Automatically consolidate same-task follow-ups, corrections and small
   adjustments into the existing task record, including across sessions. A
   different date, title, wording or implementation detail does not justify a
@@ -405,10 +429,10 @@ and retains run evidence in its [benchmark library](../KDA/benchmarks/README.md)
   never present a proposed or unverified win as a result. A defer is a candidate
   fix that matched measurement showed was not an improvement; record it with
   that evidence in the case's [defers](../KDR/audits/README.md#defers) so it is
-  not re-proposed without new evidence. A defer never resolves its finding.
+  not re-proposed without new evidence. A defer never resolves an underlying defect.
   Required case work is not deferred or postponed: finish it in the task.
-  Only a genuine blocker stays open in its active case with the exact input
-  or authority it needs.
+  For a genuine blocker, record the exact prerequisite and what was tried;
+  apply the closure checklist rather than treating the blocker as a defer.
 - Keep requested investigation/audit/benchmark reports short and `.txt`: scope
   and coverage, status/counts, findings with ID/severity/path/trigger/evidence/
   disposition, measurements, and any genuine blocker with the exact input or

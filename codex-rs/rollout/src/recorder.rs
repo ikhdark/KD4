@@ -14,8 +14,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -41,6 +44,8 @@ use tracing::warn;
 use super::SESSIONS_SUBDIR;
 use super::compression;
 use crate::config::RolloutConfigView;
+use crate::payload_artifact::AppendPayloadTiming;
+use crate::payload_artifact::time_append_stage;
 use codex_git_utils::RepositoryContext;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
@@ -49,6 +54,8 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::DiagnosticOrigin;
+use codex_protocol::protocol::DiagnosticOrigins;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
@@ -131,6 +138,32 @@ pub enum RolloutRecorderParams {
     },
 }
 
+/// A native append can establish origin; copied (including unattributed)
+/// history must not acquire a new origin at its destination.
+pub enum DiagnosticOriginSource {
+    Unknown,
+    Fresh(ThreadId),
+    Copied(DiagnosticOrigins),
+}
+
+impl DiagnosticOriginSource {
+    pub fn origin_for(
+        &self,
+        index: usize,
+        item: &RolloutItem,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Option<DiagnosticOrigin> {
+        if !item.is_origin_diagnostic() {
+            return None;
+        }
+        match self {
+            Self::Unknown => None,
+            Self::Fresh(thread_id) => Some(DiagnosticOrigin::new(*thread_id, timestamp)),
+            Self::Copied(origins) => origins.get(&index).cloned(),
+        }
+    }
+}
+
 /// A rollout item paired with the instant it was handed to the recorder.
 ///
 /// Records are coalesced and flushed in batches, and a batch can be rebased or
@@ -141,6 +174,7 @@ pub enum RolloutRecorderParams {
 struct CapturedRolloutItem {
     captured_at: OffsetDateTime,
     item: CapturedRolloutPayload,
+    diagnostic_origin: Option<Box<DiagnosticOrigin>>,
     // Shared batch admission follows canonical records from enqueue through
     // persistence, including retries and in-place manifest compaction.
     admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -165,6 +199,7 @@ impl CapturedRolloutItem {
         Self {
             captured_at,
             item: CapturedRolloutPayload::Canonical(item),
+            diagnostic_origin: None,
             admission: None,
         }
     }
@@ -182,6 +217,7 @@ impl CapturedRolloutItem {
         Self {
             captured_at: self.captured_at,
             item: CapturedRolloutPayload::Canonical(item),
+            diagnostic_origin: self.diagnostic_origin.clone(),
             admission: self.admission.clone(),
         }
     }
@@ -938,7 +974,7 @@ impl RolloutRecorder {
     }
 
     pub async fn record_canonical_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
-        self.record_canonical_items_with_admission(items, None)
+        self.record_canonical_items_with_admission(items, None, &DiagnosticOriginSource::Unknown, 0)
             .await
     }
 
@@ -950,6 +986,15 @@ impl RolloutRecorder {
     pub async fn record_canonical_items_ordered(
         &self,
         items: &[RolloutItem],
+    ) -> std::io::Result<()> {
+        self.record_canonical_items_ordered_with_origins(items, &DiagnosticOriginSource::Unknown)
+            .await
+    }
+
+    pub async fn record_canonical_items_ordered_with_origins(
+        &self,
+        items: &[RolloutItem],
+        origins: &DiagnosticOriginSource,
     ) -> std::io::Result<()> {
         let admission_bytes = rollout_admission_bytes(items);
         if admission_bytes.is_err() {
@@ -974,6 +1019,8 @@ impl RolloutRecorder {
                         self.record_canonical_items_with_admission(
                             &items[start..index],
                             Some(charge as u32),
+                            origins,
+                            start,
                         )
                         .await?;
                     }
@@ -990,6 +1037,8 @@ impl RolloutRecorder {
                     self.record_canonical_items_with_admission(
                         &items[start..index],
                         Some(charge as u32),
+                        origins,
+                        start,
                     )
                     .await?;
                     // Lazy pending items release admission only after materialization.
@@ -1001,7 +1050,7 @@ impl RolloutRecorder {
                 charge = charge.saturating_add(next);
             }
             if start < items.len() {
-                self.record_canonical_items_with_admission(&items[start..], Some(charge as u32))
+                self.record_canonical_items_with_admission(&items[start..], Some(charge as u32), origins, start)
                     .await?;
             }
             return self.persist().await;
@@ -1009,7 +1058,7 @@ impl RolloutRecorder {
         // Queue admission transfers ownership and preserves ordering with
         // barriers/shutdown under the enqueue gate. Do not wait for preceding
         // disk writes here; durability still requires an explicit barrier.
-        self.record_canonical_items_with_admission(items, Some(admission_bytes?))
+        self.record_canonical_items_with_admission(items, Some(admission_bytes?), origins, 0)
             .await
     }
 
@@ -1056,6 +1105,7 @@ impl RolloutRecorder {
                         _retention: retention,
                         _sync_owner: sync_owner,
                     })),
+                    diagnostic_origin: None,
                     admission: Some(admission),
                 },
                 enqueue_guard,
@@ -1080,6 +1130,8 @@ impl RolloutRecorder {
         &self,
         items: &[RolloutItem],
         admission_bytes: Option<u32>,
+        origins: &DiagnosticOriginSource,
+        offset: usize,
     ) -> std::io::Result<()> {
         let enqueue_guard = self
             .writer_task
@@ -1107,10 +1159,17 @@ impl RolloutRecorder {
                 // records, and it is the only point that still knows.
                 items: {
                     let captured_at = OffsetDateTime::now_utc();
+                    let origin_timestamp = chrono::DateTime::from_timestamp_millis(
+                        captured_at.unix_timestamp() * 1_000 + i64::from(captured_at.millisecond()),
+                    );
                     items
                         .iter()
-                        .map(|item| {
+                        .enumerate()
+                        .map(|(index, item)| {
                             let mut captured = CapturedRolloutItem::new(item.clone(), captured_at);
+                            captured.diagnostic_origin = origin_timestamp
+                                .and_then(|timestamp| origins.origin_for(offset + index, item, timestamp))
+                                .map(Box::new);
                             captured.admission = Some(Arc::clone(&admission));
                             captured
                         })
@@ -1207,7 +1266,7 @@ impl RolloutRecorder {
     pub async fn load_rollout_items(
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
-        let (items, thread_id, errors, _) = Self::load_rollout_items_inner(path, false).await?;
+        let (items, thread_id, errors, _, _) = Self::load_rollout_items_inner(path, false, false).await?;
         Ok((items, thread_id, errors))
     }
 
@@ -1221,10 +1280,13 @@ impl RolloutRecorder {
         usize,
         Vec<crate::PayloadDependencyVersion>,
     )> {
-        Self::load_rollout_items_inner(path, true).await
+        let (items, thread_id, errors, versions, _) =
+            Self::load_rollout_items_inner(path, true, false).await?;
+        Ok((items, thread_id, errors, versions))
     }
 
-    async fn load_rollout_items_inner(
+    /// Operational history and exact diagnostic origins observed by one reader.
+    pub async fn load_rollout_items_with_origins(
         path: &Path,
         capture_payload_versions: bool,
     ) -> std::io::Result<(
@@ -1232,16 +1294,37 @@ impl RolloutRecorder {
         Option<ThreadId>,
         usize,
         Vec<crate::PayloadDependencyVersion>,
+        DiagnosticOrigins,
+    )> {
+        Self::load_rollout_items_inner(path, capture_payload_versions, true).await
+    }
+
+    async fn load_rollout_items_inner(
+        path: &Path,
+        capture_payload_versions: bool,
+        capture_origins: bool,
+    ) -> std::io::Result<(
+        Vec<RolloutItem>,
+        Option<ThreadId>,
+        usize,
+        Vec<crate::PayloadDependencyVersion>,
+        DiagnosticOrigins,
     )> {
         let mut items = Vec::new();
+        let mut origins = DiagnosticOrigins::new();
         let (thread_id, parse_errors, trailing_partial_records, unresolved_payloads, versions) =
-            Self::for_each_rollout_item_with_versions_inner(
+            Self::visit_rollout_with_origins(
                 path,
                 false,
                 capture_payload_versions,
                 true,
-                |item, _| {
+                capture_origins,
+                None,
+                |item, _, origin| {
                     if !matches!(item, RolloutItem::ContextReplay { .. }) {
+                        if let Some(origin) = origin {
+                            origins.insert(items.len(), origin);
+                        }
                         items.push(item);
                     }
                 },
@@ -1259,7 +1342,7 @@ impl RolloutRecorder {
             trailing_partial_records,
             unresolved_payloads,
         );
-        Ok((items, thread_id, parse_errors, versions))
+        Ok((items, thread_id, parse_errors, versions, origins))
     }
 
     fn append_reconstruction_notice(
@@ -1369,8 +1452,32 @@ impl RolloutRecorder {
     where
         F: FnMut(RolloutItem, usize),
     {
+        Self::visit_rollout_with_origins(
+            path, enroll_dependencies, capture_payload_versions, exclude_context_replay, false,
+            None, |item, record, _| visit(item, record),
+        ).await
+    }
+
+    async fn visit_rollout_with_origins<F>(
+        path: &Path,
+        enroll_dependencies: bool,
+        capture_payload_versions: bool,
+        exclude_context_replay: bool,
+        capture_origins: bool,
+        mut timing: Option<&mut AppendWriterTiming>,
+        mut visit: F,
+    ) -> std::io::Result<(
+        Option<ThreadId>,
+        usize,
+        usize,
+        usize,
+        Vec<crate::PayloadDependencyVersion>,
+    )>
+    where
+        F: FnMut(RolloutItem, usize, Option<DiagnosticOrigin>),
+    {
         trace!("Resuming rollout from {path:?}");
-        let mut decoder = RolloutRecordDecoder::default();
+        let mut decoder = RolloutRecordDecoder { capture_origins, ..Default::default() };
         let mut reader = compression::open_rollout_line_reader(path).await?;
         if exclude_context_replay {
             reader.exclude_context_replay();
@@ -1383,7 +1490,11 @@ impl RolloutRecorder {
             reader.enroll_payload_dependencies();
         }
         use crate::payload_artifact::HydratedRecord;
-        while let Some(record) = reader.next_record(enroll_dependencies).await? {
+        let measure_decode = timing.is_some();
+        while let Some(record) = reader
+            .next_record(enroll_dependencies, timing.as_mut().map(|t| &mut t.payload))
+            .await?
+        {
             if matches!(&record, HydratedRecord::Text(line) if line.trim().is_empty()) {
                 continue;
             }
@@ -1401,26 +1512,46 @@ impl RolloutRecorder {
             let decoded = if let HydratedRecord::Text(line) = &record
                 && line.len() < BLOCKING_DECODE_THRESHOLD_BYTES
             {
-                decoder.decode(line, terminated)
+                time_append_stage(timing.as_mut().map(|t| &mut t.decode), || {
+                    decoder.decode(line, terminated)
+                })
             } else {
-                let (returned_decoder, result) = tokio::task::spawn_blocking(move || {
+                let (returned_decoder, result, measured) = tokio::task::spawn_blocking(move || {
                     let mut decoder = decoder;
+                    let mut measured = measure_decode.then(<(Duration, Duration)>::default);
                     let result = match record {
-                        HydratedRecord::Text(line) => decoder.decode(&line, terminated),
-                        HydratedRecord::Parsed(value) => {
+                        HydratedRecord::Text(line) => {
+                            time_append_stage(measured.as_mut().map(|t| &mut t.0), || {
+                                decoder.decode(&line, terminated)
+                            })
+                        }
+                        HydratedRecord::Parsed(mut value) => {
                             decoder.begin_record();
-                            decoder.decode_value(value)
+                            // Enrolling Parsed reads are append preflight. Its visitors
+                            // use session/tool metadata but never a replay capture.
+                            if enroll_dependencies {
+                                time_append_stage(measured.as_mut().map(|t| &mut t.1), || {
+                                    discard_verified_replay_capture(&mut value);
+                                });
+                            }
+                            time_append_stage(measured.as_mut().map(|t| &mut t.0), || {
+                                decoder.decode_value(value)
+                            })
                         }
                     };
-                    (decoder, result)
+                    (decoder, result, measured)
                 })
                 .await
                 .map_err(|error| IoError::other(format!("rollout decode task failed: {error}")))?;
+                if let (Some(timing), Some((decode, discard))) = (timing.as_mut(), measured) {
+                    timing.decode += decode;
+                    timing.replay_discard += discard;
+                }
                 decoder = returned_decoder;
                 result
             };
             if let Some(item) = decoded? {
-                visit(item, decoder.record_number);
+                visit(item, decoder.record_number, decoder.diagnostic_origin.take());
             }
         }
         let thread_id = decoder.finish(path)?;
@@ -1481,7 +1612,8 @@ impl RolloutRecorder {
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
-        let (items, thread_id, parse_errors) = Self::load_rollout_items(path).await?;
+        let (items, thread_id, parse_errors, _, diagnostic_origins) =
+            Self::load_rollout_items_with_origins(path, false).await?;
         if parse_errors > 0 {
             warn!(
                 ?path,
@@ -1500,6 +1632,7 @@ impl RolloutRecorder {
             conversation_id,
             history: Arc::new(items),
             rollout_path: Some(compression::plain_rollout_path(path)),
+            diagnostic_origins,
         }))
     }
 
@@ -1601,6 +1734,50 @@ pub(crate) struct RolloutRecordDecoder {
     last_record_partial: bool,
     saw_non_empty_line: bool,
     record_number: usize,
+    capture_origins: bool,
+    diagnostic_origin: Option<DiagnosticOrigin>,
+}
+
+fn discard_verified_replay_capture(value: &mut Value) {
+    if value["format_version"].as_u64()
+        != Some(u64::from(codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION))
+        || value["type"].as_str() != Some("context_replay")
+    {
+        return;
+    }
+    let Some(payload) = value["payload"].as_object_mut() else {
+        return;
+    };
+    if payload.len() != 5
+        || !["version", "turn_id", "sampling_request_id", "physical_attempt_id"]
+            .iter()
+            .all(|key| payload.contains_key(*key))
+    {
+        return;
+    }
+    let Some(capture) = payload.get_mut("capture") else {
+        return;
+    };
+    // The artifact reader has verified length/hash/type and fully parsed the
+    // capture as Value, the exact unconstrained type of this field. Avoid
+    // rematerializing that discarded tree through RolloutLine and the tagged
+    // enum. The canonical decoder still validates the whole typed envelope.
+    // Reserved serde_json map keys can change meaning during re-deserialization;
+    // leave those and unusual numeric representations on the original path.
+    if is_plain_replay_json(capture) {
+        *capture = Value::Null;
+    }
+}
+
+fn is_plain_replay_json(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().all(|(key, child)| {
+            !key.starts_with("$serde_json::private::") && is_plain_replay_json(child)
+        }),
+        Value::Array(items) => items.iter().all(is_plain_replay_json),
+        Value::Number(number) => number.is_i64() || number.is_u64() || number.as_f64().is_some(),
+        _ => true,
+    }
 }
 
 impl RolloutRecordDecoder {
@@ -1682,7 +1859,13 @@ impl RolloutRecordDecoder {
         // existing recoverable-gap treatment for that optional provenance.
         let secondary_metadata =
             self.thread_id.is_some() && v.get("type").and_then(Value::as_str) == Some("session_meta");
-        // Parse the rollout line structure
+        // This metadata is optional and never participates in canonical payload
+        // decoding or legacy migration. Malformed provenance isn't a history gap.
+        let origin = if self.capture_origins && !is_v0 {
+            v.as_object_mut().and_then(|fields| fields.remove("diagnostic_origin"))
+        } else {
+            None
+        };
         match serde_json::from_value::<RolloutLine>(v) {
             Ok(rollout_line) => {
                 let item = rollout_line.item;
@@ -1692,6 +1875,11 @@ impl RolloutRecordDecoder {
                     && let RolloutItem::SessionMeta(session_meta_line) = &item
                 {
                     self.thread_id = Some(session_meta_line.meta.id);
+                }
+                if item.is_origin_diagnostic() {
+                    self.diagnostic_origin = origin
+                        .and_then(|value| serde_json::from_value::<DiagnosticOrigin>(value).ok())
+                        .filter(|origin| !origin.id.is_nil());
                 }
                 Ok(Some(item))
             }
@@ -2485,6 +2673,16 @@ async fn open_rollout_for_append(path: &Path) -> std::io::Result<(PathBuf, Jsonl
 
 type AppendReplayIntegrity = (Option<ThreadId>, usize, usize, usize);
 
+#[derive(Default)]
+struct AppendWriterTiming {
+    payload: AppendPayloadTiming,
+    lock: Duration,
+    preflight: Duration,
+    decode: Duration,
+    replay_discard: Duration,
+    writer_materialize: Duration,
+}
+
 async fn open_rollout_for_append_with_replay<F>(
     path: &Path,
     visit: F,
@@ -2492,9 +2690,59 @@ async fn open_rollout_for_append_with_replay<F>(
 where
     F: FnMut(RolloutItem, usize),
 {
+    use codex_protocol::timing::observations;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let started = (*ENABLED.get_or_init(|| {
+        std::env::var_os("CODEX_ROLLOUT_WRITER_OPEN_TIMING").is_some_and(|value| value == "1")
+    }) && observations::enabled())
+    .then(Instant::now);
+    let mut timing = started.map(|_| AppendWriterTiming::default());
+    let result = open_rollout_for_append_with_replay_inner(path, visit, timing.as_mut()).await;
+    if let (Some(started), Some(timing)) = (started, timing) {
+        let total_ns = started.elapsed().as_nanos();
+        let integrity = result.as_ref().ok().and_then(|(_, _, integrity)| *integrity);
+        let thread_id = integrity.and_then(|(id, ..)| id).map(|id| id.to_string());
+        let store_id = crate::diagnostic_revision::store_id(path);
+        let _ = observations::record(
+            "rollout_writer_open_summary",
+            thread_id.as_deref().unwrap_or_default(),
+            "",
+            &store_id,
+            serde_json::json!({
+                "outcome": if result.is_ok() { "ok" } else { "error" },
+                "total_ns": total_ns,
+                "lock_ns": timing.lock.as_nanos(),
+                "preflight_ns": timing.preflight.as_nanos(),
+                "payload_candidates": timing.payload.candidates,
+                "payload_bytes_read": timing.payload.bytes_read,
+                "payload_read_ns": timing.payload.read.as_nanos(),
+                "payload_sha256_ns": timing.payload.sha256.as_nanos(),
+                "payload_parse_ns": timing.payload.parse.as_nanos(),
+                "plain_replay_projected": timing.payload.plain_replay_projected,
+                "payload_enroll_ns": timing.payload.enroll.as_nanos(),
+                "payload_envelope_ns": timing.payload.envelope.as_nanos(),
+                "canonical_decode_ns": timing.decode.as_nanos(),
+                "replay_discard_ns": timing.replay_discard.as_nanos(),
+                "writer_materialize_ns": timing.writer_materialize.as_nanos(),
+            }),
+        );
+    }
+    result
+}
+
+async fn open_rollout_for_append_with_replay_inner<F>(
+    path: &Path,
+    mut visit: F,
+    mut timing: Option<&mut AppendWriterTiming>,
+) -> std::io::Result<(PathBuf, JsonlWriter, Option<AppendReplayIntegrity>)>
+where
+    F: FnMut(RolloutItem, usize),
+{
     let path = path.to_path_buf();
     let lock_path = path.clone();
-    let (payload_retention, append_lock, snapshot) = tokio::task::spawn_blocking(move || {
+    let lock_started = timing.as_ref().map(|_| Instant::now());
+    let locks = tokio::task::spawn_blocking(move || {
         // Same order as ordinary publication: payload lease, representation,
         // then byte writer. Keep all three across preflight and materialization.
         let retention = crate::payload_artifact::lock_publication(&lock_path)?;
@@ -2503,19 +2751,41 @@ where
         Ok::<_, IoError>((retention, append, snapshot))
     })
     .await
-    .map_err(IoError::other)??;
+    .map_err(IoError::other);
+    if let (Some(timing), Some(started)) = (timing.as_mut(), lock_started) {
+        timing.lock = started.elapsed();
+    }
+    let (payload_retention, append_lock, snapshot) = locks??;
     let payload_sync_owner = crate::payload_artifact::PayloadSyncOwner::new(&path);
     // Collection and append preflight share this one verified observation,
     // while all publication/representation/byte-write owners remain held.
-    let integrity = match RolloutRecorder::for_each_rollout_item_with_integrity(&path, true, visit).await {
+    let preflight_started = timing.as_ref().map(|_| Instant::now());
+    let replay = RolloutRecorder::visit_rollout_with_origins(
+        &path,
+        true,
+        false,
+        false,
+        false,
+        timing.as_deref_mut(),
+        |item, record, _| visit(item, record),
+    )
+    .await;
+    if let (Some(timing), Some(started)) = (timing.as_mut(), preflight_started) {
+        timing.preflight = started.elapsed();
+    }
+    let integrity = match replay {
         // A live owner can reopen an empty file after an interrupted initial
         // write. There is no unknown semantic record to fence in that case.
         Err(error)
             if error.kind() == ErrorKind::InvalidData
                 && error.to_string() == "empty session file" => None,
-        result => Some(result?),
+        result => {
+            let (id, errors, partial, unresolved, _) = result?;
+            Some((id, errors, partial, unresolved))
+        }
     };
-    let (path, writer) = tokio::task::spawn_blocking(move || {
+    let materialize_started = timing.as_ref().map(|_| Instant::now());
+    let materialized = tokio::task::spawn_blocking(move || {
         let path = compression::materialize_rollout_for_append_locked(&path)?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -2533,7 +2803,11 @@ where
         Ok::<_, IoError>((path, file.into_jsonl_writer()))
     })
     .await
-    .map_err(IoError::other)??;
+    .map_err(IoError::other);
+    if let (Some(timing), Some(started)) = (timing, materialize_started) {
+        timing.writer_materialize = started.elapsed();
+    }
+    let (path, writer) = materialized??;
     Ok((path, writer, integrity))
 }
 
@@ -2613,6 +2887,8 @@ enum FailedAppendRecovery {
 struct RolloutLineRef<'a> {
     timestamp: String,
     format_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic_origin: Option<&'a DiagnosticOrigin>,
     #[serde(flatten)]
     item: &'a RolloutItem,
 }
@@ -2628,6 +2904,7 @@ impl<'a> RolloutLineRef<'a> {
         Ok(Self {
             timestamp,
             format_version: CURRENT_ROLLOUT_FORMAT_VERSION,
+            diagnostic_origin: None,
             item,
         })
     }
@@ -2737,7 +3014,9 @@ impl JsonlWriter {
                 }
             };
             if !crate::payload_artifact::is_artifact_candidate(item) {
-                Self::serialize_rollout_item(&mut bytes, item, captured.captured_at)?;
+                let mut line = RolloutLineRef::new(item, captured.captured_at)?;
+                line.diagnostic_origin = captured.diagnostic_origin.as_deref();
+                line.write_jsonl(&mut bytes)?;
                 continue;
             }
             let line = RolloutLineRef::new(item, captured.captured_at)?;
@@ -2779,14 +3058,6 @@ impl JsonlWriter {
             }
         }
         self.write_transaction(&bytes, append_start).await
-    }
-
-    fn serialize_rollout_item(
-        bytes: &mut Vec<u8>,
-        rollout_item: &RolloutItem,
-        captured_at: OffsetDateTime,
-    ) -> std::io::Result<()> {
-        RolloutLineRef::new(rollout_item, captured_at)?.write_jsonl(bytes)
     }
 
     async fn write_transaction(&mut self, bytes: &[u8], append_start: u64) -> std::io::Result<u64> {

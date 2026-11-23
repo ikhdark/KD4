@@ -366,12 +366,8 @@ pub(super) async fn user_input_or_turn_inner(
     // unless an admitted turn start adopts their root's current turn for a
     // follow-up sent under it.
     if !session_configuration.session_source.is_non_root_agent() {
-        let scope = Some((sess.thread_id().to_string(), sub_id.clone()));
-        session_configuration.validation_root_turn = scope.clone();
+        session_configuration.validation_root_turn = Some((sess.thread_id().to_string(), sub_id.clone()));
         session_configuration.validation_attempts.clear();
-        let mut state = sess.state.lock().await;
-        state.session_configuration.validation_root_turn = scope;
-        state.session_configuration.validation_attempts.clear();
     }
 
     let current_context = sess
@@ -448,7 +444,7 @@ pub(super) async fn user_input_or_turn_inner(
         let result = sess
             .start_task_with_admission(
                 &task_start_permit,
-                Arc::clone(&current_context),
+                current_context,
                 task_input,
                 crate::tasks::RegularTask::new(),
             )
@@ -457,7 +453,7 @@ pub(super) async fn user_input_or_turn_inner(
         let _ = admission.send(result);
     } else {
         sess.spawn_task(
-            Arc::clone(&current_context),
+            current_context,
             task_input,
             crate::tasks::RegularTask::new(),
         )

@@ -1060,6 +1060,7 @@ pub struct ModelRequestTiming {
     diagnostics_owner_attempt_id: Option<String>,
     physical_attempt_ids: Vec<String>,
     dispatched_attempt_ids: BTreeSet<String>,
+    retry_source_response_created_ids: BTreeSet<String>,
     dispatched_attempt_count: u32,
     progress_kinds: Vec<TurnTimingProgressKind>,
     structured_action_fingerprint: Option<String>,
@@ -2356,12 +2357,31 @@ impl TurnTimingState {
             .map(|sample| sample.time.wall_unix_ms / 1_000)
     }
 
-    pub fn complete_snapshot(&self) -> TurnTimingSnapshot {
+    pub fn complete_snapshot(&self, thread_id: &str, turn_id: &str) -> TurnTimingSnapshot {
+        use codex_protocol::timing::observations;
+        use codex_protocol::timing::process_monotonic_ns;
+
+        let observe = observations::enabled();
         let mut state = self.state();
-        if state.completed_snapshot.is_none() { state.measurements.performance.finish(); }
+        let cached = state.completed_snapshot.is_some();
+        if !cached { state.measurements.performance.finish(); }
         let sample = self.clock.sample();
         state.retry_decisions.finish(sample.time.monotonic_ns, None);
-        state.complete(sample)
+        // Capture the actual call, excluding lock acquisition and journal I/O.
+        let started = observe.then(process_monotonic_ns);
+        let snapshot = state.complete(sample);
+        if let Some(start_ns) = started {
+            let end_ns = process_monotonic_ns();
+            drop(state);
+            let _ = observations::record(
+                "terminal_state_complete",
+                thread_id,
+                turn_id,
+                turn_id,
+                serde_json::json!({ "start_ns": start_ns, "end_ns": end_ns, "cached": cached }),
+            );
+        }
+        snapshot
     }
 
     /// Freeze an observation without terminalizing live timers or task state.
@@ -2608,6 +2628,7 @@ impl TurnTimingState {
             if request.physical_attempt_ids.len() >= MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS {
                 let evicted = request.physical_attempt_ids.remove(0);
                 request.dispatched_attempt_ids.remove(&evicted);
+                request.retry_source_response_created_ids.remove(&evicted);
                 request.request_sha256_by_attempt.remove(&evicted);
                 request.request_section_sha256_by_attempt.remove(&evicted);
                 request.response_id_by_attempt.remove(&evicted);
@@ -4338,7 +4359,7 @@ impl TurnTimingState {
         self.record_retry_decision_with_stream_failure(trigger, http_status, None, action, backoff);
     }
 
-    /// Same decision, plus allowlisted facts about the stream failure it answers.
+    /// Legacy attribution for callers without result-bound source plumbing.
     pub fn record_retry_decision_with_stream_failure(
         &self,
         trigger: retries::RetryTrigger,
@@ -4346,6 +4367,65 @@ impl TurnTimingState {
         stream_failure: Option<retries::RetryStreamFailure>,
         action: retries::RetryAction,
         backoff: Option<Duration>,
+    ) {
+        self.record_retry_decision_inner(
+            trigger, http_status, stream_failure, action, backoff,
+            |state| {
+                if matches!(trigger, retries::RetryTrigger::MissingCredentials) {
+                    return None;
+                }
+                let request = state.model_requests.last()?;
+                let attempt = request.physical_attempt_ids.iter().rev()
+                    .find(|id| request.dispatched_attempt_ids.contains(*id))?;
+                Some(retries::RetrySource {
+                    sampling_request_id: request.sampling_request_id.clone()?,
+                    physical_attempt_id: attempt.clone(),
+                    dispatch: None,
+                    acceptance: None,
+                })
+            },
+        );
+    }
+
+    /// Records an exact result-bound transport entry if this turn owns it.
+    /// None means unknown or pre-entry; never fall back to an older entry.
+    pub fn record_retry_decision_for_source(
+        &self,
+        source: Option<&codex_api::ResponseAttemptIdentity>,
+        trigger: retries::RetryTrigger,
+        http_status: Option<u16>,
+        stream_failure: Option<retries::RetryStreamFailure>,
+        action: retries::RetryAction,
+        backoff: Option<Duration>,
+    ) {
+        self.record_retry_decision_inner(
+            trigger, http_status, stream_failure, action, backoff,
+            |state| {
+                let source = source?;
+                let request = state.model_requests.last()?;
+                (Some(request.generation_index) == state.current_generation_index
+                    && request.sampling_request_id.as_deref() == Some(source.sampling_request_id.as_str())
+                    && request.dispatched_attempt_ids.contains(&source.physical_attempt_id))
+                .then(|| retries::RetrySource {
+                    sampling_request_id: source.sampling_request_id.clone(),
+                    physical_attempt_id: source.physical_attempt_id.clone(),
+                    dispatch: Some(retries::RetrySourceDispatch::TransportEntered),
+                    acceptance: request.retry_source_response_created_ids
+                        .contains(&source.physical_attempt_id)
+                        .then_some(retries::RetrySourceAcceptance::ResponseCreated),
+                })
+            },
+        );
+    }
+
+    fn record_retry_decision_inner(
+        &self,
+        trigger: retries::RetryTrigger,
+        http_status: Option<u16>,
+        stream_failure: Option<retries::RetryStreamFailure>,
+        action: retries::RetryAction,
+        backoff: Option<Duration>,
+        resolve_source: impl FnOnce(&TurnTimingStateInner) -> Option<retries::RetrySource>,
     ) {
         if codex_protocol::timing::observations::enabled() {
             self.observe_runtime("recovery_retry_decision", "", serde_json::json!({
@@ -4357,14 +4437,7 @@ impl TurnTimingState {
         if state.completed_snapshot.is_some() {
             return;
         }
-        let source = state.model_requests.last().and_then(|request| {
-            if matches!(trigger, retries::RetryTrigger::MissingCredentials) {
-                return None;
-            }
-            let attempt = request.physical_attempt_ids.iter().rev()
-                .find(|id| request.dispatched_attempt_ids.contains(*id))?;
-            Some((request.sampling_request_id.clone()?, attempt.clone()))
-        });
+        let source = resolve_source(&state);
         let now_ns = self.clock.sample().time.monotonic_ns;
         let generation_index = state.current_generation_index;
         state.retry_decisions.plan(now_ns, retries::RetryPlan {
@@ -4374,7 +4447,7 @@ impl TurnTimingState {
             http_status,
             stream_failure,
             action,
-            source: source.as_ref().map(|(request, attempt)| (request.as_str(), attempt.as_str())),
+            source: source.as_ref(),
             backoff_ns: backoff.map(|duration| duration.as_nanos()),
         });
         if state.activity.retry > 0 {
@@ -4793,6 +4866,23 @@ impl TurnTimingState {
             sampling_request_id: request.sampling_request_id.clone()?,
             physical_attempt_id: physical_attempt_id.clone(),
         })
+    }
+
+    /// Records a lifecycle-admitted creation on the owning WebSocket attempt.
+    /// No other attempt, pre-entry stream, or finalized turn can acquire it.
+    pub fn record_retry_source_response_created(&self, source: &codex_api::ResponseAttemptIdentity) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() {
+            return;
+        }
+        let generation_index = state.current_generation_index;
+        if let Some(request) = state.model_requests.last_mut()
+            && Some(request.generation_index) == generation_index
+            && request.sampling_request_id.as_deref() == Some(source.sampling_request_id.as_str())
+            && request.dispatched_attempt_ids.contains(&source.physical_attempt_id)
+        {
+            request.retry_source_response_created_ids.insert(source.physical_attempt_id.clone());
+        }
     }
 
     /// Called at transport entry, after preparation/authentication, not at readiness.

@@ -169,7 +169,16 @@ async fn handle_get_agent_task(
         let store = coordinator.store().ok_or_else(|| FunctionCallError::RespondToModel(
             "get_agent_task: task store is unavailable".into()))?;
         let (attempt, receipt) = store.get_agent_attempt(assignment_id, attempt_id).await
-            .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+            .map_err(|error| match error {
+                StoreError::InvalidAssignment(_) => FunctionCallError::structured(
+                    codex_protocol::tool_failure::ToolFailure::handler_refusal(
+                        codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+                        format!("{GET_AGENT_TASK_TOOL}: {error}"),
+                        "get_agent_task_lookup",
+                    ),
+                ),
+                error => task_store_error(GET_AGENT_TASK_TOOL, error),
+            })?;
         return Ok(boxed_tool_output(AgentAttemptResult { attempt, receipt, acceptance: "not_evaluated" }));
     }
     let (cold_review_context, receipt_handoffs) = if caller_binding
@@ -301,7 +310,7 @@ async fn handle_submit_agent_receipt(
                 ),
             );
             failure.safe_next_actions = vec![
-                "Continue the required work and reconcile it with update_plan before resubmitting completed. If genuinely blocked, keep the outstanding requirements open and submit a truthful blocked receipt.".into(),
+                "Continue any unmet work. For a fulfilled requirement, complete its mapped steps and pass that exact requirement ID in update_plan resolve with the current expected_revision. For an unmapped fulfilled pin, submit the unchanged plan plus resolve. Resubmit completed only after the unresolved requirements are cleared. If genuinely blocked, keep the outstanding requirements open and submit a truthful blocked receipt.".into(),
             ];
             return Err(FunctionCallError::structured(failure));
         }
@@ -771,8 +780,25 @@ fn parse_assignment_id(
 }
 
 fn task_store_error(tool_name: &'static str, error: StoreError) -> FunctionCallError {
+    let lookup_rejected = tool_name == GET_AGENT_TASK_TOOL
+        && matches!(
+            &error,
+            StoreError::InvalidUuidV7 { .. }
+                | StoreError::AssignmentNotFound(_)
+                | StoreError::AttemptNotFound(_)
+        );
     let detail = task_store_error_detail(tool_name, error);
-    FunctionCallError::RespondToModel(format!("{tool_name}: {detail}"))
+    let message = format!("{tool_name}: {detail}");
+    if lookup_rejected {
+        return FunctionCallError::structured(
+            codex_protocol::tool_failure::ToolFailure::handler_refusal(
+                codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+                message,
+                "get_agent_task_lookup",
+            ),
+        );
+    }
+    FunctionCallError::RespondToModel(message)
 }
 
 fn receipt_validation_refusal(

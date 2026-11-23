@@ -125,8 +125,91 @@ impl BufferedServerEnvelope {
 }
 
 // Only the last frame owns the receipt. Replay and the current physical writer
-// may both hold it; the first successful flush consumes the sender exactly once.
-type WriteCompletion = Arc<std::sync::Mutex<Option<oneshot::Sender<std::time::Instant>>>>;
+// may both hold it; an unacknowledged frame keeps it across physical reconnects.
+type WriteCompletion = Arc<RemoteWriteCompletion>;
+
+struct RemoteWriteCompletion {
+    state: std::sync::Mutex<RemoteWriteCompletionState>,
+    delivery_failure: Option<CancellationToken>,
+}
+
+struct RemoteWriteCompletionState {
+    sender: Option<oneshot::Sender<std::time::Instant>>,
+    feed_attempted: bool,
+    acknowledged_at: Option<std::time::Instant>,
+}
+
+impl RemoteWriteCompletion {
+    fn new(
+        sender: oneshot::Sender<std::time::Instant>,
+        delivery_failure: Option<CancellationToken>,
+    ) -> Self {
+        Self {
+            state: std::sync::Mutex::new(RemoteWriteCompletionState {
+                sender: Some(sender),
+                feed_attempted: false,
+                acknowledged_at: None,
+            }),
+            delivery_failure,
+        }
+    }
+
+    fn mark_feed_attempted(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .feed_attempted = true;
+    }
+
+    fn record_relay_ack(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.feed_attempted && state.sender.is_some() {
+            // ACK can arrive before a local flush finishes, including while a
+            // feed operation makes progress. Enqueue alone is not a receipt.
+            state.acknowledged_at = Some(std::time::Instant::now());
+        }
+    }
+
+    fn complete_flushed(&self, flushed_at: std::time::Instant) {
+        if !self
+            .delivery_failure
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+            && let Some(sender) = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sender
+                .take()
+        {
+            let _ = sender.send(flushed_at);
+        }
+    }
+}
+
+impl Drop for RemoteWriteCompletion {
+    fn drop(&mut self) {
+        // If ACK removed replay custody and the writer exited without
+        // completing its flush, relay acknowledgment still proves delivery
+        // to the transport boundary, not receipt or rendering on the phone.
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self
+            .delivery_failure
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+            && let Some(acknowledged_at) = state.acknowledged_at
+            && let Some(sender) = state.sender.take()
+        {
+            let _ = sender.send(acknowledged_at);
+        }
+    }
+}
 
 struct ScheduledServerFrame {
     payload: tungstenite::Utf8Bytes,
@@ -162,6 +245,7 @@ impl ServerEventReceiver {
 
 struct PendingServerEncoding {
     message_observation_id: Option<uuid::Uuid>,
+    encoding_attempt_id: Option<uuid::Uuid>,
     key: (ClientId, StreamId),
     seq_id: u64,
     completion: Option<oneshot::Sender<std::time::Instant>>,
@@ -215,6 +299,7 @@ impl ServerWriterQueue {
         ping_interval: &mut tokio::time::Interval,
         websocket_writer: &mut (impl futures::Sink<tungstenite::Message, Error = tungstenite::Error> + Unpin),
         shutdown: &CancellationToken,
+        socket_generation: Option<uuid::Uuid>,
     ) -> io::Result<Option<((ClientId, StreamId), u64)>> {
         if receiver.encoding.is_none() {
             // Leave the original in shared custody across this await as well.
@@ -236,17 +321,24 @@ impl ServerWriterQueue {
             let envelope = ServerEnvelope {
                 event: queued.event, client_id: queued.client_id, stream_id: queued.stream_id, seq_id,
             };
-            if let Some(observation) = super::protocol::DeliveryObservation::new(&envelope.client_id, &envelope.stream_id, seq_id, None) {
+            let observation = super::protocol::DeliveryObservation::new(
+                &envelope.client_id, &envelope.stream_id, seq_id, None,
+            ).map(|observation| observation.with_message_id(queued.message_observation_id));
+            let encoding_attempt_id = observation.as_ref().map(|_| uuid::Uuid::now_v7());
+            if let Some(observation) = &observation {
                 let mut facts = match &envelope.event {
                     super::protocol::ServerEvent::ServerMessage { message } => super::protocol::response_observation(message),
                     super::protocol::ServerEvent::Pong { .. } => serde_json::json!({"message_kind":"transport_control","message_category":"pong"}),
                     _ => serde_json::json!({"message_kind":"transport_control"}),
                 };
                 facts["message_observation_id"] = serde_json::json!(queued.message_observation_id);
+                facts["encoding_attempt_id"] = serde_json::json!(encoding_attempt_id);
+                facts["socket_generation"] = serde_json::json!(socket_generation);
                 observation.record("mobile_transport_encoding", facts);
             }
             receiver.encoding = Some(PendingServerEncoding {
                 message_observation_id: queued.message_observation_id,
+                encoding_attempt_id,
                 key, seq_id, completion: queued.write_complete_tx,
                 delivery_failure: queued.delivery_failure,
                 encoded: None,
@@ -254,8 +346,29 @@ impl ServerWriterQueue {
                 task: AbortOnDropHandle::new(tokio::spawn(async move {
                     let permit = encoding_admission.acquire_owned().await.map_err(io::Error::other)?;
                     tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        encode_server_payloads_for_transport(envelope)
+                        if let Some(observation) = observation {
+                            // Measure the encoder itself, before journal I/O and independent of
+                            // when (or whether) the socket writer polls this result.
+                            let started_at = std::time::Instant::now();
+                            let result = encode_server_payloads_for_transport(envelope);
+                            let returned_at = std::time::Instant::now();
+                            drop(permit);
+                            observation.record("mobile_transport_encode_started", serde_json::json!({
+                                "encoding_attempt_id": encoding_attempt_id,
+                                "socket_generation": socket_generation,
+                                "encode_started_ns": journal_ns(started_at),
+                            }));
+                            observation.record("mobile_transport_encode_returned", serde_json::json!({
+                                "encoding_attempt_id": encoding_attempt_id,
+                                "socket_generation": socket_generation,
+                                "encode_returned_ns": journal_ns(returned_at),
+                                "outcome": if result.is_ok() { "ok" } else { "encode_error" },
+                            }));
+                            result
+                        } else {
+                            let _permit = permit;
+                            encode_server_payloads_for_transport(envelope)
+                        }
                     }).await.map_err(io::Error::other)?
                 })),
             });
@@ -298,12 +411,16 @@ impl ServerWriterQueue {
         let count = encoded.len();
         for (index, encoded) in encoded.into_iter().enumerate() {
             let completion = if index + 1 == count {
-                encoding.completion.take().map(|sender| Arc::new(std::sync::Mutex::new(Some(sender))))
+                encoding.completion.take().map(|sender| {
+                    Arc::new(RemoteWriteCompletion::new(sender, encoding.delivery_failure.clone()))
+                })
             } else { None };
             let buffered = BufferedServerEnvelope::from_payload(encoded, completion, encoding.delivery_failure.clone(),
                 Arc::clone(&encoding.replay_credit), encoding.message_observation_id);
             if let Some(observation) = &buffered.observation {
-                observation.record("mobile_transport_buffered", serde_json::json!({"frame_count":count}));
+                observation.record("mobile_transport_buffered", serde_json::json!({
+                    "frame_count": count, "encoding_attempt_id": encoding.encoding_attempt_id,
+                }));
             }
             self.push(&buffered);
             state.outbound_buffer.insert_encoded(buffered);
@@ -325,6 +442,99 @@ async fn writer_operation(
         result = tokio::time::timeout(REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT, operation) => {
             result.map_err(|_| io::Error::new(ErrorKind::TimedOut, "remote control websocket write stalled"))?
                 .map_err(io::Error::other)
+        }
+    }
+}
+
+fn journal_ns(at: std::time::Instant) -> Option<u64> {
+    u64::try_from(codex_protocol::timing::process_monotonic_ns_at(at)?).ok()
+}
+
+struct FedFrameObservation {
+    delivery: super::protocol::DeliveryObservation,
+    buffered_at: std::time::Instant,
+    feed_started: std::time::Instant,
+    feed_done: std::time::Instant,
+}
+
+// One attempt per existing non-empty observed batch, not an extra queue.
+// A scope drop without a classified result is not proof of a successful flush
+// or a particular cancellation cause.
+struct FlushAttemptObservation<'a> {
+    frames: &'a [FedFrameObservation],
+    id: uuid::Uuid,
+    socket_generation: Option<uuid::Uuid>,
+    started_at: Option<std::time::Instant>,
+    returned: Option<(std::time::Instant, Option<&'static str>)>,
+    reported: bool,
+}
+
+impl FlushAttemptObservation<'_> {
+    fn finish(mut self, result: &io::Result<()>) {
+        self.reported = true;
+        match (self.started_at, self.returned) {
+            (Some(started_at), Some((returned_at, None))) => {
+                let nanos_between = |start: std::time::Instant, end: std::time::Instant| {
+                    u64::try_from(end.checked_duration_since(start)?.as_nanos()).ok()
+                };
+                for frame in self.frames {
+                    frame.delivery.record("mobile_transport_flushed", serde_json::json!({
+                        "boundary": "relay_socket_flush_not_phone_receipt",
+                        "socket_generation": self.socket_generation,
+                        "flush_attempt_id": self.id,
+                        "flush_started_ns": journal_ns(started_at),
+                        "flush_completed_ns": journal_ns(returned_at),
+                        "buffer_to_feed_ns": nanos_between(frame.buffered_at, frame.feed_started),
+                        "feed_wait_ns": nanos_between(frame.feed_started, frame.feed_done),
+                        "feed_to_flush_ns": nanos_between(frame.feed_done, started_at),
+                        "flush_wait_ns": nanos_between(started_at, returned_at),
+                        "buffer_age_ns": nanos_between(frame.buffered_at, returned_at),
+                    }));
+                }
+            }
+            (_, Some((returned_at, error_class))) => {
+                self.record_not_flushed("sink_error", returned_at, error_class);
+            }
+            (_, None) => {
+                // writer_operation returns Ok without polling to completion on
+                // cancellation; the other way to end without a sink result is timeout.
+                let outcome = if result.is_err() {
+                    "timed_out"
+                } else if self.started_at.is_some() {
+                    "cancelled_during_flush"
+                } else {
+                    "cancelled_before_flush_poll"
+                };
+                self.record_not_flushed(outcome, std::time::Instant::now(), None);
+            }
+        }
+    }
+
+    fn record_not_flushed(
+        &self,
+        outcome: &'static str,
+        ended_at: std::time::Instant,
+        error_class: Option<&'static str>,
+    ) {
+        let started_ns = self.started_at.and_then(journal_ns);
+        let ended_ns = journal_ns(ended_at);
+        for frame in self.frames {
+            frame.delivery.record("mobile_transport_flush_not_completed", serde_json::json!({
+                "socket_generation": self.socket_generation,
+                "flush_attempt_id": self.id,
+                "flush_started_ns": started_ns,
+                "flush_ended_ns": ended_ns,
+                "outcome": outcome,
+                "websocket_error_class": error_class,
+            }));
+        }
+    }
+}
+
+impl Drop for FlushAttemptObservation<'_> {
+    fn drop(&mut self) {
+        if !self.reported {
+            self.record_not_flushed("writer_future_dropped", std::time::Instant::now(), None);
         }
     }
 }
@@ -410,16 +620,20 @@ impl BoundedOutboundBuffer {
         while buffer.front().is_some_and(|envelope| {
             (envelope.seq_id, envelope.segment_id.unwrap_or_default()) <= acked_cursor
         }) {
-            if let Some(envelope) = buffer.pop_front()
-                && let Some(observation) = envelope.observation {
-                let mut facts = serde_json::json!({"boundary":"relay_ack_not_phone_rendering"});
-                if let Some((generation, received_ns, accepted_ns)) = receive_boundary {
-                    facts["socket_generation"] = serde_json::json!(generation);
-                    facts["ack_reader_received_ns"] = serde_json::json!(u64::try_from(received_ns).ok());
-                    facts["ack_reader_to_buffer_ns"] =
-                        serde_json::json!(u64::try_from(accepted_ns.saturating_sub(received_ns)).ok());
+            if let Some(envelope) = buffer.pop_front() {
+                if let Some(completion) = &envelope.completion {
+                    completion.record_relay_ack();
                 }
-                observation.record("mobile_transport_acknowledged", facts);
+                if let Some(observation) = envelope.observation {
+                    let mut facts = serde_json::json!({"boundary":"relay_ack_not_phone_rendering"});
+                    if let Some((generation, received_ns, accepted_ns)) = receive_boundary {
+                        facts["socket_generation"] = serde_json::json!(generation);
+                        facts["ack_reader_received_ns"] = serde_json::json!(u64::try_from(received_ns).ok());
+                        facts["ack_reader_to_buffer_ns"] =
+                            serde_json::json!(u64::try_from(accepted_ns.saturating_sub(received_ns)).ok());
+                    }
+                    observation.record("mobile_transport_acknowledged", facts);
+                }
             }
             removed += 1;
         }
@@ -1462,11 +1676,20 @@ impl RemoteControlWebsocket {
             }
         };
         shutdown_token.cancel();
+        // The child token may already be cancelled by the parent. This marks
+        // the connection owner's cancellation boundary, not the first signal.
+        let cancel_boundary_ns = socket_generation.and_then(|_| journal_ns(std::time::Instant::now()));
 
-        Self::join_connection_workers(&mut join_set, REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT)
+        let abort_requested = Self::join_connection_workers(&mut join_set, REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT)
             .await;
-        observe_socket(socket_generation, "mobile_socket_ended",
-            serde_json::json!({"reason":format!("{connection_end_reason:?}")}));
+        if socket_generation.is_some() {
+            observe_socket(socket_generation, "mobile_socket_ended", serde_json::json!({
+                "reason": format!("{connection_end_reason:?}"),
+                "socket_cancel_boundary_ns": cancel_boundary_ns,
+                "connection_workers_joined_ns": journal_ns(std::time::Instant::now()),
+                "connection_worker_join": if abort_requested { "abort_requested_then_drained" } else { "drained" },
+            }));
+        }
         if matches!(
             connection_end_reason,
             ConnectionEndReason::AuthChanged | ConnectionEndReason::Disabled
@@ -1501,12 +1724,12 @@ impl RemoteControlWebsocket {
     async fn join_connection_workers(
         join_set: &mut tokio::task::JoinSet<()>,
         shutdown_timeout: std::time::Duration,
-    ) {
+    ) -> bool {
         if tokio::time::timeout(shutdown_timeout, Self::drain_join_set(join_set))
             .await
             .is_ok()
         {
-            return;
+            return false;
         }
 
         warn!(
@@ -1516,6 +1739,7 @@ impl RemoteControlWebsocket {
         );
         join_set.abort_all();
         Self::drain_join_set(join_set).await;
+        true
     }
 
     async fn drain_join_set(join_set: &mut tokio::task::JoinSet<()>) {
@@ -1602,7 +1826,7 @@ impl RemoteControlWebsocket {
                         Err(mpsc::error::TryRecvError::Disconnected) => break,
                     }
                 }
-                pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
+                pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token, socket_generation).await?;
                 if shutdown_token.is_cancelled() { return Ok(()); }
                 if server_event_rx.encoding.is_some() {
                     break;
@@ -1625,7 +1849,7 @@ impl RemoteControlWebsocket {
                 envelope = server_event_rx.recv() => {
                     let envelope = envelope.ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "server event channel closed"))?;
                     server_event_rx.queued = Some(envelope);
-                    pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
+                    pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token, socket_generation).await?;
                     continue;
                 }
             }
@@ -1651,43 +1875,59 @@ impl RemoteControlWebsocket {
                 batch_messages += 1;
                 batch_bytes += frame.payload.len();
                 let feed_started = frame.observation.as_ref().map(|_| std::time::Instant::now());
-                writer_operation(&shutdown_token, websocket_writer.feed(tungstenite::Message::Text(frame.payload))).await?;
+                writer_operation(&shutdown_token, async {
+                    if let Some(completion) = &frame.completion {
+                        completion.mark_feed_attempted();
+                    }
+                    websocket_writer
+                        .feed(tungstenite::Message::Text(frame.payload))
+                        .await
+                })
+                .await?;
                 if shutdown_token.is_cancelled() { return Ok(()); }
-                if let Some(observation) = frame.observation {
-                    let feed_done = std::time::Instant::now();
-                    flushed_observations.push((observation, frame.buffered_at, feed_started, feed_done));
+                if let (Some(delivery), Some(feed_started)) = (frame.observation, feed_started) {
+                    flushed_observations.push(FedFrameObservation {
+                        delivery,
+                        buffered_at: frame.buffered_at,
+                        feed_started,
+                        feed_done: std::time::Instant::now(),
+                    });
                 }
                 if let Some(completion) = frame.completion {
-                    completions.push((completion, frame.delivery_failure));
+                    completions.push(completion);
                 }
             }
-            let flush_started = (!flushed_observations.is_empty()).then(std::time::Instant::now);
-            writer_operation(&shutdown_token, websocket_writer.flush()).await?;
-            if shutdown_token.is_cancelled() { return Ok(()); }
-            // Use one timestamp for the entire batch, before recording any
-            // observations; journal I/O must not inflate the later frame ages.
-            let flush_done = flush_started.map(|_| std::time::Instant::now());
-            let nanos_between = |start: std::time::Instant, end: std::time::Instant| {
-                u64::try_from(end.checked_duration_since(start)?.as_nanos()).ok()
-            };
-            for (observation, buffered_at, feed_started, feed_done) in flushed_observations {
-                let (Some(feed_started), Some(flush_started), Some(flush_done)) =
-                    (feed_started, flush_started, flush_done) else { continue };
-                observation.record("mobile_transport_flushed", serde_json::json!({
-                    "boundary":"relay_socket_flush_not_phone_receipt", "socket_generation":socket_generation,
-                    "buffer_to_feed_ns":nanos_between(buffered_at, feed_started),
-                    "feed_wait_ns":nanos_between(feed_started, feed_done),
-                    "feed_to_flush_ns":nanos_between(feed_done, flush_started),
-                    "flush_wait_ns":nanos_between(flush_started, flush_done),
-                    "buffer_age_ns":nanos_between(buffered_at, flush_done),
-                }));
-            }
-            for (completion, failure) in completions {
-                if !failure.as_ref().is_some_and(CancellationToken::is_cancelled)
-                    && let Some(sender) = completion.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
-                {
-                    let _ = sender.send(std::time::Instant::now());
+            let mut flush_attempt = (!flushed_observations.is_empty()).then(|| FlushAttemptObservation {
+                frames: &flushed_observations,
+                id: uuid::Uuid::now_v7(),
+                socket_generation,
+                started_at: None,
+                returned: None,
+                reported: false,
+            });
+            let flush_result = writer_operation(&shutdown_token, async {
+                if let Some(attempt) = &mut flush_attempt {
+                    attempt.started_at = Some(std::time::Instant::now());
                 }
+                let result = websocket_writer.flush().await;
+                if let Some(attempt) = &mut flush_attempt {
+                    attempt.returned = Some((
+                        std::time::Instant::now(),
+                        result.as_ref().err().map(websocket_error_class),
+                    ));
+                }
+                result
+            }).await;
+            // Preserve the existing cancellation check before any journal
+            // writes. An actual flush return can still be observed in this race.
+            let cancelled = flush_result.is_ok() && shutdown_token.is_cancelled();
+            if let Some(attempt) = flush_attempt {
+                attempt.finish(&flush_result);
+            }
+            flush_result?;
+            if cancelled { return Ok(()); }
+            for completion in completions {
+                completion.complete_flushed(std::time::Instant::now());
             }
             if heartbeat_due {
                 writer_operation(&shutdown_token, websocket_writer.send(tungstenite::Message::Ping(Vec::new().into()))).await?;

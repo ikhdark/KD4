@@ -41,6 +41,9 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::tool_failure::ToolDispatchState;
+use codex_protocol::tool_failure::ToolFailure;
+use codex_protocol::tool_failure::ToolFailureCode;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashSet;
@@ -392,7 +395,23 @@ async fn handle_spawn_agent(
                     ("role", typed_role_metric),
                 ],
             );
-            return Err(collab_spawn_error(error));
+            let capacity_refused = matches!(&error, CodexErr::AgentLimitReached { .. });
+            let error = match collab_spawn_error(error) {
+                FunctionCallError::RespondToModel(message) if capacity_refused => {
+                    // Reservation can perform residency housekeeping, but it
+                    // precedes assignment admission. Fresh admission after a
+                    // capacity change cannot repeat a previously admitted child.
+                    let mut failure = ToolFailure::new(ToolFailureCode::Failed, message)
+                        .with_completed_execution();
+                    failure.dispatch_state = Some(ToolDispatchState::NotAdmitted);
+                    failure.safe_next_actions = vec![
+                        "No assignment or child was admitted. Continue independent work or wait for a real capacity change before requesting fresh admission; existing checks still apply.".to_string(),
+                    ];
+                    FunctionCallError::structured(failure)
+                }
+                other => other,
+            };
+            return Err(error);
         }
     };
     let mut typed_reservation_metric = TypedSpawnReservationMetric::new(

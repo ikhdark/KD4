@@ -55,8 +55,36 @@ clock. These are observations, not task acceptance or achievable savings.
 
 Native inventories retain their limits and explicit dropped/saturation counts.
 Ordinary timing, canonical/rendered output measurements and physical retry
-telemetry remain separate. Sampling checkpoints do not repeat terminal-only
-output inventories or certify a completed dependency graph.
+telemetry remain separate. A result-bound Responses retry source identifies
+the physical attempt that returned the triggering result. The optional
+retry-decision fields `source_dispatch: "transport_entered"` and
+`source_acceptance: "response_created"` record only positive facts. Entry is
+after local transport admission, not a completed socket write. Acceptance
+requires a WebSocket `response.created` with a valid nested response ID
+admitted by that stream's response lifecycle; a metadata-only frame, HTTP
+status, warmup or retry action does not qualify. HTTP acceptance, legacy
+source attribution, and missing evidence leave the respective fields absent,
+not false. These are source facts copied unchanged from the planned row to
+its terminal row. Fallback may execute on HTTP after a WebSocket setup failure
+with no source; its execution IDs and route describe the destination, never
+source acceptance. Internal HTTP retries match the completed lower retry
+ordinal; pre-entry failures and WebSocket handshakes have no sampling transport
+source. Proven-unsent entries can still identify their own transport failures
+without counting as provider usage. Sampling checkpoints do not repeat
+terminal-only output inventories or certify a completed dependency graph.
+
+For a matched retry capture, compare the same reconnectable WebSocket close
+after a valid creation with the close after metadata only. The former has
+both source fields; the latter has only entry. A creation-shaped frame with
+only a top-level ID is not proof of acceptance. Join each plan and terminal
+row on clock and decision ID, and compare its source attempt to the stream
+that produced the failure, not the next attempt. An HTTP 503 after entry
+has only source dispatch; a pre-entry WebSocket setup failure or fallback
+has neither. Proven-unsent connection recovery jitters the cancellable wait around its
+nominal 500 ms-to-15 s exponential schedule. The nominal state, total deadline,
+provider-directed `Retry-After`, and separate WebSocket fallback cooldown are
+unchanged. Cancellation during backoff can leave an unexecuted terminal
+row without erasing the plan's source facts.
 
 ## Controlled capture labels
 
@@ -128,6 +156,17 @@ envelope construction, not remote sandbox work. Opaque socket transfer and
 network delay remain unavailable without authoritative transport evidence;
 provider compute/queue/reasoning timing still requires provider evidence.
 
+Terminal diagnostics use the same opt-in journal and process clock:
+`terminal_state_complete` brackets only the terminal snapshot's inner
+state completion, with a flag for cached results. The start/end pairs for
+`terminal_rollout_append` and `terminal_rollout_barrier` distinguish ordered
+append acknowledgment from stable-storage acknowledgment; an abandoned span
+does not establish cancellation of a queued write. These pairs are absent on
+paths without terminal storage. The listener's `terminal_queue_pause` span
+brackets its pause call; owner return is not proof a queue changed. Join an
+interrupt's `cancel_ack_ready` to `bounded_response` using the connection and
+request IDs on the same clock; those rows are not a client receipt.
+
 Connectors can emit `codex_http_client::TransportIntervalObservation` through
 `observe_transport_interval`, or retain `current_transport_interval_observer()`
 when moving request-owned I/O to another task. The existing request telemetry
@@ -172,9 +211,37 @@ ordering; it grants no thread access and never changes runtime execution.
 claims separate from server-verified delivery and in-process native paint tokens.
 Real frontend integration is required; transport flush is not paint.
 
+The app-server catalog records opt-in `hooks_list_*` spans in the runtime
+journal. Group by the opaque operation ID and join each finish to its exact
+start event; per-directory starts carry the original zero-based request index
+(the server-default directory is index 0 when no directories are supplied).
+Separate phases cover auth, configuration, workspace plugin policy, plugin
+loading when allowed by both gates, and hook discovery. The discovery wait
+includes blocking dispatch/join; the nested discovery span records the work
+inside that task. Different directory indices can overlap. Configuration
+includes cache and single-flight lookup; the workspace outcome is the effective
+decision, not evidence of a network fetch instead of cache, a local default or
+fail-open. No paths, wire request IDs, authentication data or hook content are
+recorded. An assembled result does not attest client receipt.
+
+Local stdio ingress uses an exact allowlist: `thread/list`, `thread/read`,
+`thread/resume`, `thread/turns/list`, `thread/items/list`, `thread/queue/list`,
+`thread/queue/add`, `thread/metadata/update`, `turn/start`, `config/read` and
+`fs/getMetadata`. With journaling enabled, `local_rpc_received` records the
+canonical method, server connection ID, versioned SHA-256 of the JSON wire
+request ID, and an opaque `local:` operation ID for joining the applicable
+admission, queue and handler events. These RPC observations do not log raw
+wire IDs, request parameters, response bodies, or raw error messages.
+`thread/items/list` can also emit the inline response-owner span;
+`thread/queue/add` success sends its response from the queue owner instead.
+A server boundary does not attest peer receipt or UI consumption.
+Other local methods and non-stdio local transports do not enter this allowlist;
+the independently owned remote-control observations are unchanged.
+
 Remote-control requests additionally emit `mobile_rpc_received` and bounded
 `mobile_rpc_admission`, `mobile_rpc_handler`, `mobile_file_read` and
-`mobile_rpc_response` spans in the same opt-in journal. An opaque occurrence
+`mobile_rpc_response` spans in the same opt-in journal. Opt-in remote `thread/resume` component spans use the mobile lane and the same
+operation ID; local stdio retains its own `thread_resume_*` spans. An opaque occurrence
 links ingress, dispatch, file reads and response attempts without recording wire
 request IDs, paths, file contents, credentials or raw error messages. File reads
 retain byte counts, OS/error-kind codes, limit/revision failures and filesystem
@@ -191,6 +258,30 @@ idle expiry, outbound stop, transport retirement, or initialize-forward failure)
 KDR exposes these under `mobile.owner_events`. This journal boundary survives
 missing terminal SQLite log rows; it records the server's retirement decision,
 not the initiating phone/network cause or successful close-event forwarding.
+
+### Mobile backend admission
+
+`mobile_backend_admission` (schema 1) is an opt-in app-server startup receipt,
+recorded before remote-control work starts. Join it by journal PID and unique
+`clock_id`, not by PID or wall time alone. `monotonic_before_ns` and
+`monotonic_after_ns` bracket the `unix_ns` sample in that clock domain. It does
+not replace the existing transport's `mobile_backend_epoch` or Desktop receipt.
+
+`executable_sha256` is the process build hash, not publication metadata. A
+`pinned_running_image` hash is bound to the Linux running image; a
+`current_executable_path_snapshot` is best effort and must be matched against
+an independently pinned stable executable for exact build attribution. A null
+hash means unavailable. `startup_policy_sha256` identifies only the
+`app_server_startup_policy.v1` projection of the resolved startup: transport
+kind, startup mode and enforced remote-control policy, runtime source and plugin
+choices, analytics default resolution, validation, residency, approval,
+permission/network categories, login-shell policy, web search, and sorted
+code-defined feature keys. No layer text, paths, provider/endpoint strings,
+filesystem rules, credentials or other free-form values enter the digest. Equal
+hashes do not attest equal full configurations or later runtime overrides. If
+startup fell back after a configuration error, `startup_config_resolved` is
+false and the projection hash is null. This is not proof of phone activity,
+remote-control admission after authentication, or archive completeness.
 
 The editable sibling Codex-Fork supplies opt-in transcript receipt/application
 observations through the existing privileged host connection. Initialization

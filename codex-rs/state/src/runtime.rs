@@ -185,10 +185,11 @@ impl StateRuntime {
         telemetry_override: Option<DbTelemetryHandle>,
         register_job_runner: bool,
     ) -> anyhow::Result<Arc<Self>> {
+        let owners = recovery::lock_runtime_initialization(&codex_home).await?;
         // The owned task retains exclusion through pool cleanup even if its
         // caller stops waiting during a migration.
         tokio::spawn(async move {
-            let _owners = recovery::lock_runtime_initialization(&codex_home).await?;
+            let _owners = owners;
             Self::init_inner(codex_home, default_provider, telemetry_override, register_job_runner).await
         })
         .await?
@@ -200,12 +201,13 @@ impl StateRuntime {
         database_path: PathBuf,
         default_provider: String,
     ) -> anyhow::Result<Vec<RuntimeDbBackup>> {
+        let home = database_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("database has no parent"))?
+            .to_path_buf();
+        let owners = recovery::lock_runtime_initialization(&home).await?;
         tokio::spawn(async move {
-            let home = database_path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("database has no parent"))?
-                .to_path_buf();
-            let _owners = recovery::lock_runtime_initialization(&home).await?;
+            let _owners = owners;
             let mut backups = Vec::new();
             let mut attempted = BTreeSet::new();
             loop {

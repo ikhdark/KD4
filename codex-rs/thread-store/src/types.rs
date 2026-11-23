@@ -11,6 +11,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::DiagnosticOrigins;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::RolloutItem;
@@ -157,6 +158,9 @@ pub struct StoredThreadHistory {
     pub thread_id: ThreadId,
     /// Persisted rollout items in replay order.
     pub items: Vec<RolloutItem>,
+    /// Exact persisted origins for eligible diagnostics (keys are item indices).
+    #[serde(default, skip_serializing_if = "DiagnosticOrigins::is_empty")]
+    pub diagnostic_origins: DiagnosticOrigins,
 }
 
 /// Parameters for reading a thread summary and optionally its replay history.

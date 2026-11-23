@@ -2,6 +2,7 @@ use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
+use crate::request_processors::normalize_thread_turns_status;
 use crate::request_processors::populate_thread_turns_from_history;
 use crate::request_processors::thread_from_stored_thread;
 use crate::request_processors::thread_settings_from_core_snapshot;
@@ -77,6 +78,7 @@ use codex_app_server_protocol_types::TurnTiming;
 use codex_app_server_protocol_types::WarningNotification;
 use codex_app_server_protocol_projection::item_event_to_server_notification;
 use codex_core::CodexThread;
+use codex_protocol::protocol::AgentStatus;
 use codex_core::ThreadManager;
 use codex_protocol::ThreadId;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
@@ -995,12 +997,20 @@ pub(crate) async fn apply_bespoke_event_handling(
                 // This immutable view is coherent now. Projection and transport
                 // backpressure must not hold up other thread-list consumers.
                 drop(thread_list_state_guard);
+                // Core rejects rollback with an active turn, but admits newer
+                // work once the durable commit releases its task-start permit.
+                let live_turn_id = if matches!(conversation.agent_status().await, AgentStatus::Running) {
+                    conversation.active_turn_id().await
+                } else {
+                    None
+                };
                 let response = match thread_rollback_response_from_stored_thread(
                     stored_thread,
                     conversation.session_configured().session_id.to_string(),
                     fallback_model_provider.as_str(),
                     &fallback_cwd,
                     loaded_status,
+                    live_turn_id.as_deref(),
                 ) {
                     Ok(response) => response,
                     Err(err) => {
@@ -1418,6 +1428,7 @@ fn thread_rollback_response_from_stored_thread(
     fallback_model_provider: &str,
     fallback_cwd: &AbsolutePathBuf,
     loaded_status: ThreadStatus,
+    live_turn_id: Option<&str>,
 ) -> std::result::Result<ThreadRollbackResponse, String> {
     let thread_id = stored_thread.thread_id;
     let (mut thread, history) =
@@ -1430,6 +1441,7 @@ fn thread_rollback_response_from_stored_thread(
     };
     populate_thread_turns_from_history(&mut thread, &history.items, /*active_turn*/ None)
         .map_err(|error| format!("rollback completed, but its history view is unavailable; do not repeat the rollback: {error}"))?;
+    normalize_thread_turns_status(&mut thread.turns, live_turn_id);
     thread.status = loaded_status;
     Ok(ThreadRollbackResponse { thread })
 }

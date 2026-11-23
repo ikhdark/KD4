@@ -69,6 +69,20 @@ pub enum RetryRoute {
     Websocket,
 }
 
+/// The result-bound source entered its physical transport. Not a socket-write receipt.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrySourceDispatch {
+    TransportEntered,
+}
+
+/// Positive provider acceptance tied to the same physical source stream.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrySourceAcceptance {
+    ResponseCreated,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RetryDecision {
     schema_version: u16,
@@ -82,6 +96,10 @@ pub struct RetryDecision {
     generation_index: Option<u32>,
     source_sampling_request_id: Option<String>,
     source_physical_attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_dispatch: Option<RetrySourceDispatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_acceptance: Option<RetrySourceAcceptance>,
     executed_sampling_request_id: Option<String>,
     executed_physical_attempt_id: Option<String>,
     executed_route: Option<RetryRoute>,
@@ -117,6 +135,13 @@ pub struct RetryDecisionLedger {
     dropped_decisions: u64,
 }
 
+pub struct RetrySource {
+    pub sampling_request_id: String,
+    pub physical_attempt_id: String,
+    pub dispatch: Option<RetrySourceDispatch>,
+    pub acceptance: Option<RetrySourceAcceptance>,
+}
+
 pub struct RetryPlan<'a> {
     pub generation_index: Option<u32>,
     pub clock_id: &'static str,
@@ -124,7 +149,7 @@ pub struct RetryPlan<'a> {
     pub http_status: Option<u16>,
     pub stream_failure: Option<RetryStreamFailure>,
     pub action: RetryAction,
-    pub source: Option<(&'a str, &'a str)>,
+    pub source: Option<&'a RetrySource>,
     /// None means the account/network recovery deadline is not a scheduled sleep.
     pub backoff_ns: Option<u128>,
 }
@@ -174,8 +199,10 @@ impl RetryDecisionLedger {
             stream_failure: plan.stream_failure,
             action: plan.action,
             generation_index: plan.generation_index,
-            source_sampling_request_id: plan.source.map(|source| source.0.to_owned()),
-            source_physical_attempt_id: plan.source.map(|source| source.1.to_owned()),
+            source_sampling_request_id: plan.source.map(|source| source.sampling_request_id.clone()),
+            source_physical_attempt_id: plan.source.map(|source| source.physical_attempt_id.clone()),
+            source_dispatch: plan.source.and_then(|source| source.dispatch),
+            source_acceptance: plan.source.and_then(|source| source.acceptance),
             executed_sampling_request_id: None,
             executed_physical_attempt_id: None,
             executed_route: None,

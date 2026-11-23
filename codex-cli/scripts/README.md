@@ -44,5 +44,10 @@ a prehydrated canonical vendor tree. Use the root staging helper for a matching
 set of CLI, native, and SDK tarballs, or pass both `--cli-tarball` and
 `--native-tarball` when packing an SDK against an already staged local set.
 An SDK pack with no local pair still resolves its dependencies normally.
+`--pack-output` runs the smoke install before returning the tarball. For a
+no-install diagnostic of the launcher or a prehydrated native package, stage
+with `build_npm_package.py --staging-dir` **without** `--pack-output`, then run
+`npm pack --ignore-scripts` in that staged directory. Do not use a startup
+hook to suppress installation. This route does not qualify smoke behavior.
 For CLI installation, follow the
 [local install instructions](../README.npm.md).

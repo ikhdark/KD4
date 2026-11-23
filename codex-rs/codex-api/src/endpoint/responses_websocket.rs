@@ -1201,6 +1201,26 @@ fn map_wrapped_websocket_error_event(
     }))
 }
 
+// Provider observations also support a top-level response_id for metadata.
+// Only a nested ID establishes ownership in the response lifecycle. Check the
+// creation frame's shape without re-decoding any other frame or altering policy.
+fn has_created_response_id(payload: &str, expected_id: &str) -> bool {
+    #[derive(Deserialize)]
+    struct CreatedFrame<'a> {
+        #[serde(borrow)]
+        response: CreatedResponse<'a>,
+    }
+
+    #[derive(Deserialize)]
+    struct CreatedResponse<'a> {
+        #[serde(borrow)]
+        id: std::borrow::Cow<'a, str>,
+    }
+
+    serde_json::from_str::<CreatedFrame<'_>>(payload)
+        .is_ok_and(|frame| frame.response.id.as_ref() == expected_id)
+}
+
 async fn run_websocket_response_stream(
     ws_stream: &mut WsStream,
     tx_event: ResponseEventSender<ApiError>,
@@ -1259,6 +1279,14 @@ async fn run_websocket_response_stream(
                     map_wrapped_websocket_error_event(wrapped_error, text.to_string())
                 }, |observation| {
                     if let Some(t) = telemetry.as_ref() {
+                        // The interpreter invokes this callback for creation only
+                        // after lifecycle validation, before any queue send.
+                        if observation.phase == "created"
+                            && let Some(id) = observation.response_id.as_deref()
+                            && has_created_response_id(&text, id)
+                        {
+                            t.on_response_created();
+                        }
                         t.on_provider_observation(observation);
                     }
                 }) {

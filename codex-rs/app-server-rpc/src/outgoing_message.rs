@@ -147,6 +147,9 @@ impl RequestContext {
 
 #[derive(Debug)]
 pub struct OutgoingWriteReceipt {
+    /// Transport delivery boundary, not client receipt. Remote control normally
+    /// reports a local flush, with relay acknowledgment as a fallback if the
+    /// socket writer exits before settling an acknowledged frame.
     pub writer: oneshot::Sender<Instant>,
     pub filtered: Option<oneshot::Sender<()>>,
 }

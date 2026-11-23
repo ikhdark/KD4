@@ -75,8 +75,8 @@ pub(super) async fn read_thread_with_payload_versions(
                 // object remains authoritative for every persisted metadata field.
                 thread.preview = preview;
             }
-            if let Some(items) = preloaded_history {
-                thread.history = Some(StoredThreadHistory { thread_id, items });
+            if let Some(history) = preloaded_history {
+                thread.history = Some(history);
             }
             return Ok(thread);
         }
@@ -169,26 +169,23 @@ async fn read_thread_from_resolved_rollout(
 async fn load_history_items_for_thread_with_versions(
     path: &std::path::Path,
     thread_id: codex_protocol::ThreadId,
-    payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
-) -> std::io::Result<Option<Vec<codex_protocol::protocol::RolloutItem>>> {
-    if let Some(versions) = payload_versions {
+    mut payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
+) -> std::io::Result<Option<StoredThreadHistory>> {
+    if let Some(versions) = payload_versions.as_deref_mut() {
         *versions = None;
-        if codex_rollout::try_existing_rollout_path(path).await?.is_none() {
-            return Ok(None);
-        }
-        let (items, loaded_thread_id, _, observed) =
-            RolloutRecorder::load_rollout_items_with_payload_versions(path).await?;
-        if loaded_thread_id != Some(thread_id) {
-            return Ok(None);
-        }
-        *versions = Some(observed);
-        return Ok(Some(items));
     }
     if codex_rollout::try_existing_rollout_path(path).await?.is_none() {
         return Ok(None);
     }
-    let (items, loaded_thread_id, _) = RolloutRecorder::load_rollout_items(path).await?;
-    Ok((loaded_thread_id == Some(thread_id)).then_some(items))
+    let (items, loaded_thread_id, _, observed, diagnostic_origins) =
+        RolloutRecorder::load_rollout_items_with_origins(path, payload_versions.is_some()).await?;
+    if loaded_thread_id != Some(thread_id) {
+        return Ok(None);
+    }
+    if let Some(versions) = payload_versions {
+        *versions = Some(observed);
+    }
+    Ok(Some(StoredThreadHistory { thread_id, items, diagnostic_origins }))
 }
 
 pub(super) async fn read_thread_by_rollout_path(
@@ -322,7 +319,7 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
-    let items = load_history_items_for_thread_with_versions(&path, thread_id, payload_versions)
+    let history = load_history_items_for_thread_with_versions(&path, thread_id, payload_versions)
         .await
         .map_err(|error| ThreadStoreError::Internal {
             message: format!("failed to load thread history {} for {thread_id}: {error}", path.display()),
@@ -333,7 +330,7 @@ async fn attach_history_if_requested(
                 path.display()
             ),
         })?;
-    thread.history = Some(StoredThreadHistory { thread_id, items });
+    thread.history = Some(history);
     Ok(())
 }
 

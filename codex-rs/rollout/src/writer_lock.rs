@@ -6,7 +6,8 @@
 //! must be fully stopped before an upgraded executable writes the same home.
 //! A new marker, an idle-turn scan, or a momentarily free physical lock cannot
 //! prevent an unmodified old process from publishing later. Such mixed-version
-//! mutation is unsupported; payload collection remains deferred for this reason.
+//! mutation is unsupported. Home-authoritative payload collection requires an
+//! explicit cutover to upgraded writers; otherwise final objects are retained.
 use std::fs::File;
 use std::io;
 use std::path::Path;

@@ -75,6 +75,27 @@ so legal repairs remain supported. A failed effective build retires that
 candidate, allowing a subsequent load to fetch a corrected bundle without an
 invalid disk-cache TTL or a permanently memoized successful download.
 
+### Managed marketplace host rules
+
+When `marketplaces.restrict_to_allowed_sources = true`, an entry in
+`marketplaces.allowed_sources` with `source = "host_pattern"` matches only
+the Git source's hostname (not its port, path, or ref). The `host_pattern`
+value is one of:
+
+- `repo.example`: one exact hostname, not its subdomains. Literal hostnames
+  are case-insensitive and accept Unicode or ASCII (Punycode) spelling.
+- `*.repo.example`: one or more complete subdomain labels, excluding
+  `repo.example` itself. The suffix uses the same case and IDN normalization.
+  A final DNS root dot is significant in both literal and wildcard rules.
+- `regex:<expression>`: an explicit Rust regex over the lowercase ASCII
+  hostname. Unanchored expressions intentionally match substrings. Use
+  anchors and escaped dots when a regex must match the entire hostname.
+
+To migrate a legacy regex, either replace it with the intended literal or
+subdomain rule, or prefix it with `regex:` to opt into regex matching. Review
+each plain hostname separately: it no longer admits subdomains without an
+explicit wildcard. Invalid active allowlist rules fail closed.
+
 ## Typical usage
 
 Most callers want the effective config plus metadata:

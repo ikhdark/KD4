@@ -2,6 +2,7 @@ mod answer_delivery;
 mod assistant_stream;
 mod generation_budget;
 mod request_scaffold;
+pub(crate) mod terminal_read_delivery;
 mod tool_surface;
 
 pub(super) use answer_delivery::NoProseAuthorization;
@@ -1415,7 +1416,12 @@ pub(crate) fn run_turn<'a>(
                         // Gate ordinary completion before answer-only repair or effectful hooks.
                         // Terminal budgets, user Stop, and sealed receipts keep their authority.
                         if allows_ordinary_final_reconciliation() {
-                            let retry = match turn_execution.decide_obligation_stop() {
+                            let user_intent_epoch = sess.input_queue.incorporated_user_intent_epoch();
+                            let retry = match turn_execution.decide_obligation_stop(
+                                turn_context.as_ref(),
+                                settled_state.mutation_revision,
+                                user_intent_epoch,
+                            ) {
                                 ObligationStoppingDecision::Allow => None,
                                 ObligationStoppingDecision::Continue(text) => {
                                     if let Some(plan) = turn_execution.unresolved_plan() {
@@ -1423,7 +1429,7 @@ pub(crate) fn run_turn<'a>(
                                             sess.as_ref(),
                                             turn_context.as_ref(),
                                             plan,
-                                            sess.input_queue.incorporated_user_intent_epoch(),
+                                            user_intent_epoch,
                                         ).await;
                                     }
                                     Some(text)
@@ -1707,9 +1713,9 @@ pub(crate) fn run_turn<'a>(
                                     )
                                 };
                                 // Parsing is CPU work bounded by its own deadline.
-                                let analysis_paths = changed_existing
+                                let unavailable = changed_existing
                                     .iter()
-                                    .map(|(path, ..)| path.clone())
+                                    .map(|(path, ..)| (path.clone(), "analysis_worker_unavailable"))
                                     .collect();
                                 let mut changed_tests = tokio::task::spawn_blocking(move || {
                                     changed_existing_tests(changed_existing)
@@ -1717,7 +1723,7 @@ pub(crate) fn run_turn<'a>(
                                 .await
                                 .unwrap_or_else(|_| ExistingTestChanges {
                                     changed: Vec::new(),
-                                    incomplete: analysis_paths,
+                                    incomplete: unavailable,
                                 });
                                 changed_tests.incomplete.sort();
                                 changed_tests.incomplete.dedup();
@@ -2274,7 +2280,7 @@ fn conventional_test_path(path: &str) -> bool {
 #[derive(Default)]
 struct ExistingTestChanges {
     changed: Vec<String>,
-    incomplete: Vec<String>,
+    incomplete: Vec<(String, &'static str)>,
 }
 
 fn changed_existing_tests(files: Vec<(String, String, Option<String>)>) -> ExistingTestChanges {
@@ -2289,9 +2295,9 @@ fn changed_existing_tests(files: Vec<(String, String, Option<String>)>) -> Exist
             conventional,
             deadline,
         ) {
-            Some(true) => result.changed.push(path),
-            Some(false) => {}
-            None => {
+            Ok(true) => result.changed.push(path),
+            Ok(false) => {}
+            Err(gap) => {
                 // A failed/unsupported outline is not evidence of unchanged
                 // tests. Keep the conventional-file fallback and expose its
                 // uncertainty separately, without blaming an unproven edit.
@@ -2299,7 +2305,7 @@ fn changed_existing_tests(files: Vec<(String, String, Option<String>)>) -> Exist
                     result.changed.push(path.clone());
                 }
                 if conventional || path.ends_with(".rs") || path.ends_with(".py") {
-                    result.incomplete.push(path);
+                    result.incomplete.push((path, gap.label()));
                 }
             }
         }
@@ -2336,10 +2342,17 @@ fn changed_tests_advisory(paths: &[String]) -> Option<String> {
     })
 }
 
-fn incomplete_test_evidence_advisory(paths: &[String]) -> Option<String> {
-    (!paths.is_empty()).then(|| format!(
-        "Existing-test evidence could not be fully assessed (incomplete analysis or uncertain before/after attribution): {}. Do not treat this as proof that tests were unchanged or attribute uncertain edits to this turn.",
-        serde_json::to_string(paths).expect("path inventory is JSON serializable")
+fn incomplete_test_evidence_advisory(paths: &[(String, &'static str)]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut by_reason = std::collections::BTreeMap::<_, Vec<&str>>::new();
+    for (path, reason) in paths {
+        by_reason.entry(*reason).or_default().push(path.as_str());
+    }
+    Some(format!(
+        "Existing-test evidence could not be fully assessed; paths by analysis gap: {}. Do not treat this as proof that tests were unchanged or attribute uncertain edits to this turn.",
+        serde_json::to_string(&by_reason).expect("path inventory is JSON serializable")
     ))
 }
 
@@ -3081,6 +3094,7 @@ enum PendingTurnPlanBuild {
 #[derive(Default)]
 struct SamplingAttemptProgress {
     accepted_output: bool,
+    retry_source: Option<codex_model_client::client_common::ResponseAttemptIdentity>,
 }
 
 impl SamplingAttemptProgress {
@@ -4946,9 +4960,10 @@ impl Drop for RetirementAttemptObservation<'_> {
 
 /// Retires consumed tool results to their recovery pins; read_tool_output
 /// still recovers their exact bytes. Returns true when that alone brings the
-/// context under its automatic-compaction limit, so the LLM summary is
-/// unnecessary. An insufficient candidate is left for summarization; if new
-/// history arrives during publication, valid pins remain and compaction follows.
+/// context under both its automatic-compaction and physical window limits,
+/// so the LLM summary is unnecessary. An insufficient candidate is left for
+/// summarization; if new history arrives during publication, valid pins remain
+/// and compaction follows.
 ///
 /// `projected_pressure` is the next prompt's absolute projection when the
 /// caller triggered on it instead of on live usage. Retirement must clear the
@@ -4989,66 +5004,106 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         observation.outcome = "no_limit";
         return false;
     };
-    // Aim well below the limit so the next compaction is not one request away.
+    // Aim well below the soft limit, but also select enough to put the same
+    // live or projected total strictly below the physical window.
     let target = limit.saturating_mul(2) / 3;
-    let Ok(excess) = u64::try_from(status.auto_compact_scope_tokens.saturating_sub(target)) else {
-        observation.outcome = "below_target";
-        return false;
-    };
+    let soft_reclaim = u64::try_from(status.auto_compact_scope_tokens.saturating_sub(target))
+        .unwrap_or(0);
+    let hard_reclaim = status
+        .full_context_window_limit
+        .filter(|full| pressure_tokens >= *full)
+        .map_or(0, |full| pressure_tokens.abs_diff(full).saturating_add(1));
+    let excess = soft_reclaim.max(hard_reclaim);
     if excess == 0 {
         observation.outcome = "below_target";
         return false;
     }
-    let mut candidate = sess.clone_history().await;
-    let (call_ids, _, decisions) = candidate.pressure_retirement_decision(kept_generations, excess);
+    let candidate = sess.clone_history().await;
+    let (mut call_ids, _, decisions) = candidate.pressure_retirement_decision(kept_generations, excess);
     observation.output_decisions = decisions;
     observation.selected_outputs = call_ids.len();
     if call_ids.is_empty() {
         observation.outcome = "no_eligible_outputs";
         return false;
     }
-    let checkpoint = crate::tool_history::pressure_retirement_checkpoint(
-        &call_ids,
-        crate::tool_history::PressureRetirementTrigger::ContextLimit,
-        {
-            observation.supporting_state = serde_json::json!({"target_tokens":target, "excess_tokens":excess});
-            observation.checkpoint_evidence()
-        },
-    );
-    let Some(before) = candidate.estimate_token_count(&turn_context.model_info.input_modalities, turn_context.base_instructions.as_ref()) else {
+    observation.supporting_state = serde_json::json!({"target_tokens":target, "excess_tokens":excess});
+    let checkpoint_for = |ids: &[String], obs: &RetirementAttemptObservation<'_>| {
+        crate::tool_history::pressure_retirement_checkpoint(
+            ids,
+            crate::tool_history::PressureRetirementTrigger::ContextLimit,
+            obs.checkpoint_evidence(),
+        )
+    };
+    let mut checkpoint = checkpoint_for(&call_ids, &observation);
+    let modalities = &turn_context.model_info.input_modalities;
+    let instructions = turn_context.base_instructions.as_ref();
+    let Some(before) = candidate.estimate_token_count(modalities, instructions) else {
         observation.outcome = "estimate_unavailable";
         return false;
     };
-    candidate.record_items(
-        std::iter::once(&checkpoint),
-        turn_context.model_info.truncation_policy.into(),
-    );
-    let Some(after) = candidate.estimate_token_count(&turn_context.model_info.input_modalities, turn_context.base_instructions.as_ref()) else {
+    let prepare = |checkpoint: &ResponseItem| {
+        let mut rewritten = candidate.clone();
+        rewritten.record_items(
+            std::iter::once(checkpoint),
+            turn_context.model_info.truncation_policy.into(),
+        );
+        let tokens = rewritten.estimate_token_count(modalities, instructions)?;
+        Some((rewritten, tokens))
+    };
+    let Some((baseline_rewrite, after)) = prepare(&checkpoint) else {
         observation.outcome = "estimate_unavailable";
         return false;
     };
-    // Size the actual pin rewrite AND its checkpoint with sampling's estimator.
-    // Apply the same calibration to each side, retaining the caller's pending
-    // input/scaffold pressure rather than substituting live history pressure.
-    let saved = sess
-        .calibrated_prompt_tokens(turn_context, before)
-        .await
+    // Score the actual pin-and-checkpoint projection with the existing
+    // calibrated estimator and both of the triggering pressure limits.
+    let calibrated_before = sess.calibrated_prompt_tokens(turn_context, before).await;
+    let mut saved = calibrated_before
         .saturating_sub(sess.calibrated_prompt_tokens(turn_context, after).await);
     observation.estimate_available = true;
     observation.estimated_saved_tokens = saved;
-    // Check the physical window against the same total the caller triggered on.
-    // `active_context_tokens` stays live even under a projection, so using it
-    // here would clear a projected prompt that still overflows.
-    let full_window_tokens = projected_pressure.map_or(status.active_context_tokens, |pressure| {
-        pressure.total_tokens
-    });
-    let fits = status.auto_compact_scope_tokens.saturating_sub(saved) < limit
-        && status
-            .full_context_window_limit
-            .is_none_or(|full| full_window_tokens.saturating_sub(saved) < full);
-    if saved <= 0 || !fits {
+    let fits = |saved: i64| {
+        saved > 0 && status.auto_compact_scope_tokens.saturating_sub(saved) < limit
+            && status.full_context_window_limit
+                .is_none_or(|full| pressure_tokens.saturating_sub(saved) < full)
+    };
+    if !fits(saved) {
         observation.outcome = "insufficient_reclaim";
         return false;
+    }
+    // Exactly one trial, only on live routine total-scope soft relief. No
+    // publication, context discount or budget effect before choosing.
+    if projected_pressure.is_none()
+        && hard_reclaim == 0
+        && kept_generations == CONTEXT_PRESSURE_KEPT_GENERATIONS
+        && matches!(turn_context.config.model_auto_compact_token_limit_scope, AutoCompactTokenLimitScope::Total)
+    {
+        let (ids, estimate, decisions) =
+            candidate.pressure_retirement_later_cut(kept_generations, excess, &call_ids[0]);
+        if !ids.is_empty() && ids.len() <= call_ids.len() && estimate >= excess {
+            let baseline_decisions = std::mem::replace(&mut observation.output_decisions, decisions);
+            observation.selected_outputs = ids.len();
+            let trial = checkpoint_for(&ids, &observation);
+            let mut preferred = false;
+            if let Some((rewritten, after_trial)) = prepare(&trial) {
+                let trial_saved = calibrated_before.saturating_sub(
+                    sess.calibrated_prompt_tokens(turn_context, after_trial).await,
+                );
+                if fits(trial_saved)
+                    && candidate.shared_retirement_sampling_prefix_items(&rewritten, modalities)
+                        > candidate.shared_retirement_sampling_prefix_items(&baseline_rewrite, modalities)
+                {
+                    checkpoint = trial;
+                    call_ids = ids;
+                    saved = trial_saved;
+                    observation.estimated_saved_tokens = saved;
+                    preferred = true;
+                }
+            }
+            if !preferred {
+                observation.output_decisions = baseline_decisions;
+                observation.selected_outputs = call_ids.len();
+            }
+        }
     }
     if let Err(error) = sess
         .record_conversation_items(turn_context, &[checkpoint])
@@ -5084,7 +5139,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         >= limit
         || status
             .full_context_window_limit
-            .is_some_and(|full| full_window_tokens.saturating_sub(committed_saved) >= full)
+            .is_some_and(|full| pressure_tokens.saturating_sub(committed_saved) >= full)
     {
         observation.outcome = "committed_pressure_exceeded";
         return false;
@@ -5301,6 +5356,7 @@ fn run_auto_compact<'a>(
                 reason,
                 phase,
                 /*emit_error_event*/ false,
+                /*run_pre_compact_hook*/ !remote_compaction,
                 &mut recovery_wait,
                 cancellation_token,
             )
@@ -5346,6 +5402,7 @@ fn run_auto_compact<'a>(
                         reason,
                         phase,
                         /*emit_error_event*/ false,
+                        /*run_pre_compact_hook*/ false,
                         &mut recovery_wait,
                         cancellation_token,
                     )
@@ -5650,6 +5707,7 @@ fn run_sampling_request<'a>(
                 model = %turn_context.model_info.slug))
             .await;
             drop(request_owner);
+            retry_state.set_failed_sampling_source(attempt_progress.retry_source.take());
             let dispatch_after = turn_context.turn_timing_state.latest_model_dispatch_identity();
             let mcp_auth_scope_changed =
                 matches!(&attempt_result, Err(CodexErr::McpAuthScopeChanged));
@@ -6503,7 +6561,7 @@ fn unique_read_output<'a>(input: &'a [ResponseItem], id: &str) -> Option<(usize,
     found
 }
 
-fn project_provider_read_offers(prompt: &Prompt, offers: &[&ProviderReadOffer]) -> Prompt {
+fn project_provider_read_outputs(prompt: &Prompt, replacements: &[(&str, &str, &str)]) -> Prompt {
     use codex_protocol::models::FunctionCallOutputBody;
     let inputs = [
         &prompt.input, &prompt.stable_context_fallback_input,
@@ -6515,13 +6573,13 @@ fn project_provider_read_offers(prompt: &Prompt, offers: &[&ProviderReadOffer]) 
             projected[i] = Arc::clone(&projected[j]);
             continue;
         }
-        for entry in offers {
-            if let Some((index, text)) = unique_read_output(input, &entry.call_id)
-                && text == entry.full
+        for &(call_id, original, replacement) in replacements {
+            if let Some((index, text)) = unique_read_output(input, call_id)
+                && text == original
                 && let ResponseItem::FunctionCallOutput { output, .. } =
                     &mut Arc::make_mut(&mut projected[i])[index]
             {
-                output.body = FunctionCallOutputBody::Text(entry.offer.clone());
+                output.body = FunctionCallOutputBody::Text(replacement.to_owned());
             }
         }
     }
@@ -6532,6 +6590,13 @@ fn project_provider_read_offers(prompt: &Prompt, offers: &[&ProviderReadOffer]) 
     ] = projected;
     result.digests.history = None;
     result
+}
+
+fn project_provider_read_offers(prompt: &Prompt, offers: &[&ProviderReadOffer]) -> Prompt {
+    let replacements = offers.iter().map(|entry| {
+        (entry.call_id.as_str(), entry.full.as_str(), entry.offer.as_str())
+    }).collect::<Vec<_>>();
+    project_provider_read_outputs(prompt, &replacements)
 }
 
 async fn choose_provider_read_prompt(
@@ -6616,6 +6681,7 @@ async fn admit_prepared_prompt(
     turn: &TurnContext,
     prompt: &Prompt,
     computed_admission: Option<PreparedPromptAdmission>,
+    terminal_read_projection: bool,
 ) -> CodexResult<()> {
     let image_count = crate::image_preparation::image_input_count(&prompt.input);
     if image_count != 0 && !turn.model_info.input_modalities
@@ -6633,7 +6699,7 @@ async fn admit_prepared_prompt(
     if !admission.fits {
         // The turn relieves this projection instead of treating the refusal as
         // a provider overflow.
-        let requires_compaction = prompt.tool_calls_disabled
+        let requires_compaction = terminal_read_projection || (prompt.tool_calls_disabled
             && turn.extension_data.get::<ProviderReadOffers>().is_some_and(|offers| {
                 [
                     &prompt.input,
@@ -6643,7 +6709,7 @@ async fn admit_prepared_prompt(
                 ]
                 .into_iter()
                 .any(|input| offers.applies_to(input))
-            });
+            }));
         turn.extension_data.insert(AdmissionRefusedProjection {
             pressure: admission.local,
             requires_compaction,
@@ -6789,10 +6855,43 @@ fn try_run_sampling_request<'a>(
             }
             return Err(CodexErr::TurnAborted);
         }
-        let (read_prompt, computed_admission) =
-            choose_provider_read_prompt(&sess, &turn_context, prompt).await;
+        let (read_prompt, computed_admission, terminal_read_projection) = if prompt.tool_calls_disabled {
+            let projection = tokio::select! {
+                biased;
+                () = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+                result = terminal_read_delivery::project(&sess, &turn_context, prompt) => result,
+            };
+            match projection {
+                Ok(Some(mut projected)) => {
+                    let mut admission = prepared_prompt_admission(&sess, &turn_context, &projected).await;
+                    if !admission.fits {
+                        // Preserve the normal cached schema prefix when it fits. On
+                        // this recovery-only fallback the catalog is inert: make
+                        // room for the required data, then admit the actual prompt.
+                        projected.tools = Arc::new(crate::client_common::ToolSchemaArtifact::default());
+                        projected.digests.tools = None;
+                        admission = prepared_prompt_admission(&sess, &turn_context, &projected).await;
+                    }
+                    (Some(projected), Some(admission), true)
+                }
+                Ok(None) => (None, None, false),
+                Err(terminal_read_delivery::RecoveryUnavailable) => {
+                    let admission = prepared_prompt_admission(&sess, &turn_context, prompt).await;
+                    turn_context.extension_data.insert(AdmissionRefusedProjection {
+                        pressure: admission.local,
+                        requires_compaction: true,
+                    });
+                    return Err(CodexErr::ContextWindowExceeded);
+                }
+            }
+        } else {
+            let (projected, admission) = choose_provider_read_prompt(&sess, &turn_context, prompt).await;
+            (projected, admission, false)
+        };
         let prompt = read_prompt.as_ref().unwrap_or(prompt);
-        admit_prepared_prompt(&sess, &turn_context, prompt, computed_admission).await?;
+        admit_prepared_prompt(
+            &sess, &turn_context, prompt, computed_admission, terminal_read_projection,
+        ).await?;
         let request_effort = sess.request_reasoning_effort(&turn_context).await;
         let service_tier = service_tier_for_sampling(&sess, &turn_context).await;
         feedback_tags!(
@@ -7119,7 +7218,7 @@ fn try_run_sampling_request<'a>(
         let steering = sess.input_queue.wait_for_user_intent_change(authoring_epoch);
         tokio::pin!(steering);
         let mut was_steered = false;
-        let mut stream = {
+        let stream_open = {
             let request = Box::pin(client_session.stream_with_attempt_prepared(
                 prompt,
                 &turn_context.model_info,
@@ -7139,9 +7238,19 @@ fn try_run_sampling_request<'a>(
                     was_steered = true;
                     None
                 }
-                result = &mut request => Some(result??),
+                result = &mut request => Some(result?),
             }
         };
+        let mut stream = match stream_open {
+            Some(Ok(stream)) => Some(stream),
+            Some(Err(err)) => {
+                attempt_progress.retry_source = client_session.take_stream_retry_source();
+                return Err(err);
+            }
+            None => None,
+        };
+        let mut stream_retry_source = client_session.take_stream_retry_source();
+        let mut stream_failure_source = None;
         drop(model_request_timing_guard);
         let attempt_identity = stream
             .as_ref()
@@ -7254,6 +7363,7 @@ fn try_run_sampling_request<'a>(
                             break Err(accounting_error);
                         }
                     }
+                    stream_failure_source = stream_retry_source.take();
                     break Err(err.into_response_error());
                 }
                 None => {
@@ -7978,6 +8088,8 @@ fn try_run_sampling_request<'a>(
             }));
         }
 
+        // A later local failure returned above must not inherit this stream's source.
+        attempt_progress.retry_source = stream_failure_source;
         outcome
     })
 }

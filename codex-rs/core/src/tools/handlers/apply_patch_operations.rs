@@ -1,6 +1,7 @@
 //! Durable receipts owned by the dedicated patch handler. A pending record is
 //! deliberately not retryable: a lost observer is not evidence of no mutation.
 use crate::FunctionCallError;
+use crate::environment_selection::TurnEnvironmentSnapshot;
 use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -10,6 +11,40 @@ use std::path::{Path, PathBuf};
 
 const MAX_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
 const RECEIPT_STORAGE: &str = "owned-sha256-v1";
+// Disjoint from the process-scoped "<approval UUID>:<runtime>" owner IDs.
+const LOCAL_RECEIPT_OWNER: &str = "local-filesystem-v1";
+
+pub(super) struct Binding {
+    current: Value,
+    legacy_environments: Option<Vec<Value>>,
+}
+
+pub(super) fn binding(patch: String, snapshot: &TurnEnvironmentSnapshot) -> Binding {
+    let environments = &snapshot.turn_environments;
+    let mut scope = environments
+        .iter()
+        .map(|e| json!({"id": e.environment_id, "owner": e.owner_id(), "cwd": e.cwd()}))
+        .collect::<Vec<_>>();
+    // Only a fully known native-local scope can outlive its approval owners.
+    // Keep the exact sampled IDs, order and absolute cwd URIs. For remote,
+    // mixed or incomplete scopes, preserve the prior runtime-owner binding.
+    let durable_local = snapshot.starting.is_empty()
+        && !environments.is_empty()
+        && environments.iter().all(|e| {
+            !e.environment.is_remote() && e.runtime.is_none() && e.cwd().to_abs_path().is_ok()
+        });
+    let legacy_environments = durable_local.then(|| {
+        let legacy = scope.clone();
+        for environment in &mut scope {
+            environment["owner"] = json!(LOCAL_RECEIPT_OWNER);
+        }
+        legacy
+    });
+    Binding {
+        current: json!({"patch": patch, "environments": scope}),
+        legacy_environments,
+    }
+}
 
 pub(super) enum Admission {
     New(Operation),
@@ -108,7 +143,7 @@ pub(super) fn begin(
     home: &Path,
     thread: &str,
     id: &str,
-    binding: Value,
+    binding: Binding,
 ) -> Result<Admission, FunctionCallError> {
     // This namespace is scoped to the originating thread and Codex home. Never
     // derive a target path from model-controlled operation text.
@@ -140,7 +175,7 @@ pub(super) fn begin(
             .map_err(|e| unknown(format!("Cannot recover patch operation {id}: {e}")))?,
     };
     file.try_lock().map_err(|_| unknown(format!("Patch operation {id} is owned by a live mutation task. Recover this identity after its owner settles; do not submit another patch.")))?;
-    let expected = json!({"version":1, "operation_id":id, "binding":binding});
+    let mut expected = json!({"version":1, "operation_id":id, "binding":binding.current});
     if is_new {
         let mut bytes = serde_json::to_vec(&expected).map_err(|e| unknown(e.to_string()))?;
         // Leave room for a terminal record even when the patch text nearly
@@ -181,12 +216,15 @@ pub(super) fn begin(
                 "Patch operation {id} has an unreadable reservation: {e}"
             ))
         })?;
-    let matches = if original["version"] == 2 {
-        let expected = serde_json::to_vec(&expected).map_err(|e| unknown(e.to_string()))?;
-        original == hashed_reservation(id, &expected)
-    } else {
-        original == expected
-    };
+    let mut matches = reservation_matches(id, &original, &expected)?;
+    if !matches && let Some(legacy_environments) = binding.legacy_environments {
+        // No provenance conversion: a legacy ":local" suffix is also used
+        // when a remote runtime is absent, and a v2 digest hides the scope
+        // entirely. Match legacy records only against the full current
+        // ephemeral ownership identity, for both reservation formats.
+        expected["binding"]["environments"] = json!(legacy_environments);
+        matches = reservation_matches(id, &original, &expected)?;
+    }
     if !matches {
         return Err(FunctionCallError::structured(ToolFailure::no_effects(
             ToolFailureCode::InvalidInput,
@@ -211,6 +249,19 @@ pub(super) fn begin(
         return Err(receipt_identity_error());
     }
     Ok(Admission::Recovered(receipt))
+}
+
+fn reservation_matches(
+    id: &str,
+    original: &Value,
+    expected: &Value,
+) -> Result<bool, FunctionCallError> {
+    if original["version"] == 2 {
+        let expected = serde_json::to_vec(expected).map_err(|e| unknown(e.to_string()))?;
+        Ok(*original == hashed_reservation(id, &expected))
+    } else {
+        Ok(original == expected)
+    }
 }
 
 fn hashed_reservation(id: &str, serialized: &[u8]) -> Value {

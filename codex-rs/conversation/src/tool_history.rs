@@ -1899,6 +1899,18 @@ impl ToolHistoryState {
         target_tokens: u64,
         capture: bool,
     ) -> (Vec<String>, u64, serde_json::Value) {
+        self.pressure_retirement_decision_excluding(items, keep_generations, target_tokens, capture, None)
+    }
+
+    /// Evaluate one bounded later cut with the same eligibility checks.
+    pub(crate) fn pressure_retirement_decision_excluding(
+        &self,
+        items: &[ResponseItem],
+        keep_generations: usize,
+        target_tokens: u64,
+        capture: bool,
+        exclude: Option<&str>,
+    ) -> (Vec<String>, u64, serde_json::Value) {
         let reused = crate::tool_occurrence::reused_call_ids(items);
         let retired = items
             .iter()
@@ -1952,9 +1964,13 @@ impl ToolHistoryState {
                     else if sha256(output.as_bytes()) != candidate.derived.bounded_model_output_sha256 { "representation_changed" }
                     else if let Some((_, tokens)) = candidate.checkpoint_pin() {
                         pin_tokens = Some(tokens);
-                        saved = saved.saturating_add(candidate.derived.bounded_model_output_tokens.saturating_sub(tokens as u64));
-                        selected.push(call_id.to_string());
-                        "selected"
+                        if exclude == Some(call_id) {
+                            "before_candidate_cut"
+                        } else {
+                            saved = saved.saturating_add(candidate.derived.bounded_model_output_tokens.saturating_sub(tokens as u64));
+                            selected.push(call_id.to_string());
+                            "selected"
+                        }
                     } else { "no_smaller_recovery_pin" }
                 } else { "untracked_output" };
             if capture {
@@ -4004,7 +4020,7 @@ pub async fn classify_workspace_tool_call_at_admission(
                             .iter()
                             .any(|key| arguments.get(key).is_some_and(serde_json::Value::is_array))
                     {
-                        dependency_command(&arguments).map(|command| (command, None))
+                        dependency_command(&arguments).map(|(command, _)| (command, None))
                     } else {
                         dependency_shell_command(&arguments)
                     }
@@ -4062,7 +4078,7 @@ fn workspace_call_observes_from_arguments(
                     || path == crate::TURN_DIFF_LOCATOR
             });
     }
-    let Some(command) = dependency_command(arguments) else {
+    let Some((command, _)) = dependency_command(arguments) else {
         return true;
     };
     // An uncertain command can read repository files. Only a known writer
@@ -4168,10 +4184,11 @@ fn source_dependencies_from_arguments(
         *source_scope_complete = false;
         return cargo_test_dependencies(arguments, cwd);
     }
-    if let Some((command, shell_type)) = dependency_search_command(arguments) {
+    if let Some((command, shell_type, shell_string)) = dependency_search_command(arguments) {
         use codex_command_analysis::command_preflight::infer_direct_shell_type;
         use codex_command_analysis::command_preflight::rg_argv_commands;
         let shell_type = shell_type.or_else(|| infer_direct_shell_type(&command));
+        let may_expand = shell_string || shell_type.is_some();
         match rg_argv_commands(&command, shell_type) {
             Ok(commands) if !commands.is_empty() => {
                 // Reuse the already parsed argv for quoted paths and batches of
@@ -4184,18 +4201,23 @@ fn source_dependencies_from_arguments(
                 for index in 0..commands.len() {
                     // These parsers retain cmd expansions and bare POSIX word
                     // escapes rather than resolving them to literal paths.
-                    // A `$` word, or `%` when the shell is unknown, may be a
-                    // variable; joining it to cwd would record a path no
-                    // mutation can ever invalidate.
-                    if commands[index].iter().any(|arg| arg.contains('$') || match shell_type {
-                        None => arg.contains('%'),
-                        Some(codex_shell_command::shell_detect::ShellType::Cmd) => arg.contains(['%', '!']),
-                        Some(
-                            codex_shell_command::shell_detect::ShellType::Bash
-                            | codex_shell_command::shell_detect::ShellType::Zsh
-                            | codex_shell_command::shell_detect::ShellType::Sh,
-                        ) => arg.contains('\\'),
-                        _ => false,
+                    // Only a shell can expand these words. Direct argv has
+                    // already supplied literal arguments even if they contain
+                    // dollars or percent signs.
+                    if may_expand && commands[index].iter().any(|arg| {
+                        arg.contains('$')
+                            || match shell_type {
+                                None => arg.contains('%'),
+                                Some(codex_shell_command::shell_detect::ShellType::Cmd) => {
+                                    arg.contains(['%', '!'])
+                                }
+                                Some(
+                                    codex_shell_command::shell_detect::ShellType::Bash
+                                    | codex_shell_command::shell_detect::ShellType::Zsh
+                                    | codex_shell_command::shell_detect::ShellType::Sh,
+                                ) => arg.contains('\\'),
+                                _ => false,
+                            }
                     }) {
                         return BTreeSet::new();
                     }
@@ -4220,7 +4242,7 @@ fn source_dependencies_from_arguments(
             Ok(_) => {}
         }
     }
-    let Some(command) = dependency_command(arguments) else {
+    let Some((command, _)) = dependency_command(arguments) else {
         return BTreeSet::new();
     };
     dependencies_for_command(&command, cwd, source_scope_complete)
@@ -4767,7 +4789,8 @@ fn command_has_environment_overrides(arguments: &serde_json::Value) -> bool {
         .is_some_and(|env| env.as_object().is_none_or(|entries| !entries.is_empty()))
 }
 
-fn dependency_command(arguments: &serde_json::Value) -> Option<Vec<String>> {
+// The second field marks a shell string flattened by the plain-command fast path.
+fn dependency_command(arguments: &serde_json::Value) -> Option<(Vec<String>, bool)> {
     if let Some(program) = arguments.get("program").and_then(serde_json::Value::as_str) {
         let mut command = vec![program.to_string()];
         command.extend(
@@ -4778,7 +4801,7 @@ fn dependency_command(arguments: &serde_json::Value) -> Option<Vec<String>> {
                 .map(|value| value.as_str().map(str::to_string))
                 .collect::<Option<Vec<_>>>()?,
         );
-        return Some(command);
+        return Some((command, false));
     }
     for key in ["command", "cmd", "script_body"] {
         match arguments.get(key) {
@@ -4786,7 +4809,8 @@ fn dependency_command(arguments: &serde_json::Value) -> Option<Vec<String>> {
                 return values
                     .iter()
                     .map(|value| value.as_str().map(str::to_string))
-                    .collect();
+                    .collect::<Option<Vec<_>>>()
+                    .map(|command| (command, false));
             }
             Some(serde_json::Value::String(command))
                 if !command.chars().any(|ch| {
@@ -4796,7 +4820,10 @@ fn dependency_command(arguments: &serde_json::Value) -> Option<Vec<String>> {
                     )
                 }) =>
             {
-                return Some(command.split_whitespace().map(str::to_string).collect());
+                return Some((
+                    command.split_whitespace().map(str::to_string).collect(),
+                    true,
+                ));
             }
             _ => {}
         }
@@ -4806,11 +4833,11 @@ fn dependency_command(arguments: &serde_json::Value) -> Option<Vec<String>> {
 
 fn dependency_search_command(
     arguments: &serde_json::Value,
-) -> Option<(Vec<String>, Option<codex_shell_command::shell_detect::ShellType>)> {
-    if let Some(command) = dependency_command(arguments) {
-        return Some((command, None));
+) -> Option<(Vec<String>, Option<codex_shell_command::shell_detect::ShellType>, bool)> {
+    if let Some((command, shell_string)) = dependency_command(arguments) {
+        return Some((command, None, shell_string));
     }
-    dependency_shell_command(arguments)
+    dependency_shell_command(arguments).map(|(command, shell_type)| (command, shell_type, true))
 }
 
 fn dependency_shell_command(

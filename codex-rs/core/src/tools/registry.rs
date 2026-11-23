@@ -546,12 +546,29 @@ pub(crate) fn record_tool_result_measurement(
                 .is_some_and(|((offers, result), receipt)| {
                     result.provider_read_offer_eligible && !result.workspace_source_invalidated
                         && exact_read_offer(&result.response(), receipt).is_some_and(|(full, offer)| {
-                            offers.stage(ProviderReadOffer {
+                            let digest = sha2::Sha256::digest(full.as_bytes()).into();
+                            let staged = offers.stage(ProviderReadOffer {
                                 call_id: call_id.to_owned(), execution_id: execution_id.to_owned(),
                                 full, offer, receipt: receipt.clone(), history: history.clone(),
-                            })
+                            });
+                            if staged {
+                                turn.extension_data
+                                    .get_or_init(crate::session::turn::terminal_read_delivery::TerminalReadDelivery::default)
+                                    .remember_exact(call_id, digest);
+                            }
+                            staged
                         })
                 });
+        if name == "read_file"
+            && let Ok(result) = result
+            && result.provider_read_offer_eligible
+            && !result.workspace_source_invalidated
+            && signal.as_ref().is_some_and(|signal| signal["provider_terminal_read_eligible"] == true)
+        {
+            turn.extension_data
+                .get_or_init(crate::session::turn::terminal_read_delivery::TerminalReadDelivery::default)
+                .stage(&result.response());
+        }
         if !staged {
             timing.record_native_operation(execution_id, call_id,
                 if matches!(name, "read_file" | "read_tool_output") { "read" } else { "command" },
@@ -2529,11 +2546,12 @@ impl ToolRegistry {
                     }
                 }
                 result.install_model_projection(model_projection, rewritten_source_dependencies);
-                result.provider_read_offer_eligible = provider_visible
-                    && !hook_rewrote_input
-                    && !post_hook_ran
-                    && result.result.sampling_request_signal()
-                        .is_some_and(|signal| signal["provider_exact_read_offer_eligible"] == true);
+                if provider_visible && !hook_rewrote_input && !post_hook_ran
+                    && let Some(signal) = result.result.sampling_request_signal()
+                {
+                    result.provider_read_offer_eligible = signal["provider_exact_read_offer_eligible"] == true
+                        || signal["provider_terminal_read_eligible"] == true;
+                }
                 // Cancellation may win while projection or its bookkeeping is
                 // pending. Its owner publishes the aborted terminal outcome.
                 if dispatch_state.is_aborted() {

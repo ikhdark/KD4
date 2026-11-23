@@ -11,6 +11,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::DiagnosticOrigins;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 
@@ -168,8 +169,9 @@ fn fork_boundaries(items: &[RolloutItem]) -> ForkBoundaries {
 /// Filter owned history while repairing rollback counts for removed instructions.
 pub(crate) fn filter_rollout_preserving_rollbacks(
     items: Vec<RolloutItem>,
+    origins: &DiagnosticOrigins,
     keep: impl FnMut(&RolloutItem) -> bool,
-) -> Vec<RolloutItem> {
+) -> (Vec<RolloutItem>, DiagnosticOrigins) {
     let decisions = rollout_filter_decisions(&items, keep);
     // The owned source is consumed below. Retain only global diagnostics from
     // discarded records so rollback cannot erase evidence of source gaps.
@@ -184,23 +186,44 @@ pub(crate) fn filter_rollout_preserving_rollbacks(
         .cloned()
         .map(RolloutItem::ResponseItem)
         .collect::<Vec<_>>();
-    let retained = items.into_iter().zip(decisions)
-        .filter_map(|(item, decision)| apply_rollout_filter_decision(item, decision)).collect();
-    carry_source_integrity_notice(&notices, retained)
+    let mut retained = (Vec::new(), DiagnosticOrigins::new());
+    for (index, (item, decision)) in items.into_iter().zip(decisions).enumerate() {
+        if let Some(item) = apply_rollout_filter_decision(item, decision) {
+            push_selected_item(&mut retained, item, origins, index);
+        }
+    }
+    (carry_source_integrity_notice(&notices, retained.0), retained.1)
 }
 
 /// Borrow a shared parent until selection is known; clone retained payloads only.
 pub(crate) fn filter_borrowed_rollout_preserving_rollbacks(
     items: &[RolloutItem],
+    origins: &DiagnosticOrigins,
     keep: impl FnMut(&RolloutItem) -> bool,
     mut clone_retained: impl FnMut(&RolloutItem) -> RolloutItem,
-) -> Vec<RolloutItem> {
+) -> (Vec<RolloutItem>, DiagnosticOrigins) {
     let decisions = rollout_filter_decisions(items, keep);
-    let retained = items.iter().zip(decisions).filter_map(|(item, decision)| {
-        decision.0.then(|| clone_retained(item))
+    let mut retained = (Vec::new(), DiagnosticOrigins::new());
+    for (index, (item, decision)) in items.iter().zip(decisions).enumerate() {
+        if let Some(item) = decision.0.then(|| clone_retained(item))
             .and_then(|item| apply_rollout_filter_decision(item, decision))
-    }).collect();
-    carry_source_integrity_notice(items, retained)
+        {
+            push_selected_item(&mut retained, item, origins, index);
+        }
+    }
+    (carry_source_integrity_notice(items, retained.0), retained.1)
+}
+
+fn push_selected_item(
+    (items, retained_origins): &mut (Vec<RolloutItem>, DiagnosticOrigins),
+    item: RolloutItem,
+    origins: &DiagnosticOrigins,
+    source_index: usize,
+) {
+    if let Some(origin) = origins.get(&source_index) {
+        retained_origins.insert(items.len(), origin.clone());
+    }
+    items.push(item);
 }
 
 fn rollout_filter_decisions(
@@ -508,10 +531,11 @@ pub fn truncate_rollout_after_turn_id(
 /// checkpoint placed it.
 pub(crate) fn truncate_rollout_to_last_n_fork_turns(
     items: &[RolloutItem],
+    origins: &DiagnosticOrigins,
     n_from_end: usize,
-) -> CodexResult<Vec<RolloutItem>> {
+) -> CodexResult<(Vec<RolloutItem>, DiagnosticOrigins)> {
     if n_from_end == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), DiagnosticOrigins::new()));
     }
 
     let boundaries = fork_boundaries(items);
@@ -520,21 +544,20 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
         .get(boundaries.turns.len().saturating_sub(n_from_end))
         .copied()
     else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), DiagnosticOrigins::new()));
     };
-    let mut retained = Vec::with_capacity(items.len() - keep_idx);
+    let mut retained = (Vec::with_capacity(items.len() - keep_idx), DiagnosticOrigins::new());
     // A pre-input compaction belongs to the excluded history, even if planning
     // wrote it after TurnStarted. Keep the opening event, not that checkpoint.
-    retained.extend(
-        items[keep_idx..anchor]
-            .iter()
-            .filter(|item| !matches!(item, RolloutItem::Compacted(_)))
-            .cloned(),
-    );
-    let anchor_offset = retained.len();
-    retained.extend_from_slice(&items[anchor..]);
+    for (index, item) in items.iter().enumerate().skip(keep_idx) {
+        if index >= anchor || !matches!(item, RolloutItem::Compacted(_)) {
+            push_selected_item(&mut retained, item.clone(), origins, index);
+        }
+    }
+    let (mut retained, retained_origins) = retained;
+    let anchor_offset = retained.len() - (items.len() - anchor);
     if boundaries.checkpoints.last().is_none_or(|index| *index < anchor) {
-        return Ok(carry_source_integrity_notice(items, retained));
+        return Ok((carry_source_integrity_notice(items, retained), retained_origins));
     }
     let cannot_bound_checkpoint = || {
         CodexErr::InvalidRequest(
@@ -610,7 +633,7 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
             });
         }
     }
-    Ok(carry_source_integrity_notice(items, retained))
+    Ok((carry_source_integrity_notice(items, retained), retained_origins))
 }
 
 fn is_real_user_message_boundary(item: &ResponseItem) -> bool {

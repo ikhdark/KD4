@@ -571,12 +571,23 @@ impl AnalyticsReducer {
     }
 
     // Keep recent completed IDs as lightweight markers so late facts cannot
-    // recreate their payloads. The same FIFO bound also retires lost completions.
-    fn turn_state(&mut self, turn_id: &str) -> Option<&mut TurnState> {
+    // recreate their payloads. Retain the same FIFO horizon for all turn IDs.
+    async fn turn_state(
+        &mut self,
+        turn_id: &str,
+        out: &mut Vec<TrackEventRequest>,
+    ) -> Option<&mut TurnState> {
         if !self.turns.contains_key(turn_id) {
             if self.turns.len() >= MAX_PENDING_ANALYTICS_ITEMS
                 && let Some(oldest) = self.turn_order.pop_front()
             {
+                if self.turns.get(&oldest).is_some_and(|turn| turn.completed.is_some()) {
+                    // A terminal fact already accepted by the reducer must
+                    // get the drain fallback before its state is retired.
+                    // Leave metadata retirement to the normal ingest boundary:
+                    // the incoming fact has not attached its thread yet.
+                    self.emit_turn_event(&oldest, out, true).await;
+                }
                 self.turns.remove(&oldest);
                 self.clear_turn_items(&oldest);
             }
@@ -721,7 +732,7 @@ impl AnalyticsReducer {
                     )));
                 }
                 CustomAnalyticsFact::TurnCodexError(input) => {
-                    self.ingest_turn_codex_error(*input);
+                    self.ingest_turn_codex_error(*input, out).await;
                 }
                 CustomAnalyticsFact::SkillInvoked(input) => {
                     self.ingest_skill_invoked(input, out).await;
@@ -846,7 +857,7 @@ impl AnalyticsReducer {
         let turn_id = input.turn_id.clone();
         let thread_id = input.thread_id.clone();
         let num_input_images = input.num_input_images;
-        let Some(turn_state) = self.turn_state(&turn_id) else {
+        let Some(turn_state) = self.turn_state(&turn_id, out).await else {
             return;
         };
         turn_state.thread_id = Some(thread_id);
@@ -861,7 +872,7 @@ impl AnalyticsReducer {
         out: &mut Vec<TrackEventRequest>,
     ) {
         let turn_id = input.turn_id.clone();
-        let Some(turn_state) = self.turn_state(&turn_id) else {
+        let Some(turn_state) = self.turn_state(&turn_id, out).await else {
             return;
         };
         turn_state.thread_id = Some(input.thread_id);
@@ -879,7 +890,7 @@ impl AnalyticsReducer {
             profile,
             timing,
         } = input;
-        let Some(turn_state) = self.turn_state(&turn_id) else {
+        let Some(turn_state) = self.turn_state(&turn_id, out).await else {
             return;
         };
         turn_state.profile = Some(profile);
@@ -887,13 +898,17 @@ impl AnalyticsReducer {
         self.maybe_emit_turn_event(&turn_id, out).await;
     }
 
-    fn ingest_turn_codex_error(&mut self, input: TurnCodexErrorFact) {
+    async fn ingest_turn_codex_error(
+        &mut self,
+        input: TurnCodexErrorFact,
+        out: &mut Vec<TrackEventRequest>,
+    ) {
         let TurnCodexErrorFact {
             turn_id,
             thread_id,
             error,
         } = input;
-        let Some(turn_state) = self.turn_state(&turn_id) else {
+        let Some(turn_state) = self.turn_state(&turn_id, out).await else {
             return;
         };
         turn_state.thread_id.get_or_insert(thread_id);
@@ -1092,7 +1107,7 @@ impl AnalyticsReducer {
                 else {
                     return;
                 };
-                let Some(turn_state) = self.turn_state(&turn_id) else {
+                let Some(turn_state) = self.turn_state(&turn_id, out).await else {
                     return;
                 };
                 turn_state.connection_id = Some(connection_id);
@@ -1410,7 +1425,7 @@ impl AnalyticsReducer {
                 };
                 if self.tool_items_in_progress.len() >= MAX_PENDING_ANALYTICS_ITEMS
                     && !self.tool_items_in_progress.contains_key(&key)
-                    && let Some(turn) = self.turn_state(&key.turn_id)
+                    && let Some(turn) = self.turn_state(&key.turn_id, out).await
                 {
                     turn.tool_counts_incomplete = true;
                 }
@@ -1499,7 +1514,7 @@ impl AnalyticsReducer {
                 }
             }
             ServerNotification::TurnStarted(notification) => {
-                let Some(turn_state) = self.turn_state(&notification.turn.id) else {
+                let Some(turn_state) = self.turn_state(&notification.turn.id, out).await else {
                     return;
                 };
                 turn_state.thread_id = Some(notification.thread_id);
@@ -1510,7 +1525,7 @@ impl AnalyticsReducer {
                     .and_then(|started_at| u64::try_from(started_at).ok());
             }
             ServerNotification::TurnDiffUpdated(notification) => {
-                let Some(turn_state) = self.turn_state(&notification.turn_id) else {
+                let Some(turn_state) = self.turn_state(&notification.turn_id, out).await else {
                     return;
                 };
                 turn_state.thread_id = Some(notification.thread_id);
@@ -1550,7 +1565,7 @@ impl AnalyticsReducer {
                     key.turn_id == turn_id
                         && (!flushes_abandoned_tools || key.thread_id != thread_id)
                 });
-                let Some(turn_state) = self.turn_state(&turn_id) else {
+                let Some(turn_state) = self.turn_state(&turn_id, out).await else {
                     return;
                 };
                 turn_state.thread_id = Some(thread_id.clone());
@@ -1874,7 +1889,9 @@ impl AnalyticsReducer {
     }
 
     async fn maybe_emit_turn_event(&mut self, turn_id: &str, out: &mut Vec<TrackEventRequest>) {
-        self.emit_turn_event(turn_id, out, false).await;
+        if self.emit_turn_event(turn_id, out, false).await {
+            self.retire_closed_metadata();
+        }
     }
 
     pub(crate) async fn flush_completed_turns(&mut self, out: &mut Vec<TrackEventRequest>) {
@@ -1886,7 +1903,9 @@ impl AnalyticsReducer {
             .map(|(turn_id, _)| turn_id.clone())
             .collect::<Vec<_>>();
         for turn_id in pending {
-            self.emit_turn_event(&turn_id, out, true).await;
+            if self.emit_turn_event(&turn_id, out, true).await {
+                self.retire_closed_metadata();
+            }
         }
     }
 
@@ -1895,22 +1914,22 @@ impl AnalyticsReducer {
         turn_id: &str,
         out: &mut Vec<TrackEventRequest>,
         allow_incomplete: bool,
-    ) {
+    ) -> bool {
         let Some(turn_state) = self.turns.get(turn_id) else {
-            return;
+            return false;
         };
-        if turn_state.thread_id.is_none() || turn_state.completed.is_none() {
-            return;
+        if turn_state.completed.is_none() {
+            return false;
         }
         if !allow_incomplete
             && (turn_state.num_input_images.is_none()
                 || turn_state.resolved_config.is_none()
                 || turn_state.profile.is_none())
         {
-            return;
+            return false;
         }
         let Some(thread_id) = turn_state.thread_id.as_ref() else {
-            return;
+            return false;
         };
         let drop_site = AnalyticsDropSite::turn(thread_id, turn_id);
         let connection_id = turn_state.connection_id.or_else(|| {
@@ -1920,22 +1939,22 @@ impl AnalyticsReducer {
         });
         let Some(connection_id) = connection_id else {
             warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadConnection);
-            return;
+            return false;
         };
         let Some(connection_state) = self.connections.get(&connection_id) else {
             warn_missing_analytics_context(
                 &drop_site,
                 MissingAnalyticsContext::Connection { connection_id },
             );
-            return;
+            return false;
         };
         let Some(thread_state) = self.threads.get(drop_site.thread_id) else {
             warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadMetadata);
-            return;
+            return false;
         };
         let Some(thread_metadata) = thread_state.metadata.as_ref() else {
             warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadMetadata);
-            return;
+            return false;
         };
         let turn_event = TrackEventRequest::TurnEvent(Box::new(CodexTurnEventRequest {
             event_type: "codex_turn_event",
@@ -1962,7 +1981,7 @@ impl AnalyticsReducer {
                 ..TurnState::default()
             },
         );
-        self.retire_closed_metadata();
+        true
     }
 
     fn thread_connection_or_warn(

@@ -1199,6 +1199,7 @@ impl Session {
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
         initial_history: InitialHistory,
+        fork_origins: DiagnosticOrigins,
         session_source: SessionSource,
         skills_service: Arc<SkillsService>,
         plugins_manager: Arc<PluginsManager>,
@@ -2006,7 +2007,7 @@ impl Session {
             );
             let sess = Arc::new(Session {
                 thread_id,
-                _storage_ownership: std::sync::Mutex::new(Some(storage_ownership)),
+                _storage_ownership: std::sync::Mutex::new(Some(Arc::clone(&storage_ownership))),
                 installation_id,
                 tx_event: tx_event.clone(),
                 agent_status,
@@ -2069,6 +2070,20 @@ impl Session {
             // Dispatch the SessionConfiguredEvent first and then report any errors.
             // If resuming, include converted initial messages in the payload so UIs can render them immediately.
             let mut startup_rollout_facts = StartupRolloutFacts::reduce(&initial_history);
+            if let (Some(rollout), Some(rollout_path)) =
+                (sess.live_thread(), rollout_path.as_deref())
+            {
+                sess.input_queue
+                    .attach_mailbox_storage(
+                        config.codex_home.to_path_buf(),
+                        thread_id,
+                        &storage_ownership,
+                        rollout,
+                        !matches!(&initial_history, InitialHistory::Resumed(_)),
+                        rollout_path,
+                    )
+                    .await?;
+            }
             sess.input_queue
                 .seed_seen_mailbox_communication_ids_from_ids(std::mem::take(
                     &mut startup_rollout_facts.mailbox_communication_ids,
@@ -2183,7 +2198,7 @@ impl Session {
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
             Box::pin(
-                sess.record_initial_history_with_facts(initial_history, startup_rollout_facts),
+                sess.record_initial_history_with_facts(initial_history, startup_rollout_facts, fork_origins),
             )
             .await?;
             if config.completed_tool_history_projection

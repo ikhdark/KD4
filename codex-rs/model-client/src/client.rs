@@ -2215,6 +2215,8 @@ pub struct ModelClientSession {
     preconnect_failure_setup: Option<Arc<StdMutex<Option<WebsocketSetupFingerprint>>>>,
     failed_websocket_setup: Option<WebsocketSetupFingerprint>,
     dispatched_account: Option<crate::account_identity::AccountChangeIdentity>,
+    // This stream-open result only; never search older turn entries for a source.
+    stream_retry_source: Option<ResponseAttemptIdentity>,
     preconnect_failure_credit: bool,
     prepared_startup_websocket_attempt: Option<PreparedStartupWebsocketAttempt>,
     /// A receipt-bearing request invalidated provider inheritance. Subsequent
@@ -2801,6 +2803,7 @@ impl ModelClient {
             preconnect_failure_setup: None,
             failed_websocket_setup: None,
             dispatched_account: None,
+            stream_retry_source: None,
             preconnect_failure_credit: false,
             prepared_startup_websocket_attempt: None,
             tool_history_fail_open_pending: false,
@@ -2830,6 +2833,7 @@ impl ModelClient {
             preconnect_failure_setup: None,
             failed_websocket_setup: None,
             dispatched_account: None,
+            stream_retry_source: None,
             preconnect_failure_credit: false,
             prepared_startup_websocket_attempt: None,
             tool_history_fail_open_pending: false,
@@ -3566,6 +3570,12 @@ impl ModelClientSession {
 
     pub fn dispatched_account(&self) -> Option<&crate::account_identity::AccountChangeIdentity> {
         self.dispatched_account.as_ref()
+    }
+
+    /// Consume the identity associated with the immediately returned stream open.
+    /// For a stream error, the caller must bind this to that stream's result.
+    pub fn take_stream_retry_source(&mut self) -> Option<ResponseAttemptIdentity> {
+        self.stream_retry_source.take()
     }
 
     pub fn set_startup_timing(
@@ -4437,9 +4447,11 @@ impl ModelClientSession {
                     // An upgrade can be blocked even when ordinary HTTPS works. No prompt
                     // was sent; let HTTP report any actual authorization failure.
                     if let Some(timing) = &self.turn_timing {
-                        timing.record_retry_decision(
+                        timing.record_retry_decision_for_source(
+                            None,
                             codex_turn_timing::retries::RetryTrigger::Http,
                             Some(status.as_u16()),
+                            None,
                             codex_turn_timing::retries::RetryAction::FallbackHttp,
                             Some(Duration::ZERO),
                         );
@@ -4478,7 +4490,7 @@ impl ModelClientSession {
                             request_auth_snapshot.as_ref(),
                             session_telemetry,
                             &provider,
-                            self.turn_timing.as_ref(),
+                            self.turn_timing.as_deref().map(|timing| (timing, None)),
                         )
                         .await?,
                     );
@@ -4725,7 +4737,7 @@ impl ModelClientSession {
                             .and_then(|timing| timing.current_model_attempt_metadata()),
                     );
                     essential_attempt.turn_timing = self.turn_timing.clone();
-                    let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
+                    let request_telemetry = Self::build_streaming_telemetry(
                         &request_session_telemetry,
                         request_auth_context,
                         RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
@@ -4739,6 +4751,7 @@ impl ModelClientSession {
                             retry_index,
                             dispatched: AtomicBool::new(false),
                             highest_started_transport_attempt: StdMutex::new(None),
+                            completed_transport_result: StdMutex::new(None),
                             readiness: StdMutex::new(transport_readiness_guard),
                         },
                     );
@@ -4778,7 +4791,7 @@ impl ModelClientSession {
                     }
                     let client = ApiResponsesClient::new(transport, api_provider, client_setup.api_auth)
                         .with_ollama_summary_compat(self.client.state.provider.info().kind == codex_model_provider_info::ProviderKind::Ollama)
-                        .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+                        .with_telemetry(Some(request_telemetry.clone()), Some(request_telemetry.clone()));
                     let turn_timing = self.turn_timing.clone();
                     let serialization_timing_guard = self
                         .turn_timing
@@ -4812,6 +4825,8 @@ impl ModelClientSession {
                             }
                         })
                         .await;
+                    self.stream_retry_source =
+                        request_telemetry.completed_transport_source(None, stream_result.is_err());
                     if stream_result.is_ok() {
                         attempt_clock.mark_stream_established();
                     } else {
@@ -4961,6 +4976,8 @@ impl ModelClientSession {
                             if is_recoverable_authentication_failure(&unauthorized_transport) =>
                         {
                             finish_failed_model_attempt(&mut attempt, Vec::new());
+                            // A refresh failure or next loop's setup error is not this HTTP rejection.
+                            let source = self.stream_retry_source.take();
                             pending_retry = PendingUnauthorizedRetry::from_recovery(
                                 handle_unauthorized(
                                     unauthorized_transport,
@@ -4969,7 +4986,7 @@ impl ModelClientSession {
                                     request_auth_snapshot.as_ref(),
                                     session_telemetry,
                                     &self.client.state.provider,
-                                    self.turn_timing.as_ref(),
+                                    self.turn_timing.as_deref().map(|timing| (timing, source.as_ref())),
                                 )
                                 .await?,
                             );
@@ -5196,9 +5213,11 @@ impl ModelClientSession {
                     // Only a rejected handshake is replayable here, never a 403 from an
                     // established response stream or the subsequent HTTP request.
                     if let Some(timing) = &self.turn_timing {
-                        timing.record_retry_decision(
+                        timing.record_retry_decision_for_source(
+                            None,
                             codex_turn_timing::retries::RetryTrigger::Http,
                             Some(status.as_u16()),
+                            None,
                             codex_turn_timing::retries::RetryAction::FallbackHttp,
                             Some(Duration::ZERO),
                         );
@@ -5217,7 +5236,7 @@ impl ModelClientSession {
                             request_auth_snapshot.as_ref(),
                             session_telemetry,
                             &self.client.state.provider,
-                            self.turn_timing.as_ref(),
+                            self.turn_timing.as_deref().map(|timing| (timing, None)),
                         )
                         .await?,
                     );
@@ -5449,6 +5468,7 @@ impl ModelClientSession {
                             .clone()
                             .unwrap_or_else(new_sampling_request_id);
                         telemetry.websocket_response = Some((identity.clone(), clock.clone()));
+                        telemetry.websocket_response_timing = transport_timing.clone();
                         Arc::new(telemetry) as Arc<dyn WebsocketTelemetry>
                     });
             let startup_timing = self.startup_timing.clone();
@@ -5684,6 +5704,10 @@ impl ModelClientSession {
                     return Err(err);
                 }
             };
+            if !warmup {
+                // Bound to the returned stream; timing will require its send-entry callback.
+                self.stream_retry_source = attempt.as_ref().map(ModelAttemptState::response_identity);
+            }
             self.remember_verified_request_history(
                 &request,
                 prompt.stable_context_manifest.fingerprint(),
@@ -5714,7 +5738,7 @@ impl ModelClientSession {
         request_route_telemetry: RequestRouteTelemetry,
         auth_env_telemetry: AuthEnvTelemetry,
         model_request: ModelRequestTelemetryContext,
-    ) -> (Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>) {
+    ) -> Arc<ApiTelemetry> {
         let mut telemetry = ApiTelemetry::new(
             session_telemetry.clone(),
             auth_context,
@@ -5740,10 +5764,7 @@ impl ModelClientSession {
             "model transport identity"
         );
         telemetry.model_request = Some(model_request);
-        let telemetry = Arc::new(telemetry);
-        let request_telemetry: Arc<dyn RequestTelemetry> = telemetry.clone();
-        let sse_telemetry: Arc<dyn SseTelemetry> = telemetry;
-        (request_telemetry, sse_telemetry)
+        Arc::new(telemetry)
     }
 
     /// Builds telemetry for the Responses API WebSocket transport.
@@ -5908,6 +5929,7 @@ impl ModelClientSession {
             // A receipt is valid only for this immediate ordinary dispatch.
             self.preconnect_failure_credit = false;
             self.dispatched_account = None;
+            self.stream_retry_source = None;
             self.last_logical_request_counted = false;
             if turn_scoped && !self.client.responses_websocket_enabled() {
                 self.http_for_turn = true;
@@ -6764,16 +6786,18 @@ async fn handle_unauthorized(
     rejected_auth: Option<&CodexAuth>,
     session_telemetry: &SessionTelemetry,
     provider: &SharedModelProvider,
-    turn_timing: Option<&Arc<TurnTimingState>>,
+    retry_diagnostics: Option<(&TurnTimingState, Option<&ResponseAttemptIdentity>)>,
 ) -> Result<UnauthorizedRecoveryExecution> {
     let debug = extract_response_debug_context(&transport);
     if let Some(recovery) = auth_recovery
         && recovery.has_next()
     {
-        if let Some(timing) = turn_timing {
-            timing.record_retry_decision(
+        if let Some((timing, source)) = retry_diagnostics {
+            timing.record_retry_decision_for_source(
+                source,
                 codex_turn_timing::retries::RetryTrigger::Authentication,
                 match &transport { TransportError::Http { status, .. } => Some(status.as_u16()), _ => None },
+                None,
                 codex_turn_timing::retries::RetryAction::AuthRecovery,
                 None,
             );
@@ -6911,12 +6935,20 @@ struct ModelRequestTelemetryContext {
     // This watermark outlives capped diagnostic IDs, so duplicate callbacks
     // cannot re-register an evicted identity and inflate the additive total.
     highest_started_transport_attempt: StdMutex<Option<u64>>,
+    completed_transport_result: StdMutex<Option<HttpAttemptResult>>,
     readiness: StdMutex<Option<codex_turn_timing::TurnTimingGuard>>,
+}
+
+#[derive(Clone, Copy)]
+struct HttpAttemptResult {
+    ordinal: u64,
+    failed: bool,
 }
 
 struct ApiTelemetry {
     retry_backoff: StdMutex<Option<codex_turn_timing::TurnTimingGuard>>,
     websocket_response: Option<(ResponseAttemptIdentity, ModelAttemptClock)>,
+    websocket_response_timing: Option<std::sync::Weak<TurnTimingState>>,
     first_response_event: AtomicBool,
     model_request: Option<ModelRequestTelemetryContext>,
     session_telemetry: SessionTelemetry,
@@ -6928,6 +6960,24 @@ struct ApiTelemetry {
 }
 
 impl ApiTelemetry {
+    fn completed_transport_source(
+        &self,
+        expected_ordinal: Option<u64>,
+        failed: bool,
+    ) -> Option<ResponseAttemptIdentity> {
+        let context = self.model_request.as_ref()?;
+        let result = (*context.completed_transport_result.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        if expected_ordinal.is_some_and(|expected| expected != result.ordinal)
+            || failed != result.failed
+            || *context.highest_started_transport_attempt.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) != Some(result.ordinal)
+        {
+            return None;
+        }
+        self.physical_transport_identity(result.ordinal)
+    }
+
     fn physical_transport_identity(&self, attempt: u64) -> Option<ResponseAttemptIdentity> {
         let context = self.model_request.as_ref()?;
         Some(ResponseAttemptIdentity {
@@ -6956,6 +7006,7 @@ impl ApiTelemetry {
         Self {
             retry_backoff: StdMutex::new(None),
             websocket_response: None,
+            websocket_response_timing: None,
             first_response_event: AtomicBool::new(false),
             session_telemetry,
             auth_context,
@@ -6984,7 +7035,7 @@ impl RequestTelemetry for ApiTelemetry {
             "transport retry owner budget");
     }
 
-    fn on_retry_scheduled(&self, _attempt: u64, error: &TransportError, delay: Duration) {
+    fn on_retry_scheduled(&self, attempt: u64, error: &TransportError, delay: Duration) {
         use codex_turn_timing::retries::RetryAction;
         use codex_turn_timing::retries::RetryTrigger;
         if let Some(timing) = self.model_request.as_ref().and_then(|request| request.timing.as_ref()) {
@@ -7002,8 +7053,9 @@ impl RequestTelemetry for ApiTelemetry {
                     close_code: None,
                     reconnectable_close: false,
                 });
-            timing.record_retry_decision_with_stream_failure(
-                trigger, status, stream_failure, RetryAction::TransportRetry, Some(delay));
+            let source = self.completed_transport_source(Some(attempt), true);
+            timing.record_retry_decision_for_source(
+                source.as_ref(), trigger, status, stream_failure, RetryAction::TransportRetry, Some(delay));
             let guard = timing.begin_retry_backoff();
             let previous = self.retry_backoff.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner).replace(guard);
@@ -7090,7 +7142,7 @@ impl RequestTelemetry for ApiTelemetry {
     }
 
     fn on_request_cancelled(&self, attempt: u64, duration: Duration) {
-        self.on_request(
+        self.record_request_outcome(
             attempt,
             None,
             Some(&TransportError::Network("request cancelled".into())),
@@ -7182,6 +7234,27 @@ impl RequestTelemetry for ApiTelemetry {
     }
 
     fn on_request(
+        &self,
+        attempt: u64,
+        status: Option<HttpStatusCode>,
+        error: Option<&TransportError>,
+        duration: Duration,
+    ) {
+        if let Some(context) = &self.model_request {
+            // Unlike the send-entry callback, this fires even when auth fails.
+            // Publish the completed ordinal, not the most recent dispatch.
+            *context.completed_transport_result.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HttpAttemptResult {
+                    ordinal: attempt,
+                    failed: error.is_some(),
+                });
+        }
+        self.record_request_outcome(attempt, status, error, duration);
+    }
+}
+
+impl ApiTelemetry {
+    fn record_request_outcome(
         &self,
         attempt: u64,
         status: Option<HttpStatusCode>,
@@ -7340,6 +7413,18 @@ impl WebsocketTelemetry for ApiTelemetry {
             clock.mark_first_provider_event();
         }
     }
+
+    fn on_response_created(&self) {
+        if let Some((identity, _)) = &self.websocket_response
+            && let Some(timing) = self
+                .websocket_response_timing
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+        {
+            timing.record_retry_source_response_created(identity);
+        }
+    }
+
     fn logical_transport_id(&self) -> Option<&str> {
         Some(&self.logical_request_id)
     }

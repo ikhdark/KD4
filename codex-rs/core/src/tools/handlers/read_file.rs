@@ -1255,9 +1255,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 &invocation, if script_consumer { output.value() } else { &projected },
             ).await;
             let mut complete_obligation_read = false;
-            if let Some(evidence) = evidence {
-                let mut signal = crate::tools::context::semantic_evidence_sampling_signal(evidence);
+            let terminal_read_eligible = ordinary_snapshot && !successful && artifact_id.is_some()
+                && matches!(&invocation.source, ToolCallSource::Direct)
+                && advisory.is_none()
+                && crate::session::turn::terminal_read_delivery::is_clipped_selection(&projected);
+            if evidence.is_some() || terminal_read_eligible {
+                let mut signal = evidence.map(crate::tools::context::semantic_evidence_sampling_signal)
+                    .unwrap_or_else(|| json!({}));
                 if let Some(advisory) = advisory { signal["evidence_advisory"] = advisory; }
+                if terminal_read_eligible {
+                    signal["provider_terminal_read_eligible"] = json!(true);
+                }
                 if ordinary_snapshot && successful && artifact_id.is_some()
                     && matches!(&invocation.source, ToolCallSource::Direct)
                     && signal.get("evidence_advisory").is_none()

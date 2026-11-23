@@ -552,6 +552,13 @@ impl SessionState {
         self.active_connector_selection.clear();
     }
 
+    pub(crate) fn pending_compact_session_start_count(&self) -> usize {
+        self.pending_session_start_sources
+            .iter()
+            .filter(|source| matches!(source, codex_hooks::SessionStartSource::Compact))
+            .count()
+    }
+
     pub(crate) fn queue_pending_session_start_source(
         &mut self,
         value: codex_hooks::SessionStartSource,

@@ -804,7 +804,7 @@ impl RolloutLineReader {
 
     /// Reads the next JSONL record from the rollout.
     pub async fn next_line(&mut self) -> io::Result<Option<String>> {
-        match self.next_record(false).await? {
+        match self.next_record(false, None).await? {
             Some(HydratedRecord::Text(line)) => Ok(Some(line)),
             None => Ok(None),
             Some(HydratedRecord::Parsed(_)) => unreachable!("text-only rollout reader"),
@@ -814,6 +814,7 @@ impl RolloutLineReader {
     pub(crate) async fn next_record(
         &mut self,
         decode_value: bool,
+        timing: Option<&mut crate::payload_artifact::AppendPayloadTiming>,
     ) -> io::Result<Option<HydratedRecord>> {
         let line = match &mut self.inner {
             RolloutLineReaderInner::Plain(reader) => {
@@ -853,16 +854,27 @@ impl RolloutLineReader {
         let enroll = self.enroll_payloads;
         let capture_versions = self.payload_versions.is_some();
         let payload_sync_owner = enroll.then(|| crate::payload_artifact::PayloadSyncOwner::new(&path));
-        let (version, result) = tokio::task::spawn_blocking(move || {
+        let measure_payload = timing.is_some();
+        let (version, result, contribution) = tokio::task::spawn_blocking(move || {
             let version = capture_versions
                 .then(|| crate::payload_artifact::named_payload_version(&path, &line))
                 .flatten();
-            let result = crate::payload_artifact::hydrate_record(&path, line, enroll, decode_value);
+            let mut contribution = measure_payload.then(Default::default);
+            let result = crate::payload_artifact::hydrate_record(
+                &path,
+                line,
+                enroll,
+                decode_value,
+                contribution.as_mut(),
+            );
             drop(payload_sync_owner);
-            (version, result)
+            (version, result, contribution)
         })
         .await
         .map_err(io::Error::other)?;
+        if let (Some(timing), Some(contribution)) = (timing, contribution) {
+            timing.add(contribution);
+        }
         if let (Some(versions), Some(version)) = (&mut self.payload_versions, version) {
             // Retain the first pre-hydration observation for repeated references:
             // replacement during replay must invalidate this projection.
@@ -1391,6 +1403,11 @@ mod worker {
                 /*compressed_bytes*/ None,
             ));
         }
+        // A home-authoritative sweep must not race a representation rename.
+        let payload_dir = crate::payload_artifact::root(path);
+        let _collector = if payload_dir.parent().is_some_and(crate::home_retention_enabled) {
+            Some(crate::payload_artifact::lock_publication(path)?)
+        } else { None };
         let Some(_rollout_lock) = try_lock_rollout_for_compression(path)? else {
             return Ok(CompressionMeasurement::new(
                 CompressionOutcome::SkippedLocked,

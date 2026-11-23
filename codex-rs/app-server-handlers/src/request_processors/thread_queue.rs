@@ -1206,8 +1206,26 @@ impl ThreadQueueRequestProcessor {
         }
     }
 
-    pub(super) async fn pause(&self, id: ThreadId) {
-        if let Err(error) = self.pause_with_result(id).await {
+    pub(super) async fn pause(&self, id: ThreadId, turn_id: &str) {
+        use codex_protocol::timing::observations;
+
+        let observation = observations::enabled().then(|| {
+            observations::Span::start(
+                "terminal_queue_pause",
+                &id.to_string(),
+                turn_id,
+                turn_id,
+                serde_json::Value::Null,
+            )
+        });
+        let result = self.pause_with_result(id).await;
+        if let Some(observation) = observation {
+            observation.finish(
+                if result.is_ok() { "owner_returned" } else { "error" },
+                serde_json::Value::Null,
+            );
+        }
+        if let Err(error) = result {
             tracing::warn!(%id, error = %error.message, "failed to pause thread queue");
         }
     }

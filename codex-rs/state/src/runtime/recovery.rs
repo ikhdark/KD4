@@ -8,8 +8,10 @@
 use std::borrow::Cow;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const BACKUP_DIR_NAME: &str = "db-backups";
+const INITIALIZATION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// All initializers and quarantine operations acquire the same per-database
 /// owners in stable order. A deterministic application-owned cache namespace
@@ -20,7 +22,7 @@ pub(super) async fn lock_runtime_initialization(
     home: &Path,
 ) -> std::io::Result<Vec<std::fs::File>> {
     let home = home.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let paths = tokio::task::spawn_blocking(move || {
         let home = initialization_home_identity(&home)?;
         let parent = initialization_lock_directory(&home)?;
         std::fs::create_dir_all(&parent)?;
@@ -34,22 +36,37 @@ pub(super) async fn lock_runtime_initialization(
             })
             .collect::<std::io::Result<Vec<_>>>()?;
         paths.sort();
-        paths
-            .into_iter()
-            .map(|path| {
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(path)?;
-                file.lock()?;
-                Ok(file)
-            })
-            .collect()
+        Ok::<_, std::io::Error>(paths)
     })
     .await
-    .map_err(std::io::Error::other)?
+    .map_err(std::io::Error::other)??;
+
+    // Keep the contention wait in the caller's future, with no native blocking
+    // lock that would outlive cancellation or keep Tokio from shutting down.
+    let mut owners = Vec::with_capacity(paths.len());
+    for path in paths {
+        let file = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(INITIALIZATION_LOCK_RETRY_INTERVAL).await;
+                }
+                Err(std::fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        owners.push(file);
+    }
+    Ok(owners)
 }
 
 fn initialization_home_identity(home: &Path) -> std::io::Result<PathBuf> {
@@ -171,11 +188,13 @@ pub async fn backup_runtime_db_for_fresh_start(
     db_path: &Path,
 ) -> std::io::Result<Vec<RuntimeDbBackup>> {
     let path = db_path.to_path_buf();
+    let home = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("database has no parent"))?;
+    let owners = lock_runtime_initialization(home).await?;
     tokio::spawn(async move {
-        let home = path
-            .parent()
-            .ok_or_else(|| std::io::Error::other("database has no parent"))?;
-        let _owners = lock_runtime_initialization(home).await?;
+        // Once backup starts, keep the locks through the last filesystem move.
+        let _owners = owners;
         backup_runtime_db_owned(&path).await
     })
     .await

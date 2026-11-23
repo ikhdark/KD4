@@ -3,6 +3,7 @@ use super::*;
 use crate::context::ContextualUserFragment;
 use crate::context::TaskCapsuleFragment;
 use codex_extension_api::ExtensionDataInit;
+use codex_protocol::protocol::DiagnosticOrigins;
 use tracing::Instrument;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
@@ -1004,12 +1005,12 @@ impl AgentControl {
                 let stored_parent_thread_id = stored_thread.parent_thread_id;
                 let history = stored_thread
                     .history
-                    .ok_or(CodexErr::ThreadNotFound(thread_id))?
-                    .items;
+                    .ok_or(CodexErr::ThreadNotFound(thread_id))?;
                 let initial_history = InitialHistory::Resumed(ResumedHistory {
                     conversation_id: thread_id,
-                    history: Arc::new(history),
+                    history: Arc::new(history.items),
                     rollout_path: stored_thread.rollout_path,
+                    diagnostic_origins: history.diagnostic_origins,
                 });
                 (initial_history, stored_source, stored_parent_thread_id)
             }
@@ -1688,6 +1689,7 @@ impl AgentControl {
                 .fork_thread_with_source(
                     config.clone(),
                     InitialHistory::Forked(Vec::new()),
+                    DiagnosticOrigins::new(),
                     self.clone(),
                     session_source,
                     /*thread_source*/ Some(ThreadSource::Subagent),
@@ -1786,13 +1788,17 @@ impl AgentControl {
                 && !matches!(item, RolloutItem::ResponseItem(response_item)
                     if is_multi_agent_v2_usage_hint_message(response_item, &multi_agent_v2_usage_hint_texts_to_filter))
         };
-        let mut forked_rollout_items = match fork_mode {
+        let (mut forked_rollout_items, fork_origins) = match fork_mode {
             SpawnAgentForkMode::LastNTurns(last_n_turns) => {
-                let selected = truncate_rollout_to_last_n_fork_turns(&parent_history.items, *last_n_turns)?;
-                crate::thread_rollout_truncation::filter_rollout_preserving_rollbacks(selected, keep)
+                let (selected, origins) = truncate_rollout_to_last_n_fork_turns(
+                    &parent_history.items, &parent_history.diagnostic_origins, *last_n_turns,
+                )?;
+                crate::thread_rollout_truncation::filter_rollout_preserving_rollbacks(
+                    selected, &origins, keep,
+                )
             }
             _ => crate::thread_rollout_truncation::filter_borrowed_rollout_preserving_rollbacks(
-                &parent_history.items, keep,
+                &parent_history.items, &parent_history.diagnostic_origins, keep,
                 |item| clone_forked_rollout_item(item, &multi_agent_v2_usage_hint_texts_to_filter),
             ),
         };
@@ -1831,6 +1837,7 @@ impl AgentControl {
             .fork_thread_with_source(
                 config.clone(),
                 InitialHistory::Forked(forked_rollout_items),
+                fork_origins,
                 self.clone(),
                 session_source,
                 /*thread_source*/ Some(ThreadSource::Subagent),

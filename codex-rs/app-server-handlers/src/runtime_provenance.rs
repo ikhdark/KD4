@@ -10,17 +10,152 @@ use codex_app_server_protocol_types::DesktopStdioPeer;
 use codex_app_server_protocol_types::ServerPackageLayout;
 use codex_app_server_protocol_types::ServerRuntimeInfo;
 use codex_app_server_protocol_types::ServerRuntimeWarning;
+use codex_app_server_transport::AppServerTransport;
+use codex_app_server_transport::RemoteControlPolicy;
+use codex_app_server_transport::RemoteControlStartupMode;
+use codex_core::config::Config;
 use codex_install_context::CodexPackageLayout;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
 use codex_utils_absolute_path as path_utils;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::timing::observations;
+use codex_protocol::timing::process_monotonic_ns;
 use codex_utils_build_info::BuildInfo;
+use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 
 const LOCAL_PUBLISH_DIR_ENV: &str = "CODEX_LOCAL_PUBLISH_DIR";
 const LOCAL_CLI_PATH_ENV: &str = "CODEX_CLI_PATH";
 const ACTION_PUBLISH_LOCAL_CODEX: &str = "publishLocalCodex";
 const ACTION_RESTART_CODEX_DESKTOP: &str = "restartCodexDesktop";
+
+// Domain-separate the digest from other projections and bump this version if
+// the included facts or their canonical encoding change.
+const NATIVE_STARTUP_POLICY_SCHEMA: &str = "app_server_startup_policy.v1";
+
+pub struct NativeCaptureAdmission<'a> {
+    pub transport: &'a AppServerTransport,
+    pub remote_control_mode: RemoteControlStartupMode,
+    pub remote_control_policy: RemoteControlPolicy,
+    pub config_resolved: bool,
+    pub state_db_available: bool,
+    pub ignore_user_config: bool,
+    pub start_plugins: bool,
+    pub default_analytics_enabled: bool,
+}
+
+impl NativeCaptureAdmission<'_> {
+    fn startup_policy_sha256(&self, config: &Config) -> Option<String> {
+        if !self.config_resolved {
+            // Default config keeps non-strict startup repairable; it does not
+            // stand in for the effective config and requirements that failed.
+            return None;
+        }
+
+        let transport = match self.transport {
+            AppServerTransport::Stdio => "stdio",
+            AppServerTransport::UnixSocket { .. } => "unix_socket",
+            AppServerTransport::WebSocket { .. } => "websocket",
+            AppServerTransport::Off => "off",
+        };
+        let permission_kind = match config.permissions.permission_profile() {
+            PermissionProfile::Managed { .. } => "managed",
+            PermissionProfile::Disabled => "disabled",
+            PermissionProfile::External { .. } => "external",
+        };
+        let mut features: Vec<_> = config
+            .features
+            .enabled_features()
+            .into_iter()
+            .map(|feature| feature.key())
+            .collect();
+        features.sort_unstable();
+
+        // Only typed effective policy values and code-defined labels enter the
+        // digest. Never serialize a config layer, provider, permission profile,
+        // filesystem rules or other settings containing host/user-supplied text.
+        // The array fixes encoding order even if JSON map features change.
+        let projection = json!([
+            NATIVE_STARTUP_POLICY_SCHEMA,
+            transport,
+            format!("{:?}", self.remote_control_mode),
+            // The caller already enforced the merged allow_remote_control requirement.
+            format!("{:?}", self.remote_control_policy),
+            self.ignore_user_config,
+            self.start_plugins,
+            config.analytics_enabled.unwrap_or(self.default_analytics_enabled),
+            config.validation_mode,
+            config.enforce_residency.value().is_some(),
+            config.permissions.approval_policy.value(),
+            permission_kind,
+            config.permissions.network_sandbox_policy(),
+            config.permissions.allow_login_shell,
+            config.web_search_mode.value(),
+            features,
+        ]);
+        Some(hex::encode(Sha256::digest(projection.to_string())))
+    }
+}
+
+/// Record the app-server's actual resolved startup admission, independently of
+/// Desktop's client-triggered handshake receipt.
+pub async fn record_native_capture_admission(
+    config: &Config,
+    admission: NativeCaptureAdmission<'_>,
+    deadline: tokio::time::Instant,
+) {
+    if !observations::enabled() {
+        return;
+    }
+
+    // Reuse the process hash (not a publication/expected-path lookup). Do not
+    // perform executable I/O on an async worker or extend the startup budget.
+    let executable_sha256 = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(codex_utils_build_info::executable_sha256),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten();
+    let executable_hash_method = if cfg!(target_os = "linux") {
+        "pinned_running_image"
+    } else {
+        "current_executable_path_snapshot"
+    };
+
+    let startup_policy_sha256 = admission.startup_policy_sha256(config);
+    let monotonic_before_ns = u64::try_from(process_monotonic_ns()).ok();
+    let unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok());
+    let monotonic_after_ns = u64::try_from(process_monotonic_ns()).ok();
+    // The journal envelope supplies the producer PID and process-unique clock
+    // ID (also its capture epoch). The sample bridges that clock to UTC only.
+    let _ = observations::record(
+        "mobile_backend_admission",
+        "",
+        "",
+        "",
+        json!({
+            "admission_schema": 1,
+            "executable_sha256": executable_sha256,
+            "executable_hash_method": executable_hash_method,
+            "startup_policy_schema": NATIVE_STARTUP_POLICY_SCHEMA,
+            "startup_policy_sha256": startup_policy_sha256,
+            "startup_config_resolved": admission.config_resolved,
+            "state_db_available": admission.state_db_available,
+            "unix_ns": unix_ns,
+            "monotonic_before_ns": monotonic_before_ns,
+            "monotonic_after_ns": monotonic_after_ns,
+        }),
+    );
+}
+
 pub(crate) fn write_desktop_runtime_receipt(
     codex_home: &Path,
     client_name: &str,

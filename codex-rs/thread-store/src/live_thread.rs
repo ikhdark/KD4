@@ -6,10 +6,13 @@ use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::DiagnosticOrigins;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::DiagnosticOriginSource;
 use codex_rollout::RolloutPersistenceTelemetry;
+use codex_rollout::is_persisted_rollout_item_with_activity;
 use codex_rollout::is_rollout_activity_event;
 use codex_rollout::measure_and_filter_rollout_items_with_activity;
 use codex_rollout::persisted_rollout_items_with_activity;
@@ -318,14 +321,25 @@ impl LiveThread {
     /// Append history and apply its metadata. A metadata failure can occur after history
     /// was accepted; retry pending metadata with a barrier instead of replaying the batch.
     pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        self.append_items_with_durability(raw_items, true, false)
+        self.append_items_with_durability(raw_items, true, false, None)
             .await
     }
 
     /// Queue items in canonical order and defer rollout plus metadata durability to the next
     /// persist/flush/shutdown barrier.
     pub async fn append_items_ordered(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        self.append_items_with_durability(raw_items, false, false)
+        self.append_items_with_durability(raw_items, false, false, None)
+            .await
+    }
+
+    /// Copy inherited history through the same append owner. An empty sidecar
+    /// still denotes a copy: historical diagnostics of unknown origin stay unknown.
+    pub async fn append_copied_items_ordered(
+        &self,
+        raw_items: &[RolloutItem],
+        diagnostic_origins: DiagnosticOrigins,
+    ) -> ThreadStoreResult<()> {
+        self.append_items_with_durability(raw_items, false, false, Some(diagnostic_origins))
             .await
     }
 
@@ -335,7 +349,7 @@ impl LiveThread {
         if !is_rollout_activity_event(event) {
             return Ok(());
         }
-        self.append_items_with_durability(&[RolloutItem::EventMsg(event.clone())], false, true)
+        self.append_items_with_durability(&[RolloutItem::EventMsg(event.clone())], false, true, None)
             .await
     }
 
@@ -352,6 +366,7 @@ impl LiveThread {
         raw_items: &[RolloutItem],
         durable: bool,
         capture_activity: bool,
+        copied_origins: Option<DiagnosticOrigins>,
     ) -> ThreadStoreResult<()> {
         // Empty appends are intentionally ignored rather than represented as zero-sized batches.
         if raw_items.is_empty() {
@@ -377,6 +392,25 @@ impl LiveThread {
         if items.is_empty() {
             return Ok(());
         }
+        let origins = match copied_origins {
+            None => DiagnosticOriginSource::Fresh(self.thread_id),
+            Some(origins) if origins.is_empty() || items.len() == raw_items.len() => {
+                DiagnosticOriginSource::Copied(origins)
+            }
+            Some(mut origins) => {
+                let mut retained = DiagnosticOrigins::new();
+                let mut next = 0;
+                for (index, item) in raw_items.iter().enumerate() {
+                    if is_persisted_rollout_item_with_activity(item, self.history_mode, capture_activity) {
+                        if let Some(origin) = origins.remove(&index) {
+                            retained.insert(next, origin);
+                        }
+                        next += 1;
+                    }
+                }
+                DiagnosticOriginSource::Copied(retained)
+            }
+        };
         // Keep canonical submission, observation and metadata acknowledgement in one
         // per-thread critical section, shared with explicit updates and barriers.
         let mut metadata_sync = self.metadata_sync.lock().await;
@@ -401,7 +435,7 @@ impl LiveThread {
         metadata_sync.history_observation_uncertain = true;
         metadata_sync.append_ordering_uncertain = true;
         self.thread_store
-            .append_persisted_items_ordered(self.thread_id, items.as_slice())
+            .append_persisted_items_ordered_with_origins(self.thread_id, items.as_slice(), origins)
             .await?;
         metadata_sync.append_ordering_uncertain = false;
         // Commit measurements in canonical acceptance order, not arrival order.

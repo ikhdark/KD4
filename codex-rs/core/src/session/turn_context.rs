@@ -1408,9 +1408,9 @@ impl Session {
         }
     }
 
-    /// Context for an admitted regular turn start. Only this entry may bind a
-    /// child to its root's current validation turn; history-only, resume and
-    /// other internal contexts use the `new_default_turn*` entries.
+    /// Context for a regular turn start, retaining the exact root budget when
+    /// already in the same scope. A different scope needs selected startup
+    /// input and is resolved at task installation, not here.
     pub(crate) async fn new_turn_from_configuration(
         &self,
         sub_id: String,
@@ -1454,14 +1454,8 @@ impl Session {
         // Preview exists only to prepare the startup router/transport. Its
         // metadata state is discarded; the admitted turn owns fresh enrichment.
         let enrich_git_metadata = matches!(&multi_agent_runtime, TurnMultiAgentRuntime::ResolveAndStore);
-        // A child turn start binds to the turn its root is running now only in
-        // two cases. Already in that scope: take the root's exact budget, so a
-        // reattached child's fresh control handle cannot detach it. In an older
-        // scope: move only when a queued follow-up was sent under the current
-        // scope, by the root or an agent acting in it; timing alone never
-        // moves stale work. Historical attempts belong to the old scope and
-        // are never carried into the current root budget.
-        let mut session_configuration = session_configuration;
+        // A reattached child already in the current scope uses the root's
+        // exact budget even if it has a fresh control handle.
         let root_validation = if admitted_turn_start
             && session_configuration.session_source.is_non_root_agent()
             && let Some(captured) = session_configuration.validation_root_turn.as_ref()
@@ -1470,32 +1464,9 @@ impl Session {
                 .agent_control
                 .current_root_validation_context(captured)
                 .await
+                .filter(|current| &current.scope == captured)
         } else {
             None
-        };
-        let root_validation = match root_validation {
-            Some(current)
-                if session_configuration.validation_root_turn.as_ref() == Some(&current.scope) =>
-            {
-                Some(current)
-            }
-            Some(current)
-                if self
-                    .input_queue
-                    .pending_turn_start_validation_origins()
-                    .await
-                    .contains(&current.scope) =>
-            {
-                session_configuration.validation_root_turn = Some(current.scope.clone());
-                session_configuration.validation_mode = current.mode;
-                session_configuration.validation_attempts.clear();
-                let mut state = self.state.lock().await;
-                state.session_configuration.validation_root_turn = Some(current.scope.clone());
-                state.session_configuration.validation_mode = current.mode;
-                state.session_configuration.validation_attempts.clear();
-                Some(current)
-            }
-            _ => None,
         };
         let turn_environments = self.services.turn_environments.snapshot().await;
         let git_metadata_source = self
@@ -1655,6 +1626,51 @@ impl Session {
             turn_context.turn_metadata_state.spawn_git_enrichment_task();
         }
         turn_context
+    }
+
+    /// Resolve a different scope from the authenticated origin selected for this
+    /// reservation. Do not carry old attempts into the new root budget, or
+    /// publish anything to the session while startup is still taskless.
+    pub(crate) async fn rebind_selected_start_validation(
+        &self,
+        context: &mut Arc<TurnContext>,
+        origin: Option<&(String, String)>,
+    ) -> CodexResult<bool> {
+        let Some(origin) = origin.filter(|origin| *origin != &context.validation_root_turn) else {
+            return Ok(false);
+        };
+        let Some(current) = self
+            .services
+            .agent_control
+            .current_root_validation_context(&context.validation_root_turn)
+            .await
+            .filter(|current| &current.scope == origin)
+        else {
+            return Ok(false);
+        };
+        let context = Arc::get_mut(context).ok_or_else(|| {
+            CodexErr::Fatal("regular turn context was shared before task installation".into())
+        })?;
+        context.validation_root_turn = current.scope;
+        context.validation_mode = current.mode;
+        context.full_suite_budget = current.budget;
+        Arc::make_mut(&mut context.config).validation_mode = current.mode;
+        context.runtime_identity_cache = Default::default();
+        Ok(true)
+    }
+
+    /// Acquire the last lock in startup order. Dropping the returned commit
+    /// without applying it leaves session validation unchanged.
+    pub(crate) async fn lock_turn_start_validation(&self) -> impl FnOnce(&TurnContext) + '_ {
+        let mut state = self.state.lock().await;
+        move |context| {
+            let config = &mut state.session_configuration;
+            config.validation_root_turn = Some(context.validation_root_turn.clone());
+            if context.session_source.is_non_root_agent() {
+                config.validation_mode = context.validation_mode;
+            }
+            config.validation_attempts.clear();
+        }
     }
 
     pub(crate) async fn maybe_emit_service_tier_warning(

@@ -1183,6 +1183,41 @@ impl ContextManager {
         )
     }
 
+    /// Propose one later cut without changing the oldest-first default.
+    pub fn pressure_retirement_later_cut(
+        &self,
+        keep_generations: usize,
+        target_tokens: u64,
+        first_call: &str,
+    ) -> (Vec<String>, u64, serde_json::Value) {
+        self.tool_history.pressure_retirement_decision_excluding(
+            self.items.as_slice(), keep_generations, target_tokens, true, Some(first_call),
+        )
+    }
+
+    /// Compare the normalized projection used for sampling estimation.
+    /// Only the capture of the actual wire certifies the measured effect.
+    pub fn shared_retirement_sampling_prefix_items(
+        &self,
+        revised: &Self,
+        input_modalities: &[InputModality],
+    ) -> usize {
+        let project = |source: &Self| {
+            let mut source = source.clone();
+            normalize::pair_in_flight_calls_for_estimate(&mut source.items);
+            source.prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling)
+                .shared_items()
+        };
+        let before = project(self);
+        let after = project(revised);
+        let (base, base_tail) = self.sampling_items_for_estimate(&before);
+        let (candidate, candidate_tail) = revised.sampling_items_for_estimate(&after);
+        base.iter().chain(base_tail)
+            .zip(candidate.iter().chain(candidate_tail))
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
     pub fn reserved_tool_call_ids(&self) -> std::collections::HashSet<String> {
         let mut ids = self.tool_history.reserved_call_ids();
         ids.extend(

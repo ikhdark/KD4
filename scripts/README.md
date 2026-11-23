@@ -100,7 +100,10 @@ resource-admission probes, avoiding a lane/resource lock-order cycle. PowerShell
 returns exit 75 with `executed=false`/validation pending when resources are busy,
 as it already does for busy lanes; it never queues while holding a lane. Unconfirmed cleanup quarantines
 the resource lease as well as its lane; inspect the recorded tree before manual
-recovery. Crashed owners' leases are reclaimed only after their named tree is gone.
+recovery. If a secondary settlement operation fails, the Python lane runner still
+reports the primary cleanup failure, with the secondary error as a note. Do not
+assume a quarantine marker or receipt was written if its write failed. Crashed
+owners' leases are reclaimed only after their named tree is gone.
 
 `--timing-json` adds `laneAdmissionMs`, `laneWaitMs` and `resources`: resource-admission wait, chosen
 jobs/policy, native job CPU seconds/utilization, lifetime peak tree/process commit,

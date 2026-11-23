@@ -50,6 +50,7 @@ use super::workspace_codex_plugins_enabled;
 use super::workspace_settings;
 use codex_core::config::permission_profile_catalog;
 use codex_models_manager::manager::SharedModelsManager;
+use codex_protocol::timing::observations;
 use futures::StreamExt;
 use sha2::Digest;
 
@@ -271,8 +272,9 @@ impl CatalogRequestProcessor {
     pub(crate) async fn hooks_list(
         &self,
         params: HooksListParams,
+        observation_id: Option<&str>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.hooks_list_response(params)
+        self.hooks_list_response(params, observation_id)
             .await
             .map(|response| Some(response.into()))
     }
@@ -818,29 +820,48 @@ impl CatalogRequestProcessor {
     async fn hooks_list_response(
         &self,
         params: HooksListParams,
+        observation_id: Option<&str>,
     ) -> Result<HooksListResponse, JSONRPCErrorError> {
         let HooksListParams { cwds } = params;
-        let cwds = if cwds.is_empty() {
+        let default_cwd = cwds.is_empty();
+        let cwds = if default_cwd {
             vec![self.config.cwd.to_path_buf()]
         } else {
             cwds
         };
 
+        let fallback_operation = (observation_id.is_none() && observations::enabled())
+            .then(|| uuid::Uuid::now_v7().to_string());
+        let operation = observation_id.or(fallback_operation.as_deref());
+        let request_span = operation.map(|id| {
+            observations::Span::start(
+                "hooks_list",
+                "",
+                "",
+                id,
+                serde_json::json!({ "cwd_count": cwds.len(), "default_cwd": default_cwd }),
+            )
+        });
+        let auth_span = hooks_list_phase(operation, "hooks_list_auth", None);
         let auth = self.auth_manager.auth().await;
+        finish_hooks_list_phase(auth_span, "completed");
         let plugins_manager = self.thread_manager.plugins_manager();
-        let jobs = cwds.into_iter().map(|cwd| {
+        let jobs = cwds.into_iter().enumerate().map(|(cwd_index, cwd)| {
             let auth = &auth;
             let plugins_manager = &plugins_manager;
+            let phase = move |kind: &'static str| hooks_list_phase(operation, kind, Some(cwd_index));
             async move {
-                let config = match self
+                let config_span = phase("hooks_list_config");
+                let config = self
                     .config_manager
                     .load_for_cwd(
                         /*request_overrides*/ None,
                         ConfigOverrides::default(),
                         Some(cwd.clone()),
                     )
-                    .await
-                {
+                    .await;
+                finish_hooks_list_phase(config_span, if config.is_ok() { "ok" } else { "error" });
+                let config = match config {
                     Ok(config) => config,
                     Err(err) => {
                         let error_path = cwd.clone();
@@ -855,21 +876,33 @@ impl CatalogRequestProcessor {
                         };
                     }
                 };
+                let workspace_span = phase("hooks_list_workspace_policy");
                 let workspace_codex_plugins_enabled = workspace_codex_plugins_enabled(
                     &config,
                     auth.as_ref(),
                     Some(&self.workspace_settings_cache),
                 )
                 .await;
+                finish_hooks_list_phase(
+                    workspace_span,
+                    if workspace_codex_plugins_enabled {
+                        "allowed"
+                    } else {
+                        "denied"
+                    },
+                );
                 let plugins_enabled =
                     config.features.enabled(Feature::Plugins) && workspace_codex_plugins_enabled;
                 let plugin_hooks = if plugins_enabled {
+                    let plugins_span = phase("hooks_list_plugins");
                     let plugins_input = config.plugins_config_input();
                     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
-                    codex_core_plugins::PluginHookLoadOutcome {
+                    let hook_outcome = codex_core_plugins::PluginHookLoadOutcome {
                         hook_sources: plugin_outcome.effective_plugin_hook_sources(),
                         hook_load_warnings: plugin_outcome.effective_plugin_hook_warnings(),
-                    }
+                    };
+                    finish_hooks_list_phase(plugins_span, "completed");
+                    hook_outcome
                 } else {
                     codex_core_plugins::PluginHookLoadOutcome::default()
                 };
@@ -881,11 +914,24 @@ impl CatalogRequestProcessor {
                     plugin_hook_load_warnings: plugin_hooks.hook_load_warnings,
                     ..Default::default()
                 };
-                let hooks = match tokio::task::spawn_blocking(move || {
-                    codex_hooks::list_hooks(hooks_config)
+                let discovery_wait_span = phase("hooks_list_discovery_wait");
+                let discovery_operation = operation.map(str::to_owned);
+                let hooks = tokio::task::spawn_blocking(move || {
+                    let discovery_span = hooks_list_phase(
+                        discovery_operation.as_deref(),
+                        "hooks_list_discovery",
+                        Some(cwd_index),
+                    );
+                    let hooks = codex_hooks::list_hooks(hooks_config);
+                    finish_hooks_list_phase(discovery_span, "completed");
+                    hooks
                 })
-                .await
-                {
+                .await;
+                finish_hooks_list_phase(
+                    discovery_wait_span,
+                    if hooks.is_ok() { "ok" } else { "join_error" },
+                );
+                let hooks = match hooks {
                     Ok(hooks) => hooks,
                     Err(err) => {
                         return codex_app_server_protocol_types::HooksListEntry {
@@ -908,6 +954,7 @@ impl CatalogRequestProcessor {
             }
         });
         let data = collect_hook_entries(jobs).await;
+        finish_hooks_list_phase(request_span, "assembled");
         Ok(HooksListResponse { data })
     }
 
@@ -1007,6 +1054,22 @@ fn skill_project_cwd(path: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
             None
         }
     })
+}
+
+fn hooks_list_phase(
+    operation: Option<&str>,
+    kind: &str,
+    cwd_index: Option<usize>,
+) -> Option<observations::Span> {
+    operation.map(|id| {
+        observations::Span::start(kind, "", "", id, serde_json::json!({ "cwd_index": cwd_index }))
+    })
+}
+
+fn finish_hooks_list_phase(span: Option<observations::Span>, outcome: &str) {
+    if let Some(span) = span {
+        span.finish(outcome, serde_json::Value::Null);
+    }
 }
 
 // Free completed slots immediately; response ordering is restored only after

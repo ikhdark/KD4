@@ -229,6 +229,7 @@ pub(crate) mod context_window;
 mod handlers;
 mod inject;
 mod input_queue;
+mod mailbox_storage;
 mod mcp;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
@@ -507,6 +508,7 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
+use codex_protocol::protocol::DiagnosticOrigins;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::InitialHistory;
@@ -655,6 +657,13 @@ fn event_channel() -> (async_channel::Sender<Event>, async_channel::Receiver<Eve
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
     pub(crate) async fn spawn(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
+        Self::spawn_with_fork_origins(args, DiagnosticOrigins::new()).await
+    }
+
+    pub(crate) async fn spawn_with_fork_origins(
+        args: CodexSpawnArgs,
+        fork_origins: DiagnosticOrigins,
+    ) -> CodexResult<CodexSpawnOk> {
         let parent_trace = match args.parent_trace {
             Some(trace) => {
                 if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
@@ -673,12 +682,15 @@ impl Codex {
         Self::spawn_internal(CodexSpawnArgs {
             parent_trace,
             ..args
-        })
+        }, fork_origins)
         .instrument(thread_spawn_span)
         .await
     }
 
-    async fn spawn_internal(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
+    async fn spawn_internal(
+        args: CodexSpawnArgs,
+        fork_origins: DiagnosticOrigins,
+    ) -> CodexResult<CodexSpawnOk> {
         let CodexSpawnArgs {
             mut config,
             allow_provider_model_fallback,
@@ -902,6 +914,7 @@ impl Codex {
             tx_event.clone(),
             agent_status_tx.clone(),
             conversation_history,
+            fork_origins,
             session_source_clone,
             skills_service,
             plugins_manager,
@@ -2076,6 +2089,7 @@ impl Session {
         &self,
         conversation_history: InitialHistory,
         startup_rollout_facts: StartupRolloutFacts,
+        fork_origins: DiagnosticOrigins,
     ) -> std::io::Result<()> {
         let is_subagent = {
             let state = self.state.lock().await;
@@ -2198,8 +2212,12 @@ impl Session {
 
                 // Persist the fork history with any missing item IDs assigned above
                 // (the store filters which rollout items are retained).
-                if !rollout_items.is_empty() {
-                    self.persist_rollout_items_ordered(&rollout_items).await?;
+                if !rollout_items.is_empty()
+                    && let Some(live_thread) = self.live_thread()
+                {
+                    live_thread.append_copied_items_ordered(&rollout_items, fork_origins)
+                        .await
+                        .map_err(std::io::Error::other)?;
                 }
 
                 // Root forks finish restoring reconstructed runtime-only settings in
@@ -3059,12 +3077,43 @@ impl Session {
             // A blocked recorder must not strand interruption or successor
             // admission. Timeout means unknown, not a successful durable write;
             // a queued recorder operation may still finish after this waiter.
+            use codex_protocol::timing::observations;
+
+            let thread_id = observations::enabled().then(|| self.thread_id.to_string());
+            let start_phase = |kind| {
+                thread_id.as_ref().map(|thread_id| {
+                    observations::Span::start(
+                        kind,
+                        thread_id,
+                        &turn_context.sub_id,
+                        &turn_context.sub_id,
+                        serde_json::Value::Null,
+                    )
+                })
+            };
             match tokio::time::timeout(Duration::from_secs(5), async {
                 if persist {
-                    self.persist_rollout_items_ordered(&[RolloutItem::EventMsg(msg.clone())])
-                        .await?;
+                    let append = start_phase("terminal_rollout_append");
+                    let result = self
+                        .persist_rollout_items_ordered(&[RolloutItem::EventMsg(msg.clone())])
+                        .await;
+                    if let Some(append) = append {
+                        append.finish(
+                            if result.is_ok() { "append_acknowledged" } else { "error" },
+                            serde_json::Value::Null,
+                        );
+                    }
+                    result?;
                 }
-                durable_barrier().await
+                let barrier = start_phase("terminal_rollout_barrier");
+                let result = durable_barrier().await;
+                if let Some(barrier) = barrier {
+                    barrier.finish(
+                        if result.is_ok() { "barrier_acknowledged" } else { "error" },
+                        serde_json::Value::Null,
+                    );
+                }
+                result
             })
             .await
             {
@@ -5280,9 +5329,8 @@ impl Session {
     pub(crate) async fn record_inter_agent_communication(
         self: &Arc<Self>,
         turn_context: &Arc<TurnContext>,
-        mut communication: InterAgentCommunication,
+        mail: self::input_queue::MailboxInput,
     ) -> std::io::Result<()> {
-        communication.set_turn_id_if_missing(&turn_context.sub_id);
         let session = Arc::clone(self);
         let turn_context = Arc::clone(turn_context);
         let in_flight = self.retain_tool_dispatch_commit();
@@ -5293,6 +5341,13 @@ impl Session {
                 .acquire()
                 .await
                 .map_err(|_| std::io::Error::other("durable history commit gate is closed"))?;
+            // A forced stop can recover a clone while this retained commit
+            // settles. Check its shared outcome under the same history fence.
+            if mail.is_recorded() {
+                return Ok(());
+            }
+            let mut communication = mail.communication.clone();
+            communication.set_turn_id_if_missing(&turn_context.sub_id);
             let response_item = communication.to_model_input_item();
             let items = session.prepare_conversation_items_for_history(
                 &turn_context,
@@ -5316,8 +5371,18 @@ impl Session {
                     turn_context.model_info.truncation_policy.into(),
                 );
             }
+            mail.mark_recorded();
+            // The canonical receiver item, not the queue transfer or metadata
+            // prefix, witnesses delivery. Never reclaim the durable envelope
+            // unless that item has crossed the rollout's durability barrier.
+            if let Some(rollout) = session.live_thread()
+                && let Err(error) = rollout.flush_durable().await
+            {
+                tracing::warn!(%error, "mailbox history durability barrier failed; envelope retained");
+            } else {
+                session.input_queue.acknowledge_mailbox_communication(&communication).await;
+            }
             drop(_permit);
-            session.input_queue.acknowledge_mailbox_communication(&communication).await;
             session.send_raw_response_items(&turn_context, &items).await;
             Ok::<_, std::io::Error>(())
         });
@@ -5447,6 +5512,8 @@ impl Session {
         compacted_item: CompactedItem,
         operation: codex_protocol::protocol::CompactionOperation,
     ) -> CodexResult<()> {
+        const MAX_PENDING_COMPACT_SESSION_START_HOOKS: usize = 8;
+
         let session = Arc::clone(self);
         let turn_context = Arc::clone(turn_context);
         session
@@ -5466,6 +5533,15 @@ impl Session {
                 .map_err(|_| {
                     CodexErr::Fatal("durable history commit gate is closed".to_string())
                 })?;
+            // Only compaction commits add Compact sources, so the gate protects this
+            // slot until publication. The ordinary turn consumer can only free slots.
+            if session.state.lock().await.pending_compact_session_start_count()
+                >= MAX_PENDING_COMPACT_SESSION_START_HOOKS
+            {
+                return Err(CodexErr::Fatal(format!(
+                    "Compaction was not committed: {MAX_PENDING_COMPACT_SESSION_START_HOOKS} deferred SessionStart(compact) hooks are pending. Run a regular turn before retrying compaction."
+                )));
+            }
             let _tool_history_io_permit = if turn_context.config.completed_tool_history_projection {
                 Some(session.acquire_tool_history_io_permit().await?)
             } else {

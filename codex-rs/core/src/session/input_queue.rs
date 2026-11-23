@@ -10,8 +10,12 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
+
+use super::mailbox_storage::MailboxStorage;
 
 const MAX_PENDING_MAILBOX_COMMUNICATIONS: usize = 1_024;
 const MAX_SEEN_MAILBOX_COMMUNICATION_IDS: usize = 4_096;
@@ -46,7 +50,52 @@ pub(crate) enum TurnInput {
     /// user or extension steering, this must not wake owner-held operations or
     /// force another turn solely because it is queued.
     InternalResponseItem(ResponseItem),
-    InterAgentCommunication(InterAgentCommunication),
+    InterAgentCommunication(MailboxInput),
+}
+
+/// The envelope is immutable; recovery may revoke its authority to start a
+/// turn without changing the sender's requested delivery kind.
+#[derive(Clone, Debug)]
+pub(crate) struct MailboxInput {
+    pub(super) communication: InterAgentCommunication,
+    may_start_turn: bool,
+    recorded: Arc<AtomicBool>,
+}
+
+impl MailboxInput {
+    fn new(communication: InterAgentCommunication) -> Self {
+        Self {
+            may_start_turn: communication.trigger_turn,
+            communication,
+            recorded: Arc::default(),
+        }
+    }
+
+    fn can_start_turn(&self) -> bool {
+        self.may_start_turn && !self.is_recorded()
+    }
+
+    pub(super) fn is_recorded(&self) -> bool {
+        self.recorded.load(Ordering::Acquire)
+    }
+
+    pub(super) fn mark_recorded(&self) {
+        self.recorded.store(true, Ordering::Release);
+    }
+}
+
+impl std::ops::Deref for MailboxInput {
+    type Target = InterAgentCommunication;
+
+    fn deref(&self) -> &InterAgentCommunication {
+        &self.communication
+    }
+}
+
+impl PartialEq for MailboxInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.communication == other.communication && self.may_start_turn == other.may_start_turn
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,9 +145,14 @@ struct UserIntentState {
     incorporated: u64,
 }
 
+pub(crate) struct TransferredStartupInput {
+    pub(crate) validation_origin: Option<(String, String)>,
+}
+
 #[derive(Default)]
 struct MailboxState {
-    pending_mails: VecDeque<(InterAgentCommunication, usize)>,
+    pending_mails: VecDeque<(MailboxInput, usize)>,
+    storage: Option<MailboxStorage>,
     bytes: usize,
     // true until history acknowledgment (or explicit supersession). One index
     // owns both retry deduplication and outstanding delivery, without dual hashes.
@@ -278,7 +332,7 @@ impl InputQueue {
 
 
     pub(crate) async fn enqueue_mailbox_communication(
-        &self,
+        self: &Arc<Self>,
         communication: InterAgentCommunication,
     ) -> Result<bool, codex_protocol::error::CodexErr> {
         self.enqueue_mailbox_communication_with_origin(communication, /*validation_origin*/ None)
@@ -286,8 +340,23 @@ impl InputQueue {
     }
 
     pub(super) async fn enqueue_mailbox_communication_with_origin(
-        &self,
+        self: &Arc<Self>,
         communication: InterAgentCommunication,
+        validation_origin: Option<(String, String)>,
+    ) -> Result<bool, codex_protocol::error::CodexErr> {
+        // Parked and live sends both retain admission custody if the observer
+        // leaves between durable publication and in-memory insertion.
+        let queue = Arc::clone(self);
+        tokio::spawn(async move {
+            queue.admit_mailbox_communication(communication, validation_origin).await
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    async fn admit_mailbox_communication(
+        &self,
+        mut communication: InterAgentCommunication,
         validation_origin: Option<(String, String)>,
     ) -> Result<bool, codex_protocol::error::CodexErr> {
         if let Some(progress) = &communication.progress
@@ -304,24 +373,21 @@ impl InputQueue {
             "session mailbox is full ({} messages or {} bytes); retry after messages are consumed",
             self.max_pending_mailbox_communications, self.max_pending_turn_input_bytes
         ));
-        {
-            let mailbox = self.mailbox.lock().await;
-            if communication.id.as_ref()
-                .is_some_and(|id| mailbox.seen_communication_ids.contains_key(id))
-            {
-                return Ok(false);
-            }
-        }
-        // Size outside the mutex, then repeat all admission checks atomically.
-        let bytes = serialized_size(&communication);
         let mut mailbox = self.mailbox.lock().await;
+        if mailbox.storage.is_some() && communication.id.is_none() {
+            communication.id = Some(codex_protocol::ResponseItemId::new("mail"));
+        }
         if communication
             .id
             .as_ref()
             .is_some_and(|id| mailbox.seen_communication_ids.contains_key(id))
         {
+            if let Some(storage) = &mailbox.storage {
+                storage.confirm_current().await?;
+            }
             return Ok(false);
         }
+        let bytes = serialized_size(&communication);
         let progress_query = communication.progress.as_ref().map(|progress| ProgressQuery {
             author: &communication.author, recipient: &communication.recipient,
             task: &progress.task_id, attempt: &progress.attempt_id,
@@ -342,6 +408,9 @@ impl InputQueue {
                 communication.progress.as_ref().is_some_and(|progress| progress.revision <= *revision))
         {
             // Admission acknowledgement also covers a snapshot already superseded.
+            if let Some(storage) = &mailbox.storage {
+                storage.confirm_current().await?;
+            }
             return Ok(false);
         }
         // A nonreplaceable message is an ordering barrier. Never move a snapshot
@@ -357,9 +426,22 @@ impl InputQueue {
         {
             return Err(full_error());
         }
+        let replaced_id = replace.and_then(|index| mailbox.pending_mails[index].0.id.clone());
+        if let Some(storage) = &mut mailbox.storage {
+            let mut next = storage.snapshot.clone();
+            if let Some(id) = &replaced_id {
+                next.pending.retain(|mail| mail.id.as_ref() != Some(id));
+                next.superseded.push_back(id.clone());
+                if next.superseded.len() > self.max_seen_mailbox_communication_ids {
+                    next.superseded.pop_front();
+                }
+            }
+            next.pending.push(communication.clone());
+            storage.save(next).await?;
+        }
         if let Some(index) = replace {
-            if let Some((replaced, _)) = mailbox.pending_mails.remove(index)
-                && let Some(id) = replaced.id
+            if mailbox.pending_mails.remove(index).is_some()
+                && let Some(id) = replaced_id
             {
                 if let Some(outstanding) = mailbox.seen_communication_ids.get_mut(&id) { *outstanding = false; }
             }
@@ -390,7 +472,7 @@ impl InputQueue {
         }
         let trigger_turn = communication.trigger_turn;
         mailbox.bytes += bytes;
-        mailbox.pending_mails.push_back((communication, bytes));
+        mailbox.pending_mails.push_back((MailboxInput::new(communication), bytes));
         drop(mailbox);
         self.agent_activity_tx
             .send_replace(InputQueueActivity::Mailbox);
@@ -400,6 +482,75 @@ impl InputQueue {
         Ok(true)
     }
 
+
+    /// Startup owns the live receiver lease. A previously parked queue might
+    /// already contain this snapshot, or another process might have advanced it
+    /// while the receiver was detached. Only the latter replaces in-memory mail.
+    pub(super) async fn attach_mailbox_storage(
+        &self,
+        home: std::path::PathBuf,
+        id: codex_protocol::ThreadId,
+        owner: &Arc<super::session::SessionStorageOwnership>,
+        rollout: &codex_thread_store::LiveThread,
+        needs_materialization: bool,
+        rollout_path: &std::path::Path,
+    ) -> io::Result<()> {
+        let mut recovered = self.startup_recovery_items.lock().await;
+        let mut mailbox = self.mailbox.lock().await;
+        let mut storage = MailboxStorage::load(home, id, owner, rollout, needs_materialization).await?;
+        let same_generation = mailbox.storage.as_ref().is_some_and(|old| old.same_generation(&storage));
+        let recorded = storage.recorded_ids(rollout_path).await?;
+        let was_recorded = |mail: &InterAgentCommunication| {
+            mail.id.as_ref().is_some_and(|id| recorded.contains(id))
+        };
+        let mut next = storage.snapshot.clone();
+        next.pending.retain(|mail| !was_recorded(mail));
+        if next.pending.len() != storage.snapshot.pending.len() {
+            // A previous process may have died before its barrier. Make the
+            // observed receiver record durable before reclaiming the envelope.
+            rollout.flush_durable().await.map_err(io::Error::other)?;
+            storage.save(next).await?;
+        }
+
+        if !same_generation {
+            // Never discard non-mail input recovered by the existing warm path.
+            *recovered = recovered.take_non_mail();
+            *mailbox = MailboxState::default();
+            for id in &storage.snapshot.superseded {
+                mailbox.seen_communication_ids.insert(id.clone(), false);
+                mailbox.seen_communication_id_order.push_back(id.clone());
+            }
+            for communication in &storage.snapshot.pending {
+                let id = communication.id.as_ref().expect("snapshot envelope has an id");
+                mailbox.seen_communication_ids.insert(id.clone(), true);
+                mailbox.seen_communication_id_order.push_back(id.clone());
+                seed_mailbox_progress(&mut mailbox, communication);
+                let bytes = serialized_size(communication);
+                let mut mail = MailboxInput::new(communication.clone());
+                // A persisted envelope is not a persisted scheduling permit.
+                // Only a new eligible turn may drain interrupted work.
+                mail.may_start_turn = false;
+                mailbox.pending_mails.push_back((mail, bytes));
+                mailbox.bytes += bytes;
+            }
+            compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
+        } else {
+            mailbox.pending_mails.retain(|(mail, _)| !was_recorded(mail));
+            mailbox.bytes = mailbox.pending_mails.iter().map(|(_, bytes)| *bytes).sum();
+            recovered.items.retain(|item| {
+                !matches!(item, TurnInput::InterAgentCommunication(mail) if was_recorded(mail))
+            });
+            recovered.retain_live_starts();
+            for id in &recorded {
+                if let Some(outstanding) = mailbox.seen_communication_ids.get_mut(id) {
+                    *outstanding = false;
+                }
+                mailbox.validation_origins.remove(id);
+            }
+        }
+        mailbox.storage = Some(storage);
+        Ok(())
+    }
 
     pub(crate) async fn seed_seen_mailbox_communication_ids_from_ids(
         &self,
@@ -422,46 +573,28 @@ impl InputQueue {
     pub(super) async fn seed_mailbox_progress(&self, communications: Vec<InterAgentCommunication>) {
         let mut mailbox = self.mailbox.lock().await;
         for communication in communications {
-            if !communication.trigger_turn && let Some(key) = progress_key(&communication) {
-                let revision = communication.progress.as_ref().map_or(0, |progress| progress.revision);
-                mailbox.progress_revisions.entry(key).and_modify(|seen| *seen = (*seen).max(revision)).or_insert(revision);
-            }
+            seed_mailbox_progress(&mut mailbox, &communication);
         }
     }
 
     pub(super) async fn acknowledge_mailbox_communication(&self, communication: &InterAgentCommunication) {
         let mut mailbox = self.mailbox.lock().await;
         if let Some(id) = &communication.id {
+            if let Some(storage) = &mut mailbox.storage {
+                let mut next = storage.snapshot.clone();
+                next.pending.retain(|mail| mail.id.as_ref() != Some(id));
+                if next.pending.len() != storage.snapshot.pending.len()
+                    && let Err(error) = storage.save(next).await
+                {
+                    // The durable receiver item will reconcile this receipt
+                    // on restart. Do not append it again to retry reclamation.
+                    tracing::warn!(%error, "mailbox envelope reclamation deferred");
+                }
+            }
             if let Some(outstanding) = mailbox.seen_communication_ids.get_mut(id) { *outstanding = false; }
             mailbox.validation_origins.remove(id);
         }
         compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
-    }
-
-    /// Validation scopes of the queued mail that would start the next turn,
-    /// recovered input first. Unstamped or queue-only mail contributes nothing.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Read recovered input and mailbox input as one snapshot in recovery -> mailbox lock order"
-    )]
-    pub(crate) async fn pending_turn_start_validation_origins(&self) -> Vec<(String, String)> {
-        let recovered = self.startup_recovery_items.lock().await;
-        let mailbox = self.mailbox.lock().await;
-        recovered
-            .iter()
-            .filter_map(|item| match item {
-                TurnInput::InterAgentCommunication(mail) if mail.trigger_turn => mail.id.as_ref(),
-                _ => None,
-            })
-            .chain(
-                mailbox
-                    .pending_mails
-                    .iter()
-                    .filter(|(mail, _)| mail.trigger_turn)
-                    .filter_map(|(mail, _)| mail.id.as_ref()),
-            )
-            .filter_map(|id| mailbox.validation_origins.get(id).cloned())
-            .collect()
     }
 
     #[expect(
@@ -508,14 +641,14 @@ impl InputQueue {
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
         let recovered = self.startup_recovery_items.lock().await;
         recovered.iter().any(
-            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
+            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.can_start_turn()),
         ) || self
             .mailbox
             .lock()
             .await
             .pending_mails
             .iter()
-            .any(|(mail, _)| mail.trigger_turn)
+            .any(|(mail, _)| mail.can_start_turn())
     }
 
     /// Whether recovered input should start a new turn once the current turn releases its
@@ -533,7 +666,7 @@ impl InputQueue {
                 TurnInput::UserInput { content, .. } if !content.is_empty()
             ) || matches!(
                 item,
-                TurnInput::InterAgentCommunication(mail) if mail.trigger_turn
+                TurnInput::InterAgentCommunication(mail) if mail.can_start_turn()
             )
         }) || self
             .mailbox
@@ -541,7 +674,7 @@ impl InputQueue {
             .await
             .pending_mails
             .iter()
-            .any(|(mail, _)| mail.trigger_turn)
+            .any(|(mail, _)| mail.can_start_turn())
     }
 
     /// Restores already-admitted input owned by a taskless startup placeholder
@@ -578,7 +711,7 @@ impl InputQueue {
         let activity = if recovered.iter().any(TurnInput::is_steering_input) {
             Some(InputQueueActivity::Steer)
         } else if recovered.iter().any(
-            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
+            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.can_start_turn()),
         ) {
             Some(InputQueueActivity::Mailbox)
         } else {
@@ -614,11 +747,28 @@ impl InputQueue {
         })
     }
 
+    /// Stop cancelled turn work without discarding independently accepted mail.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Recover mail under the existing recovery -> turn-state ownership order"
+    )]
     pub(crate) async fn clear_pending_for_turn_state(&self, turn_state: &Mutex<TurnState>) {
+        let mut recovered = self.startup_recovery_items.lock().await;
         let mut turn_state = turn_state.lock().await;
         turn_state.clear_pending_waiters();
-        turn_state.input_in_flight.clear();
-        turn_state.pending_input = TurnInputQueue::default();
+        let in_flight = std::mem::take(&mut turn_state.input_in_flight);
+        let pending = std::mem::take(&mut turn_state.pending_input);
+        let mail = in_flight.into_iter().chain(pending.items).filter_map(|item| {
+            let TurnInput::InterAgentCommunication(mut mail) = item else { return None };
+            if mail.is_recorded() { return None; }
+            mail.may_start_turn = false;
+            Some(TurnInput::InterAgentCommunication(mail))
+        });
+        // Each transfer drained a prefix. Recover it before the queue suffix;
+        // do not signal an autonomous wake for any work from the cancelled turn.
+        let mut retained = TurnInputQueue::from_items(mail.collect());
+        retained.append(&mut recovered);
+        *recovered = retained;
     }
 
     pub(crate) async fn defer_mailbox_delivery_to_next_turn(
@@ -771,15 +921,14 @@ impl InputQueue {
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
         expected_turn_state: &Arc<Mutex<TurnState>>,
-    ) -> bool {
+        select_validation_origin: bool,
+    ) -> Option<TransferredStartupInput> {
         let active = active_turn.lock().await;
-        let Some(turn) = active.as_ref().filter(|turn| {
+        let turn = active.as_ref().filter(|turn| {
             turn.task.is_none()
                 && turn.terminal.is_none()
                 && Arc::ptr_eq(&turn.turn_state, expected_turn_state)
-        }) else {
-            return false;
-        };
+        })?;
         let mut recovered = self.startup_recovery_items.lock().await;
         let mut turn_state = turn.turn_state.lock().await;
         let mut mailbox = if turn_state.accepts_mailbox_delivery_for_current_turn() {
@@ -790,13 +939,37 @@ impl InputQueue {
 
         // Keep accepted items in their owning queues until every lock is held.
         // No cancellation point may separate removal from destination insertion.
-        let mut input = std::mem::take(&mut *recovered);
+        let mut input = if mailbox.is_some() {
+            std::mem::take(&mut *recovered)
+        } else {
+            recovered.take_non_mail()
+        };
         input.append(&mut turn_state.pending_input);
         if let Some(mailbox) = mailbox.as_mut() {
             self.transfer_mailbox_prefix(mailbox, &mut input);
         }
+        // Only the first eligible input in the batch actually transferred can
+        // delegate a scope. Unstamped eligible mail and independent input
+        // still take their FIFO place; later mail cannot speak for them.
+        let validation_origin = if select_validation_origin {
+            mailbox.as_ref().and_then(|mailbox| {
+                input.iter()
+                    .find_map(|item| match item {
+                        TurnInput::InterAgentCommunication(mail) if mail.can_start_turn() => Some(
+                            mail.id.as_ref().and_then(|id| mailbox.validation_origins.get(id)),
+                        ),
+                        TurnInput::UserInput { content, .. } if !content.is_empty() => Some(None),
+                        TurnInput::ResponseItem(_) => Some(None),
+                        _ => None,
+                    })
+                    .flatten()
+                    .cloned()
+            })
+        } else {
+            None
+        };
         turn_state.pending_input = input;
-        true
+        Some(TransferredStartupInput { validation_origin })
     }
 
     /// Called under the startup admission lock, immediately before worker
@@ -954,6 +1127,7 @@ impl InputQueue {
     pub(crate) async fn recover_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,
+        suppress_mail_start: bool,
     ) -> bool {
         let mut recovered = self.startup_recovery_items.lock().await;
         let mut turn_state = turn_state.lock().await;
@@ -961,6 +1135,13 @@ impl InputQueue {
             !turn_state.input_in_flight.is_empty() || !turn_state.pending_input.items.is_empty();
         let mut in_flight =
             TurnInputQueue::from_items(turn_state.input_in_flight.drain(..).collect());
+        if suppress_mail_start {
+            for item in in_flight.items.iter_mut().chain(&mut turn_state.pending_input.items) {
+                if let TurnInput::InterAgentCommunication(mail) = item {
+                    mail.may_start_turn = false;
+                }
+            }
+        }
         recovered.append(&mut in_flight);
         recovered.append(&mut turn_state.pending_input);
         has_input
@@ -993,9 +1174,17 @@ impl InputQueue {
             None
         };
 
-        let mut input = std::mem::take(&mut *recovered);
+        let mut input = if mailbox.is_some() {
+            std::mem::take(&mut *recovered)
+        } else {
+            recovered.take_non_mail()
+        };
         if let Some(turn_state) = turn_state.as_mut() {
-            input.append(&mut turn_state.pending_input);
+            if accepts_mailbox_delivery {
+                input.append(&mut turn_state.pending_input);
+            } else {
+                input.append(&mut turn_state.pending_input.take_non_mail());
+            }
         }
         if let Some(mailbox) = mailbox.as_mut() {
             self.transfer_mailbox_prefix(mailbox, &mut input);
@@ -1076,6 +1265,17 @@ fn compact_seen_mailbox_ids(mailbox: &mut MailboxState, max_seen_ids: usize) {
     }
 }
 
+fn seed_mailbox_progress(mailbox: &mut MailboxState, communication: &InterAgentCommunication) {
+    if !communication.trigger_turn
+        && let Some(progress) = &communication.progress
+        && let Some(key) = progress_key(communication)
+    {
+        mailbox.progress_revisions.entry(key)
+            .and_modify(|seen| *seen = (*seen).max(progress.revision))
+            .or_insert(progress.revision);
+    }
+}
+
 fn progress_key(mail: &InterAgentCommunication) -> Option<(codex_protocol::AgentPath, codex_protocol::AgentPath, String, String)> {
     mail.progress.as_ref().map(|progress| (mail.author.clone(), mail.recipient.clone(), progress.task_id.clone(), progress.attempt_id.clone()))
 }
@@ -1106,7 +1306,7 @@ fn turn_input_size_bytes(input: &TurnInput) -> usize {
         TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
             serialized_size(item)
         }
-        TurnInput::InterAgentCommunication(communication) => serialized_size(communication),
+        TurnInput::InterAgentCommunication(mail) => serialized_size(&mail.communication),
         TurnInput::AdditionalContext { values, .. } => serialized_size(values),
     }
 }
@@ -1155,6 +1355,18 @@ impl TurnInputQueue {
         self.items.append(&mut other.items);
     }
 
+    fn take_non_mail(&mut self) -> Self {
+        if !self.items.iter().any(|item| matches!(item, TurnInput::InterAgentCommunication(_))) {
+            return std::mem::take(self);
+        }
+        let items: Vec<_> = self.items
+            .extract_if(.., |item| !matches!(item, TurnInput::InterAgentCommunication(_)))
+            .collect();
+        let bytes = items.iter().map(turn_input_size_bytes).fold(0, usize::saturating_add);
+        self.bytes = self.bytes.saturating_sub(bytes);
+        Self { items, bytes }
+    }
+
     fn retain_live_starts(&mut self) {
         self.items.retain(|item| !item.is_cancelled_start());
         self.bytes = self.items.iter().map(turn_input_size_bytes).fold(0, usize::saturating_add);
@@ -1172,12 +1384,15 @@ impl TurnInputQueue {
 }
 
 impl TurnInput {
+    pub(crate) fn start_fence(&self) -> Option<&StartInputFence> {
+        match self {
+            Self::UserInput { start_fence, .. } | Self::AdditionalContext { start_fence, .. } => start_fence.as_ref(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_cancelled_start(&self) -> bool {
-        let fence = match self {
-            Self::UserInput { start_fence, .. } | Self::AdditionalContext { start_fence, .. } => start_fence,
-            _ => return false,
-        };
-        fence.as_ref().is_some_and(|fence| fence.cancellation.is_cancelled())
+        self.start_fence().is_some_and(|fence| fence.cancellation.is_cancelled())
     }
     fn is_steering_input(&self) -> bool {
         if self.is_cancelled_start() { return false; }
@@ -1191,7 +1406,7 @@ impl TurnInput {
         if self.is_cancelled_start() { return false; }
         match self {
             Self::InternalResponseItem(_) => false,
-            Self::InterAgentCommunication(mail) => mail.trigger_turn,
+            Self::InterAgentCommunication(mail) => mail.can_start_turn(),
             Self::UserInput { .. } | Self::ResponseItem(_) | Self::AdditionalContext { .. } => true,
         }
     }

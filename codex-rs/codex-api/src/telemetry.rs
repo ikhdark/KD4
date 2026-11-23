@@ -129,6 +129,11 @@ pub trait WebsocketTelemetry: Send + Sync {
 
     /// Fresh parsed response evidence; never called for replayed handshake metadata.
     fn on_response_event(&self) {}
+
+    /// A lifecycle-admitted response.created with a valid nested response ID.
+    /// Called by the owning request stream before relaying the frame's events.
+    fn on_response_created(&self) {}
+
     /// Stable local connection correlation, not a provider receipt or credential.
     fn logical_transport_id(&self) -> Option<&str> {
         None

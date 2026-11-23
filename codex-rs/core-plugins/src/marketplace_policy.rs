@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
+use url::Host;
 use url::Url;
 
 enum AllowedMarketplaceSource {
@@ -34,8 +35,71 @@ enum AllowedMarketplaceSource {
         url: String,
         ref_name: Option<String>,
     },
-    GitHostPattern(Regex),
+    GitHostPattern(MarketplaceHostPattern),
     Local(AbsolutePathBuf),
+}
+
+enum MarketplaceHostPattern {
+    Exact(String),
+    Subdomains(String),
+    Regex(Regex),
+}
+
+impl MarketplaceHostPattern {
+    fn compile(pattern: &str) -> Result<Self, &'static str> {
+        if let Some(expression) = pattern.strip_prefix("regex:") {
+            if expression.trim().is_empty() {
+                return Err("regex: requires a nonempty expression");
+            }
+            return Regex::new(expression)
+                .map(Self::Regex)
+                .map_err(|_| "invalid regex: expression");
+        }
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            return match canonical_hostname(suffix) {
+                Some(Host::Domain(domain)) => Ok(Self::Subdomains(domain)),
+                _ => Err("*. requires a domain name"),
+            };
+        }
+        canonical_hostname(pattern)
+            .map(|host| Self::Exact(host.to_string()))
+            .ok_or("expected a hostname, *.hostname, or regex:<expression>")
+    }
+
+    fn matches(&self, hostname: &str) -> bool {
+        match self {
+            Self::Exact(allowed) => hostname == allowed,
+            Self::Subdomains(suffix) => hostname
+                .strip_suffix(suffix)
+                .and_then(|prefix| prefix.strip_suffix('.'))
+                .is_some_and(|prefix| !prefix.is_empty()),
+            Self::Regex(pattern) => pattern.is_match(hostname),
+        }
+    }
+}
+
+fn canonical_hostname(raw: &str) -> Option<Host<String>> {
+    // In opaque SSH host syntax, percent escapes need not mean what they do in HTTP.
+    if raw.contains('%') {
+        return None;
+    }
+    let host = Host::parse(raw).ok()?;
+    match &host {
+        Host::Domain(domain) => {
+            let name = domain.strip_suffix('.').unwrap_or(domain);
+            if !name.split('.').all(|label| {
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            }) {
+                return None;
+            }
+        }
+        Host::Ipv4(address) if raw != address.to_string() => return None,
+        _ => {}
+    }
+    Some(host)
 }
 
 pub(crate) struct MarketplacePolicy {
@@ -179,7 +243,7 @@ impl AllowedMarketplaceSource {
                         .is_none_or(|allowed_ref| Some(allowed_ref) == ref_name.as_ref())
             }
             (Self::GitHostPattern(pattern), MarketplaceSource::Git { url, .. }) => {
-                git_hostname(url).is_some_and(|hostname| pattern.is_match(&hostname))
+                git_hostname(url).is_some_and(|hostname| pattern.matches(&hostname))
             }
             (Self::Local(allowed), MarketplaceSource::Local { path }) => {
                 paths_match_after_normalization(allowed.as_path(), path)
@@ -357,9 +421,9 @@ fn compile_allowed_source(
                 .map(str::trim)
                 .filter(|host_pattern| !host_pattern.is_empty())
                 .ok_or_else(|| invalid("missing host_pattern"))?;
-            Regex::new(host_pattern)
+            MarketplaceHostPattern::compile(host_pattern)
                 .map(AllowedMarketplaceSource::GitHostPattern)
-                .map_err(|err| invalid(&err.to_string()))
+                .map_err(invalid)
         }
         MarketplaceAllowedSourceKind::Local => {
             let path = allowed_source
@@ -497,10 +561,23 @@ fn git_hostname(url: &str) -> Option<String> {
             return None;
         }
     }
-    if let Ok(url) = Url::parse(url) {
-        return url.host_str().map(str::to_ascii_lowercase);
+    if let Ok(parsed) = Url::parse(url) {
+        let hostname = parsed.host_str()?;
+        let hostname = if parsed.scheme() == "ssh" && hostname.contains('%') {
+            // Url's opaque SSH host is percent-encoded; normalize the raw IDN, not a
+            // potentially literal percent escape in the Git source.
+            let (_, authority_and_path) = url.split_once("://")?;
+            let authority = authority_and_path.split(['/', '?', '#']).next()?;
+            let host_and_port = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host_and_port)| host_and_port);
+            host_and_port.split(':').next()?
+        } else {
+            hostname
+        };
+        return canonical_hostname(hostname).map(|host| host.to_string());
     }
     let (_, host_and_path) = url.split_once('@')?;
     let (hostname, _) = host_and_path.split_once(':')?;
-    (!hostname.is_empty()).then(|| hostname.to_ascii_lowercase())
+    canonical_hostname(hostname).map(|host| host.to_string())
 }

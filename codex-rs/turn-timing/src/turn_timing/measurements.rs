@@ -33,7 +33,8 @@ pub(super) struct Capture {
     artifact_recoveries: BTreeMap<String, Value>,
     dropped_artifact_recoveries: u64,
     actual_context_retirements: u64,
-    context_retirements: BTreeMap<String, Value>,
+    // Frozen snapshots share immutable rows; terminal serialization still includes every fact.
+    context_retirements: BTreeMap<String, Arc<Value>>,
     dropped_context_retirements: u64,
     actual_input_prefixes: u64,
     input_prefixes: BTreeMap<String, Value>,
@@ -503,11 +504,11 @@ impl TurnTimingState {
             capture.dropped_context_retirements = capture.dropped_context_retirements.saturating_add(1);
             return;
         }
-        capture.context_retirements.insert(event.to_owned(), json!({
+        capture.context_retirements.insert(event.to_owned(), Arc::new(json!({
             "event_id":event, "after_request_id":preceding,
             "start_ms":start_ns.map(u128_to_u64_ms), "end_ms":end_ms,
             "clock_id":self.clock.domain_id(), "facts":facts,
-        }));
+        })));
     }
 
     /// Reuse the byte count from the actual nested-result serializer. This is

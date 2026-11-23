@@ -15,6 +15,8 @@ use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::DiagnosticOrigins;
+use codex_rollout::DiagnosticOriginSource;
 use codex_rollout::persisted_rollout_items;
 
 use crate::AppendThreadItemsParams;
@@ -99,6 +101,7 @@ struct InMemoryThreadStoreState {
     calls: InMemoryThreadStoreCalls,
     created_threads: HashMap<ThreadId, CreateThreadParams>,
     histories: HashMap<ThreadId, Vec<RolloutItem>>,
+    diagnostic_origins: HashMap<ThreadId, DiagnosticOrigins>,
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
     rollout_paths: HashMap<PathBuf, ThreadId>,
 }
@@ -245,6 +248,7 @@ impl InMemoryThreadStore {
         thread_id: ThreadId,
         items: &[RolloutItem],
         ordered: bool,
+        origins: DiagnosticOriginSource,
     ) -> ThreadStoreResult<()> {
         if items.is_empty() {
             return Ok(());
@@ -257,11 +261,18 @@ impl InMemoryThreadStore {
         if ordered {
             state.calls.append_items_ordered += 1;
         }
-        state
-            .histories
-            .entry(thread_id)
-            .or_default()
-            .extend_from_slice(items);
+        let history = state.histories.entry(thread_id).or_default();
+        let start = history.len();
+        history.extend_from_slice(items);
+        if !matches!(&origins, DiagnosticOriginSource::Unknown) {
+            let timestamp = Utc::now();
+            for (index, item) in items.iter().enumerate() {
+                if let Some(origin) = origins.origin_for(index, item, timestamp) {
+                    state.diagnostic_origins.entry(thread_id).or_default()
+                        .insert(start + index, origin);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -287,6 +298,7 @@ impl InMemoryThreadStore {
         Ok(StoredThreadHistory {
             thread_id: params.thread_id,
             items: items.clone(),
+            diagnostic_origins: state.diagnostic_origins.get(&params.thread_id).cloned().unwrap_or_default(),
         })
     }
 
@@ -451,6 +463,7 @@ impl InMemoryThreadStore {
         let mut state = self.state.lock().await;
         state.calls.delete_thread += 1;
         let existed = state.histories.remove(&params.thread_id).is_some();
+        state.diagnostic_origins.remove(&params.thread_id);
         state.created_threads.remove(&params.thread_id);
         state.metadata_updates.remove(&params.thread_id);
         state
@@ -497,7 +510,7 @@ impl ThreadStore for InMemoryThreadStore {
         items: &'a [RolloutItem],
     ) -> ThreadStoreFuture<'a, ()> {
         Box::pin(InMemoryThreadStore::append_persisted_items_with_ordering(
-            self, thread_id, items, false,
+            self, thread_id, items, false, DiagnosticOriginSource::Unknown,
         ))
     }
 
@@ -507,7 +520,18 @@ impl ThreadStore for InMemoryThreadStore {
         items: &'a [RolloutItem],
     ) -> ThreadStoreFuture<'a, ()> {
         Box::pin(InMemoryThreadStore::append_persisted_items_with_ordering(
-            self, thread_id, items, true,
+            self, thread_id, items, true, DiagnosticOriginSource::Unknown,
+        ))
+    }
+
+    fn append_persisted_items_ordered_with_origins<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+        origins: DiagnosticOriginSource,
+    ) -> ThreadStoreFuture<'a, ()> {
+        Box::pin(InMemoryThreadStore::append_persisted_items_with_ordering(
+            self, thread_id, items, true, origins,
         ))
     }
 
@@ -614,6 +638,7 @@ fn stored_thread_from_state(
     let history = include_history.then(|| StoredThreadHistory {
         thread_id,
         items: state.histories.get(&thread_id).cloned().unwrap_or_default(),
+        diagnostic_origins: state.diagnostic_origins.get(&thread_id).cloned().unwrap_or_default(),
     });
     let metadata = state.metadata_updates.get(&thread_id);
     let name = metadata.and_then(|metadata| metadata.name.clone().flatten());

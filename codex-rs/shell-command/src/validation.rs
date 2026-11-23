@@ -2511,6 +2511,14 @@ fn policy_kda(mut args: &[String]) -> ValidationPolicyClassification {
     use ValidationPolicyClassification as Policy;
     // Cargo's external-subcommand transport repeats the subcommand name.
     if args.first().is_some_and(|arg| arg == "kda") { args = &args[1..]; }
+    // KDA dispatches the standalone help form before entering a gate. Do not
+    // promote mixed invocations or values that merely contain a help flag.
+    let help = |flag: &String| matches!(flag.as_str(), "-h" | "--help");
+    if matches!(args, [flag] if help(flag))
+        || matches!(args, [command, flag] if command == "gate" && help(flag))
+    {
+        return Policy::ReadOnly;
+    }
     // Keep documented discovery out of the validation-attempt budget. Other
     // operations are classified by their own workload, not an unrestricted alias.
     if args.first().is_some_and(|arg| matches!(arg.as_str(), "lints" | "explain" | "config-schema")) {

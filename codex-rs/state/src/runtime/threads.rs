@@ -1318,7 +1318,7 @@ ON CONFLICT(id) DO UPDATE SET
     /// after that transaction commits, so a primary failure leaves the complete retry graph and
     /// auxiliary records intact. Auxiliary cleanup is best-effort after the logical delete.
     pub async fn delete_threads_strict(&self, thread_ids: &[ThreadId]) -> anyhow::Result<u64> {
-        self.delete_threads_with_boundary(thread_ids, None).await
+        self.delete_threads_with_boundary(thread_ids, None, None).await
     }
 
     /// Validate the selected subtree under the same writer reservation as deletion.
@@ -1328,7 +1328,7 @@ ON CONFLICT(id) DO UPDATE SET
         root: ThreadId,
         thread_ids: &[ThreadId],
     ) -> anyhow::Result<u64> {
-        self.delete_threads_with_boundary(thread_ids, Some(root)).await
+        self.delete_threads_with_boundary(thread_ids, Some(root), None).await
     }
 
     /// Explicit restore/import authorization only; ordinary metadata inference
@@ -1352,10 +1352,22 @@ ON CONFLICT(id) DO UPDATE SET
         Ok(())
     }
 
+    /// Candidates only: archive state and age are rechecked under the deletion transaction.
+    pub async fn expired_archive_ids(&self, cutoff: i64) -> anyhow::Result<Vec<ThreadId>> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM threads WHERE archived=1 AND archive_observed_at<=? AND archived_at<=? ORDER BY archive_observed_at,id")
+            .bind(cutoff).bind(cutoff).fetch_all(self.pool.as_ref()).await?;
+        ids.into_iter().map(|id| Ok(ThreadId::try_from(id)?)).collect()
+    }
+
+    pub async fn delete_expired_archive(&self, id: ThreadId, cutoff: i64, indexed_path: &Path) -> anyhow::Result<u64> {
+        self.delete_threads_with_boundary(&[id], Some(id), Some((cutoff, indexed_path))).await
+    }
+
     async fn delete_threads_with_boundary(
         &self,
         thread_ids: &[ThreadId],
         root: Option<ThreadId>,
+        archive_cutoff: Option<(i64, &Path)>,
     ) -> anyhow::Result<u64> {
         if thread_ids.is_empty() {
             return Ok(0);
@@ -1368,6 +1380,11 @@ ON CONFLICT(id) DO UPDATE SET
         let thread_ids_json = serde_json::to_string(&thread_id_strings)?;
         let now = Utc::now().timestamp();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some((cutoff, indexed_path)) = archive_cutoff {
+            let eligible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM threads WHERE id=? AND archived=1 AND archive_observed_at<=? AND archived_at<=? AND rollout_path=?)")
+                .bind(thread_ids[0].to_string()).bind(cutoff).bind(cutoff).bind(indexed_path.to_string_lossy().as_ref()).fetch_one(&mut *tx).await?;
+            anyhow::ensure!(eligible, "archive retention eligibility changed");
+        }
         if let Some(root) = root {
             anyhow::ensure!(
                 thread_ids.contains(&root),

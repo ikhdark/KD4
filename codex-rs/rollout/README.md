@@ -29,6 +29,14 @@ history or change frontend rendering. Explicit non-persisting delivery and
 ephemeral sessions stay non-persisting. Only model/backend content actually
 emitted can be captured; this does not expose unavailable private reasoning.
 
+New native `warning`, `error`, and `stream_error` event records carry an
+optional top-level `diagnostic_origin` with `id` (an opaque UUID), `thread_id`
+(the originating thread), and `timestamp` (the original recorder capture time).
+An inherited record gets its usual new physical record timestamp but carries its
+original origin unchanged through native forks, including bounded history copies.
+An absent or malformed origin is unknown and is not inferred from message text,
+record order, physical timestamp, or lineage. The event payload is unchanged.
+
 Activity uses the existing ordered writer, timestamps, and terminal durability
 barrier. There is no per-delta flush or new background queue. As with other
 ordered records, an unflushed tail can be lost on process termination. Enabled
@@ -55,3 +63,63 @@ accumulated request snapshots from being retained while opening a task.
 Ordinary history payloads, unknown formats and malformed references retain
 canonical decoding/error handling. Full `for_each_rollout_item` readers and
 diagnostic/export paths still hydrate and verify the saved diagnostic bodies.
+Append preflight still reads, verifies and enrolls every referenced dependency
+while the writer locks are held. The append metadata visitor does not consume
+replay captures. For a strictly recognized current-format replay record, preflight
+validates the authenticated JSON with the existing serde parser while retaining
+only the typed envelope. If the shape or encoding is not recognized, the exact
+same bytes still go through the existing Value/RawValue decoders; ordinary
+captures already parsed as Value can still be discarded before the typed decode.
+Neither path changes dependency enrollment or payload-before-rollout syncing.
+
+## Opt-in append writer-open timing
+
+For a diagnostic backend launch, set `CODEX_ROLLOUT_WRITER_OPEN_TIMING=1`
+and `CODEX_RUNTIME_OBSERVATIONS=1`, with
+`CODEX_RUNTIME_OBSERVATIONS_DIR` pointing to an existing absolute directory.
+The [runtime observations journal](../protocol/src/timing/observations.rs)
+emits one `rollout_writer_open_summary` per returned append writer-open
+attempt, not one row per record. A cancelled attempt need not emit a summary.
+Rows identify the rollout by its normalized path hash, not its path or contents.
+
+The summary reports elapsed nanoseconds for the owner, lock acquisition,
+preflight and final writer materialization. Preflight sub-totals measure payload
+file access and reads, SHA-256 verification, JSON parsing (including Value
+construction), dependency enrollment, envelope materialization, canonical
+record decode and replay-capture discard. These sub-totals exclude task
+dispatch and are not a complete decomposition of preflight. Candidate and
+completed-read byte counts are totals for that attempt, including repeated
+references, not distinct artifacts. The projected replay count measures records
+accepted by the fast parser before the canonical typed decode, not a count of
+records committed to storage. The diagnostic does not relax validation
+or change which records are read, retained or synced.
+
+## Opt-in seven-day archive retention
+
+For a single local home, **stop every older writer before enabling this policy**.
+All future writers, including compressors, must use the upgraded build. Do not
+copy or import rollout files into the home behind the publisher locks during
+a sweep; stop maintenance before an out-of-band restore. Copies
+outside the home that depend on its payload pool are not protected. Do not opt
+in if such copies or mixed-version writers must remain supported.
+
+Create `archive-retention.policy` directly in the selected home with the exact
+UTF-8 bytes `local-home-only:7-days` followed by one LF (no BOM). Restart with
+the upgraded build. Remove the marker to disable subsequent passes; removal
+cannot undo a committed deletion. Other homes retain final payloads by default.
+
+Local storage checks at startup and every six hours while running. Seven days
+means time archived, not time since the last message. Preexisting archives get
+a full grace period from clock migration; newly observed writer leases also get
+seven days. Unarchiving prevents expiry; rearchiving restarts the clock.
+The worker uses the staged native delete transaction and does not cascade into
+another chat. Busy, missing, conflicting or unindexed archives and parents with
+remaining children are left alone. Archive cleanup is not an unarchived-chat
+storage quota.
+
+When the home is quiet, collection scans active and archived histories (including
+compressed representations), nested JSONL exports and loose home files for references before removing
+unreferenced content-addressed payloads. Shared payloads remain. Live publishers,
+unresolved deletion staging or an incomplete inventory defer the sweep. A writer
+arriving during the scan requests that maintenance yield. An always-busy home
+may need a cold start to provide a collection window.

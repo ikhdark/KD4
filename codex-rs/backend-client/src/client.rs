@@ -380,7 +380,10 @@ impl Client {
                 // Callers log this text and return it over RPC. The untyped
                 // body can hold account or managed-config data; keep its size.
                 anyhow::bail!(
-                    "Decode error for {url}: {e}; content-type={ct}; body_bytes={}",
+                    "Decode error for {url}: {:?} at line {} column {}; content-type={ct}; body_bytes={}",
+                    e.classify(),
+                    e.line(),
+                    e.column(),
                     body.len()
                 );
             }
@@ -611,29 +614,22 @@ impl Client {
             .json(&request_body);
         let (body, ct) = self.exec_request_detailed(req, "POST", &url).await?;
         // Extract id from JSON: prefer `task.id`; fallback to top-level `id` when present.
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => {
-                if let Some(id) = v
-                    .get("task")
-                    .and_then(|t| t.get("id"))
-                    .and_then(|s| s.as_str())
-                {
-                    anyhow::ensure!(!id.trim().is_empty(), "POST {url} returned an empty task id");
-                    Ok(id.to_string())
-                } else if let Some(id) = v.get("id").and_then(|s| s.as_str()) {
-                    anyhow::ensure!(!id.trim().is_empty(), "POST {url} returned an empty task id");
-                    Ok(id.to_string())
-                } else {
-                    anyhow::bail!(
-                        "POST {url} succeeded but no task id found; content-type={ct}; body_bytes={}",
-                        body.len()
-                    );
-                }
-            }
-            Err(e) => anyhow::bail!(
-                "Decode error for {url}: {e}; content-type={ct}; body_bytes={}",
+        let v = self.decode_json::<serde_json::Value>(&url, &ct, &body)?;
+        if let Some(id) = v
+            .get("task")
+            .and_then(|t| t.get("id"))
+            .and_then(|s| s.as_str())
+        {
+            anyhow::ensure!(!id.trim().is_empty(), "POST {url} returned an empty task id");
+            Ok(id.to_string())
+        } else if let Some(id) = v.get("id").and_then(|s| s.as_str()) {
+            anyhow::ensure!(!id.trim().is_empty(), "POST {url} returned an empty task id");
+            Ok(id.to_string())
+        } else {
+            anyhow::bail!(
+                "POST {url} succeeded but no task id found; content-type={ct}; body_bytes={}",
                 body.len()
-            ),
+            );
         }
     }
 

@@ -429,6 +429,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     reason: CompactionReason,
     phase: CompactionPhase,
     emit_error_event: bool,
+    run_pre_compact_hook: bool,
     recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
@@ -459,7 +460,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         reason,
         phase,
         emit_error_event,
-        /*run_pre_compact_hook*/ true,
+        run_pre_compact_hook,
         recovery_wait,
         cancellation_token,
     )

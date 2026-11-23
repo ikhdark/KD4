@@ -12,6 +12,8 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
+use codex_rollout::DiagnosticOriginSource;
+
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
@@ -113,6 +115,17 @@ pub trait ThreadStore: Any + Send + Sync {
             thread_id,
             items: items.to_vec(),
         })
+    }
+
+    /// Ordered canonical append with explicit diagnostic provenance custody.
+    /// Compatibility stores without provenance retain their existing append behavior.
+    fn append_persisted_items_ordered_with_origins<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+        _origins: DiagnosticOriginSource,
+    ) -> ThreadStoreFuture<'a, ()> {
+        self.append_persisted_items_ordered(thread_id, items)
     }
 
     /// Materializes the thread if persistence is lazy, then persists all queued items.

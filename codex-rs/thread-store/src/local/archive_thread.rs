@@ -82,6 +82,12 @@ async fn archive_thread_owned(
         .config
         .codex_home
         .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
+    // The index can be absent or fail to settle after a successful move.
+    // Record the earliest safe expiry on the stable writer lease before moving.
+    if codex_rollout::home_retention_enabled(&store.config.codex_home) {
+        _lease.set_modified(std::time::SystemTime::now()).map_err(super::delete_thread::delete_recovery_error)?;
+        _lease.sync_all().map_err(super::delete_thread::delete_recovery_error)?;
+    }
     let archived_path = codex_rollout::move_rollout_to_directory_with_owner(
         &canonical_rollout_path,
         &archive_folder,

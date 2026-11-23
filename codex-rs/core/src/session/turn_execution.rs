@@ -3073,8 +3073,8 @@ pub(crate) enum ObligationStoppingDecision {
     Suspend,
 }
 
-// This is an instruction-epoch bound. Tool calls, plan revisions and report
-// messages cannot replenish it.
+// Ordinary instruction-epoch allowance; only an exact-read recovery may add
+// one further deferral, without replenishing this allowance.
 const MAX_OBLIGATION_FINAL_DEFERRALS: u8 = 2;
 
 pub(crate) struct TurnExecutionControl {
@@ -3089,6 +3089,7 @@ pub(crate) struct TurnExecutionControl {
     /// An inherited completed checklist is not a final-answer hint for new input.
     plan_updated_since_input: bool,
     obligation_final_deferrals: u8,
+    obligation_recovery_checkpoint: Option<BTreeSet<String>>,
     plan_revision: u64,
     input_revision: u64,
     /// Passive cycle identity excludes reports, unlike completion/dispatch authority.
@@ -3153,6 +3154,7 @@ impl TurnExecutionControl {
             plan: None,
             plan_updated_since_input: false,
             obligation_final_deferrals: 0,
+            obligation_recovery_checkpoint: None,
             plan_revision: 0,
             input_revision: 0,
             instruction_revision: 0,
@@ -3300,17 +3302,67 @@ impl TurnExecutionControl {
             .then_some(report)
     }
 
-    pub(crate) fn decide_obligation_stop(&mut self) -> ObligationStoppingDecision {
+    fn made_held_read_progress(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+        unresolved: &[String],
+        mutation_revision: u64,
+        user_intent_epoch: u64,
+    ) -> bool {
+        let Some(checkpoint) = self.obligation_recovery_checkpoint.as_ref() else {
+            return false;
+        };
+        if unresolved.len() >= checkpoint.len()
+            || !unresolved.iter().all(|id| checkpoint.contains(id))
+        {
+            return false;
+        }
+        let Some(owner) = turn.extension_data.get::<ObligationPrerequisites>() else {
+            return false;
+        };
+        let state = owner.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.held_exact_read.as_ref().is_some_and(|held| {
+            held.user_intent_epoch == user_intent_epoch
+                && held.requirements.keys().any(|id| {
+                    checkpoint.contains(id) && !unresolved.contains(id)
+                })
+                && state.complete_reads.iter().any(|(path, epoch, mutation)| {
+                    path == &held.path
+                        && *epoch == user_intent_epoch
+                        && *mutation == mutation_revision
+                })
+        })
+    }
+
+    pub(crate) fn decide_obligation_stop(
+        &mut self,
+        turn: &crate::session::turn_context::TurnContext,
+        mutation_revision: u64,
+        user_intent_epoch: u64,
+    ) -> ObligationStoppingDecision {
         let Some(plan) = self.unresolved_plan() else {
             return ObligationStoppingDecision::Allow;
         };
-        if self.obligation_final_deferrals >= MAX_OBLIGATION_FINAL_DEFERRALS {
+        if self.obligation_final_deferrals >= MAX_OBLIGATION_FINAL_DEFERRALS
+            && !self.made_held_read_progress(
+                turn,
+                &plan.obligations.unresolved,
+                mutation_revision,
+                user_intent_epoch,
+            )
+        {
             return ObligationStoppingDecision::Suspend;
         }
         let directive = format!(
             "Final answer deferred: unresolved requirement IDs {} (revision {}). Use the normal tools to advance the outstanding work, or recover an existing operation through its owner. Keep obligations not established as finished unresolved. For a prerequisite explicitly reserved to the user, use update_plan.report_blocked with fresh native NotFound evidence and the authentic source. An unchanged failed attempt or generic blocker claim does not resolve this debt.",
             plan.obligations.unresolved.join(", "), plan.revision,
         );
+        // Save the last ordinary deferral's debt; spending the recovery clears
+        // the checkpoint. Plan churn or another read cannot grant a fourth.
+        let checkpoint = (self.obligation_final_deferrals + 1
+            == MAX_OBLIGATION_FINAL_DEFERRALS)
+            .then(|| plan.obligations.unresolved.iter().cloned().collect());
+        self.obligation_recovery_checkpoint = checkpoint;
         self.obligation_final_deferrals += 1;
         ObligationStoppingDecision::Continue(directive)
     }
@@ -3831,9 +3883,10 @@ impl TurnExecutionControl {
             self.wait_advice_issued = false;
         }
         // A report from a child or peer is new information, not a new instruction.
-        // Only new instructions re-arm the gate or reset passive cycle identity.
+        // Only new instructions reset the allowance or passive cycle identity.
         if instructions_changed {
             self.obligation_final_deferrals = 0;
+            self.obligation_recovery_checkpoint = None;
             self.instruction_revision = self.instruction_revision.saturating_add(1);
 
             self.reset_convergence();

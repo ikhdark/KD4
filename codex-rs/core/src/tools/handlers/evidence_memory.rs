@@ -83,6 +83,7 @@ pub(crate) async fn ledger_context(step: &crate::session::step_context::StepCont
 {
     use codex_extension_api::{PreviousWorldStateSection, RenderedWorldStateFragment, WorldStateSectionContribution};
     if !step.turn.file_system_sandbox_policy().has_full_disk_read_access() { return None; }
+    const SECTION_ID: &str = "verification_ledger";
     let capture = async {
         let mut repositories = Vec::new();
         for environment in step.environments.turn_environments.iter().take(8) {
@@ -92,11 +93,11 @@ pub(crate) async fn ledger_context(step: &crate::session::step_context::StepCont
             let cwd = environment.cwd().clone();
             let root = codex_file_system::find_nearest_ancestor_with_markers(fs.as_ref(), &cwd,
                 vec![".git".into(), ".local/evidence/fixes/ledger-view.json".into(), ".codex/fix-evidence/ledger-view.json".into()],
-                FindUpErrorPolicy::Ignore, Some(&sandbox)).await.ok().flatten();
+                FindUpErrorPolicy::Propagate, Some(&sandbox)).await?;
             let Some(root) = root else { continue; };
-            let paths = [root.join(".local/evidence/fixes/ledger-view.json").ok()?,
-                root.join(".codex/fix-evidence/ledger-view.json").ok()?];
-            let Some(path) = fs.first_regular_file(&paths, Some(&sandbox)).await.ok().flatten() else { continue; };
+            let paths = [root.join(".local/evidence/fixes/ledger-view.json").map_err(std::io::Error::other)?,
+                root.join(".codex/fix-evidence/ledger-view.json").map_err(std::io::Error::other)?];
+            let Some(path) = fs.first_regular_file(&paths, Some(&sandbox)).await? else { continue; };
             let Some((view, _)) = read_json(fs.as_ref(), &path, INDEX_BYTES, &sandbox).await else {
                 repositories.push(json!({"ledger":path.to_string(),"coverage":"unavailable"})); continue;
             };
@@ -111,22 +112,30 @@ pub(crate) async fn ledger_context(step: &crate::session::step_context::StepCont
                 "closed_count":fixes.iter().filter(|f| f["status"] == "verified_closed").count(),
                 "evidence_gaps":view["evidence_gaps"]}));
         }
-        if repositories.is_empty() { return None; }
-        let snapshot = bounded_ledger_snapshot(&repositories, NOTICE_BYTES - LEDGER_NOTICE_INTRO.len())?;
+        if repositories.is_empty() { return Ok(None); }
+        let Some(snapshot) = bounded_ledger_snapshot(&repositories, NOTICE_BYTES - LEDGER_NOTICE_INTRO.len()) else {
+            return Ok(Some(WorldStateSectionContribution::unavailable(SECTION_ID)));
+        };
         let body = format!("{LEDGER_NOTICE_INTRO}{snapshot}");
         // Recording freshness is not a changed work queue. Keep it in the
         // delivered notice, but do not replay instructions solely for a refresh.
-        let mut identity = json!({"repositories":repositories});
-        for repository in identity["repositories"].as_array_mut()? {
-            repository.as_object_mut()?.remove("recorded_at_ns");
+        for repository in &mut repositories {
+            if let Some(fields) = repository.as_object_mut() {
+                fields.remove("recorded_at_ns");
+            }
         }
+        let identity = json!({"repositories":repositories});
         let rendered = identity.clone();
-        Some(WorldStateSectionContribution::new("verification_ledger", identity, move |previous| {
+        Ok::<_, std::io::Error>(Some(WorldStateSectionContribution::new(SECTION_ID, identity, move |previous| {
             if matches!(previous, PreviousWorldStateSection::Known(old) if old == &rendered) { return None; }
             Some(RenderedWorldStateFragment::new("developer", ("<verification_ledger>", "</verification_ledger>"), body.clone()))
-        }))
+        })))
     };
-    tokio::time::timeout(Duration::from_millis(50), capture).await.ok().flatten()
+    match tokio::time::timeout(Duration::from_millis(50), capture).await {
+        Ok(Ok(section)) => section,
+        // Uncertain discovery and deadline exhaustion cannot withdraw the accepted queue.
+        Ok(Err(_)) | Err(_) => Some(WorldStateSectionContribution::unavailable(SECTION_ID)),
+    }
 }
 
 /// Optional durable observations. No source mutation, permission changes or

@@ -1610,10 +1610,13 @@ def reserve_cargo_lane(
                 admitted = admit is None or admit(target_dir)
             finally:
                 if not admitted:
+                    primary = sys.exception()
                     try:
-                        _release_binary_file_lock(active_handle)
+                        with _retain_cleanup_failure(primary, "unadmitted lane unlock"):
+                            _release_binary_file_lock(active_handle)
                     finally:
-                        active_handle.close()
+                        with _retain_cleanup_failure(primary, "unadmitted lane lock close"):
+                            active_handle.close()
                         active_handle = None
             if admitted:
                 break
@@ -1636,13 +1639,17 @@ def reserve_cargo_lane(
         stamp.write_text(f"{time.time()}\n", encoding="utf-8")
         yield resolved_lane, target_dir
     finally:
+        primary = sys.exception()
         try:
-            stamp.write_text(f"{time.time()}\n", encoding="utf-8")
+            with _retain_cleanup_failure(primary, "lane last-used timestamp"):
+                stamp.write_text(f"{time.time()}\n", encoding="utf-8")
         finally:
             try:
-                _release_binary_file_lock(active_handle)
+                with _retain_cleanup_failure(primary, "lane unlock"):
+                    _release_binary_file_lock(active_handle)
             finally:
-                active_handle.close()
+                with _retain_cleanup_failure(primary, "lane lock close"):
+                    active_handle.close()
 
 
 def _normalized_target_dir(path: str | Path) -> str:
@@ -2456,17 +2463,60 @@ def _internal_source_link(root: Path, path: Path) -> Path:
     return target
 
 
+def _cargo_dependency_paths(manifest: Path) -> Iterator[str]:
+    try:
+        document = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (UnicodeError, ValueError):
+        # Cargo reports a malformed selected manifest; its bytes still enter
+        # the inventory. Unselected fixture manifests may also be malformed.
+        return
+
+    def tables(value: object) -> Iterator[Mapping[str, object]]:
+        if not isinstance(value, dict):
+            return
+        for name in (
+            "dependencies", "build-dependencies", "dev-dependencies",
+            "build_dependencies", "dev_dependencies", "replace",
+        ):
+            table = value.get(name)
+            if isinstance(table, dict):
+                yield table
+
+    groups = list(tables(document))
+    groups.extend(tables(document.get("workspace")))
+    targets = document.get("target")
+    if isinstance(targets, dict):
+        for target in targets.values():
+            groups.extend(tables(target))
+    patches = document.get("patch")
+    if isinstance(patches, dict):
+        groups.extend(table for table in patches.values() if isinstance(table, dict))
+    for group in groups:
+        for dependency in group.values():
+            if isinstance(dependency, dict) and isinstance(path := dependency.get("path"), str):
+                yield path
+
+
 def source_tree_files(
     root: Path, *, materialize_internal_file_links: bool = False,
 ) -> dict[str, Path]:
     """Compiled-input files below a source root, keyed by POSIX relative path.
 
-    Cargo target directories (CACHEDIR.TAG, codex-rs/target) and VCS/package
-    caches are skipped. Links remain refused by default. The explicit mirror-only
-    mode accepts relative file symlinks only after validating every target ancestor.
+    Cargo/VCS caches are skipped, except for explicitly declared local Cargo
+    dependency subtrees (including transitive ones). The link policy applies to
+    those subtrees as well as the built-in source roots.
     """
+    root = Path(os.path.abspath(root))
     files: dict[str, Path] = {}
-    pending: list[tuple[Path, str]] = []
+    pending: list[Path] = []
+    manifests: list[tuple[Path, Path]] = []
+    scanned: set[str] = set()
+
+    def add_file(logical: Path, physical: Path) -> None:
+        files[logical.relative_to(root).as_posix()] = physical
+        if os.path.normcase(logical.name) == os.path.normcase("Cargo.toml"):
+            manifests.append((logical, physical))
+
     for name in (*SOURCE_TREE_DIRS, *SOURCE_TREE_FILES):
         path = root / name
         observation = _lane_path_observation(path)
@@ -2475,29 +2525,59 @@ def source_tree_files(
         if _observation_is_indirect(observation):
             raise ValueError(f"source tree contains a link or junction: {path}")
         if name in SOURCE_TREE_FILES and stat.S_ISREG(observation.st_mode):
-            files[name] = path
+            add_file(path, path)
         elif name in SOURCE_TREE_DIRS and stat.S_ISDIR(observation.st_mode):
-            pending.append((path, f"{name}/"))
-    while pending:
-        directory, prefix = pending.pop()
+            pending.append(path)
+    while pending or manifests:
+        if not pending:
+            logical, physical = manifests.pop()
+            for spelling in _cargo_dependency_paths(physical):
+                selected = Path(spelling)
+                directory = Path(os.path.abspath(logical.parent / selected))
+                if selected.anchor or not directory.is_relative_to(root):
+                    raise ValueError(f"cannot capture Cargo dependency outside relative source layout: {logical}: {spelling}")
+                if source_root_identity(directory) in scanned:
+                    continue
+                candidate = root
+                for part in (*directory.relative_to(root).parts, "Cargo.toml"):
+                    candidate /= part
+                    observation = _lane_path_observation(candidate)
+                    if observation is None:
+                        break
+                    if _observation_is_indirect(observation):
+                        if candidate.name == "Cargo.toml" and materialize_internal_file_links:
+                            _internal_source_link(root, candidate)
+                        else:
+                            raise ValueError(f"source tree contains a link or junction: {candidate}")
+                else:
+                    if any(part in SOURCE_TREE_SKIP_DIRS for part in directory.relative_to(root).parts):
+                        raise ValueError(f"cannot capture Cargo dependency inside a source cache: {directory}")
+                    pending.append(directory)
+            continue
+        directory = pending.pop()
+        identity = source_root_identity(directory)
+        if identity in scanned:
+            continue
+        scanned.add(identity)
         with os.scandir(directory) as entries:
             for entry in entries:
-                relative = f"{prefix}{entry.name}"
+                path = Path(entry.path)
+                relative = path.relative_to(root).as_posix()
                 observation = entry.stat(follow_symlinks=False)
                 if _observation_is_indirect(observation):
                     if materialize_internal_file_links:
-                        files[relative] = _internal_source_link(root, Path(entry.path))
+                        add_file(path, _internal_source_link(root, path))
                         continue
-                    raise ValueError(f"source tree contains a link or junction: {entry.path}")
+                    raise ValueError(f"source tree contains a link or junction: {path}")
                 if stat.S_ISDIR(observation.st_mode):
                     if not (
                         entry.name in SOURCE_TREE_SKIP_DIRS
                         or relative.casefold() == "codex-rs/target"
                         or os.path.isfile(os.path.join(entry.path, "CACHEDIR.TAG"))
                     ):
-                        pending.append((Path(entry.path), f"{relative}/"))
+                        pending.append(path)
                 elif stat.S_ISREG(observation.st_mode):
-                    files[relative] = Path(entry.path)
+                    add_file(path, path)
     return files
 
 
@@ -3036,6 +3116,17 @@ def _reuse_decision(
     if decisions is not None:
         decisions.append({"gate": gate, "status": status, "candidate": str(candidate) if candidate is not None else None,
                           "expected": expected, "observed": observed})
+
+
+@contextmanager
+def _retain_cleanup_failure(primary, phase):
+    """Keep an unconfirmed cleanup authoritative across secondary I/O failures."""
+    try:
+        yield
+    except Exception as secondary:
+        if not isinstance(primary, CleanupFailed):
+            raise
+        primary.add_note(f"{phase}: {secondary}")
 
 
 def _cache_evidence_summary(evidence: Mapping[str, object]) -> dict[str, object]:
@@ -3697,35 +3788,37 @@ def run_in_cargo_lane(
                         )
                         _report_bundle_receipt(bundle_dir)
             except CleanupFailed:
-                (target_dir / ".lane-cleanup-unconfirmed").write_text(
-                    "Process cleanup was not confirmed; inspect descendants before removing this quarantine.\n"
-                )
+                with _retain_cleanup_failure(sys.exception(), "quarantine marker"):
+                    (target_dir / ".lane-cleanup-unconfirmed").write_text(
+                        "Process cleanup was not confirmed; inspect descendants before removing this quarantine.\n"
+                    )
                 raise
             finally:
                 if messages_path is not None:
-                    original_error = sys.exception()
-                    try:
-                        messages_path.unlink(missing_ok=True)
-                    except OSError as cleanup_error:
-                        if original_error is None:
-                            raise
-                        # A compiler/cache descendant may still hold this log.
-                        # Never replace the actual build/ownership failure with
-                        # a secondary Windows sharing violation during cleanup.
-                        raise RuntimeError(
-                            f"{type(original_error).__name__}: {original_error}; "
-                            f"Cargo message log retained after cleanup failed: {cleanup_error}"
-                        ) from original_error
+                    with _retain_cleanup_failure(sys.exception(), "Cargo message log"):
+                        original_error = sys.exception()
+                        try:
+                            messages_path.unlink(missing_ok=True)
+                        except OSError as cleanup_error:
+                            if original_error is None or isinstance(original_error, CleanupFailed):
+                                raise
+                            # Retain the cause when an ordinary build error is
+                            # followed by a Windows sharing violation.
+                            raise RuntimeError(
+                                f"{type(original_error).__name__}: {original_error}; "
+                                f"Cargo message log retained after cleanup failed: {cleanup_error}"
+                            ) from original_error
                 if state_path is not None:
                     # Later rewrites must postdate this build's compilations.
                     # Entries let the next snapshot pick its nearest slot.
-                    state_path.write_text(json.dumps({
-                        "targetDir": str(target_dir),
-                        "lastBuildEndedNs": time.time_ns(),
-                        "manifestSha256": mirror["sha256"],
-                        "sourceRoot": str(repo_root),
-                        "entries": mirror_entries,
-                    }) + "\n", encoding="utf-8")
+                    with _retain_cleanup_failure(sys.exception(), "mirror state"):
+                        state_path.write_text(json.dumps({
+                            "targetDir": str(target_dir),
+                            "lastBuildEndedNs": time.time_ns(),
+                            "manifestSha256": mirror["sha256"],
+                            "sourceRoot": str(repo_root),
+                            "entries": mirror_entries,
+                        }) + "\n", encoding="utf-8")
             record["status"] = "complete" if code == 0 else "failed"
             return code
     except (CargoLanesRootValidationError, OSError, RuntimeError, ValueError) as error:
@@ -3734,32 +3827,38 @@ def run_in_cargo_lane(
         record.update(exitCode=2, status="failed", error=str(error))
         raise
     finally:
-        print("Build reuse: " + json.dumps({
-            key: _cache_evidence_summary(value) for key, value in cache_reuse.items()
-        }), file=sys.stderr)
-        if resource_lease is not None and not resource_lease.finished:
-            record["resources"].update(status="failed", error="build setup interrupted before compilation")
-            resource_lease.finish(quarantined=isinstance(sys.exception(), CleanupFailed))
-        reservation = record.get("laneReservation")
-        if reservation and reservation.get("phase") not in (None, "reserved"):
-            # The wait ended without a lane; time the phase it ended in.
-            reservation["openPhaseMs"] = (time.time() - reservation["phaseEnteredAt"]) * 1000
-        if timing_path is not None:
-            if timing_evidence is not None:
-                capture_started = time.perf_counter()
+        with _retain_cleanup_failure(sys.exception(), "build reuse diagnostic"):
+            print("Build reuse: " + json.dumps({
+                key: _cache_evidence_summary(value) for key, value in cache_reuse.items()
+            }), file=sys.stderr)
+        with _retain_cleanup_failure(sys.exception(), "resource lease finalization"):
+            if resource_lease is not None and not resource_lease.finished:
+                record["resources"].update(status="failed", error="build setup interrupted before compilation")
+                resource_lease.finish(quarantined=isinstance(sys.exception(), CleanupFailed))
+        with _retain_cleanup_failure(sys.exception(), "timing receipt"):
+            reservation = record.get("laneReservation")
+            if reservation and reservation.get("phase") not in (None, "reserved"):
+                # The wait ended without a lane; time the phase it ended in.
+                reservation["openPhaseMs"] = (time.time() - reservation["phaseEnteredAt"]) * 1000
+            if timing_path is not None:
+                if timing_evidence is not None:
+                    capture_started = time.perf_counter()
+                    try:
+                        timing_evidence["sourceUnchanged"] = (
+                            source_tree_manifest(repo_root, materialize_internal_file_links=materialize_internal_file_links)
+                            == timing_evidence["sourceManifest"]
+                        )
+                    except OSError as error:
+                        timing_evidence["sourceObservationError"] = str(error)
+                    timing_evidence["captureMs"] += (time.perf_counter() - capture_started) * 1000
+                record["totalMs"] = (time.perf_counter() - started) * 1000
+                primary = sys.exception()
                 try:
-                    timing_evidence["sourceUnchanged"] = (
-                        source_tree_manifest(repo_root, materialize_internal_file_links=materialize_internal_file_links)
-                        == timing_evidence["sourceManifest"]
-                    )
+                    write_json_atomic(timing_path, record)
                 except OSError as error:
-                    timing_evidence["sourceObservationError"] = str(error)
-                timing_evidence["captureMs"] += (time.perf_counter() - capture_started) * 1000
-            record["totalMs"] = (time.perf_counter() - started) * 1000
-            try:
-                write_json_atomic(timing_path, record)
-            except OSError as error:
-                print(f"warning: Cargo lane timing could not be saved: {error}", file=sys.stderr)
+                    if isinstance(primary, CleanupFailed):
+                        raise
+                    print(f"warning: Cargo lane timing could not be saved: {error}", file=sys.stderr)
 
 
 def is_protected_target_dir_name(name: str) -> bool:
@@ -4647,6 +4746,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"unknown command {args.command}")
     except (CargoLanesRootValidationError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        for note in getattr(exc, "__notes__", ()):
+            print(f"note: {note}", file=sys.stderr)
         return 2
     return 0
 
