@@ -30,6 +30,47 @@ For each material behavior change, verify the intended outcome and representativ
 Prefer extending or adjusting an existing fix over fully replacing it; preserve its working parts and retained benefits. Replace it only when evidence shows an incremental correction is insufficient, and explain why. Before consequential behavioral edits, inspect relevant prior fixes and benchmark history; weigh required behavior, retained benefits, complexity, maintenance and workflow impact. Make consequential preserve/modify/reject decisions visible with fix IDs and a brief evidence-backed rationale, using existing review metadata when available; distinguish judgment from measurement. Advisories are selective context, not approval gates or proof of full coverage. Distinguish evidence delivery, observed reads and reported consideration; missing records remain unknown. Do not require proposal patches, per-fix reports, routine registry checks or unrelated benchmarks. When a regression is confirmed, record with its repair the behavior that must keep working, wherever the repository keeps prior-fix records. When a change touches a recorded constraint, rerun its registered reproduction with permitted checks before handoff; if that fails or cannot be obtained, report a regression warning and do not report the change as verified. Report every change to a registered reproduction, its inputs or expected results. These warnings never refuse edits.
 Read relevant code before editing and reconcile current source before patching. Preserve user changes, formatting, Unicode and line endings; edit intended hunks rather than replaying stale replacements. Ask only about irreconcilable intent. Verify destructive targets; destructive Git operations require an explicit request. When committing, give each verified fix its own commit naming its finding or fix ID and containing only that fix's files or hunks.
 Use an expected source hash or revision as a write precondition where supported. On mismatch, reread and reconcile before retrying. If unavailable, reread just before a minimal context-checked edit and inspect the diff; this is not an atomic guard.
+
+### Exact single-file line replacement
+
+When an authorized Code Mode edit names one existing local file and distinct exact old and new lines, use this function and call it in the same cell. Only use it when the requested action and no-op/ambiguity handling are clear. `AMBIGUOUS` means no write is authorized by this recipe; do not switch edit forms to force it. Otherwise use the returned complete content when needed. A refused patch or mismatched readback is not permission to retry a write.
+
+```js
+async function guardedLine(path, before, after) {
+  if (![before, after].every(s => typeof s === "string" && s && !/[\r\n\0]/.test(s)) ||
+      before === after || typeof path !== "string" || !/^[\w.-]+$/.test(path) ||
+      path === "." || path === "..")
+    throw Error("expected one local filename and distinct exact lines");
+  const get = async () => {
+    const r = await tools.read_file({ path });
+    const row = r.results?.[0];
+    if (!r.file_complete || r.results.length !== 1 || !row.complete ||
+        typeof row.text !== "string" || !/^[0-9a-f]{64}$/.test(r.source_sha256))
+      throw Error("complete native source required");
+    return [r.source_sha256, row.text];
+  };
+  const [hash, old] = await get();
+  const lines = old.split(/(\r\n|\n)/);
+  const indices = value => lines.flatMap((line,i) => i % 2 === 0 && line === value ? [i] : []);
+  const hit = indices(before), present = indices(after);
+  if (hit.length > 1 || (hit.length && present.length) || present.length > 1)
+    return {status:"AMBIGUOUS"};
+  if (!hit.length && present.length === 1)
+    return {status:"UNCHANGED", content:old};
+  if (hit.length !== 1) throw Error("old line missing");
+  lines[hit[0]] = after;
+  const n = (hit[0] / 2) + 1;
+  const patch = "*** Begin Patch\n*** Update File: "+path+"\n@@ codex-range "+n+":"+n+
+    " sha256:"+hash+"\n+"+after+"\n*** End Patch";
+  const p = await tools.apply_patch(patch);
+  if (p.success !== true || p.outcome !== "committed")
+    throw Object.assign(Error("edit refused; do not retry"),{evidence:p});
+  const [, content] = await get();
+  if (content !== lines.join("")) throw Error("exact readback differs");
+  return {status:"VERIFIED", content};
+}
+```
+
 <!-- policy:changes.workflow-recovery -->
 Repair blocking workflow or infrastructure failures in their existing owner within authorization, then resume the task. Extend an inadequate diagnostic, capture or replay owner when needed to exercise the affected path or state; obtainable required coverage is unfinished work; do not build infrastructure solely to reconstruct unavailable history or qualify a rejected proposal. A genuinely independent infrastructure project, destructive change or significant new operational commitment requires a user decision; finish independent work first and propose a default. Never bypass permissions or safeguards, invent causes, or substitute advice for an obtainable fix.
 <!-- /policy:changes.workflow-recovery -->

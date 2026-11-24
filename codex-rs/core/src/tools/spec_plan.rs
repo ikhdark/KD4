@@ -803,6 +803,8 @@ fn build_code_mode_executors(
     let mut code_mode_nested_tool_specs = Vec::new();
     let mut deferred_code_mode_nested_tool_specs = Vec::new();
     let mut eager_nested_tool_definitions = Vec::new();
+    let read_task_eager_only =
+        tool_mode == ToolMode::CodeModeOnly && turn_context.config.code_mode.read_task_eager_only;
     let mut direct_only_tool_names = Vec::new();
     let mut has_deferred_tools = false;
     let mut has_nested_apply_patch = false;
@@ -992,7 +994,15 @@ fn build_code_mode_executors(
                 } else if definition.name == "read_file" {
                     definition.description = "Result fields: path, retained_bytes, complete, file_complete, retained_artifact_complete, results. Snapshot reads add total_lines, source_sha256, canonical_bytes and optional artifact_id, continuation, page_selectors, snapshot_error, canonical_sha256 (decoded UTF-16 snapshot identity; join recovery pages on it when present), unchanged; live byte pages instead add read_mode:byte_ranges, file_bytes, file_revision and, when incomplete, range_recovery. Each results[] item has selector, status, complete and text, value or data_hex/data_base64 (search hydrated_ranges), with recovery fields when incomplete.".into();
                 }
-                eager_nested_tool_definitions.push(definition);
+                if read_task_eager_only
+                    && !matches!(&*definition.name, "read_file" | "read_tool_output")
+                {
+                    // Advertise the name, not the full eager contract. Keep
+                    // registration and authoritative deferred resolution unchanged.
+                    lazy_builtin_tool_names.push(definition.name.to_string());
+                } else {
+                    eager_nested_tool_definitions.push(definition);
+                }
             } else if tool_mode == ToolMode::CodeModeOnly
                 && executor.authorization_class() != TypedToolClass::DynamicExternal
                 && executor.tool_name().namespace.is_none()

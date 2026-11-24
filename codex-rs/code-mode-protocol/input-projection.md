@@ -3,6 +3,7 @@
 Use these opt-in recipes when the consumer needs a known subset of the result. They do not change tool permissions, retention, or tool dispatch. Keep the complete source available. Compare the cost of the **whole interaction**: omitting a useful range can cost more if it forces another model request.
 
 - **Diagnostic rows:** after checking that the input and all selections are complete, filter for the requested status **before** printing. Return all matching identities and diagnostics, including distinct failures. An empty array means no matches only for a complete, successful read. Preserve failures and recovery receipts instead of treating them as empty.
+  For a complete uniform native structured page, Code Mode may print `value_columns` once and positional `rows[].value` arrays. Pair each cell with the corresponding JSON pointer; keep the original row numbers. Nulls and wide integers retain their exact representation. Missing fields, incomplete coverage, and parser errors remain in the ordinary shape. Native JavaScript and direct results still use keyed row values.
 - **Schemas:** resolve a known tool by exact name; inspect its description or a detail section only when needed. Keep other tools discoverable. Do not enumerate and print the whole catalog to use one tool.
   The eager nested `read_file` and `read_tool_output` schemas name specialized selector kinds without repeating their detailed fields. Use `resolve_tool(name).section("arguments")` for those fields. Ordinary selector forms and any advertised direct schemas keep their full contracts.
 - **Overlapping reads:** for two known, overlapping ranges of the same source revision, request their union in one selection. Retain the origin and bounds so both original slices can be reconstructed. Do not merge across files, revisions or gaps that were not requested.
@@ -38,6 +39,15 @@ function failureDecision(failure) {
     safe_next_actions, live_operations};
 }
 ```
+
+## A smaller eager tool catalog for read-first tasks
+
+For an explicitly read-first Code Mode Only workload, set
+`features.code_mode.read_task_eager_only = true`. File and retained-output
+contracts stay eager. Other built-in contracts are discoverable by name and
+remain callable through `resolve_tool(name)`; direct tools and authorization
+are unchanged. Leave the option unset for general-purpose work. It does not
+select a task automatically or restrict what the agent is allowed to do.
 
 ## One source binding for a set of exact lines
 
@@ -75,6 +85,36 @@ function bindSourceLines(read, index = 0) {
 }
 ```
 
+## Compact line reads in a prebound workflow
+
+When a caller already provides a Code Mode cell preamble and the task only
+needs one current local file's line range, the preamble can bind a short,
+task-local action. Advertise just `text(await r(path, start, end))` to the
+model for that action. Do not add this alias to the global tool contract or
+have the model redefine it for every read; setup and discovery would change
+the cost comparison. Bounds are one-based and inclusive.
+
+<!-- compactLocalLines -->
+```js
+async function r(path, start, end) {
+  if (typeof path !== "string" || !path || !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) || start < 1 || end < start)
+    throw new TypeError("expected a file path and positive inclusive line bounds");
+  const result = await tools.read_file({path, selectors:[{kind:"lines", start, end}]});
+  const row = result.results?.[0];
+  if (!result.complete || result.results?.length !== 1 || !row?.complete ||
+      row.status !== "ok" || typeof row.text !== "string" ||
+      row.selector?.kind !== "lines" || row.selector.start !== start || row.selector.end !== end ||
+      (row.text.match(/[^\n]*\n|[^\n]+$/g) ?? []).length !== end - start + 1)
+    throw Object.assign(new Error("exact line selection unavailable"), {evidence: result});
+  return row.text;
+}
+```
+
+This is a text-only action. Use the ordinary keyed tool call for a revision,
+another environment, hashes, mixed selectors, or receipt and byte recovery.
+Native access checks and read failures still apply.
+
 ## Replay known windows of one retained snapshot
 
 When several consumers need windows from the **same authenticated artifact**,
@@ -102,6 +142,38 @@ missing windows as empty or restart the producer. For known sparse or
 overlapping windows, fetch the exact batch before considering a whole-body
 read. Compute with the returned windows in the cell and print only what
 downstream work needs; keep the artifact and range locators for recovery.
+
+### Reuse a complete batch across downstream stages
+
+If two stages need the same immutable evidence, share the completed selection
+rather than asking each stage to retrieve it again. This also keeps a known
+invariant read outside repeated work. Bind expected identity once from the
+producer, then read new or changed windows separately.
+
+```js
+async function consumeRetainedBatch(owner, selectors, laterSelectors) {
+  const {artifact_id, source_thread_id, canonical_sha256, canonical_bytes} = owner;
+  const options = {
+    preserve_line_windows: true,
+    expected_sha256: canonical_sha256,
+    expected_bytes: canonical_bytes,
+  };
+  const read = requested => select_output({
+    artifact_id, source_thread_id, selectors: requested,
+  }, options);
+  const shared = await read(selectors);
+  const first = shared.line_windows.map(({start, end}) => [start, end]);
+  const second = shared.line_windows.map(({text}) => text);
+  const later = await read(laterSelectors);
+  return {first, second, later: later.line_windows};
+}
+```
+
+Reuse only within the workflow that already owns the completed selection.
+This does not revalidate custody, refresh a live source, or authorize a
+new read. Propagate refusals with the original evidence; do not cache them
+or treat them as an empty selection. If the consumer requested a fresh
+native receipt, call the owner instead of reusing the previous value.
 
 ## A sparse change to an already-consumed text window
 

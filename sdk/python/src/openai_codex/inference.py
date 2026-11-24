@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar
 
@@ -62,3 +63,34 @@ class InferenceWorkflow:
             # an indeterminate admission merely because its await failed.
             self._remaining -= 1
         return await submit(request)
+
+
+async def latest_in_window(source: asyncio.Queue[_Input], *, window: float) -> _Input:
+    """Consume the first event plus its bounded successors; return the latest.
+
+    Use a dedicated, single-consumer queue of replaceable events, not distinct
+    requests or durable work. A later event does not extend the window. The
+    caller owns the queue and any urgent or independent submissions.
+    """
+    if not math.isfinite(window) or window <= 0:
+        raise ValueError("window must be finite and positive")
+    async def take() -> _Input:
+        event = await source.get()
+        source.task_done()
+        return event
+
+    latest = await take()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + window
+    while (remaining := deadline - loop.time()) > 0:
+        receiver = asyncio.create_task(take())
+        try:
+            done, _ = await asyncio.wait((receiver,), timeout=remaining)
+            if not done:
+                break
+            latest = receiver.result()
+        finally:
+            if not receiver.done():
+                receiver.cancel()
+                await asyncio.gather(receiver, return_exceptions=True)
+    return latest

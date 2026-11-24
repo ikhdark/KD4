@@ -1727,6 +1727,18 @@ pub struct TurnFinalAnswer {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnFinalTail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub answer_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub measurement_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_sampling_request_id: Option<String>,
     pub measurement_version: u16,
     pub item_id: Option<String>,
     pub canonical_sha256: Option<String>,
@@ -3600,6 +3612,9 @@ pub struct TurnTimingCounters {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct SurfacedToolResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_call_id: Option<String>,
     pub adapter: String,
     pub value: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]

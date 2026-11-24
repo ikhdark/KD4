@@ -38,6 +38,12 @@ a name with the exact same message still declares an alias. A shared report
 is not a second independent proof. Use normal typed assignments when the
 work needs a typed contract or write authority.
 
+For two complementary questions about the same fixed source, use one
+read-only assignment with both question IDs when one inspection can answer
+both and neither answer requires independent verification. Ask the worker
+to return each answer and its evidence separately. This is a dispatch
+choice, not automatic matching of different messages by the helper.
+
 ## Older builds: manual equivalent
 
 Store the current wave under `readWave`: rows with a unique `id`, a valid

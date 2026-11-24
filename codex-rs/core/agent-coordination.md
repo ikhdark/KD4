@@ -1,9 +1,10 @@
 # Coordinate scoped agent work
 
-These are opt-in workflows over existing native tools. Use them only when
-delegation is authorized and keep the root's task and evidence obligations
-separate from worker status. None of these workflows starts a background
-scheduler, transfers authority, or adds independent evidence by copying it.
+KD4 applies the native safeguards and optimizations below once a request
+supplies eligible typed inputs; choosing work, recipients, and review scope
+still belongs to the coordinator. Delegate only when authorized. Keep the
+root's task and evidence obligations separate from worker status. These
+workflows do not add a background scheduler or transfer authority.
 
 ## Use one ownership view
 
@@ -87,6 +88,53 @@ this metadata for findings, blockers, errors, decisions, handoffs, and any
 transition a receiver must see. Keep ordinary messages as ordering barriers.
 This compacts queued progress only; it cannot retract consumed messages.
 
+## Send only changed provisional statuses
+
+For a workflow whose parent and worker already share a fixed status map,
+publish the full baseline as version 1. On the next report of the **same
+attempt**, put the JSON-encoded `{base:1,set:{...},remove:[...]}` in the
+version-2 report's `evidence` field. An unchanged report uses empty `set` and
+`remove`. For a full report instead, put the complete map in that field. This
+recipe is for `F00`–`F99` statuses (`pass`, `fail`, or `unknown`); it is not a
+replacement for detailed findings, source references, or terminal receipts.
+
+The parent retrieves both exact versions with `agents.agent_task`
+(`operation:"partial_result"`, with the same assignment and attempt IDs
+and the explicit version). Pass the returned `partial_result` objects to the
+recipe below. Do not apply a delta against the latest available report, a
+different attempt, an absent base, or a merely remembered summary.
+
+<!-- reconstructProvisionalStatuses -->
+```js
+function reconstruct(base, next) {
+  if (base.assignment_id!==next.assignment_id || base.attempt_id!==next.attempt_id
+      || base.version!==1 || next.version!==2 || base.status!=="provisional" || next.status!=="provisional")
+    throw Error("wrong publication identity");
+  const old=JSON.parse(base.result.evidence), wire=JSON.parse(next.result.evidence);
+  const status=x=>["pass","fail","unknown"].includes(x);
+  const ids=x=>/^F[0-9]{2}$/.test(x);
+  const record=x=>x&&typeof x==="object"&&!Array.isArray(x);
+  const valid=x=>record(x)&&Object.entries(x).every(([id,value])=>ids(id)&&status(value));
+  if(!valid(old))throw Error("invalid base snapshot");
+  if(Object.hasOwn(wire,"base")){
+    if(!record(wire)||Object.keys(wire).sort().join()!=="base,remove,set"||wire.base!==base.version
+        ||!valid(wire.set)||!Array.isArray(wire.remove)||new Set(wire.remove).size!==wire.remove.length
+        ||wire.remove.some(k=>!ids(k)||!Object.hasOwn(old,k)||Object.hasOwn(wire.set,k)))
+      throw Error("invalid delta");
+    const result={...old};
+    for(const k of wire.remove) delete result[k];
+    return Object.assign(result,wire.set);
+  }
+  if(!valid(wire))throw Error("invalid full snapshot");
+  return wire;
+}
+```
+
+Keep the native reports and their source references and limitations. The
+reconstructed map is provisional before and after recovery; acceptance
+still depends on the separate source-backed receipt. If a consumer does not
+have this decoder or needs an independent snapshot, publish the full map.
+
 ## Dispatch only after evidence is ready
 
 For a root's typed spawn with one live, current typed prerequisite in the
@@ -99,13 +147,37 @@ normal admission/refusal path applies. For longer waits or multiple
 prerequisites, use selected completion waits and exact applicable receipts
 before sending the downstream request. Do not replay an uncertain dispatch.
 
+Ordinary workers receive a task capsule by default instead of the parent's
+history. The launch capsule may omit an empty diagnostic source manifest;
+its hash and dependency pins remain, and the stored capsule is unchanged.
+Typed contracts and nonempty source manifests retain their launch data.
+
+### Settle an already-running redundant assignment
+
+Prevent duplicates before launch where possible. If two owned read-only
+assignments are already running, check the winner's exact sealed attempt against
+the current source and the loser's full scope, evidence requirements and
+remaining work. Do not abandon work that still owns a distinct obligation,
+independent check, pending command or external side effect.
+
+For a conclusively superseded assignment, call `agents.abandon_agent_task`
+with its assignment ID and the reason. Confirm the returned receipt names the
+intended attempt and has status `abandoned`; reconcile a refusal or uncertain
+outcome rather than repeating it blindly. Use the current winner as evidence,
+not the abandoned receipt. `interrupt_agent` alone stops a turn and is not
+a durable assignment disposition. A selected wait can observe the abandonment.
+
+### Preserve independent verification
+
 Declare what independent observations and judgments are required **before**
 dispatch. Where the contract permits, stop requesting more reviews when all
-of those requirements already have applicable exact receipts. Distinct agents
-or attempt IDs are not enough: copies, aliases, a shared underlying
-observation, conflicts, and missing or stale proof do not satisfy an
-independent requirement. Run the review when required; never use this rule
-to waive an explicit reviewer, verifier, or gate.
+of those requirements already have applicable exact receipts. Check the
+current source identity of each source-bound observation before skipping an
+optional review. Distinct agents or attempt IDs are not enough: copies,
+aliases, a shared underlying observation, conflicts, and missing, blocked,
+or stale proof do not satisfy an independent requirement. Run the review
+when required; never use this rule to waive an explicit reviewer, verifier,
+or gate.
 
 Assign final synthesis once, normally to the coordinating root. Ask workers
 for their scoped conclusions, evidence, limitations, and unresolved work.

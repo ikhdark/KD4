@@ -24,6 +24,7 @@ use std::sync::Arc;
 pub struct PlanHandler;
 
 pub struct PlanToolOutput {
+    status_receipt: Option<JsonValue>,
     current_plan: UpdatePlanArgs,
     effect: PlanUpdateEffect,
     lineage: crate::plan_store::PlanLineage,
@@ -34,6 +35,7 @@ const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 
 impl PlanToolOutput {
     fn response_result(&self) -> JsonValue {
+        if let Some(receipt) = &self.status_receipt { return receipt.clone(); }
         let mut response = self.response_with_lineage(false);
         if let Some(fields) = response.as_object_mut() {
             // This is a display projection, not a full replay authority.
@@ -199,6 +201,11 @@ impl PlanHandler {
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
+        let status_v1 = match arguments.as_object_mut().and_then(|obj| obj.remove("receipt")) {
+            None => false,
+            Some(value) if value.as_str() == Some("status_v1") => true,
+            Some(_) => return Err(no_effects("unknown plan receipt format".into())),
+        };
         let measurements = arguments.as_object_mut().and_then(|arguments| arguments.remove("measurements"))
             .map(|packet| turn.turn_timing_state.validate_measurement_annotations(&packet))
             .transpose().map_err(no_effects)?;
@@ -304,7 +311,18 @@ impl PlanHandler {
                 step_context.user_intent_epoch,
                 mutation_revision,
             ).map_err(no_effects)?;
+            let status_receipt = (status_v1 && staged.update.effect == PlanUpdateEffect::StatusOnly).then(|| {
+                let update = &staged.update;
+                serde_json::json!({
+                    "receipt": "status_v1", "effect": update.effect.as_str(),
+                    "revision": crate::plan_store::plan_revision_with_lineage(Some(&update.current), &update.lineage),
+                    "changed": staged.changed_step_states(),
+                    "unresolved": update.lineage.obligation_summary(&update.current).unresolved,
+                    "completion_authority": crate::plan_store::checklist_completion_authority(),
+                })
+            });
             let output = PlanToolOutput {
+                status_receipt,
                 current_plan: staged.update.current.clone(),
                 effect: staged.update.effect,
                 lineage: staged.update.lineage.clone(),
@@ -371,7 +389,7 @@ impl CoreToolRuntime for PlanHandler {
         result: Option<&JsonValue>,
         error: Option<&str>,
     ) -> crate::tools::context::ToolEffectRecovery {
-        match result.filter(|value| value.get("current_plan").is_some()) {
+        match result.filter(|value| value.get("current_plan").is_some() || value.get("receipt").and_then(JsonValue::as_str) == Some("status_v1")) {
             Some(result) => crate::tools::context::ToolEffectRecovery::committed(result.clone()),
             None => crate::tools::context::ToolEffectRecovery::unknown(result, error),
         }

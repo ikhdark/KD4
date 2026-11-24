@@ -9,7 +9,7 @@ import type { TurnRequiredEvidenceFrontier } from "./TurnRequiredEvidenceFrontie
  * whitespace-separated words in the canonical final, once. No token estimate
  * is inferred. Times are monotonic offsets from this core turn's start.
  */
-export type TurnFinalTail = { measurementVersion: number, itemId: string | null, canonicalSha256: string | null, textCodepoints: number | null, textUtf8Bytes: number | null, whitespaceWords: number | null, firstContentHostMs: number | null, fullContentHostMs: number | null,
+export type TurnFinalTail = { answerOrigin?: string, measurementBasis?: string, sourceCallId?: string, sourceSamplingRequestId?: string, measurementVersion: number, itemId: string | null, canonicalSha256: string | null, textCodepoints: number | null, textUtf8Bytes: number | null, whitespaceWords: number | null, firstContentHostMs: number | null, fullContentHostMs: number | null,
 /**
  * Host observation of the admitted final candidate, not proof that every
  * user obligation or external evidence source was reconciled.

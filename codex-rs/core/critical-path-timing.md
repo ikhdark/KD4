@@ -65,6 +65,8 @@ and selection/retention/delivery facts. Metadata-only audits are excluded.
 The physical-model-retry inventory is unchanged; this separate inventory does
 not claim exhaustive recovery, restored task correctness or causal added delay.
 
+Code Mode callers that will select retained output can set `artifact_only_on_success: true` on `exec_command` to omit inline streams on a completely retained, noninteractive terminal success. The bounded display and artifact locator remain available. Failures, incomplete capture and live handles retain their normal projection.
+
 `measurementEvidence.nestedResults` reuses the complete byte count from the
 actual Code Mode result serializer, before script/outer-display projection.
 `native_nested_result_json_v1` measures that full JSON object, including wrapper
@@ -77,3 +79,7 @@ item ID; its first/full times use matching item and digest observations when
 available. A directly surfaced tool answer has no message item ID and records
 the complete-text observation as both endpoints. Equal timestamps do not measure
 generation time, and neither path establishes native renderer acknowledgment.
+The optional `answerOrigin` and `measurementBasis` distinguish these cases.
+For explicit Code Mode delivery, `sourceCallId` identifies the delivering call;
+`sourceSamplingRequestId` is present only when that call and its generation
+uniquely identify a recorded sampling request.

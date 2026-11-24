@@ -358,6 +358,7 @@ struct AuthoritativeWaitObservation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthoritativeWaitOwnerResult {
+    pub(crate) source_call_id: Option<String>,
     pub(crate) adapter: String,
     pub(crate) value: Value,
     pub(crate) surfaceable_message: Option<String>,
@@ -1592,6 +1593,7 @@ impl SamplingRequestSignalCollector {
             return None;
         }
         Some(AuthoritativeWaitOwnerResult {
+            source_call_id: state.call_ordinals.iter().find_map(|(id, index)| (index == ordinal).then(|| id.clone())),
             adapter: "code_mode_delivery".to_string(),
             value: serde_json::json!({"message": message}),
             surfaceable_message: Some(message.clone()),
@@ -2453,6 +2455,7 @@ fn authoritative_wait_observation(
         state_revision: state_revision.to_string(),
         action_identity,
         result: AuthoritativeWaitOwnerResult {
+            source_call_id: None,
             adapter: expected_adapter.to_string(),
             value: result,
             surfaceable_message,

@@ -44,7 +44,7 @@ if _TYPE_CHECKING:
         TurnResult,
     )
     from .client import CodexConfig
-    from .inference import InferenceSlotsExhausted, InferenceWorkflow
+    from .inference import InferenceSlotsExhausted, InferenceWorkflow, latest_in_window
     from .errors import (
         CodexError,
         CodexRpcError,
@@ -81,6 +81,7 @@ _LAZY_EXPORTS = {
     "TurnRunError": "._run",
     "InferenceSlotsExhausted": ".inference",
     "InferenceWorkflow": ".inference",
+    "latest_in_window": ".inference",
     "Input": ".api",
     "InputItem": ".api",
     "RunInput": ".api",
@@ -141,6 +142,7 @@ __all__ = [
     "TurnRunError",
     "InferenceSlotsExhausted",
     "InferenceWorkflow",
+    "latest_in_window",
     "Input",
     "InputItem",
     "RunInput",

@@ -926,6 +926,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CodeModeConfig {
+    pub read_task_eager_only: bool,
     pub excluded_tool_namespaces: Vec<String>,
     pub direct_only_tool_namespaces: Vec<String>,
 }
@@ -2176,6 +2177,9 @@ fn resolve_orchestrator_feature_enabled(
 fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
     let base = code_mode_toml_config(config_toml.features.as_ref());
     CodeModeConfig {
+        read_task_eager_only: base
+            .and_then(|config| config.read_task_eager_only)
+            .unwrap_or_default(),
         excluded_tool_namespaces: base
             .and_then(|config| config.excluded_tool_namespaces.as_ref())
             .cloned()

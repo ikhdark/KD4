@@ -62,13 +62,18 @@
         if (!patchHash(hash)) throw new TypeError("expected a full dependency source hash");
         return "*** Guard File: " + path + "\n*** Expect: sha256:" + hash + "\n";
       });
+      let previousPath, previousHash;
       const updates = Array.from(update, row => {
         const [path, hash, start, end, lines] = tuple(row, 5);
         if (!patchHash(hash) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
             start < 1 || end < start)
           throw new TypeError("expected a full source hash and an inclusive one-based range");
-        return "*** Update File: " + path + "\n@@ codex-range " + start + ":" + end +
-          " sha256:" + hash + "\n" + plus(lines, false);
+        // Adjacent ranges from one snapshot must reach the native parser as one file hunk.
+        // A new hash (or a different file) retains the caller's ordered verification boundary.
+        const header = path === previousPath && hash === previousHash ? "" : "*** Update File: " + path + "\n";
+        previousPath = path;
+        previousHash = hash;
+        return header + "@@ codex-range " + start + ":" + end + " sha256:" + hash + "\n" + plus(lines, false);
       });
       const additions = Array.from(add, row => {
         const [path, lines] = tuple(row, 2);

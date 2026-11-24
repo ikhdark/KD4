@@ -666,8 +666,22 @@ async fn handle_spawn_agent(
             }
         };
         let task_capsule = matches!(fork_mode, SpawnAgentForkMode::TaskCapsule).then(|| {
-            capsule_with_launch_pins(&canonical_capsule, &admitted.dependency_admissions)
-                .unwrap_or_else(|| canonical_capsule.clone())
+            let rendered = capsule_with_launch_pins(&canonical_capsule, &admitted.dependency_admissions)
+                .unwrap_or_else(|| canonical_capsule.clone());
+            // The empty diagnostic manifest adds no source observations for
+            // ordinary workers. Keep it in the canonical, persisted capsule,
+            // but omit it from the model input; retain its hash and all pins.
+            if assignment.admission_origin != AssignmentAdmissionOrigin::Typed
+                && let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&rendered)
+                && let Some(capsule) = payload.as_object_mut()
+                && let Some(manifest) = capsule.get("source_manifest")
+                && manifest.get("scopes").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty)
+                && manifest.get("entries").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty)
+            {
+                capsule.remove("source_manifest");
+                return payload.to_string();
+            }
+            rendered
         });
         assignment.task_capsule = Some(canonical_capsule);
         (assignment, attempt, task_capsule)

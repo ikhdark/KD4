@@ -224,15 +224,8 @@ wording is untouched.
 - Give every original proposal an evidence-supported disposition. Separate
   measured non-improvement from inconclusive or unrun comparisons. Discard
   unsuccessful prototype changes, not their evidence.
-- For executable-obligation proposals, exercise the real stopping decision:
-  observe permitted ready work execute and advance the obligation, an owned
-  operation resume without relaunch, and a failed diagnostic enter bounded
-  recovery rather than repeat unchanged retries or final-answer deferrals.
-  For truly blocked work, verify the exact missing prerequisite is reported after
-  independent work, with no futile retries. Preserve normal completion when no
-  work remains. Compare premature handoffs, extra user prompts needed to resume
-  obtainable work, and time spent after a genuine blocker is established.
-  Warning text, task labels and request counts alone do not prove these outcomes.
+- For executable-obligation proposals, follow the required [stopping-decision
+  comparison](../KDR/benchmarks/README.md#executable-obligation-comparisons).
 - Use KDR proactively when existing diagnostics, benchmarks or saved evidence
   materially help. Discover the relevant capability; reuse source-matched
   analysis, hashes and completed evidence instead of duplicating work. KDR is

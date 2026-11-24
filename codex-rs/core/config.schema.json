@@ -346,6 +346,10 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "read_task_eager_only": {
+          "description": "Keep only file-read and retained-output contracts eager in Code Mode Only. Other nested tools remain callable through resolve_tool.",
+          "type": "boolean"
         }
       },
       "type": "object"

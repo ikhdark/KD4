@@ -4605,7 +4605,20 @@ impl TurnTimingState {
         let direct_ms = surfaced
             .and(state.final_content.direct_ms)
             .filter(|_| text.is_some());
+        let source_call_id = surfaced.filter(|_| message.is_none()).and_then(|s| s.source_call_id.clone());
+        let source_sampling_request_id = source_call_id.as_ref().and_then(|id| {
+            let mut calls = state.tool_calls.iter().filter(|c| c.call_id == *id);
+            let generation = calls.next()?.generation_index?;
+            if calls.next().is_some() { return None; }
+            let mut requests = state.model_requests.iter().filter(|r| r.generation_index == generation);
+            let request = requests.next()?;
+            requests.next().is_none().then(|| request.sampling_request_id.clone()).flatten()
+        });
         Some(codex_protocol::protocol::TurnFinalTail {
+            answer_origin: Some(if message.is_some() { "provider_message" } else { "surfaced_tool_result" }.into()),
+            measurement_basis: Some(if observed.is_some() { "matched_message_observations" } else if direct_ms.is_some() { "complete_text_host_observation" } else { "unobserved" }.into()),
+            source_call_id,
+            source_sampling_request_id,
             measurement_version: 1,
             item_id: message.map(|message| message.item_id.clone()),
             canonical_sha256: digest,

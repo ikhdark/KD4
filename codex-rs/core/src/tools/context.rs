@@ -2040,7 +2040,15 @@ impl ToolOutput for ExecCommandToolOutput {
         // Exact programmatic access does not inherit the display-token budget.
         // Never offer a truncated or lossy string as JSON. Larger/binary streams
         // remain unavailable here; the combined output artifact is still retained.
-        let streams = self.stream_chunks.as_ref();
+        let locator_only = self.exit_code == Some(0) && self.process_id.is_none()
+            && self.error.is_none()
+            && self.process_exited && self.raw_output_artifact.as_ref().is_some_and(RawOutputArtifact::capture_finalized_complete)
+            && !self.raw_output_artifact.as_ref().is_some_and(RawOutputArtifact::retention_limit_hit)
+            && raw_output_artifact_id.is_some() && raw_output_artifact_error.is_none()
+            && matches!(payload, ToolPayload::Function { arguments } if serde_json::from_str::<JsonValue>(arguments)
+                .is_ok_and(|args| args["artifact_only_on_success"].as_bool() == Some(true)
+                    && args["tty"].as_bool() != Some(true) && args["pipe_stdin"].as_bool() != Some(true)));
+        let streams = self.stream_chunks.as_ref().filter(|_| !locator_only);
         let stream_chunks_complete = streams.is_some();
         let streams_complete = Some(stream_chunks_complete && self.process_exited && self.process_id.is_none() && self.stream_ranges.as_ref()
             .is_some_and(|ranges| ranges.iter().all(|range| range.start == 0)));
@@ -2051,7 +2059,7 @@ impl ToolOutput for ExecCommandToolOutput {
             .raw_output_artifact
             .as_ref()
             .is_some_and(RawOutputArtifact::retention_limit_hit);
-        let retained_output = self.retained_terminal_output(limits.applied_limit).map(str::to_owned);
+        let retained_output = (!locator_only).then(|| self.retained_terminal_output(limits.applied_limit)).flatten().map(str::to_owned);
         let result = UnifiedExecCodeModeResult {
             output_reference: RawOutputArtifact::output_reference(self.raw_output_artifact.as_ref()),
             environment_receipt: self.environment_receipt.clone(),

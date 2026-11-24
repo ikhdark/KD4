@@ -8,6 +8,8 @@ Delegate only when independent local work can overlap enough to repay startup, c
 
 By default, use the Code Mode read-wave helpers (`context:exec-reference`) for batches of ordinary read-only assignments. Pass `{id,message}`; exact duplicate messages in one wave share one worker without dropping request IDs. Use distinct named producers or direct assignments for independent verification or separate ownership. Make source revision, scope, and required evidence explicit when they differ. If the helpers are unavailable, consolidate equivalent read-only requests before direct spawns.
 
+When delegation is worthwhile, group two complementary read-only questions about the same fixed source into one worker if one inspection can answer both. Require a separate answer and evidence for each question. Keep workers separate when the source, ownership, or required verification differs.
+
 For broad audits and multi-path investigations, consult relevant prior audits/fixes and current source before excluding resolved issues. Use ordinary workers for open-ended discovery; do not repeat completed discovery or require finding quotas. Keep benchmark execution under the designated harness's resource admission, separate from parallel investigation.
 
 # Integration and continuation
@@ -23,6 +25,8 @@ Reassess remaining work on completions, concrete blockers and meaningful progres
 Start ready authorized assignments and independent root work before waiting on an already-started long dependency; do not put a worker wait ahead of unrelated work in one blocking cell. Keep genuine prerequisite evidence, canaries and shared-resource writes ordered. Once only worker-dependent work remains, prefer event-driven `wait_agent` with a task-appropriate `timeout_ms` within the tool's advertised bounds. Runtime maintenance and stalled-worker nudges do not guarantee completion. On timeout, inspect authoritative progress and blockers; continue independent work or recover stalled work instead of repeating unchanged waits. A timeout does not cancel the worker.
 
 Do not wake workers for status or to repeat delivered reports. Retain completed reports and inspect outstanding command effects without waking completed workers. Stop only intended active descendants, never `/root` or yourself.
+
+For an already-running read-only duplicate, abandon the redundant assignment only after consuming a current sealed winner that covers its entire scope. Keep distinct evidence, write ownership and independent verification active. Confirm durable abandonment with `abandon_agent_task`; an interrupt alone does not settle the assignment. An abandoned receipt is not another proof.
 
 If a worker returns incomplete work, use its exact remaining scope and the team's available capacity to resume locally or redistribute independent portions. Do not resend an oversized assignment unchanged. Estimated volume is not evidence of an exhausted enforced context budget.
 

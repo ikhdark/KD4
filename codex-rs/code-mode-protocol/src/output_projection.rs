@@ -603,6 +603,8 @@ fn compact_structured_row(row: &mut serde_json::Map<String, Value>) {
             _ => true,
         });
     }
+    let structured = row.get("selector").and_then(|selector| selector.get("kind"))
+        .is_some_and(|kind| kind == "structured");
     let Some(page) = row
         .get_mut("value")
         .and_then(Value::as_object_mut)
@@ -610,6 +612,11 @@ fn compact_structured_row(row: &mut serde_json::Map<String, Value>) {
     else {
         return;
     };
+    let compact_values = structured
+        && page.get("coverage_complete").is_some_and(|value| value == true)
+        && page.get("rows_exhausted").is_some_and(|value| value == true)
+        && page.get("malformed_rows").is_some_and(|value| value == 0)
+        && page.get("errors").is_none_or(is_empty);
     let delivered = page["rows"].as_array().map(Vec::len);
     page.retain(|key, value| match key.as_str() {
         "errors" => !is_empty(value),
@@ -618,6 +625,56 @@ fn compact_structured_row(row: &mut serde_json::Map<String, Value>) {
         "rows_scanned" => value.as_u64().map(|scanned| scanned as usize) != delivered,
         _ => true,
     });
+    if compact_values {
+        pack_complete_page_columns(page);
+    }
+}
+
+/// Use positional values only on uniform exact pages. Do not drop row
+/// identities, fields, or sparse/malformed data. Native values are unchanged.
+fn pack_complete_page_columns(page: &mut serde_json::Map<String, Value>) {
+    let Some(rows) = page.get("rows").and_then(Value::as_array) else {
+        return;
+    };
+    if !(8..=256).contains(&rows.len()) || page.contains_key("value_columns") {
+        return;
+    }
+    let Some(first) = rows[0].get("value").and_then(Value::as_object) else {
+        return;
+    };
+    if !(2..=32).contains(&first.len()) || first.keys().any(|key| !key.starts_with('/')) {
+        return;
+    }
+    let keys: Vec<_> = first.keys().map(|key| Value::String(key.clone())).collect();
+    // Delimiters and values are unchanged; only the repeated JSON field
+    // names and colons are removed. Charge the one-time array and field label.
+    let header = Value::Array(keys);
+    let dictionary_bytes = header.to_string().len();
+    if (dictionary_bytes.saturating_sub(1)) * (rows.len() - 1) < 160 {
+        return;
+    }
+    let keys: Vec<_> = first.keys().collect();
+    let mut projected = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(mut row) = row.as_object().cloned() else {
+            return;
+        };
+        let Some(Value::Object(values)) = row.shift_remove("value") else {
+            return;
+        };
+        if values.len() != keys.len() { return; }
+        let Some(values) = keys
+            .iter()
+            .map(|key| values.get(*key).cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        row.insert("value".into(), Value::Array(values));
+        projected.push(Value::Object(row));
+    }
+    page.insert("rows".into(), Value::Array(projected));
+    page.insert("value_columns".into(), header);
 }
 
 /// A settled result whose print can drop what only matters when something went wrong: every

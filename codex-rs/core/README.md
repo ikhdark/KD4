@@ -29,6 +29,8 @@ process boundaries, start with the [workspace map](../README.md).
 
 ## Avoid unnecessary continuations
 
+- Send `exec_command.yield_time_ms` as an integer. The [command decoder](src/tools/handlers/unified_exec.rs) also repairs a canonical decimal string in that one observation field and reports the conversion before applying the usual bounds. It does not infer other arguments, repair shell syntax, or retry a command.
+
 - Resolve known completion blockers before drafting a final. Use the
   [current plan and its native receipts](../tools/src/builtin_specs/plan_progress.md);
   an open requirement is not authority to invent work or skip a real blocker.
@@ -61,7 +63,7 @@ known steps.
 | Situation | Workflow |
 | --- | --- |
 | Fixed prefix, then a real decision | Validate and normalize the inputs in the cell. Return the exact decision inputs and stop there; the cell does not choose an outcome that was not declared. |
-| Compatible read, edit and verification | Keep the complete read, source-hash guard, conditional patch and exact readback in order in one cell. Skip an already-current write; stop on refusal rather than retrying an edit against stale evidence. |
+| Compatible read, edit and verification | Keep the complete read, source-hash guard, conditional patch and exact readback in order in one cell. Skip an already-current write; stop on refusal rather than retrying an edit against stale evidence. For a declared exact single-file line replacement, use the [guarded line recipe](../protocol/src/prompts/base_instructions/default.md#exact-single-file-line-replacement). |
 | Several decisions | Present independently ready evidence together, with a distinct result key per decision and an explicit consumer for each. Keep a separate round when one result supplies evidence for another. Do not merge unrelated turns. |
 | Declared success and an exceptional outcome | Perform the authorized normal action locally. Send unexpected or incomplete observations back with their provenance; do not guess a new action or route an unknown result through a default write. |
 | Ready branch, unrelated work still running | In the same cell, use `run_graph` with the actual dependency edges. Start the branch once its own inputs settle; collect both results before finalizing. Add the tail as a dependency if it can affect the branch. |
@@ -84,12 +86,21 @@ text(extract_result(r, {
 }).text);
 ```
 
+The same pattern applies to exact grouped reports: parse the local records,
+keep duplicate values, and sort numbers numerically inside the delivery cell.
+Emit the finished report once instead of returning the rows for model
+transcription. Use this only when the requested format and ordering are known.
+
 A failed projection emits no proposed final. Use ordinary model completion
 when the requested answer needs interpretation or additional work. The
 [turn owner](src/session/turn.rs) handles an interrupted Responses attempt
 separately: a settled tool item can carry its committed output into the retry;
 an unfinished item cannot. This is in-turn recovery, not permission to replay
 an external effect or a process-restart guarantee.
+After an orderly interruption and app-server restart, resume the same thread.
+If the original committed output is present and authenticated in the new turn's
+history, consume it instead of repeating the effect. A missing receipt does
+not establish that an external effect did not happen.
 
 ## Find the responsibility
 
@@ -128,6 +139,12 @@ window even when the [scoped compaction threshold](src/session/context_window.rs
 has not been reached. It sizes exact retirement against the live or projected
 pressure that prompted it, and only skips summarization if the rewritten history
 fits under both limits.
+
+At the soft compaction boundary, a continuing turn can also reuse its prefix for
+one request when the just-completed generation reports that at least half of its
+input was cached. Unknown usage, new user input and insufficient physical headroom
+do not qualify. Prepared-prompt admission rechecks the waiver; continued pressure
+and provider overflow still take the existing compaction paths.
 
 The [compaction history commit](src/session/mod.rs) allows at most eight
 pending `SessionStart(compact)` occurrences per session. Each successful

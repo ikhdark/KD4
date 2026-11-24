@@ -55,6 +55,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
         ("modelTimeAttribution".into(), evidence_object()),
     ]), Some(vec!["samplingRequestId".into()]), Some(false.into()));
     let properties = BTreeMap::from([
+        ("receipt".into(), JsonSchema::string_enum(vec![json!("status_v1")], Some("Opt in to compact status-only receipts; other effects and omitted receipt retain the full projection.".into()))),
         ("measurements".into(), JsonSchema::object(BTreeMap::from([
             ("requests".into(), JsonSchema::array(annotations, Some(
                 "Optional evidence-backed rework/necessity/time annotations for at most 128 retained requests. Totals require complete classification. Does not complete requirements or authorize work.".into()))),
@@ -116,7 +117,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
             }).collect()),
             ..JsonSchema::object(properties, None, Some(false.into()))
         },
-        output_schema: Some(json!({"oneOf":[{
+        output_schema: Some(json!({"oneOf":[{"type":"object","properties":{"receipt":{"const":"status_v1"},"changed":{"type":"array","description":"Changed [step ID,status] pairs."},"unresolved":{"type":"array"},"effect":{"const":"status_only"},"revision":{"type":"string"},"completion_authority":{"const":"checklist_only"}},"required":["receipt","changed","unresolved","effect","revision","completion_authority"],"additionalProperties":false},{
             "type":"object",
             "properties":{
                 "current_plan":{"type":"object","properties":{

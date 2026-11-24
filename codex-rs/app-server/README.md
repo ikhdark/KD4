@@ -41,6 +41,41 @@ and the expected answer item before using it. Missing or ambiguous history
 is not a successful lookup; keep the ordinary turn path available for work
 that actually requires inference. This does not route free-form chat input.
 
+When the caller has authorized creating an exact command working directory,
+prefer `fs/createDirectory` (use `recursive: true` only when authorized to create
+its parents) over a shell preflight. Use an absolute path and require successful
+creation before launching in that directory. An existing directory is accepted;
+an obstructing file is an error, not permission to overwrite it, substitute a
+different working directory, or restart an unrelated process.
+
+## Soft reserve for explicitly optional client work
+
+A client that submits its own phases can defer a discretionary `turn/start`
+when its soft token target would leave too little room for mandatory phases.
+The caller must explicitly classify the discretionary phase as deferrable.
+Do not infer that classification from elapsed turns, model text, or a plan label.
+
+Use [thread token usage](../app-server-protocol-types/src/protocol/v2/thread.rs)
+from the latest settled turn for the matching thread and turn IDs. Subtract
+the thread total at workflow start to obtain `spent`; do not sum cumulative
+updates. `remaining_required` and `optional_cost` are client estimates in the
+same input-plus-output token units. If any input is unknown, use the client's
+ordinary policy rather than treating it as zero.
+
+```python
+def should_defer_optional(spent, soft_target, remaining_required, optional_cost):
+    values = (spent, soft_target, remaining_required, optional_cost)
+    if any(type(value) is not int or value < 0 for value in values):
+        return False
+    return spent + remaining_required + optional_cost > soft_target
+```
+
+Apply this decision only before starting a discretionary turn. Record a
+deferred turn as not run, not completed. Continue required work, including
+newly discovered work, even if the estimate was wrong or the soft target
+has already been exceeded. This does not interrupt live turns, change
+server admission or retry behavior, reserve provider quota, or estimate a bill.
+
 ## MCP OAuth completion correlation
 
 Explicit `mcpServer/oauth/login` responses include an optional `loginId`, echoed

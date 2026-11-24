@@ -1827,37 +1827,9 @@ pub(super) fn handle_runtime_response(
                     &into_function_call_output_content_items(content_items.clone()),
                 ),
             };
-            let reported_failure = match &response {
-                RuntimeResponse::Result { error_text: Some(error), .. } => {
-                    unique_reported_native_failure(&packet.nested_results, error)
-                        .and_then(|ordinal| packet.nested_results.iter().find(|result| result.ordinal == ordinal))
-                }
-                _ => None,
-            };
-            let directory = packet.nested_recovery.into_values().map(|mut entry| {
-                if let Some(reported) = reported_failure
-                    && entry["call_id"] == reported.call_id.as_str()
-                    && let Some(result) = entry.pointer_mut("/outcome/result")
-                    && result["tool_failure"]["details"]["handler_refusal"] == "powershell_syntax"
-                    && let Some(identity) = reported.failure_identity.as_ref()
-                {
-                    // Compare the exact displayed failure with the one already
-                    // present below. This directory still keeps call/effect state
-                    // and recovery routing; canonical receipts keep the diagnosis.
-                    let mut display = result.clone();
-                    if let Some(object) = display.as_object_mut() {
-                        codex_code_mode::omit_first_failure_history(object);
-                    }
-                    if identity.get("tool_failure") == display.get("tool_failure") {
-                        if let Some(failure) = display["tool_failure"].as_object_mut() {
-                            failure.shift_remove("message");
-                            failure.insert("message_reference".into(), "Script error".into());
-                        }
-                        *result = display;
-                    }
-                }
-                compact_emitted_packet_recovery(entry, &emitted)
-            }).collect::<Vec<_>>();
+            let directory = packet.nested_recovery.into_values()
+                .map(|entry| compact_emitted_packet_recovery(entry, &emitted))
+                .collect::<Vec<_>>();
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
                 text: serde_json::json!({
                     "nested_result_recovery_directory": directory,
@@ -3218,10 +3190,21 @@ fn retain_failed_dispatch_result(
     let canonical = codex_tools::CanonicalToolResult::json(result.clone());
     let service = &exec.session.services.code_mode_service;
     let result_bytes = usize::try_from(canonical.exact_bytes).unwrap_or(usize::MAX);
-    if service.try_record_inline_packet_recovery(cell_id, packet_ordinal, result_bytes, || {
-        serde_json::json!({"call_id":nested_call_id, "tool_name":tool_name.to_string(),
-            "failed":true, "outcome":{"result":result}})
-    }) {
+    let failure = &result["tool_failure"];
+    let exact_recovery_for_compact_display = failure["code"] == "invalid_syntax"
+        && failure["execution_state"] == "not_started"
+        && failure["effects"] == "none"
+        && failure["details"]["handler_refusal"] == "powershell_syntax";
+    let inline = || serde_json::json!({
+        "call_id":nested_call_id, "tool_name":tool_name.to_string(),
+        "failed":true, "outcome":{"result":result},
+    });
+    // A compact script error does not carry the exact structured receipt.
+    // Use the existing full-result owner rather than substituting the summary
+    // for this failure in the recovery directory.
+    if !exact_recovery_for_compact_display
+        && service.try_record_inline_packet_recovery(cell_id, packet_ordinal, result_bytes, inline)
+    {
         return None;
     }
     let id = crate::tools::command_output_artifact::ToolOutputArtifactId::new();
@@ -3255,6 +3238,14 @@ fn retain_failed_dispatch_result(
                 "canonical_bytes":canonical.exact_bytes, "recovery":{"tool":"read_tool_output",
                     "arguments":{"artifact_id":id, "selectors":[{"kind":"bytes", "start":0,
                         "end":canonical.exact_bytes}]}}})
+        } else if exact_recovery_for_compact_display
+            && retention_exec.session.services.code_mode_service.try_record_inline_packet_recovery(
+                &retention_cell, packet_ordinal, result_bytes,
+                || serde_json::json!({"call_id":nested_call_id, "tool_name":tool_name,
+                    "failed":true, "outcome":{"result":result}}),
+            )
+        {
+            return;
         } else {
             serde_json::json!({"output":retained_output, "output_truncated":output_truncated,
                 "recovery_available":!output_truncated,

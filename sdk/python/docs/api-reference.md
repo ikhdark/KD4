@@ -205,6 +205,29 @@ final = await workflow.run_phase(
   Provider-side work retirement was measured only on the qualified local
   Responses route.
 
+### Coalesce replaceable refresh events
+
+For a burst of revisions where **only the latest value matters**, feed a
+dedicated `asyncio.Queue` from that one source. The first queued event opens a
+fixed window; later events update the selected value without extending the
+window. Urgent actions and ordinary user turns should use their own direct
+admission path.
+
+```python
+from openai_codex import latest_in_window
+
+latest = await latest_in_window(refresh_events, window=0.300)
+result = await workflow.run_phase(lambda _: latest, refresh_thread.run)
+```
+
+Choose the window for your application's latency tolerance. The helper
+intentionally discards superseded values and delays even a single refresh on
+that queue. It neither deduplicates independent turns nor cancels a submitted
+turn. A queue item is acknowledged when consumed, not when inference succeeds.
+On cancellation the helper stops receiving; the caller owns any durable
+records and subsequent attempts. Use one consumer per queue and do not put
+auditable user input or irreversible work in this lane.
+
 ## AsyncCodex (async parity)
 
 ```python

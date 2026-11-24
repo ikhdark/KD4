@@ -25,6 +25,9 @@ pub struct CodeModeConfigToml {
     /// Exact tool namespaces to omit from the code-mode nested tool surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excluded_tool_namespaces: Option<Vec<String>>,
+    /// Keep only file-read and retained-output contracts eager in Code Mode Only. Other nested tools remain callable through resolve_tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_task_eager_only: Option<bool>,
     /// Exact tool namespaces to expose only as direct model tools.
     /// These tools bypass deferral, remain top-level in code-mode-only sessions, and are omitted
     /// from the nested code-mode tool surface.

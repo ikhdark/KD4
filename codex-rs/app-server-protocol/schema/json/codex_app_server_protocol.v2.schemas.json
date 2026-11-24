@@ -15410,6 +15410,12 @@
             "null"
           ]
         },
+        "sourceCallId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "value": true
       },
       "required": [
@@ -18988,6 +18994,12 @@
     "TurnFinalTail": {
       "description": "Version 1 counts Unicode scalar values, UTF-8 bytes and nonempty Unicode whitespace-separated words in the canonical final, once. No token estimate is inferred. Times are monotonic offsets from this core turn's start.",
       "properties": {
+        "answerOrigin": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "canonicalSha256": {
           "type": [
             "string",
@@ -19011,6 +19023,12 @@
           ]
         },
         "itemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "measurementBasis": {
           "type": [
             "string",
             "null"
@@ -19051,6 +19069,18 @@
             }
           ],
           "description": "Unknown unless an authoritative task oracle supplies required evidence; never substitute the most recent tool, status call, or plan completion."
+        },
+        "sourceCallId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceSamplingRequestId": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "textCodepoints": {
           "format": "uint64",

@@ -379,8 +379,8 @@ pub(crate) fn run_turn<'a>(
         // How the overflow arm last relieved the context, until a request
         // completes. A summary leaves no smaller history to summarize.
         let mut unsampled_overflow_relief: Option<ContextPressureRelief> = None;
-        let mut final_answer_compaction_deferred = false;
-        let mut final_answer_soft_limit_waiver = None;
+        let mut soft_compaction_deferred = false;
+        let mut one_request_soft_limit_waiver = None;
         if run_pending_session_start_hooks(&sess, &turn_context).await {
             return Ok(finish_stopped_session_start(&sess, &turn_context, input).await);
         }
@@ -653,7 +653,7 @@ pub(crate) fn run_turn<'a>(
             };
 
             if recorded_input.accepted_context_input {
-                final_answer_soft_limit_waiver = None;
+                one_request_soft_limit_waiver = None;
                 seen_stop_repairs.clear();
                 stop_hook_bookkeeping_revisions = 0;
                 completion_evidence = None;
@@ -949,7 +949,7 @@ pub(crate) fn run_turn<'a>(
                     &base_instructions,
                     &mut preparation_timing_guard,
                     generation_request.clone(),
-                    final_answer_soft_limit_waiver.as_ref().is_some_and(|(epoch, fingerprint)|
+                    one_request_soft_limit_waiver.as_ref().is_some_and(|(epoch, fingerprint)|
                         *epoch == step_context.user_intent_epoch
                             && *fingerprint == request_baselines.relevant_state_fingerprint()),
                     generation_id.clone(),
@@ -975,10 +975,11 @@ pub(crate) fn run_turn<'a>(
                 .remove::<AdmissionRefusedProjection>();
             match sampling_request_result {
                 Ok((sampling_request_output, sampling_request_input)) => {
-                    final_answer_soft_limit_waiver = None;
+                    one_request_soft_limit_waiver = None;
                     unsampled_overflow_relief = None;
                     let SamplingRequestResult {
                         needs_follow_up: model_needs_follow_up,
+                        generation_cache_warm,
                         last_agent_message: sampling_request_last_agent_message,
                         assistant_output,
                         final_message_candidate,
@@ -1309,8 +1310,8 @@ pub(crate) fn run_turn<'a>(
                     let defer_compaction = needs_follow_up
                         && !has_pending_input
                         && token_limit_reached
-                        && !final_answer_compaction_deferred
-                        && defer_compaction_for_final_answer(
+                        && !soft_compaction_deferred
+                        && can_defer_compaction_once(
                             turn_execution.plan_completed()
                                 || pending_generation_request
                                     .as_ref()
@@ -1318,14 +1319,18 @@ pub(crate) fn run_turn<'a>(
                                 // Admission will force the next request to report the
                                 // budget boundary, even without a completed checklist.
                                 || (!has_pending_input
-                                    && !logical_generation_budget.has_regular_generation_capacity()),
+                                    && !logical_generation_budget.has_regular_generation_capacity())
+                                // A known warm prefix can make one more request cheaper than
+                                // invalidating it now. Never waive physical-window pressure.
+                                || (generation_cache_warm
+                                    && !token_status.full_context_window_limit_reached),
                             token_status.active_context_tokens,
                             turn_context.model_context_window(),
                         );
-                    final_answer_compaction_deferred |= defer_compaction;
+                    soft_compaction_deferred |= defer_compaction;
                     if defer_compaction && !has_pending_input {
                         let tracker = turn_diff_tracker.lock().await;
-                        final_answer_soft_limit_waiver = Some((
+                        one_request_soft_limit_waiver = Some((
                             sess.input_queue.incorporated_user_intent_epoch(),
                             turn_execution.baselines_with_tool_exposure_revision(
                                 tracker.current_mutation_revision(),
@@ -2239,6 +2244,7 @@ fn authoritative_wait_terminal_surface(
             Some(SurfacedToolResult {
                 adapter: result.adapter.clone(),
                 value: result.value.clone(),
+                source_call_id: result.source_call_id.clone(),
                 canonical_message: result.surfaceable_message.clone(),
             })
         }
@@ -4016,19 +4022,17 @@ fn projected_prompt_tokens_from_estimates(
 /// Recorded final-answer requests used at most ~1.5K output and reasoning tokens.
 const FINAL_ANSWER_TOKEN_RESERVE: i64 = 8_192;
 
-/// A completed plan, or a next request that is already the tool-free final
-/// synthesis, means the next request is most likely the final answer.
-/// Compacting first spends a summarization request (96 s in a recorded turn)
-/// only to answer from a summary. Defer once while the answer still fits:
-/// another tool call compacts on the next check, and a provider overflow still
-/// compacts and retries. `active_context_tokens` is server usage plus the
-/// unsent tail, not the local whole-prompt estimate.
-fn defer_compaction_for_final_answer(
-    final_answer_expected: bool,
+/// Defer once for terminal synthesis or a qualified warm prefix while the
+/// next request has physical headroom. Continued pressure compacts on the
+/// next check, and a provider overflow still compacts and retries.
+/// `active_context_tokens` is server usage plus the unsent tail, not the
+/// local whole-prompt estimate.
+fn can_defer_compaction_once(
+    eligible: bool,
     active_context_tokens: i64,
     context_window: Option<i64>,
 ) -> bool {
-    final_answer_expected
+    eligible
         && context_window.is_some_and(|window| {
             active_context_tokens.saturating_add(FINAL_ANSWER_TOKEN_RESERVE) <= window
         })
@@ -5931,6 +5935,7 @@ fn enforce_terminal_prompt_contract(prompt: &mut Prompt, terminal_completion_onl
 #[derive(Debug)]
 struct SamplingRequestResult {
     needs_follow_up: bool,
+    generation_cache_warm: bool,
     last_agent_message: Option<String>,
     assistant_output: Option<FinalizedAssistantOutput>,
     final_message_candidate: Option<codex_protocol::protocol::AcceptedFinalMessage>,
@@ -5943,6 +5948,7 @@ struct SamplingRequestResult {
 #[derive(Debug)]
 struct UnsettledSamplingRequestResult {
     needs_follow_up: bool,
+    generation_cache_warm: bool,
     last_agent_message: Option<String>,
     assistant_output: Option<FinalizedAssistantOutput>,
     tool_result_continuation: bool,
@@ -5953,6 +5959,7 @@ impl UnsettledSamplingRequestResult {
     fn steered(tool_result_continuation: bool) -> Self {
         Self {
             needs_follow_up: true,
+            generation_cache_warm: false,
             last_agent_message: None,
             assistant_output: None,
             tool_result_continuation,
@@ -6760,7 +6767,7 @@ async fn prepared_prompt_admission(
     // A selected one-request waiver preserves normal tool capability. Recheck
     // the reserve against the immutable prepared prompt, never just the prior receipt.
     let soft_limit_waived = prompt.soft_limit_waiver
-        && defer_compaction_for_final_answer(true, total.max(local_tokens), turn.model_context_window());
+        && can_defer_compaction_once(true, total.max(local_tokens), turn.model_context_window());
     PreparedPromptAdmission {
         fits: !(status.full_context_window_limit_reached
             || (status.token_limit_reached && !prompt.tool_calls_disabled && !soft_limit_waived)),
@@ -7726,8 +7733,15 @@ fn try_run_sampling_request<'a>(
                         needs_follow_up = true;
                         server_end_turn_false = true;
                     }
+                    let generation_cache_warm = token_usage
+                        .as_ref()
+                        .and_then(|usage| {
+                            Some((usage.known_cached_input()?, usage.known_non_cached_input()?))
+                        })
+                        .is_some_and(|(cached, uncached)| cached > 0 && cached >= uncached);
                     break Ok(UnsettledSamplingRequestResult {
                         needs_follow_up,
+                        generation_cache_warm,
                         last_agent_message,
                         assistant_output,
                         tool_result_continuation,
@@ -8042,6 +8056,7 @@ fn try_run_sampling_request<'a>(
         };
         let outcome = outcome.map(|result| SamplingRequestResult {
             needs_follow_up: result.needs_follow_up,
+            generation_cache_warm: result.generation_cache_warm,
             last_agent_message: result.last_agent_message,
             assistant_output: result.assistant_output,
             final_message_candidate: final_message_candidate.map(|mut candidate| {

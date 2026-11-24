@@ -140,6 +140,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
             JsonSchema::boolean(Some("Keep piped stdin open for write_stdin; requires tty=false. Defaults to false (immediate EOF). Finish input with write_stdin close_stdin=true, not a terminal control character.".into())),
         ),
         ("stall_timeout_ms".to_string(), stall_timeout_schema()),
+        ("artifact_only_on_success".into(), JsonSchema::boolean(Some("Code Mode: omit inline streams only for completely retained terminal success. Otherwise return the ordinary receipt.".into()))),
         ("quiet_on_success".to_string(), quiet_on_success_schema()),
         (
             "yield_time_ms".to_string(),

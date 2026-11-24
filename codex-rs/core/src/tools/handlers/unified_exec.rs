@@ -94,7 +94,7 @@ struct RawExecCommandArgs {
     #[serde(default)]
     pipe_stdin: bool,
     #[serde(default)]
-    yield_time_ms: Option<i128>,
+    yield_time_ms: Option<ExecObservationWindow>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
     #[serde(default)]
@@ -123,6 +123,36 @@ struct RawExecCommandArgs {
     workdir: Option<String>,
     #[serde(flatten)]
     extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExecObservationWindow {
+    milliseconds: i128,
+    repaired_decimal_string: bool,
+}
+
+impl<'de> Deserialize<'de> for ExecObservationWindow {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let literal = raw.get();
+        let repaired_decimal_string = literal.starts_with('"');
+        let milliseconds = if repaired_decimal_string {
+            let decoded: String = serde_json::from_str(literal).map_err(D::Error::custom)?;
+            let digits = decoded.strip_prefix('-').unwrap_or(&decoded);
+            if digits.is_empty()
+                || !digits.bytes().all(|byte| byte.is_ascii_digit())
+                || (digits.starts_with('0') && decoded != "0")
+            {
+                return Err(D::Error::custom("expected an integer millisecond observation window"));
+            }
+            decoded.parse::<i128>().map_err(D::Error::custom)?
+        } else {
+            serde_json::from_str(literal).map_err(D::Error::custom)?
+        };
+        Ok(Self { milliseconds, repaired_decimal_string })
+    }
 }
 
 impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
@@ -183,14 +213,17 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
         // during synchronous Code Mode preflight, so only decode structure here.
         let requested_yield_time_ms = raw
             .yield_time_ms
-            .unwrap_or_else(|| i128::from(default_exec_yield_time_ms()));
+            .map_or_else(|| i128::from(default_exec_yield_time_ms()), |window| window.milliseconds);
+        if raw.yield_time_ms.is_some_and(|window| window.repaired_decimal_string) {
+            argument_notices.push("Interpreted decimal string `yield_time_ms` as integer milliseconds.".to_string());
+        }
         let yield_time_ms = requested_yield_time_ms.clamp(
             i128::from(crate::unified_exec::MIN_YIELD_TIME_MS),
             i128::from(crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS),
         ) as u64;
         if raw
             .yield_time_ms
-            .is_some_and(|requested| requested != i128::from(yield_time_ms))
+            .is_some_and(|window| window.milliseconds != i128::from(yield_time_ms))
         {
             argument_notices.push(format!("Adjusted `yield_time_ms` to {yield_time_ms}."));
         }

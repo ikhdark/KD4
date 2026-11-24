@@ -893,6 +893,12 @@ pub struct StagedPlanUpdate<'a> {
 }
 
 impl StagedPlanUpdate<'_> {
+    pub fn changed_step_states(&self) -> Vec<(String, StepStatus)> {
+        self.current.plan.iter().flat_map(|old| old.plan.iter().zip(&self.update.current.plan))
+            .filter(|(old, new)| old.status != new.status)
+            .map(|(_, new)| (self.update.lineage.step_id(&new.step), new.status.clone())).collect()
+    }
+
     pub fn needs_publication(&self) -> bool {
         self.update.effect != PlanUpdateEffect::NoOp || !self.current.durably_published
     }
