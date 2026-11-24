@@ -4,8 +4,9 @@ node_modules
 .pnpm-store
 .pnpm-debug.log
 
-# Vendored third-party sources (tracked files stay tracked).
-/third_party/
+# Vendored third-party sources (tracked files stay tracked); keep the KD4 integration note.
+/third_party/*
+!/third_party/transport-forks.txt
 
 # Keep pnpm-lock.yaml
 !pnpm-lock.yaml

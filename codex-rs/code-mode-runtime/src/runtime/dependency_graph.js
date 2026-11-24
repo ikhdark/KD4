@@ -14,8 +14,8 @@ Object.defineProperty(globalThis, "run_graph", {
       );
     }
     // Without `accept`, explicit failed tool receipts reject the prerequisite.
-    // Commands must also exit 0 without an interaction error. Apply the same
-    // checks to each array entry; domain-specific outcomes use explicit accept.
+    // A zero exit is not enough when a command result is observation-only or
+    // still has a handle to collect. Domain-specific outcomes use explicit accept.
     const isCommand = (value) =>
       value !== null &&
       typeof value === "object" &&
@@ -26,7 +26,9 @@ Object.defineProperty(globalThis, "run_graph", {
       (Array.isArray(value) ? value : [value]).every(
         (item) => item?.success !== false &&
           (item?.completion_recovered !== true || item.success === true) &&
-          (!isCommand(item) || (item.error == null && item.exit_code === 0)),
+          (!isCommand(item) ||
+            (item.error == null && item.exit_code === 0 &&
+              item.status_only !== true && item.session_id == null)),
       );
     // Capture definitions before running callbacks. Reject the entire graph
     // before starting any effect, including errors in disconnected components.
@@ -406,6 +408,28 @@ Object.defineProperty(globalThis, "run_graph", {
       throw error;
     }
     return ordered;
+  },
+});
+
+const runGraph = globalThis.run_graph;
+Object.defineProperty(runGraph, "each", {
+  value: async function each(items, run, { concurrency } = {}) {
+    if (!Array.isArray(items) || items.length < 1 || items.length > 256) {
+      throw new TypeError("run_graph.each requires 1–256 items");
+    }
+    if (typeof run !== "function") {
+      throw new TypeError("run_graph.each requires an item callback");
+    }
+    const nodes = items.map((item, index) => ({
+      id: String(index),
+      run: () => run(item, index),
+    }));
+    try {
+      return Object.values(await runGraph(nodes, { concurrency }));
+    } catch (error) {
+      if (!error?.results) throw error;
+      return Object.values(error.results);
+    }
   },
 });
 })();

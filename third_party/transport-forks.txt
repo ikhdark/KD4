@@ -1,0 +1,30 @@
+KD4 transport diagnostic forks -- upstream production sources
+
+reqwest 0.13.5; hyper-util 0.1.21; hyper-rustls 0.27.10.
+Imported from the existing Cargo registry packages at the locked releases.
+Original license files, Cargo manifests and production sources are retained.
+Upstream unit-test modules, doctest scaffolding and external example/integration
+workloads are omitted from this production import; none is installed or run here.
+
+Maintained deltas:
+- hyper-util: optional weak task-local observer; DNS resolution and individual
+  TCP-attempt spans; bounded raw TCP read/write completions; context propagation
+  through the existing executor. No address, URL, header or payload capture.
+- hyper-rustls: exact Rustls handshake future boundaries (including TLS to proxy).
+- reqwest: connector context/identity and destination TLS inside CONNECT/SOCKS;
+  re-export of the callback contract used by codex-http-client.
+- codex-http-client: bind callbacks to the existing physical-attempt observer,
+  retaining its strong lifetime only in request/body owners.
+
+Keep these source-matched patches when upgrading all three releases. Never label
+connection-scoped raw socket activity as a particular HTTP/2 stream, body upload,
+download, provider computation or TCP RTT. Socket polls include readiness waits;
+wire bytes can include TLS handshakes and HTTP framing. Actual upstream-native
+TLS, QUIC/HTTP3, WASM, local pipes and opaque SOCKS raw I/O are not covered by the
+Rustls/raw-TCP instrumentation. Missing rows are unknown, not zero duration.
+
+Retention: at most 64 socket completions and one overflow marker per observed
+connection, plus existing turn/journal caps. Context and sockets hold weak
+observers; no global callback singleton or request-retaining socket is added.
+TLS verification, proxy routing, retry policy, scheduling and cancellation stay
+with their existing owners. Abandoned phase futures record censored outcomes.

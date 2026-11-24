@@ -18,13 +18,78 @@ process boundaries, start with the [workspace map](../README.md).
 3. [tasks/](src/tasks/) selects the task, then
    [session/turn.rs](src/session/turn.rs) coordinates model sampling and results.
    [turn_execution.rs](src/session/turn_execution.rs) owns execution control and
-   completion reconciliation. [turn_context.rs](src/session/turn_context.rs) and
+   completion reconciliation. Its batching notice counts tool calls, not the operations inside each call.
+   [turn_context.rs](src/session/turn_context.rs) and
    [step_context.rs](src/session/step_context.rs) carry turn/step configuration.
 4. [tools/router.rs](src/tools/router.rs) and
    [tools/registry.rs](src/tools/registry.rs) route tool calls to
    [handlers/](src/tools/handlers/). [tools/code_mode/](src/tools/code_mode/)
    adapts the same tool surface to cells; [runtimes/](src/tools/runtimes/)
    and [unified_exec/](src/unified_exec/) own execution and process lifetimes.
+
+## Avoid unnecessary continuations
+
+- Resolve known completion blockers before drafting a final. Use the
+  [current plan and its native receipts](../tools/src/builtin_specs/plan_progress.md);
+  an open requirement is not authority to invent work or skip a real blocker.
+- Start dependent work from an exact ready result when the remaining producer is
+  independent. Keep its live handle and consume the required tail before
+  finalizing. If the tail affects selection, wait for it before selecting.
+- With the [thread queue](../app-server/THREAD_QUEUE.md), delete a submission
+  only after its owner identifies it as obsolete. Combine inputs only when they
+  intentionally belong to one turn. Retransmitting one identified submission is
+  not the same as merging independent requests with matching text.
+- Dispatch a branch after its prerequisite selects it when an eager request
+  would be disposable. Do not infer provider cancellation or zero usage from a
+  locally interrupted turn. With a qualified provider, explicitly stop work
+  once an authoritative replacement makes it obsolete. On the pinned local
+  llama.cpp Responses engine, engine logs confirmed cancellation and slot
+  release; that does not establish hosted billing or cancellation support.
+
+### Explicit inference boundaries
+
+Use `run_graph.frontier(steps, decisions)` to execute the local prefix and
+return a single bundle of independently ready decision inputs. Declare each
+decision's reason and evidence dependencies; return `null` from its collector
+when the normal path handled it. Use a later cell for decisions that depend on
+an answer, and keep native plan reconciliation and final delivery separate.
+
+Compose declared work in [Code Mode](../code-mode-protocol/src/description/exec_reference.md);
+do not infer the next action from tool success or default to round trips between
+known steps.
+
+| Situation | Workflow |
+| --- | --- |
+| Fixed prefix, then a real decision | Validate and normalize the inputs in the cell. Return the exact decision inputs and stop there; the cell does not choose an outcome that was not declared. |
+| Compatible read, edit and verification | Keep the complete read, source-hash guard, conditional patch and exact readback in order in one cell. Skip an already-current write; stop on refusal rather than retrying an edit against stale evidence. |
+| Several decisions | Present independently ready evidence together, with a distinct result key per decision and an explicit consumer for each. Keep a separate round when one result supplies evidence for another. Do not merge unrelated turns. |
+| Declared success and an exceptional outcome | Perform the authorized normal action locally. Send unexpected or incomplete observations back with their provenance; do not guess a new action or route an unknown result through a default write. |
+| Ready branch, unrelated work still running | In the same cell, use `run_graph` with the actual dependency edges. Start the branch once its own inputs settle; collect both results before finalizing. Add the tail as a dependency if it can affect the branch. |
+| Evidence still pending | Keep and collect the owned receipt before asking for a dependent choice. Continue unrelated ready work without consuming or restarting that receipt twice. |
+| Work remains before a final | Reconcile required IDs against current receipts before drafting. Execute ready work, resume live owners and make a bounded diagnostic correction when the evidence allows it. Leave genuine blockers unresolved and report their exact prerequisite. |
+
+For example, if the requested answer is exactly one CSV field from a JSON
+record, put the complete acquisition and projection in the delivery cell:
+
+```js
+// @exec: {"deliver": true}
+const r = await tools.read_file({
+  path: "record.json",
+  selectors: [{kind: "json_pointer", pointer: ""}],
+});
+if (r.results.length !== 1 || !r.results[0].complete) throw Error("incomplete selection");
+text(extract_result(r, {
+  fields: [{name: "label", pointer: "/results/0/value/label"}],
+  format: "csv",
+}).text);
+```
+
+A failed projection emits no proposed final. Use ordinary model completion
+when the requested answer needs interpretation or additional work. The
+[turn owner](src/session/turn.rs) handles an interrupted Responses attempt
+separately: a settled tool item can carry its committed output into the retry;
+an unfinished item cannot. This is in-turn recovery, not permission to replay
+an external effect or a process-restart guarantee.
 
 ## Find the responsibility
 
@@ -34,7 +99,7 @@ process boundaries, start with the [workspace map](../README.md).
 | Verification ledger context | [tools/handlers/evidence_memory.rs](src/tools/handlers/evidence_memory.rs) captures the queue; [session/world_state.rs](src/session/world_state.rs) retains its accepted baseline when capture is unavailable, not when discovery confirms absence. |
 | Tool exposure and discovery | [tools/spec_plan.rs](src/tools/spec_plan.rs), [tools/exposure.rs](src/tools/exposure.rs), [tools/handlers/tool_search.rs](src/tools/handlers/tool_search.rs) |
 | Model-visible tool-output selection, authenticated recovery and bounded rendering | [tools/registry/output_projection.rs](src/tools/registry/output_projection.rs); registry retains dispatch and hook ordering |
-| Agent lifecycle and coordination | [agent/control.rs](src/agent/control.rs), its [domain modules](src/agent/control/), [multi-agent handlers](src/tools/handlers/multi_agents_v2/) |
+| Agent lifecycle and coordination | [agent/control.rs](src/agent/control.rs), its [domain modules](src/agent/control/), [multi-agent handlers](src/tools/handlers/multi_agents_v2/), [read-only wave recipe](agent-read-wave.md), [scoped coordination workflows](agent-coordination.md) |
 | Typed spawn capacity refusal | [Reservation before assignment admission](src/tools/handlers/multi_agents_v2/spawn.rs) reports `not_admitted` when capacity refuses the reservation. This allows a fresh admission check after capacity changes without implying that residency housekeeping had no effects or permitting an automatic retry. |
 | Typed completion refused for unresolved requirements | [Receipt admission](src/tools/handlers/multi_agents_v2/task.rs) reports the plan revision and unsettled IDs. Return fulfilled IDs through [plan reconciliation](../tools/src/builtin_specs/plan_progress.md) only after their mapped work is complete; genuine blockers stay open. |
 | Ordinary completion with unresolved requirements | [Turn stop gate](src/session/turn_execution.rs) defers a final at most twice per instruction epoch. It can defer once more when a held exact user read has current native proof, retires a previously unresolved requirement and leaves a strictly smaller set of outstanding IDs. It neither dispatches work nor grants tool authority. |
@@ -50,7 +115,7 @@ process boundaries, start with the [workspace map](../README.md).
 
 | Module | Owns | Parent retains |
 | --- | --- | --- |
-| [session/turn/request_scaffold.rs](src/session/turn/request_scaffold.rs) | Reusable request-scaffold identity, tool-surface invalidation, stable-context manifests and prompt projection | Sampling, retries, terminal-request policy and session cache lifetime |
+| [session/turn/request_scaffold.rs](src/session/turn/request_scaffold.rs) | Reusable request-scaffold identity, tool-surface invalidation, [batched stable-context manifest construction](../conversation/src/stable_context.rs) and prompt projection | Sampling, retries, terminal-request policy and session cache lifetime |
 | [session/turn/tool_surface.rs](src/session/turn/tool_surface.rs) | Tool-router construction, prepared-router reuse and dynamic exposure identity | Planning/retry decisions and the session-owned router cache lifetime |
 | [session/turn/assistant_stream.rs](src/session/turn/assistant_stream.rs) | Assistant text parsers, deferred plan-mode item publication and durable partial-plan cleanup | Response-event dispatch, tool execution and final-answer acceptance |
 | [session/turn/answer_delivery.rs](src/session/turn/answer_delivery.rs) | Turn-local answer acceptance, revision invalidation, visible-output identity and final-message candidate ranking | Repair admission, completion hooks and final publication |

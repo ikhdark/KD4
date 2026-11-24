@@ -69,6 +69,13 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     {
         return Err("failed to install lazy ALL_TOOLS".to_string());
     }
+    let projections_key = v8::String::new(scope, "output_projections")
+        .ok_or_else(|| "failed to allocate output_projections key".to_string())?;
+    if global.set_lazy_data_property(scope, projections_key.into(), output_projections_callback)
+        != Some(true)
+    {
+        return Err("failed to install lazy output_projections".to_string());
+    }
     set_global(scope, global, "ALL_TOOL_NAMES", all_tool_names)?;
     set_global(scope, global, "resolve_tool", resolve_tool.into())?;
     // Recorded cells call `tools.resolve_tool(...)` (audit 2026-10-28 #5). Alias
@@ -134,7 +141,14 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     v8::Script::compile(scope, aggregates, None)
         .and_then(|script| script.run(scope))
         .ok_or_else(|| "failed to install promise aggregate provenance".to_string())?;
-    let graph_source = v8::String::new(scope, include_str!("dependency_graph.js"))
+    let graph_source = v8::String::new(
+        scope,
+        concat!(
+            include_str!("dependency_graph.js"),
+            "\n",
+            include_str!("decision_frontier.js")
+        ),
+    )
         .ok_or_else(|| "failed to allocate dependency graph helper".to_string())?;
     v8::Script::compile(scope, graph_source, None)
         .and_then(|script| script.run(scope))
@@ -142,8 +156,14 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     // A separate private closure capability for owned mechanical helpers.
     set_global(scope, global, "__codex_helper_observation", observe_graph.into())?;
     // Keep helper registration capabilities private to the owned closures.
-    let helpers = format!("((registerSearchProjection, registerCommandEvidence) => {{\n{}\n{}\n}})",
-        include_str!("search_pagination.js"), include_str!("orchestration.js"));
+    let helpers = format!(
+        "((registerSearchProjection, registerCommandEvidence) => {{\n{}\n{}\n{}\n{}\n{}\n}})",
+        include_str!("search_pagination.js"),
+        include_str!("orchestration.js"),
+        include_str!("read_wave.js"),
+        include_str!("file_workflows.js"),
+        include_str!("context_evidence.js"),
+    );
     let orchestration = v8::String::new(scope, &helpers)
         .ok_or_else(|| "failed to allocate orchestration helpers".to_string())?;
     let factory = v8::Script::compile(scope, orchestration, None)
@@ -339,6 +359,21 @@ fn build_tools_object<'s>(
         install_tool_property(scope, namespace, member, *index)?;
     }
     Ok(tools)
+}
+
+fn output_projections_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _key: v8::Local<v8::Name>,
+    _args: v8::PropertyCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let value = v8::String::new(scope, include_str!("output_projections.js"))
+        .and_then(|source| v8::Script::compile(scope, source, None))
+        .and_then(|script| script.run(scope));
+    match value {
+        Some(value) => retval.set(value),
+        None => throw_type_error(scope, "failed to initialize output_projections"),
+    }
 }
 
 fn all_tools_callback(

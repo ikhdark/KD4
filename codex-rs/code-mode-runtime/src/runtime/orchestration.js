@@ -262,12 +262,45 @@
     },
   });
 
+  const isLineWindow = (kind, start, end) => kind === "lines" &&
+    Number.isSafeInteger(start) && Number.isSafeInteger(end) && start > 0 && end >= start;
+  const nextLf = Function.prototype.call.bind(String.prototype.indexOf);
+  const sliceText = Function.prototype.call.bind(String.prototype.slice);
+  function restoreLineWindows(requested, results, reject) {
+    const spans = arrayMap(results, (row) => {
+      const { kind, start, end } = row.selector ?? {};
+      const { text } = row;
+      if (!isLineWindow(kind, start, end) || typeof text !== "string")
+        reject("native line span is malformed");
+      // Index each delivered span once. Slice the original string, preserving
+      // CRLF, Unicode, empty lines and a final line without LF.
+      const offsets = [0];
+      for (let lf = nextLf(text, "\n", 0); lf !== -1; lf = nextLf(text, "\n", lf + 1))
+        arrayPush(offsets, lf + 1);
+      if (offsets[offsets.length - 1] !== text.length) arrayPush(offsets, text.length);
+      if (offsets.length - 1 !== end - start + 1) reject("native line span cannot be sliced exactly");
+      return { start, end, text, offsets };
+    });
+    const cached = new Map();
+    return arrayMap(requested, ({ start, end }) => {
+      const key = start + ":" + end;
+      let text = cached.get(key);
+      if (text === undefined) {
+        const span = spans.find((row) => row.start <= start && row.end >= end);
+        if (!span) reject("native selection omitted a requested line window");
+        text = sliceText(span.text, span.offsets[start - span.start], span.offsets[end - span.start + 1]);
+        cached.set(key, text);
+      }
+      return { start, end, text };
+    });
+  }
+
   // Route one explicit native selection before yielding to the caller. Keep
   // raw read_tool_output and the checkpoint-based helper unchanged.
   Object.defineProperty(globalThis, "select_output", {
     value: async function select_output(
       { artifact_id, source_thread_id, selectors, max_bytes: initial_max_bytes },
-      { expected_sha256, expected_bytes, max_calls, max_bytes } = {},
+      { expected_sha256, expected_bytes, max_calls, max_bytes, preserve_line_windows = false } = {},
     ) {
       const isHash = (v) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
       const isSize = (v) => Number.isSafeInteger(v) && v >= 0;
@@ -282,8 +315,26 @@
       if (max_calls !== undefined) integer(max_calls, 1, 64, "max_calls");
       if (max_bytes !== undefined) integer(max_bytes, 1, 8 * 1024 * 1024, "max_bytes");
 
+      if (typeof preserve_line_windows !== "boolean")
+        throw new TypeError("select_output: preserve_line_windows must be boolean");
+      let requested = selectors;
+      if (preserve_line_windows) {
+        if (!isHash(expected_sha256) || !isSize(expected_bytes))
+          throw new TypeError("select_output: line windows require the expected artifact hash and size");
+        integer(selectors.length, 1, 64, "line window count");
+        // Copy the effective requests across the native await, without retaining
+        // caller objects or rewriting the native selector normalization rules.
+        requested = [];
+        for (const window of selectors) {
+          const { kind, start, end } = window ?? {};
+          if (!isLineWindow(kind, start, end))
+            throw new TypeError("select_output: expected positive inclusive line windows");
+          arrayPush(requested, { kind, start, end });
+        }
+      }
+
       const initial = await capability("read_tool_output")({
-        artifact_id, source_thread_id, selectors, max_bytes: initial_max_bytes,
+        artifact_id, source_thread_id, selectors: requested, max_bytes: initial_max_bytes,
       });
       const evidence = { initial, pages: [], selection_complete: false };
       const reject = (message) => fail(`select_output: ${message}`, evidence);
@@ -304,9 +355,14 @@
           arrayEvery(initial.results, (result) => result.status === "ok" && result.complete === true)) {
         // Keep the native authenticity label: a complete command-log selection
         // bound to the requested artifact is not an authenticated snapshot.
+        if (preserve_line_windows) {
+          if (authenticity !== "authenticated") reject("line windows require an authenticated snapshot");
+          evidence.line_windows = restoreLineWindows(requested, initial.results, reject);
+        }
         evidence.selection_complete = true;
         return evidence;
       }
+      if (preserve_line_windows) reject("line windows need a complete native selection");
       if (initial.delivered_selection_complete !== false || authenticity !== "authenticated" ||
           stop?.resumable !== true || !["budget", "page_limit"].includes(stop.reason) ||
           !nativeIsArray(stop.remaining_selectors) || !stop.remaining_selectors.length ||

@@ -3213,6 +3213,23 @@ impl CodeModeArgumentPreflight {
         });
         match diagnostic.or_else(|| native_rejection.map(reject)) {
             Some(mut failure) => {
+                // A snapshot tail on a live file is a known carrier mismatch, not
+                // twelve independent violations of mutually exclusive branches.
+                if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "read_file"
+                    && value.as_object().is_some_and(|args| args.len() == 2)
+                    && value["path"].as_str().is_some_and(|path| !path.is_empty())
+                    && value["selectors"].as_array().is_some_and(|items| items.len() == 1 && items[0]["kind"] == "tail")
+                {
+                    let details = serde_json::json!({"message": failure.message, "field_errors": failure.field_errors,
+                        "details": failure.details});
+                    failure.message = "tail is a read_tool_output snapshot selector. For a live file use lines with start and end. Full schema diagnostic: tool_failure.details.selector_branches.".into();
+                    failure.field_errors = vec![ToolFieldError {
+                        path: "/selectors/0/kind".into(),
+                        expected: "lines, bytes, search, section, json_pointer, structured, symbol or enclosing".into(),
+                        correction: "Use the advertised read_file selector and its required fields.".into(),
+                    }];
+                    failure.details = Some(serde_json::json!({"selector_branches": details}));
+                }
                 failure.message = format!("tool `{tool_name}` rejected before execution: {}", failure.message);
                 Err(failure)
             }

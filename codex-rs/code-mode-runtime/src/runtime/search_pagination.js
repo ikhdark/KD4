@@ -185,6 +185,12 @@ const __codex_paginate_search = (search) => {
       count_only: false, overlapping: options.overlapping ?? false,
     }, page_size: options.page_size }));
     const opts = request.options;
+    const comparisonKey = request => {
+      const { pattern, options } = request;
+      return typeof pattern === "string" && pattern.length > 0 &&
+        !options.ignore_case && !options.overlapping && !/[^A-Za-z0-9_]/.test(pattern)
+        ? { ...request, options: { ...options, fixed: true } } : request;
+    };
     if (!Array.isArray(opts.path) || opts.path.length < 1 || opts.path.length > 32 ||
         opts.path.some(path => typeof path !== "string" || !path.trim()) ||
         !Array.isArray(opts.glob) || opts.glob.length > 64 ||
@@ -205,7 +211,7 @@ const __codex_paginate_search = (search) => {
       }
       if (!Number.isSafeInteger(index) || index < 1 || state.cursors[index] !== options.cursor)
         return incomplete(pattern, "invalid_cursor");
-      if (!same(request, state.request)) return incomplete(pattern, "search_parameters_changed");
+      if (!same(request, state.request) && !same(comparisonKey(request), comparisonKey(state.request))) return incomplete(pattern, "search_parameters_changed");
     }
     try {
       const scope = await inventory(opts);
@@ -253,7 +259,7 @@ const __codex_paginate_search = (search) => {
         matching_lines: files.reduce((sum, file) => sum + file.pattern_counts.find(p => p.id === item.id).matching_lines, 0),
         matching_files: files.filter(file => file.pattern_counts.some(p => p.id === item.id && p.matching_lines > 0)).length,
         complete: !more, lower_bound: more }));
-      return present({ ...state.result, files, file_count: files.length, match_count: end - start,
+      return present({ ...state.result, semantics, files, file_count: files.length, match_count: end - start,
         pattern_counts, counts: { occurrences: pattern_counts.reduce((sum, p) => sum + p.occurrences, 0),
           matching_lines: end - start, matching_files: files.length, complete: !more, lower_bound: more },
         complete: !more && state.result.complete, search_complete: !more,

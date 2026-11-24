@@ -2011,7 +2011,20 @@ async fn prepare_initial_operation(
     output_schema_path: Option<PathBuf>,
     allow_no_prose: bool,
 ) -> anyhow::Result<(InitialOperation, String)> {
-    let output_schema = load_output_schema(output_schema_path).await?;
+    let verification = matches!(command, Some(ExecCommand::Verify { .. }));
+    let output_schema = if verification && output_schema_path.is_none() {
+        Some(serde_json::from_str(include_str!(
+            "../output-contracts/verification.json"
+        ))?)
+    } else {
+        load_output_schema(output_schema_path).await?
+    };
+    let prompt = match command {
+        Some(ExecCommand::Verify {
+            prompt: verification_prompt,
+        }) => verification_prompt.clone().or(prompt),
+        _ => prompt,
+    };
     let prompt_text = match command {
         Some(ExecCommand::Resume(args)) => {
             images.extend(args.images.iter().cloned());
@@ -2024,7 +2037,7 @@ async fn prepare_initial_operation(
         }
         // Without a positional prompt, piped stdin is the prompt itself (not an
         // appended `<stdin>` block); images make an absent prompt optional.
-        None => match prompt {
+        None | Some(ExecCommand::Verify { .. }) => match prompt {
             None if !images.is_empty() => {
                 read_prompt_from_stdin(StdinPromptBehavior::OptionalAppend).unwrap_or_default()
             }

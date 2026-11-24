@@ -13,6 +13,9 @@ process-clock `activityTimeline`. It does not change scheduling or admission.
   holders or repositories. `agent_lock` prerequisites additionally retain the
   resource, observed holder and acquisition token from the lock owner's atomic
   busy/subscription snapshot; this is historical attribution, not current ownership.
+- Hook-free passive process polls can join the native read cohort. Same-handle
+  interaction remains ordered by the process manager; input, EOF and termination
+  are not passive polls.
 - Dependency-wait observers cover ordered tool-result collection and interrupt
   resolution. Explicit edges also link model-issued (direct) tool executions to
   their emitting generation and a resumed generation to model-visible tool
@@ -68,3 +71,9 @@ actual Code Mode result serializer, before script/outer-display projection.
 metadata, after the owning tool's per-result budget. It is not canonical artifact
 bytes, displayed bytes, provider tokens, or an unbounded pre-owner-reduction
 object. Counts and retention completeness are independent and bounded to 1,024.
+
+Final-answer tail schema 1 measures host observations. An accepted message has an
+item ID; its first/full times use matching item and digest observations when
+available. A directly surfaced tool answer has no message item ID and records
+the complete-text observation as both endpoints. Equal timestamps do not measure
+generation time, and neither path establishes native renderer acknowledgment.

@@ -327,6 +327,90 @@ impl StableContextManifest {
         }
     }
 
+    /// Build the invariant part of a sampling request's manifest in a single pass.
+    /// The returned measurements count only incoming history components, not
+    /// the base model, tool schemas, or availability markers.
+    pub fn with_request_scaffold(
+        &self,
+        repository: Option<([u8; 32], bool, bool)>,
+        model_slug: &str,
+        base_instructions: &str,
+        tool_schemas: &[u8],
+        has_request_user_input: bool,
+        has_wait: bool,
+    ) -> (Self, u64, i64) {
+        let (history_bytes, history_tokens, signed_repository_tokens) = self
+            .components
+            .iter()
+            .filter(|component| component.active)
+            .fold((0_u64, 0_i64, false), |(bytes, tokens, signed_repo), component| {
+                (
+                    bytes.saturating_add(component.identity.serialized_bytes),
+                    tokens.saturating_add(component.identity.approx_tokens),
+                    signed_repo
+                        || (component.identity.approx_tokens < 0
+                            && component.kind == StableContextKind::Repository),
+                )
+            });
+        // Repository identity replacement can reorder its components. The
+        // order matters only for signed estimates under saturating addition.
+        let history_tokens = if signed_repository_tokens && repository.is_some() {
+            self.with_repository_identity(repository).projected_tokens()
+        } else {
+            history_tokens
+        };
+        let mut components = Vec::with_capacity(self.components.len() + 4);
+        components.extend(self.components.iter().cloned());
+        if let Some(repository) = repository {
+            apply_repository_identity(&mut components, repository);
+        }
+        components.push(base_component(model_slug, base_instructions));
+        components.push(component_from_bytes(
+            StableContextKind::ToolSchemas,
+            "tool_schemas",
+            tool_schemas,
+            true,
+            StableContextDisposition::Unchanged,
+            None,
+        ));
+        static REQUEST_USER_INPUT: std::sync::OnceLock<StableContextComponent> =
+            std::sync::OnceLock::new();
+        static WAIT: std::sync::OnceLock<StableContextComponent> = std::sync::OnceLock::new();
+        if has_request_user_input {
+            let marker = REQUEST_USER_INPUT.get_or_init(|| {
+                component_from_bytes(
+                    StableContextKind::RequestUserInput,
+                    "request_user_input_available",
+                    b"request_user_input",
+                    true,
+                    StableContextDisposition::Unchanged,
+                    Some((0, 0)),
+                )
+            });
+            components.push(marker.clone());
+        }
+        if has_wait {
+            let marker = WAIT.get_or_init(|| {
+                component_from_bytes(
+                    StableContextKind::Wait,
+                    "wait_available",
+                    b"wait",
+                    true,
+                    StableContextDisposition::Unchanged,
+                    Some((0, 0)),
+                )
+            });
+            components.push(marker.clone());
+        }
+
+        (
+            Self::from_components(components, self.projection_enabled, self.fail_open)
+                .with_filtering_receipts(Arc::clone(&self.filtering_receipts)),
+            history_bytes,
+            history_tokens,
+        )
+    }
+
     pub fn with_base_model(&self, model_slug: &str, base_instructions: &str) -> Self {
         let mut components = self.components.to_vec();
         components.push(base_component(model_slug, base_instructions));
@@ -338,20 +422,11 @@ impl StableContextManifest {
         &self,
         repository: Option<([u8; 32], bool, bool)>,
     ) -> Self {
-        let Some((semantic_id, local_reused, semantic_replacement)) = repository else {
+        let Some(repository) = repository else {
             return self.clone();
         };
         let mut components = self.components.to_vec();
-        let semantic_id = format!("repository:v1:{}", short_hash(&semantic_id));
-        for component in &mut components {
-            if component.kind == StableContextKind::Repository && component.active {
-                component.identity.semantic_id.clone_from(&semantic_id);
-                component.local_reused = local_reused;
-                if semantic_replacement {
-                    component.disposition = StableContextDisposition::Replaced;
-                }
-            }
-        }
+        apply_repository_identity(&mut components, repository);
         Self::from_components(components, self.projection_enabled, self.fail_open)
             .with_filtering_receipts(Arc::clone(&self.filtering_receipts))
     }
@@ -1981,6 +2056,22 @@ fn marked_body_is(text: &str, open: &str, close: &str, expected: &str) -> bool {
         .strip_prefix(open)
         .and_then(|body| body.strip_suffix(close))
         .is_some_and(|body| body.trim() == expected)
+}
+
+fn apply_repository_identity(
+    components: &mut [StableContextComponent],
+    (identity, local_reused, semantic_replacement): ([u8; 32], bool, bool),
+) {
+    let semantic_id = format!("repository:v1:{}", short_hash(&identity));
+    for component in components {
+        if component.kind == StableContextKind::Repository && component.active {
+            component.identity.semantic_id.clone_from(&semantic_id);
+            component.local_reused = local_reused;
+            if semantic_replacement {
+                component.disposition = StableContextDisposition::Replaced;
+            }
+        }
+    }
 }
 
 fn component_from_text(

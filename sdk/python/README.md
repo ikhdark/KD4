@@ -54,6 +54,9 @@ when available, and the original stream exception as `__cause__`.
 Earlier tools may already have completed: inspect these receipts before retrying.
 Async cancellation still propagates `CancelledError`.
 
+To gate optional turns on exact readiness or reserve a local synthesis slot, use
+[explicit inference workflows](docs/api-reference.md#explicit-inference-workflow).
+
 ## Authentication
 
 Pass the same `config` from the quickstart to each client below. Existing Codex
@@ -169,10 +172,15 @@ Use Python's standard `help(openai_codex)`, `help(Codex)`, or
 
 ## Documentation
 
+These links are checkout-relative. From package metadata, use the
+[KD4 source edition of this index](https://github.com/ikhdark/KD4/blob/main/sdk/python/README.md#documentation).
+
 - [Getting started](docs/getting-started.md)
 - [API reference](docs/api-reference.md)
 - [FAQ](docs/faq.md)
 - [Examples](examples/README.md)
+- [SDK walkthrough notebook](notebooks/sdk_walkthrough.ipynb) (running it bootstraps the pinned runtime and uses live services)
+- [Versioned compatibility inputs](scripts/compatibility/README.md) for binding generation and legacy runtimes
 
 The package is licensed under the
 [repository Apache License 2.0](../../LICENSE).

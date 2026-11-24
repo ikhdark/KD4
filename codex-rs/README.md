@@ -9,7 +9,7 @@ not another instruction source.
 
 | Surface | Entry point | Follow next |
 | --- | --- | --- |
-| CLI commands | [cli/src/main.rs](cli/src/main.rs) | Command dispatch selects the app server, [exec](exec/), or another command owner |
+| CLI commands | [cli/src/main.rs](cli/src/main.rs) | Command dispatch selects the app server, [exec](exec/README.md), or another command owner |
 | Desktop / JSON-RPC service | [app-server/src/lib.rs](app-server/src/lib.rs) | [app-server-handlers](app-server-handlers/) routes requests into the runtime |
 | Live thread, session and turn execution | [Core navigation](core/README.md) | Thread manager → session handlers → tasks → turn loop → tool router |
 | Client-facing wire contract | [Protocol navigation](app-server-protocol/README.md) | Types, projections and schema generation have separate owners |
@@ -27,11 +27,12 @@ not another instruction source.
 | Request cache diagnostics (not provider-history admission) | [model-client/src/client/request_measurements.rs](model-client/src/client/request_measurements.rs); transport selection and ordered state lifetime remain in client.rs |
 | Completed-tool history disk compatibility and journal replay | [conversation/src/tool_history/persistence.rs](conversation/src/tool_history/persistence.rs); public loader/writer paths remain in tool_history |
 | Resolved runtime configuration | [runtime-config](runtime-config/); [config](config/) owns configuration support and the [layer loader](config/src/loader/README.md) |
-| Session persistence | [rollout](rollout/README.md) |
+| Session persistence | [Rollout storage](rollout/README.md); [SQLite initialization and recovery](state/README.md) |
 | Timing records and dispatch tracing | [turn-timing](turn-timing/README.md); core emits runtime observations |
 | Turn analytics | [analytics reducer](analytics/src/reducer.rs); completed turns awaiting enrichment use the same fallback at queue drain and before bounded FIFO eviction |
 | Execution service and process transport | [exec-server](exec-server/README.md), [exec-server-protocol](exec-server-protocol/) |
 | Extension interfaces and built-ins | [ext](ext/), starting with the [extension API](ext/extension-api/src/lib.rs) |
+| Bundled skills | [Source assets](skills/src/assets/samples/); see [skills architecture](core/instruction-architecture.md#extensions-skills-apps-and-plugin-guidance) for staging, discovery and delivery |
 | Shared utilities | [utils](utils/); use a specific utility crate rather than a core facade |
 
 ## Code Mode: client, host, runtime, contract
@@ -46,6 +47,7 @@ These similarly named crates serve different sides of the process boundary:
    and in-process sessions; the host links it in production.
 5. [code-mode-protocol](code-mode-protocol/src/lib.rs) owns shared session/host
    contracts, tool descriptions and output projection.
+   See the [input projection recipes](code-mode-protocol/input-projection.md) for sparse refreshes, diagnostic rows, overlapping reads, failure receipts and shared source bindings.
 
 Follow the client and host sides when changing their shared contract; a
 re-export in `code-mode` does not make that crate the implementation owner.

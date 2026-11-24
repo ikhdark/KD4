@@ -21,6 +21,7 @@ use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::AssignmentRelation;
 use codex_agent_task_store::Attempt;
+use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::DependencyAdmission;
 use codex_agent_task_store::IntegrationPlan;
 use codex_agent_task_store::LocalAgentTaskStore;
@@ -32,6 +33,7 @@ use codex_agent_task_store::TaskCapsuleHandle;
 use codex_agent_task_store::TaskCapsuleV1;
 use codex_agent_task_store::normalize_repo_path;
 use codex_agent_task_store::repository_lineage_id;
+use codex_agent_task_store::repository_workspace_id;
 use codex_agent_task_store::repo_path_identity_keys;
 use codex_context_fragments::ModelContextBudget;
 use codex_git_utils::get_git_repo_root;
@@ -39,6 +41,7 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::tool_failure::ToolDispatchState;
@@ -50,6 +53,7 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -134,6 +138,80 @@ impl Drop for AdmittedLaunchGuard {
                     .await;
             }
         });
+    }
+}
+
+// Park only an already authorized request, before reserving a slot or
+// creating an assignment. No deferred job survives its caller.
+const LIVE_SPAWN_DEPENDENCY_WAIT: Duration = Duration::from_secs(3);
+
+async fn wait_for_live_spawn_dependency(
+    session: &crate::session::session::Session,
+    cwd: &AbsolutePathBuf,
+    dependency: AssignmentId,
+    cancellation: &CancellationToken,
+) -> Result<(), FunctionCallError> {
+    let control = &session.services.agent_control;
+    let coordinator = control.task_coordinator();
+    let (Some(store), Some(root), Some(binding)) = (
+        coordinator.store(),
+        coordinator.root_session_id(),
+        coordinator.binding_for_assignment(dependency),
+    ) else {
+        return Ok(());
+    };
+    let Some(thread) = binding.thread_id.as_deref().and_then(|id| ThreadId::from_string(id).ok()) else {
+        return Ok(());
+    };
+    let cwd = cwd.to_path_buf();
+    let ready = async {
+        let workspace = tokio::task::spawn_blocking(move || {
+            let repo = get_git_repo_root(&cwd).unwrap_or(cwd);
+            repository_workspace_id(&repo)
+        }).await.ok()?.ok()?;
+        // Subscribe from a cursor observed before reading the attempt. A receipt
+        // committed between the read and subscription is therefore not missed.
+        let mut cursor = store.current_wake_cursor(&root).await.ok()?;
+        let task = coordinator.get_agent_task_authorization(dependency).await.ok()?;
+        if workspace != task.assignment.workspace_id
+            || task.admission_origin != AssignmentAdmissionOrigin::Typed
+            || task.current_attempt.state != AttemptState::Active
+            || task.current_attempt.attempt_id != binding.attempt_id
+        {
+            return Some(());
+        }
+        let mut status = control.subscribe_status(thread).await.ok()?;
+        if matches!(*status.borrow(), AgentStatus::Interrupted | AgentStatus::Shutdown | AgentStatus::NotFound) {
+            return Some(());
+        }
+        loop {
+            let wake = tokio::select! {
+                read = store.wait_for_wake_events(root.clone(), cursor) => read.ok()?,
+                _ = status.wait_for(|status| matches!(
+                    status, AgentStatus::Interrupted | AgentStatus::Shutdown | AgentStatus::NotFound
+                )) => return Some(()),
+            };
+            let current = coordinator.get_agent_task_authorization(dependency).await.ok()?;
+            if current.current_attempt.state != AttemptState::Active
+                || current.current_attempt.attempt_id != binding.attempt_id
+            {
+                return Some(());
+            }
+            if wake.latest_event_id == cursor {
+                break;
+            }
+            cursor = wake.latest_event_id;
+        }
+        Some(())
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(FunctionCallError::RespondToModel(
+            "spawn_agent cancelled".to_string(),
+        )),
+        // Every outcome flows through the existing admission oracle. A watch,
+        // timeout or terminal state alone is never permission to launch.
+        _ = tokio::time::timeout(LIVE_SPAWN_DEPENDENCY_WAIT, ready) => Ok(()),
     }
 }
 
@@ -342,6 +420,13 @@ async fn handle_spawn_agent(
     .map_err(|error| pre_effect_settings_refusal(error, &args))?;
     config.cwd = admission_cwd.clone();
     worker_startup_preflight(&session, &turn, &config, &primary, &cancellation_token).await?;
+
+    if !turn.session_source.is_non_root_agent()
+        && let Some(assignment) = args.assignment.as_ref()
+        && let [dependency] = assignment.dependencies.as_slice()
+    {
+        wait_for_live_spawn_dependency(&session, &admission_cwd, *dependency, &cancellation_token).await?;
+    }
 
     // Preserve the legacy message spawn tag; typed calls carry their requested role.
     let durable_role_name = agent_role_metric_label(typed_role);

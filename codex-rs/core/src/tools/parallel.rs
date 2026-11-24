@@ -2574,16 +2574,16 @@ impl ToolCallRuntime {
                     workspace_capable,
                 );
                 workspace_admission.native_additions = additions;
+                // Passive process observations serialize at the handle's interaction lock.
+                // Share only with readers; a possible completion hook still needs exclusion.
                 workspace_admission.native_read_cohort = !post_hook_may_run
-                    && matches!(
+                    && (passive_poll || (matches!(
                         evidence_call.tool_name.name.as_str(),
                         "read_file" | "list_files"
                     )
                     && router.permits_shared_workspace_observation(&evidence_call)
                     && workspace_admission_classification.source_scope_complete
-                    && !workspace_admission_classification
-                        .source_dependencies
-                        .is_empty();
+                    && !workspace_admission_classification.source_dependencies.is_empty()));
                 if tracks_workspace {
                     // Like the gates: an uncontended acquisition is not
                     // contention, even when Tokio's coop budget defers lock().

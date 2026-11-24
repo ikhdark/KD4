@@ -79,6 +79,7 @@ Properties/methods:
 - `login_chatgpt_device_code() -> DeviceCodeLoginHandle`
 - `account(*, refresh_token: bool = False) -> GetAccountResponse`
 - `logout() -> None`
+- `read_file_range(path, *, start, length, expected_revision=None) -> FsReadFileRangeResponse` ([native file reads](#native-file-reads))
 - `thread_start(*, approval_mode=ApprovalMode.deny_all, base_instructions=None, config=None,
   cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None,
   personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=UNSET,
@@ -108,6 +109,102 @@ with Codex() as codex:
 pass `None` to send an explicit null. Do not replace omission with `None` when
 forwarding optional settings.
 
+## Native file reads
+
+Use `read_file_range` when your application already knows which file to read.
+It calls the [app-server filesystem endpoint](../../../codex-rs/app-server-protocol-types/src/protocol/v2/fs.rs),
+not a model or a thread. Use an absolute path on the SDK runtime's filesystem.
+Offsets are bytes from zero; `length` is 1–65,536. A short response can be
+the end of a file, and an empty file is not an error. For subsequent ranges
+of the same file, pass the first result's `revision` as `expected_revision`
+so a changed file fails rather than mixing revisions. Errors, including
+an unavailable endpoint on an older runtime, propagate without model fallback.
+
+```python
+from base64 import b64decode
+
+page = codex.read_file_range(r"C:\work\receipt.json", start=0, length=65_536)
+data = b64decode(page.data_base64, validate=True)
+if len(data) != page.file_bytes:
+    raise ValueError("Expected the complete receipt; read more ranges or stop")
+```
+
+For a small, known-format receipt, parse and validate the complete bytes in the
+caller. To finish a task that also needs judgment, pass only the relevant
+validated fields to a normal turn; don't ask it to fetch or reconstruct the
+same evidence. Use the normal turn directly when the path, fields or operation
+must be inferred. `AsyncCodex.read_file_range` has the same contract.
+
+## Model selection for an independent operation
+
+If your application explicitly selects a model for a self-contained operation,
+start a separate ephemeral thread and pass only the input that operation needs:
+
+```python
+operation = codex.thread_start(ephemeral=True, model="gpt-6.2-sol")
+result = operation.run(prompt, output_schema=operation_schema)
+```
+
+This leaves any existing conversation's model unchanged. A `model` override on
+`Thread.run()` selects that model for the turn **and subsequent turns on that
+thread**; don't use a temporary override on a shared conversation to isolate
+an operation. Keep dependent turns on the original thread when they require
+its history or configuration.
+
+## Explicit inference workflow
+
+Use `InferenceWorkflow` when **your application** knows which results are
+required and which branch should run. It does not change sampling inside a
+Codex turn, inspect task semantics, or launch autonomous work.
+
+```python
+import asyncio
+
+from openai_codex import InferenceSlotsExhausted, InferenceWorkflow
+
+# selection and tail are caller-owned asyncio tasks. Only selection is needed
+# to choose the branch. Both the branch result and tail are needed for the final.
+workflow = InferenceWorkflow(slots=2, reserve=1)
+branch = asyncio.create_task(workflow.run_phase(
+    lambda results: branch_prompt_for(results[0]),
+    branch_thread.run,
+    ready=[selection],
+))
+final = await workflow.run_phase(
+    lambda results: synthesis_prompt_for(*results),
+    final_thread.run,
+    ready=[branch, tail],
+    essential=True,
+)
+```
+
+- Supply only the tasks that gate each phase, in the order its pure
+  `prepare(results)` callback needs. Failed prerequisites propagate without
+  submitting. Cancelling the readiness wait leaves those tasks owned by their
+  original caller. Once submission begins, the SDK submitter owns cancellation.
+  Use distinct threads for concurrent turns or await prior completion.
+- Return `None` from `prepare` to skip a phase without spending a slot. For
+  completion preflight, check the exact current result first (for example,
+  `await thread.recorded_answer(turn_id)` without fallback), retain that result
+  when it satisfies the task, and prepare a fresh turn only if still needed.
+  Do not treat missing evidence as completion.
+- `slots=None` (default) is unbounded. A finite `slots` counts calls to the
+  submitter within this workflow, not transport retries, physical provider
+  requests, hosted quota, or tokens. `reserve` protects local slots for phases
+  marked `essential=True`. A denied phase raises `InferenceSlotsExhausted`
+  without contacting the runtime. Never refund or auto-retry an uncertain
+  submission; inspect the owning receipt. This helper runs on one event loop.
+- For a queue, use `thread/queue/delete` only for the ID explicitly identified
+  as obsolete and check the deletion result. Submit jointly intended inputs as
+  one turn; do not merge independent requests based on text or timing. The
+  [local queue contract](../../../codex-rs/app-server/THREAD_QUEUE.md) describes
+  acceptance receipts and replay identity.
+- To retire an already-started turn, use its handle's `interrupt()` rather
+  than launching a replacement blindly. Read terminal and partial-output
+  events separately; absence of a reported usage receipt is not zero usage.
+  Provider-side work retirement was measured only on the qualified local
+  Responses route.
+
 ## AsyncCodex (async parity)
 
 ```python
@@ -134,6 +231,7 @@ Properties/methods:
 - `login_chatgpt_device_code() -> Awaitable[AsyncDeviceCodeLoginHandle]`
 - `account(*, refresh_token: bool = False) -> Awaitable[GetAccountResponse]`
 - `logout() -> Awaitable[None]`
+- `read_file_range(path, *, start, length, expected_revision=None) -> Awaitable[FsReadFileRangeResponse]`
 - `thread_start(*, approval_mode=ApprovalMode.deny_all, base_instructions=None, config=None,
   cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None,
   personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=UNSET,
@@ -189,6 +287,17 @@ API-key login completes synchronously and does not return a handle.
 
 `Thread` and `AsyncThread` share the same shape and intent.
 
+Use `thread.fork(*, last_turn_id=None, ephemeral=None)` to branch an
+independent investigation from the existing history without injecting later
+branch turns into the parent. It keeps the original working scope. To change
+the instruction scope without bringing earlier directory-specific history,
+use `codex.start_scoped_thread(cwd, *, ephemeral=None)` instead.
+It takes an absolute working directory (a string or `Path`) and uses the
+server's ordinary project instruction discovery. Put local guidance in the
+nested `AGENTS.md` and workspace-wide guidance at the root. Both helpers
+have async equivalents. Existing `thread_start` and `thread_fork` remain
+available for more configuration options.
+
 ### Thread
 
 - `run(input: str | Input, *, approval_mode=None, allow_no_prose=None, cwd=None, effort=None, model=None,
@@ -198,6 +307,7 @@ API-key login completes synchronously and does not return a handle.
   output_schema=None, personality=None, run_independently=None, sandbox: Sandbox | None = None, service_tier=UNSET,
   summary=None) -> TurnHandle`
 - `read(*, include_turns: bool = False) -> ThreadReadResponse`
+- `recorded_answer(turn_id: str, *, fallback: RunInput | None = None) -> str | None`
 - `set_name(name: str) -> ThreadSetNameResponse`
 - `compact() -> ThreadCompactStartResponse`
 
@@ -210,8 +320,16 @@ API-key login completes synchronously and does not return a handle.
   output_schema=None, personality=None, run_independently=None, sandbox: Sandbox | None = None, service_tier=UNSET,
   summary=None) -> Awaitable[AsyncTurnHandle]`
 - `read(*, include_turns: bool = False) -> Awaitable[ThreadReadResponse]`
+- `recorded_answer(turn_id: str, *, fallback: RunInput | None = None) -> Awaitable[str | None]`
 - `set_name(name: str) -> Awaitable[ThreadSetNameResponse]`
 - `compact() -> Awaitable[ThreadCompactStartResponse]`
+
+`recorded_answer(turn_id)` reads history and returns the exact text of a unique,
+nonempty, uninterrupted final answer in the specified completed turn, without
+starting a new turn. Missing, incomplete or ambiguous history returns `None`.
+Pass `fallback=...` only if a miss should start an ordinary turn on that same
+thread; read failures and thread ID mismatches propagate. Free-form
+`run(...)` always starts a turn.
 
 `run(...)` is the common-case convenience path. It accepts plain strings, starts
 the turn, consumes notifications until completion, and returns a small result
@@ -358,6 +476,9 @@ from openai_codex import (
 - `is_retryable_error(exc)` checks if an exception is transient/overload-like.
 
 ## Example
+
+`Codex()` uses the installed pinned runtime. To select a local KD4 build, see
+[local setup](../README.md#local-setup).
 
 ```python
 from openai_codex import Codex

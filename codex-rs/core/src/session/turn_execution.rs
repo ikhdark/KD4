@@ -3674,7 +3674,7 @@ impl TurnExecutionControl {
             return Some((
                 ConvergenceGuardKind::BatchingAdvice,
                 format!(
-                    "Batching advice: the last {} continuations each issued a single observation. When further reads, searches, Git observations or predetermined checks are independent and their targets are already known, issue them together in one response (in Code Mode, one cell) and interpret the results once. Keep a separate step only when one result determines the next action, and serialize work that shares a build target.",
+                    "Batching advice: the last {} continuations each issued one counted tool call. A call can already contain several operations. Where results fit the output budget and further reads, searches, Git observations or predetermined checks are independent with known targets, issue them together in one response (in Code Mode, one cell) and interpret the results once. Keep a separate step only when one result determines the next action, and serialize work that shares a build target.",
                     self.serial_single_action_streak
                 ),
             ));

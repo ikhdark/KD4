@@ -1332,10 +1332,10 @@ fn build_worker_prompt(
     let output_schema = job
         .output_schema_json
         .as_ref()
-        .map(serde_json::to_string_pretty)
+        .map(serialize_worker_prompt_json)
         .transpose()?
         .unwrap_or_else(|| "{}".to_string());
-    let row_json = serde_json::to_string_pretty(&item.row_json)?;
+    let row_json = serialize_worker_prompt_json(&item.row_json)?;
     Ok(format!(
         "You are processing one item for a generic agent job.\n\
 Job ID: {job_id}\n\
@@ -1356,6 +1356,24 @@ If schema validation rejects your result, correct the payload and call it again.
 If you need to stop the job early, include `stop` = true in the tool call.\n\n\
 After `accepted: true`, stop. If submission remains blocked, explain the blocker without claiming the result was recorded.",
     ))
+}
+
+fn serialize_worker_prompt_json(value: &Value) -> serde_json::Result<String> {
+    const MAX_SCORED_JSON_BYTES: usize = 8 * 1024;
+    let pretty = serde_json::to_string_pretty(value)?;
+    if pretty.len() > MAX_SCORED_JSON_BYTES {
+        return Ok(pretty);
+    }
+
+    let compact = serde_json::to_string(value)?;
+    // Only model-visible whitespace changes. Keep the existing rendering on
+    // ties and bound the extra tokenizer work during worker admission.
+    let count = codex_utils_output_truncation::model_token_count;
+    if compact != pretty && count(&compact) < count(&pretty) {
+        Ok(compact)
+    } else {
+        Ok(pretty)
+    }
 }
 
 fn render_instruction_template(instruction: &str, row_json: &Value) -> String {

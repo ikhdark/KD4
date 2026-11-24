@@ -10,6 +10,9 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
     if tool.namespace.is_none() && tool.name == "apply_patch" {
         return patch_without_repeated_summary(raw);
     }
+    if let Some(projected) = grouped_findings_without_repeated_evidence(tool, raw) {
+        return Some(projected);
+    }
     // The task capsule projection composes with the generic rules below; a
     // result it does not apply to keeps exactly the generic projection.
     let capsule = is_get_agent_task(tool)
@@ -303,10 +306,44 @@ pub fn model_visible_error_text(text: &str) -> Option<String> {
 
 /// Reuse the display rule on an already-decoded, owned native failure envelope.
 pub fn omit_first_failure_history(projected: &mut serde_json::Map<String, Value>) -> bool {
-    projected.get_mut("tool_failure")
-        .and_then(|failure| failure.get_mut("details"))
-        .and_then(Value::as_object_mut)
-        .is_some_and(omit_first_attempt_history)
+    let Some(failure) = projected.get_mut("tool_failure") else { return false };
+    let has_branch_summary = failure["code"] == "invalid_input" && failure["message"]
+        .as_str().is_some_and(|message| message.ends_with("tool_failure.details.selector_branches."));
+    let repeated_reason = omit_repeated_powershell_reason(failure);
+    let history = failure.get_mut("details").and_then(Value::as_object_mut).is_some_and(|details| {
+        let branches = has_branch_summary && details.shift_remove("selector_branches").is_some();
+        omit_first_attempt_history(details) || branches
+    });
+    history || repeated_reason
+}
+
+fn omit_repeated_powershell_reason(failure: &mut Value) -> bool {
+    if failure["code"] != "invalid_syntax"
+        || failure["details"]["handler_refusal"] != "powershell_syntax"
+    {
+        return false;
+    }
+    let Some(message) = failure["message"].as_str() else { return false };
+    let Some((reason, metadata)) = message.rsplit_once("\nTool error metadata: ") else { return false };
+    let (metadata, suffix) = metadata.split_once('\n').unwrap_or((metadata, ""));
+    let Ok(Value::Object(metadata)) = serde_json::from_str(metadata) else { return false };
+    if metadata.len() != 2 || metadata["kind"] != "powershell_syntax"
+        || !metadata["summary"].as_str().is_some_and(|summary| {
+            !summary.is_empty()
+                && reason.split_once("\nReason: ").is_some_and(|(_, detail)| {
+                    detail == summary || detail.strip_prefix(summary)
+                        .is_some_and(|rest| rest.starts_with("\nUse: "))
+                })
+        })
+    {
+        return false;
+    }
+    failure["message"] = Value::String(if suffix.is_empty() {
+        reason.to_owned()
+    } else {
+        format!("{reason}\n{suffix}")
+    });
+    true
 }
 
 /// Retry memory exists to surface earlier outcomes for identical input. A
@@ -815,9 +852,8 @@ fn project_search_metadata(result: &mut serde_json::Map<String, Value>) {
     }
 }
 
-/// Keep the committed delta, retry receipt and diagnostics. Only the generic
-/// rendering of an authoritative delta is redundant; custom success messages
-/// and partial/failing patches are not interchangeable with generic success.
+/// Keep the committed delta, retry receipt and diagnostics. Omit only an
+/// exact generic summary or an exact mirror of the typed owner's diagnosis.
 fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
     let object = raw.as_object()?;
     let mut projected = object.clone();
@@ -827,6 +863,22 @@ fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
         && generic_patch_summary(text, changes)
     {
         projected.shift_remove("text");
+    } else if raw["success"] == false
+        && raw["tool_failure"]["execution_state"] == "not_started"
+        && raw["tool_failure"]["effects"] == "none"
+        && let Some(diagnostic) = raw["tool_failure"]["details"]["owner_diagnostic"].as_str()
+        && raw["text"].as_str()
+            .and_then(|text| text.strip_prefix("apply_patch verification failed: ")) == Some(diagnostic)
+    {
+        projected.shift_remove("text");
+        if let Some((reason, source)) = diagnostic.split_once("\nFile: ")
+            && reason.starts_with("Invalid codex-replace in ")
+            && reason.ends_with(": every chunk must be count-guarded; do not mix with line hunks")
+            && let Some((identity, _)) = source.split_once("\nExpected patch excerpt (bounded;")
+        {
+            projected["tool_failure"]["details"]["owner_diagnostic"] =
+                Value::String(format!("{reason}\nFile: {identity}"));
+        }
     }
     omit_first_attempt_history(&mut projected);
     // Register even when nothing can be removed: fallback display must not
@@ -930,6 +982,68 @@ fn is_get_agent_task(tool: &ToolName) -> bool {
             || tool.name.strip_suffix("__get_agent_task")
                 .is_some_and(|namespace| !namespace.is_empty() && !namespace.starts_with("mcp__")),
     }
+}
+
+/// Keep the first exact body inline and refer to it from later reports. No
+/// report or occurrence is removed, and the native JavaScript result is unchanged.
+fn grouped_findings_without_repeated_evidence(tool: &ToolName, raw: &Value) -> Option<Value> {
+    let tool_matches = match tool.namespace.as_deref() {
+        Some("agents" | "agent_communication" | "agent_tasks") => {
+            matches!(tool.name.as_str(), "group_agent_findings" | "agent_task")
+        }
+        None => matches!(
+            tool.name.as_str(),
+            "group_agent_findings" | "agent_task" | "agents__agent_task" | "agents__group_agent_findings"
+                | "agent_tasks__agent_task" | "agent_tasks__group_agent_findings"
+        ),
+        _ => false,
+    };
+    if !tool_matches
+        || raw["acceptance"] != "not_evaluated"
+        || raw["discards_reports"] != false
+        || !raw["groups"].is_array()
+        || !raw["verification_candidates"].is_array()
+    {
+        return None;
+    }
+    let reports = raw["reports"].as_array()?;
+    let mut first = std::collections::HashMap::new();
+    let mut duplicates = Vec::new();
+    for (index, report) in reports.iter().enumerate() {
+        // Only the durable report shape qualifies. Do not rewrite another
+        // operation's output or hide any separately selected source detail.
+        if !report["assignment_id"].is_string()
+            || !report["attempt_id"].is_string()
+            || !report["version"].is_u64()
+        {
+            return None;
+        }
+        let evidence = report["result"]["evidence"].as_str()?;
+        if evidence.len() < 512 {
+            continue;
+        }
+        match first.entry(evidence) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                duplicates.push((index, *entry.get()));
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(index);
+            }
+        }
+    }
+    if duplicates.is_empty() {
+        return None;
+    }
+    let mut projected = raw.clone();
+    for (index, first) in duplicates {
+        let result = projected["reports"][index]["result"].as_object_mut()?;
+        if result.contains_key("evidence_same_as") {
+            return None;
+        }
+        result.shift_remove("evidence");
+        result.insert("evidence_same_as".into(), Value::String(format!("/reports/{first}/result/evidence")));
+    }
+    Some(projected)
 }
 
 /// A task read prints its assignment and that assignment's immutable capsule.

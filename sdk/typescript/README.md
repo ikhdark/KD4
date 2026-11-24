@@ -2,9 +2,10 @@
 
 Embed the Codex agent in your workflows and apps.
 
-The TypeScript SDK wraps the local `codex` CLI. It spawns the CLI and exchanges JSONL
-events over stdin/stdout. This KD4 checkout is Windows-only; its package names are
+The TypeScript SDK wraps the local `codex` CLI. It writes prompt text to stdin and reads JSONL
+events from stdout. This KD4 checkout is Windows-only; its package names are
 inherited from upstream and do not identify a published KD4 SDK.
+From a staged package, [open the KD4 source guide](https://github.com/ikhdark/KD4/blob/main/sdk/typescript/README.md) for checkout-relative links.
 
 ## Local setup
 
@@ -193,7 +194,8 @@ const codex = new Codex({
 ```
 
 The SDK still injects its required variables (such as `CODEX_API_KEY`) on top of the environment you
-provide. If you set
+provide. This selects subprocess variables; it does not restrict filesystem or network access.
+KD4 accepts legacy sandbox settings for compatibility, not enforcement. If you set
 `baseUrl`, the SDK passes it as a `--config openai_base_url=...` override.
 
 ### Passing `--config` overrides

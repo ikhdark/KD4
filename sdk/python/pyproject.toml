@@ -19,10 +19,10 @@ classifiers = [
 dependencies = ["pydantic>=2.12", "openai-codex-cli-bin==0.149.0"]
 
 [project.urls]
-Homepage = "https://github.com/openai/codex"
-Repository = "https://github.com/openai/codex"
-Issues = "https://github.com/openai/codex/issues"
-Documentation = "https://github.com/openai/codex/tree/main/sdk/python/docs"
+Homepage = "https://github.com/ikhdark/KD4"
+Repository = "https://github.com/ikhdark/KD4"
+Issues = "https://github.com/ikhdark/KD4/issues"
+Documentation = "https://github.com/ikhdark/KD4/blob/main/sdk/python/README.md"
 
 [dependency-groups]
 format = ["ruff>=0.15.8"]

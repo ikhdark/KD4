@@ -45,6 +45,11 @@ as `provider_processing_us`; it is provider-reported processing, not an isolated
 inference or queue duration. These observations do not independently prove provider
 queueing, throttling, or provider computation time.
 
+The per-attempt provider observation retains phase-labelled tier receipts. Its
+scalar retains the first label until a valid, response-bound completed label
+arrives; lifecycle resolution (e.g. `auto` to `default`) is not a conflict.
+Use the invalid flag and phase coverage before interpreting the scalar.
+
 The header and first-body timestamps describe occurrences, not when their
 existing telemetry callbacks finish. The first-body receipt is emitted with
 the existing first SSE poll result, including its timeout/error paths. If the

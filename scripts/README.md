@@ -174,6 +174,51 @@ with the bundle rather than creating another artifact manifest. Legacy lookup
 (`--include-legacy`) cannot be combined with `--receipt`: older provenance is
 not a frozen build receipt.
 
+## Deterministic source editing
+
+Use an existing generator or formatter when the desired output is mechanical.
+For a standalone Rust binary, `cargo init --bin --vcs none --edition 2024
+--name NAME PATH` creates the starter manifest and main without creating a
+test scaffold. Use a new or inspected isolated destination, then review the
+generated files before integrating them. For Python formatting, use an existing
+`ruff format PATH` scoped to the intended file and its project settings rather
+than authoring a whitespace patch.
+
+When syntax determines the scope of a rewrite:
+
+- [Python AST preview](maintenance/python_ast_patch.py):
+  `python python_ast_patch.py PATH SOURCE_SHA256 EDITS_JSON`. Supported keys
+  are `import.MODULE` (replace a one-module top-level import), `assignment.NAME`
+  (replace a top-level literal), and `function.FUNCTION.assignment.NAME`
+  (replace the literal right operand of a binary expression in a direct named
+  assignment). Missing, duplicate and unsupported selectors refuse the plan.
+- Use an installed `ast-grep scan --inline-rules RULE --json=compact PATH` to
+  preview a structural rewrite. Target the smallest syntax node (for example
+  the name of a keyword argument under a specific receiver call, not the whole
+  call). Use the returned source byte spans only against the exact captured
+  bytes, and publish through a native guarded patch. Do not use regex to
+  substitute matching spellings in comments, strings or different receivers.
+- [TypeScript language-service preview](maintenance/typescript_patch.cjs):
+  `node typescript_patch.cjs SPEC_JSON [trusted-TypeScript-module]`. From the
+  project directory provide `files:[[relativePath,sourceSha256],...]` for a
+  complete, explicitly enumerated standalone TypeScript project (1–64 UTF-8
+  `.ts` files; no config/dependency discovery). Plans contain `op` and `file`:
+  `rename` takes `symbol` and the new identifier in `value`; `move` takes the
+  absent target path in `value`; `signature` takes `symbol` and converts
+  supported positional parameters and callers to a destructured object.
+  Use an already installed trusted TypeScript module. Unresolved module
+  references and edits outside the supplied project are refused.
+
+The Python and TypeScript previews write only a patch to stdout. Check
+successful, exact stdout and submit it to native `apply_patch` if intended;
+continue only after inspecting its receipt. The previews do not apply or retry
+edits. Currency is checked on preview and native application. Native guards are
+preconditions, not multi-file atomic publication. For range edits and repeated
+literal substitutions see the [Code Mode recipe reference](../codex-rs/code-mode-protocol/src/description/exec_reference.md#deterministic-recipes);
+for strict JSON use the existing
+[native JSON operations](../codex-rs/prompts/templates/apply_patch_tool_instructions.md)
+instead of reserializing the file.
+
 ## Other workflows
 
 Repository test suites, test-only support files, and named test and

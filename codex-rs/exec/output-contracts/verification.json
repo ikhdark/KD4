@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "check": { "type": "string" },
+    "next_step": { "type": "string" },
+    "provider_effect": { "type": ["string", "null"] }
+  },
+  "required": ["check", "next_step", "provider_effect"],
+  "additionalProperties": false
+}

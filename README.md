@@ -32,9 +32,11 @@ Approval policy, validation restrictions and project/hook trust remain separate.
 | Session persistence | [Rollout storage](codex-rs/rollout/README.md) |
 | Process and transport utilities | [Process hardening](codex-rs/process-hardening/README.md), [PTY](codex-rs/utils/pty/README.md), [stdio-to-UDS](codex-rs/stdio-to-uds/README.md) |
 | Parsing and rendering utilities | [Stream parser](codex-rs/utils/stream-parser/README.md), [templates](codex-rs/utils/template/README.md) |
-| Extensions and bundled skills | [Extension API](codex-rs/ext/extension-api/src/), [skill samples](codex-rs/skills/src/assets/samples/) |
+| Extension API and skill delivery | [Extension API](codex-rs/ext/extension-api/src/), [how bundled skills are delivered](codex-rs/core/instruction-architecture.md#extensions-skills-apps-and-plugin-guidance) |
+| Bundled skill guides (task-specific, not repository policy) | [Image generation](codex-rs/skills/src/assets/samples/imagegen/SKILL.md), [OpenAI docs](codex-rs/skills/src/assets/samples/openai-docs/SKILL.md), [plugin creator](codex-rs/skills/src/assets/samples/plugin-creator/SKILL.md), [skill creator](codex-rs/skills/src/assets/samples/skill-creator/SKILL.md), [skill installer](codex-rs/skills/src/assets/samples/skill-installer/SKILL.md) |
 | Argument-comment lint | [Dylint guide](tools/argument-comment-lint/README.md) |
-| Vendored integration notes | [Notify patch](third_party/notify/KD4.md), [Tungstenite](third_party/tungstenite/README.md), [V8](third_party/v8/README.md) |
+| Vendored integration notes | [Transport diagnostic forks](third_party/transport-forks.txt), [Notify patch](third_party/notify/KD4.md), [Tungstenite](third_party/tungstenite/README.md), [V8](third_party/v8/README.md) |
+| Vendored upstream references (not KD4 setup or example commands) | [hyper-rustls](third_party/hyper-rustls/README.md), [hyper-util](third_party/hyper-util/README.md), [Notify](third_party/notify/README.md), [reqwest](third_party/reqwest/README.md) |
 | Local workspace and historical KD4 reports (read-only; new reports go to KDR) | [Workspace navigation](.codex/README.md), [historical audit library](.codex/audits/README.md) |
 
 ## Local development

@@ -388,6 +388,19 @@ impl ModelAttemptClock {
             }
         }
         if observation.response_service_tier.is_some() || observation.response_service_tier_invalid {
+            let invalid = observation.response_service_tier_invalid || observation.invalid_source_fields;
+            let id = observation.response_id.as_deref();
+            evidence.response_service_tier_invalid |= invalid || id.is_none()
+                || evidence.response_id.as_deref().is_some_and(|previous| Some(previous) != id)
+                || evidence.service_tier_observations.iter().any(|previous|
+                    previous.phase == observation.phase
+                        && previous.service_tier != observation.response_service_tier);
+            if !evidence.response_service_tier_invalid
+                && let Some(tier) = observation.response_service_tier.as_ref()
+                && (observation.phase == "completed" || evidence.response_service_tier.is_none())
+            {
+                evidence.response_service_tier = Some(tier.clone());
+            }
             if evidence.service_tier_observations.len() < 16 {
                 evidence.service_tier_observations.push(ProviderTierObservation {
                     phase: observation.phase, at_us: now_us,
@@ -397,14 +410,7 @@ impl ModelAttemptClock {
                 });
             } else {
                 evidence.service_tier_observations_dropped = evidence.service_tier_observations_dropped.saturating_add(1);
-            }
-        }
-        evidence.response_service_tier_invalid |= observation.response_service_tier_invalid;
-        if let Some(tier) = observation.response_service_tier {
-            if let Some(previous) = &evidence.response_service_tier {
-                evidence.response_service_tier_invalid |= previous != &tier;
-            } else {
-                evidence.response_service_tier = Some(tier);
+                evidence.response_service_tier_invalid = true;
             }
         }
         if let Some(id) = observation.response_id {

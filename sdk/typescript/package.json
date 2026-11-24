@@ -4,7 +4,7 @@
   "description": "TypeScript SDK for Codex APIs.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/openai/codex.git",
+    "url": "git+https://github.com/ikhdark/KD4.git",
     "directory": "sdk/typescript"
   },
   "keywords": [

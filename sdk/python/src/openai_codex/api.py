@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import InitVar, dataclass, field
+from pathlib import Path
 from typing import AsyncIterator, Iterator
 
 from ._approval_mode import (
@@ -44,10 +45,15 @@ from .async_client import AsyncCodexClient
 from .client import CodexClient, CodexConfig, _Operation, _params_dict
 from .errors import TransportClosedError
 from .generated.v2_all import (
+    AbsolutePathBuf,
+    AgentMessageThreadItem,
     ApiKeyLoginAccountParams,
+    FsReadFileRangeParams,
+    FsReadFileRangeResponse,
     GetAccountParams,
     GetAccountResponse,
     LoginAccountParams,
+    MessagePhase,
     ModelListResponse,
     Personality,
     ReasoningEffort,
@@ -69,10 +75,52 @@ from .generated.v2_all import (
     ThreadStartSource,
     TurnCompletedNotification,
     TurnInterruptResponse,
+    TurnItemsView,
     TurnStartParams,
+    TurnStatus,
     TurnSteerResponse,
 )
 from .models import InitializeResponse, JsonObject, Notification
+
+
+def _read_file_range_params(
+    path: str, start: int, length: int, expected_revision: str | None
+) -> JsonObject:
+    return FsReadFileRangeParams(
+        path=AbsolutePathBuf(root=path),
+        start=start,
+        len=length,
+        expected_revision=expected_revision,
+    ).model_dump(mode="json", by_alias=True, exclude_none=True)
+
+
+def _exact_recorded_answer(
+    response: ThreadReadResponse, thread_id: str, turn_id: str
+) -> str | None:
+    if response.thread.id != thread_id:
+        raise ValueError("thread/read returned a different thread")
+    matches = [turn for turn in response.thread.turns if turn.id == turn_id]
+    if len(matches) != 1:
+        return None
+    turn = matches[0]
+    if turn.status != TurnStatus.completed or turn.items_view != TurnItemsView.full:
+        return None
+    answers = [
+        item.root
+        for item in turn.items
+        if isinstance(item.root, AgentMessageThreadItem)
+        and item.root.phase == MessagePhase.final_answer
+    ]
+    if len(answers) != 1 or answers[0].interruption is not None or not answers[0].text.strip():
+        return None
+    return answers[0].text
+
+
+def _scoped_directory(cwd: str | Path) -> str:
+    directory = Path(cwd)
+    if not directory.is_absolute():
+        raise ValueError("A scoped thread requires an absolute working directory")
+    return str(directory)
 
 
 class Codex:
@@ -145,6 +193,19 @@ class Codex:
     def logout(self) -> None:
         """Clear the current Codex account session."""
         self._client.account_logout()
+
+    def read_file_range(
+        self, path: str, *, start: int, length: int, expected_revision: str | None = None
+    ) -> FsReadFileRangeResponse:
+        """Read a bounded range at an absolute runtime path without starting a turn."""
+        params = _read_file_range_params(path, start, length, expected_revision)
+        return self._client.request(
+            "fs/readFileRange", params, response_model=FsReadFileRangeResponse
+        )
+
+    def start_scoped_thread(self, cwd: str | Path, *, ephemeral: bool | None = None) -> Thread:
+        """Start with directory-scoped instructions and no inherited conversation."""
+        return self.thread_start(cwd=_scoped_directory(cwd), ephemeral=ephemeral)
 
     # BEGIN GENERATED: Codex.flat_methods
     def thread_start(
@@ -401,6 +462,20 @@ class AsyncCodex:
         await self._ensure_initialized()
         await self._client.account_logout()
 
+    async def read_file_range(
+        self, path: str, *, start: int, length: int, expected_revision: str | None = None
+    ) -> FsReadFileRangeResponse:
+        """Read a bounded range at an absolute runtime path without starting a turn."""
+        params = _read_file_range_params(path, start, length, expected_revision)
+        await self._ensure_initialized()
+        return await self._client.request(
+            "fs/readFileRange", params, response_model=FsReadFileRangeResponse
+        )
+
+    async def start_scoped_thread(self, cwd: str | Path, *, ephemeral: bool | None = None) -> AsyncThread:
+        """Start with directory-scoped instructions and no inherited conversation."""
+        return await self.thread_start(cwd=_scoped_directory(cwd), ephemeral=ephemeral)
+
     # BEGIN GENERATED: AsyncCodex.flat_methods
     async def thread_start(
         self,
@@ -573,6 +648,14 @@ class Thread:
     _client: CodexClient
     id: str
 
+    def fork(self, *, last_turn_id: str | None = None, ephemeral: bool | None = None) -> Thread:
+        """Fork this history for isolated work without changing its instruction scope."""
+        forked = self._client.thread_fork(
+            self.id,
+            ThreadForkParams(thread_id=self.id, last_turn_id=last_turn_id, ephemeral=ephemeral),
+        )
+        return Thread(self._client, forked.thread.id)
+
     def run(
         self,
         input: RunInput,
@@ -652,6 +735,13 @@ class Thread:
         """Read this thread, optionally including its turn history."""
         return self._client.thread_read(self.id, include_turns=include_turns)
 
+    def recorded_answer(self, turn_id: str, *, fallback: RunInput | None = None) -> str | None:
+        """Read one completed final answer by ID; start a new turn only on an explicit fallback."""
+        answer = _exact_recorded_answer(self.read(include_turns=True), self.id, turn_id)
+        if answer is not None or fallback is None:
+            return answer
+        return self.run(fallback).final_response
+
     def set_name(self, name: str) -> ThreadSetNameResponse:
         return self._client.thread_set_name(self.id, name)
 
@@ -665,6 +755,10 @@ class AsyncThread:
 
     _codex: AsyncCodex
     id: str
+
+    async def fork(self, *, last_turn_id: str | None = None, ephemeral: bool | None = None) -> AsyncThread:
+        """Fork this history for isolated work without changing its instruction scope."""
+        return await self._codex.thread_fork(self.id, last_turn_id=last_turn_id, ephemeral=ephemeral)
 
     async def run(
         self,
@@ -750,6 +844,15 @@ class AsyncThread:
         """Read this thread, optionally including its turn history."""
         await self._codex._ensure_initialized()
         return await self._codex._client.thread_read(self.id, include_turns=include_turns)
+
+    async def recorded_answer(
+        self, turn_id: str, *, fallback: RunInput | None = None
+    ) -> str | None:
+        """Read one completed final answer by ID; start a new turn only on an explicit fallback."""
+        answer = _exact_recorded_answer(await self.read(include_turns=True), self.id, turn_id)
+        if answer is not None or fallback is None:
+            return answer
+        return (await self.run(fallback)).final_response
 
     async def set_name(self, name: str) -> ThreadSetNameResponse:
         await self._codex._ensure_initialized()

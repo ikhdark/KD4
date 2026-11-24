@@ -43,7 +43,7 @@ pub struct Cli {
     #[arg(long = "output-schema", value_name = "FILE", global = true)]
     pub output_schema: Option<PathBuf>,
     /// Allow an exactly empty completed final answer for this request only.
-    /// Does not waive required work or completion hooks; ignored with --output-schema.
+    /// Does not waive required work or completion hooks; ignored when a schema is selected.
     #[arg(long = "allow-no-prose", global = true, default_value_t = false)]
     pub allow_no_prose: bool,
 
@@ -157,6 +157,13 @@ fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
 pub enum Command {
     /// Resume a previous session by id or pick the most recent with --last.
     Resume(ResumeArgs),
+
+    /// Run a verification task with the built-in final schema unless --output-schema is supplied.
+    Verify {
+        /// Initial instructions; if omitted or set to "-", read them from stdin.
+        #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
+        prompt: Option<String>,
+    },
 
     /// Unavailable: review is not supported by the exec app-server protocol.
     #[command(hide = true)]

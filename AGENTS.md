@@ -158,8 +158,10 @@ wording is untouched.
   Stopping one fix does not end the remaining requested work.
 - Reconcile each item at handoff: verified, evidence-backed no-defect or
   not-applicable, justified proposal disposition, user withdrawal, exhausted
-  historical recovery, or genuine blocker. Implement and verify adopted changes;
-  reject unsupported, inconclusive or non-improving proposals without adoption.
+  historical recovery, or genuine blocker. Implement and verify adopted changes.
+  Do not adopt unsupported or non-improving proposals.
+  Complete feasible prototype comparisons before disposing
+  of inconclusive proposals.
   For missing historical recordings, source versions, artifacts or reproduction
   conditions, make a bounded recovery or reproduction attempt with existing
   resources. If exhausted, stop. Record exactly what was missing, what was
@@ -178,19 +180,22 @@ wording is untouched.
 
 **Benchmark reuse and preservation:** Before modifying or creating benchmark scripts, identify existing workloads that measure the requested behavior. Prefer reusing or parameterizing established benchmarks over changing their definitions. Extend coverage without removing existing scenarios. Changes to shared benchmark logic are permitted when correcting defects or improving measurement reliability, but must not silently invalidate historical comparisons. Preserve reproducibility and clearly distinguish new measurements from previously established baselines. Prefer stable benchmark infrastructure with reusable, named scenarios rather than accumulating a separate Python script for every measurement.
 
-- Before implementing a proposed feature or optimization, run a matched A/B
-  comparison of the current behavior (A) and proposed behavior (B) against
-  explicit improvement criteria with representative inputs and equivalent
-  settings.
-  If measurement requires code, use a bounded isolated prototype first; proceed
-  with full implementation only when the comparison demonstrates an improvement
-  without regressions in required behavior. Consider correctness, performance,
-  usability and maintenance cost as relevant; retain evidence and tradeoffs.
-  An inconclusive comparison is not evidence of improvement. If a valid
-  comparison cannot be obtained within applicable permissions and limits,
-  record the limit and leave the candidate unimplemented beyond a permitted
-  isolated prototype. This blocks adoption, not a justified decision against
-  adoption. Continue independent work, including separable correctness repairs.
+- Before implementing a proposed feature or optimization, run a scoped, matched
+  A/B comparison with explicit improvement criteria, representative inputs and
+  equivalent settings. Use current production defaults for A unless another
+  baseline is warranted. Benchmark viable proposals rather than reject them
+  unmeasured. If code is needed, use a minimal, bounded, isolated functional
+  prototype for B. Honor review-only, diagnosis-only and no-write instructions,
+  validation limits and permissions.
+  Proceed with full implementation only when the comparison demonstrates a
+  meaningful improvement without regressions in required behavior. Consider
+  correctness, performance, usability and maintenance cost as relevant; retain
+  evidence and tradeoffs. An inconclusive comparison is not evidence of
+  improvement. If a valid comparison cannot be obtained within applicable
+  permissions and limits, record the limit and leave the candidate unimplemented
+  beyond a permitted isolated prototype. This blocks adoption, not a justified
+  decision against adoption. Continue independent work, including separable
+  correctness repairs.
   Classify changes by effect: restoring established behavior is a repair;
   added behavior or optimization beyond that contract is a candidate change,
   even when bundled with a repair. Ordinary correctness repairs do not require
@@ -205,12 +210,20 @@ wording is untouched.
   runs. Record each exclusion's reason; do not infer improvement from
   selectively retained results.
   Benchmark the proposed mechanism through the path it is meant to change, not
-  a weaker substitute. Keep proxy and partial results scoped to what they
-  exercised. Correct the workload and run missing scenarios needed to adopt
-  the proposal or independently requested by the user, unless genuinely blocked.
-  Once bounded evidence settles non-adoption, identify unrun scenarios; do not
-  run them solely to reject the proposal again. A negative result rules out
-  only the measured candidate, not an underlying repair obligation.
+  a weaker substitute. Use native execution for runtime claims; label simulations
+  and estimates. Do not substitute reporting or verification improvements for the
+  proposed functional change.
+  Keep proxy and partial results scoped to what they exercised.
+  Complete feasible matched comparisons for every viable proposal.
+  Insufficient evidence, partial measurements or an unimplemented
+  candidate do not justify premature rejection. Skip prototyping
+  only when existing evidence establishes redundancy, incompatibility,
+  infeasibility or non-improvement. Record genuine blockers and
+  unrun comparisons separately. A negative result rules out only
+  the measured candidate, not an underlying repair obligation.
+- Give every original proposal an evidence-supported disposition. Separate
+  measured non-improvement from inconclusive or unrun comparisons. Discard
+  unsuccessful prototype changes, not their evidence.
 - For executable-obligation proposals, exercise the real stopping decision:
   observe permitted ready work execute and advance the obligation, an owned
   operation resume without relaunch, and a failed diagnostic enter bounded
@@ -354,21 +367,7 @@ outside the ledger does not substitute for its status.
 
 ## Frontend diagnostics
 
-Use one owned session and the predefined reusable clone described in
-[frontend measurement](../KDR/docs/operations/FRONTEND_MEASUREMENT.md), not fresh
-profiles or repeated onboarding discovery. Initialize its private
-`home/config.toml` as a byte-for-byte copy of
-`C:\Users\kuh\Desktop\LOCAL-KD\config.toml`. The intended clone selection is
-GPT-6 Luna with Light reasoning. Confirm availability in the clone's model
-picker; do not substitute another model. Preserve the private config, other
-explicit overrides, the initialized profile and backend home.
-
-Before launch verify the complete application snapshot against the real frontend
-selected for the task. Refresh only clone application files on version drift,
-retain rollback evidence and reverify UI readiness; do not reset onboarding.
-Advance through the actual UI and capture the failing downstream path. If entry
-screens recur, change the method, not the profile. Startup success is not proof
-of downstream behavior. Preserve the live installation, credentials and active chats.
+For frontend diagnostics, follow the required [clone and capture rules](../KDR/docs/operations/FRONTEND_MEASUREMENT.md#required-clone-and-capture-rules).
 
 ## Reporting and organization
 

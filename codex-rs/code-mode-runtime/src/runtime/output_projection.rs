@@ -83,7 +83,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     if (!entry.lazy && !entry.recipeRoot) return preserveFragmentReceipts(entry);
     const root = entry.recipeRoot || entry;
     if (root.lazy) {
-      root.projected = projectTool(root.serialized, root.namespace, root.toolName);
+      root.projected = projectTool(root.serialized, root.namespace, root.toolName, root.extractionSource);
       root.disabled = root.projected === undefined;
       if (!root.disabled || root.extractionSource) root.original = parseExact(root.serialized);
       root.lazy = false;
@@ -245,6 +245,22 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
   // Display-only: retain native errors in scripts, but never print opaque {}.
   function errorProjection(error, remaining = 16384, controlsFirst = true) {
     const seen = new Set();
+    const failure = !isProxy(error) && descriptor(error, 'tool_failure')?.value;
+    const nativeFailure = failure && typeof failure === 'object' && !isProxy(failure);
+    const code = nativeFailure ? descriptor(failure, 'code')?.value : undefined;
+    const message = nativeFailure ? descriptor(failure, 'message')?.value : undefined;
+    const details = nativeFailure ? descriptor(failure, 'details')?.value : undefined;
+    const failureDetails = code === 'invalid_input' && typeof message === 'string' &&
+      message.endsWith('tool_failure.details.selector_branches.') ? details : null;
+    // Caught errors are projected here rather than as native tool results. Use
+    // the same verified duplicate-reason rule on just the bounded message, not
+    // on the original failure or its recovery fields.
+    const syntaxMessage = code === 'invalid_syntax' && typeof message === 'string' &&
+      message.length <= remaining && details && typeof details === 'object' &&
+      !isProxy(details) && descriptor(details, 'handler_refusal')?.value === 'powershell_syntax'
+      ? projectTool(stringify({tool_failure: {code, message, details: {handler_refusal: 'powershell_syntax'}}}),
+          null, 'exec_command')?.tool_failure?.message
+      : undefined;
     function bounded(value, depth = 0, settledNodes = false) {
       if (remaining <= 0 || depth >= 8) return "[error details truncated]";
       if (typeof value === 'string') {
@@ -277,6 +293,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       }
       const selectedNames = names.slice(0, 64);
       for (const [index, key] of selectedNames.entries()) {
+        if (value === failureDetails && key === 'selector_branches') continue;
         if (remaining <= 0) { result.details_omitted = true; break; }
         if (key.length > 512 || key.length + 8 > remaining) { result.details_omitted = true; continue; }
         remaining -= key.length + 8;
@@ -294,7 +311,9 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
             const available = remaining;
             if (settledNodes) remaining = Math.floor(remaining / (selectedNames.length - index));
             const allowance = remaining;
-            fields[key] = 'value' in field ? bounded(field.value, depth + 1,
+            const displayValue = value === failure && key === 'message' && syntaxMessage !== undefined
+              ? syntaxMessage : field.value;
+            fields[key] = 'value' in field ? bounded(displayValue, depth + 1,
               value instanceof NativeError && key === 'results') : '[accessor omitted]';
             if (settledNodes) remaining = available - (allowance - remaining);
           }
@@ -547,6 +566,20 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       const unframed = rows.some(row => typeof row?.text !== 'string' &&
         !(row?.selector?.kind === 'search' && row.value?.hydrated_ranges?.some(range => typeof range?.text === 'string')));
       const selected = fragment === 'rows' ? raw.envelope.results : raw.envelope.results[0];
+      // All labels in a native results array have the same registered parent.
+      // The request reader already binds body IDs to an enclosing source.
+      // Do not change the representation of individual or mixed-origin rows.
+      if (fragment === 'rows' && raw.texts.length > 1 && raw.texts.length === rows.length
+          && typeof source.path === 'string' && source.path.length > 0
+          && typeof source.environment_id === 'string' && typeof source.artifact_id === 'string'
+          && typeof source.source_sha256 === 'string' && /^[0-9a-f]{64}$/.test(source.source_sha256)
+          && original.every(row => row.selector?.kind === 'lines' && row.status === 'ok'
+            && row.complete === true && row.canonical_range && !row.continuation)) {
+        const {selector, canonical_range, complete, text_lines, ...scope} = raw.texts[0].source;
+        for (const {source: label} of raw.texts)
+          for (const field of keys(scope)) delete label[field];
+        return {envelope: {...scope, results: selected}, texts: raw.texts};
+      }
       // Non-text rows have no source body label. Preserve their trusted parent
       // identity in presentation only, after the existing mutation guards.
       const envelope = unframed ? {source: {
@@ -1195,11 +1228,95 @@ fn project_tool_callback(
         .then(|| args.get(1).to_rust_string_lossy(scope));
     let name = args.get(2).to_rust_string_lossy(scope);
     let tool = codex_protocol::ToolName::new(namespace, name);
-    if let Some(projected) = codex_code_mode_protocol::printed_tool_result(&tool, &raw) {
+    if let Some(mut projected) = codex_code_mode_protocol::printed_tool_result(&tool, &raw) {
+        if args.get(3).is_true() && tool.namespace.is_none() && tool.name == "exec_command"
+            && let Some(printed) = projected.as_object_mut()
+        {
+            compact_retained_stdout(&raw, printed);
+        }
         match json_to_v8(scope, &projected) {
             Some(projected) => retval.set(projected),
             None => super::value::throw_type_error(scope, "failed to materialize output projection"),
         }
+    }
+}
+
+/// Compact only the whole presentation of an exact retained command result.
+fn compact_retained_stdout(raw: &Value, printed: &mut serde_json::Map<String, Value>) {
+    let Some(stdout) = raw["stdout"].as_str() else {
+        return;
+    };
+    if !(512..=128 * 1024).contains(&stdout.len())
+        || raw["stderr"] != ""
+        || raw["exit_code"] != 0
+        || raw["execution_state"] != "exited"
+        || !raw["session_id"].is_null()
+        || !raw["error"].is_null()
+        || !raw["tool_failure"].is_null()
+        || !raw["output_decoding_notice"].is_null()
+        || !raw["raw_output_artifact_error"].is_null()
+        || !raw["recovery"].is_null()
+        || !raw.pointer("/session_capabilities/shutdown").is_none_or(Value::is_null)
+        || raw["process_exited"] != true
+        || raw["output_drained"] != true
+        || raw["output_complete"] != true
+        || raw["output_reduced"] != false
+        || raw["streams_complete"] != true
+        || raw["stream_chunks_complete"] != true
+        || raw["retained_artifact_complete"] != true
+        || raw["raw_output_artifact_retention_limit_hit"] != false
+        || raw["output"] != stdout
+        || printed.get("output").and_then(Value::as_str) != Some(stdout)
+        || printed.contains_key("stdout_line_runs")
+    {
+        return;
+    }
+    // Bind the compact presentation to the producer's exact complete capture.
+    let Some(artifact_id) = raw["raw_output_artifact_id"].as_str().filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let bytes = stdout.len() as u64;
+    let reference = &raw["output_reference"];
+    if raw["raw_output_artifact_bytes"] != bytes
+        || reference["artifact_id"] != artifact_id
+        || reference["capture_complete"] != true
+        || reference["retained_bytes"] != bytes
+        || reference["missing_bytes"] != 0
+        || reference["retrieval_availability"] != "available"
+        || reference.pointer("/recovery/arguments/artifact_id").and_then(Value::as_str)
+            != Some(artifact_id)
+    {
+        return;
+    }
+    let mut runs: Vec<(usize, &str)> = Vec::new();
+    for line in stdout.split_inclusive('\n') {
+        if let Some((count, previous)) = runs.last_mut()
+            && *previous == line
+        {
+            *count += 1;
+        } else {
+            runs.push((1, line));
+        }
+    }
+    let replacement = serde_json::json!({
+        "stdout_line_runs": runs,
+        "raw_output_artifact_id": artifact_id,
+    });
+    // Require a material net saving, including the locator and run framing.
+    let Some(raw_size) = serde_json::to_string(&serde_json::json!({"output": stdout})).ok().map(|s| s.len()) else {
+        return;
+    };
+    let Some(replacement_size) = serde_json::to_string(&replacement).ok().map(|s| s.len()) else {
+        return;
+    };
+    if replacement_size * 4 <= raw_size * 3 {
+        printed.shift_remove("output");
+        if printed.get("retained_output").and_then(Value::as_str) == Some(stdout) {
+            printed.shift_remove("retained_output");
+        }
+        printed.insert("stdout_line_runs".into(), replacement["stdout_line_runs"].clone());
+        printed.insert("raw_output_artifact_id".into(), Value::String(artifact_id.to_string()));
     }
 }
 

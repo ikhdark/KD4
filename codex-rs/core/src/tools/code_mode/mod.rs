@@ -1827,9 +1827,40 @@ pub(super) fn handle_runtime_response(
                     &into_function_call_output_content_items(content_items.clone()),
                 ),
             };
+            let reported_failure = match &response {
+                RuntimeResponse::Result { error_text: Some(error), .. } => {
+                    unique_reported_native_failure(&packet.nested_results, error)
+                        .and_then(|ordinal| packet.nested_results.iter().find(|result| result.ordinal == ordinal))
+                }
+                _ => None,
+            };
+            let directory = packet.nested_recovery.into_values().map(|mut entry| {
+                if let Some(reported) = reported_failure
+                    && entry["call_id"] == reported.call_id.as_str()
+                    && let Some(result) = entry.pointer_mut("/outcome/result")
+                    && result["tool_failure"]["details"]["handler_refusal"] == "powershell_syntax"
+                    && let Some(identity) = reported.failure_identity.as_ref()
+                {
+                    // Compare the exact displayed failure with the one already
+                    // present below. This directory still keeps call/effect state
+                    // and recovery routing; canonical receipts keep the diagnosis.
+                    let mut display = result.clone();
+                    if let Some(object) = display.as_object_mut() {
+                        codex_code_mode::omit_first_failure_history(object);
+                    }
+                    if identity.get("tool_failure") == display.get("tool_failure") {
+                        if let Some(failure) = display["tool_failure"].as_object_mut() {
+                            failure.shift_remove("message");
+                            failure.insert("message_reference".into(), "Script error".into());
+                        }
+                        *result = display;
+                    }
+                }
+                compact_emitted_packet_recovery(entry, &emitted)
+            }).collect::<Vec<_>>();
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
                 text: serde_json::json!({
-                    "nested_result_recovery_directory": packet.nested_recovery.into_values().map(|entry| compact_emitted_packet_recovery(entry, &emitted)).collect::<Vec<_>>(),
+                    "nested_result_recovery_directory": directory,
                     "omitted_inline_result_count": packet.omitted_nested_result_count,
                     "notice": "Inline diagnostics retain at most two results. Recover settled outcomes through this directory; do not rerun successful siblings. Artifact bytes are historical evidence, not fresh execution.",
                 }).to_string(),

@@ -3,6 +3,7 @@
 This is the npm launcher for the local, Windows-only KD4 checkout of OpenAI Codex.
 It is not an installation guide for the upstream npm distribution. See the
 [repository README](../README.md) for the local build and setup workflow.
+From a staged package, [open this guide in the KD4 source tree](https://github.com/ikhdark/KD4/blob/main/codex-cli/README.npm.md) for checkout-relative links.
 
 ## Install locally staged tarballs
 

@@ -622,6 +622,7 @@ fn render_project_docs(
         let Some((text, retained_bytes)) = render_project_doc_to_budget(
             &mut read,
             &candidate.path,
+            environment_id,
             remaining.saturating_sub(separator_bytes + source_header_bytes),
         ) else {
             omitted_documents.push(ProjectDocOmission {
@@ -739,6 +740,7 @@ fn project_doc_omission_notice(documents: &[ProjectDocOmission], recovery: &str)
 fn render_project_doc_to_budget(
     read: &mut ProjectDocRead,
     path: &PathUri,
+    environment_id: &str,
     max_bytes: usize,
 ) -> Option<(String, usize)> {
     truncate_project_doc_to_budget(read, max_bytes);
@@ -757,8 +759,10 @@ fn render_project_doc_to_budget(
             }
             text.push_str(&project_doc_truncation_notice(
                 path,
+                environment_id,
                 read.original_bytes,
                 retained_bytes,
+                invalid_utf8,
             ));
         }
         let encoded_bytes = ContextUserInstructions::escaped_text_len(&text);
@@ -969,14 +973,32 @@ fn classify_retained_utf8_boundary(
 
 fn project_doc_truncation_notice(
     source_path: &PathUri,
+    environment_id: &str,
     original_bytes: u64,
     retained_bytes: usize,
+    invalid_utf8: bool,
 ) -> String {
-    let omitted_bytes = original_bytes.saturating_sub(retained_bytes as u64);
-    format!(
-        "[Project documentation truncation notice: source path: {}; original byte count: {original_bytes}; retained byte count: {retained_bytes}; omitted byte count: {omitted_bytes}.]",
-        source_path.inferred_native_path_string()
-    )
+    let start = retained_bytes as u64;
+    let omitted_bytes = original_bytes.saturating_sub(start);
+    let source_path = source_path.inferred_native_path_string();
+    let mut notice = format!(
+        "[Project documentation truncation notice: source path: {source_path}; original byte count: {original_bytes}; retained byte count: {retained_bytes}; omitted byte count: {omitted_bytes}.]"
+    );
+    // Use the live read_file byte-page contract. Leave room for a tool-side
+    // continuation on larger files; this is not a retained startup snapshot.
+    let end = original_bytes.min(start.saturating_add(32 * 1024));
+    let mut arguments = serde_json::json!({
+        "path": source_path,
+        "environment_id": environment_id,
+        "selectors": [{"kind": "bytes", "start": start, "end": end}],
+    });
+    if invalid_utf8 {
+        arguments["encoding"] = serde_json::json!("base64");
+    }
+    notice.push_str(&format!(
+        "\nBefore relying on the missing instructions, continue with read_file: {arguments}. Use any returned continuation and the remaining byte range through {original_bytes}. This reads the live source; if it changed, reread the complete file."
+    ));
+    notice
 }
 
 async fn agents_md_paths_with_markers(

@@ -935,6 +935,9 @@ fn build_code_mode_executors(
                         .get_mut("properties")
                         .and_then(serde_json::Value::as_object_mut)
                     {
+                        if matches!(&*definition.name, "read_file" | "read_tool_output") {
+                            defer_nested_selector_details(properties);
+                        }
                         for field in withdrawn {
                             properties.remove(*field);
                         }
@@ -1070,6 +1073,42 @@ fn build_code_mode_executors(
     phases.mark("nested_catalog");
     result.push(Arc::new(CodeModeWaitHandler));
     Ok(result)
+}
+
+/// Keep the concrete forms used for ordinary reads and recovery in the eager
+/// Code Mode contract. The original spec is registered unchanged for dispatch
+/// and its named arguments section remains available on demand.
+fn defer_nested_selector_details(properties: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(variants) = properties.get_mut("selectors")
+        .and_then(|s| s.get_mut("items"))
+        .and_then(|s| s.get_mut("oneOf"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut deferred = Vec::new();
+    variants.retain(|variant| {
+        let Some(kind) = variant.pointer("/properties/kind/enum/0").and_then(serde_json::Value::as_str) else {
+            return true;
+        };
+        if matches!(kind, "structured" | "json_pointer" | "section" | "enclosing" | "tail") {
+            deferred.push(kind.to_owned());
+            false
+        } else {
+            true
+        }
+    });
+    if !deferred.is_empty() {
+        // A kind-only branch names each available selector without repeating
+        // its specialized input schema. It is not an execution validator.
+        variants.push(serde_json::json!({
+            "type": "object",
+            "properties": {"kind": {"type": "string", "enum": deferred}},
+            "required": ["kind"],
+            "additionalProperties": true,
+            "description": "For these selectors load the tool's arguments section with resolve_tool(name).section(\"arguments\")."
+        }));
+    }
 }
 
 /// Reduces every field description in an eager schema to its first sentence, in place.

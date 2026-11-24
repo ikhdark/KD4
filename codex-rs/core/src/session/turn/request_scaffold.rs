@@ -82,39 +82,18 @@ impl RequestScaffold {
         base_instructions: BaseInstructions,
         exec_policy: Option<&codex_execpolicy::Policy>,
     ) -> Self {
-        let mut manifest = prepared.stable_context_manifest().with_repository_identity(
-            step_context
-                .agents_md_stable_context
-                .as_ref()
-                .map(RepositoryStableContextBundle::metadata),
-        );
-        let stable_input_bytes = manifest.projected_bytes();
-        let stable_input_tokens = manifest.projected_tokens();
-        manifest = manifest
-            .with_base_model(&step_context.turn.model_info.slug, &base_instructions.text)
-            .add_component_bytes(
-                StableContextKind::ToolSchemas,
-                "tool_schemas",
+        let (manifest, stable_input_bytes, stable_input_tokens) =
+            prepared.stable_context_manifest().with_request_scaffold(
+                step_context
+                    .agents_md_stable_context
+                    .as_ref()
+                    .map(RepositoryStableContextBundle::metadata),
+                &step_context.turn.model_info.slug,
+                &base_instructions.text,
                 tools.serialized(),
+                tools.has_request_user_input(),
+                tools.has_wait(),
             );
-        if tools.has_request_user_input() {
-            manifest = manifest.add_measured_component(
-                StableContextKind::RequestUserInput,
-                "request_user_input_available",
-                b"request_user_input",
-                0,
-                0,
-            );
-        }
-        if tools.has_wait() {
-            manifest = manifest.add_measured_component(
-                StableContextKind::Wait,
-                "wait_available",
-                b"wait",
-                0,
-                0,
-            );
-        }
         let digests = PromptDigests {
             instructions: manifest.active_content_hash(StableContextKind::BaseModel),
             tools: Some(tools.digest()),

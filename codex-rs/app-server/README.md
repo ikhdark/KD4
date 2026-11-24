@@ -34,6 +34,13 @@ use the same stale-turn projection as history reads: only the matching live
 turn can remain `inProgress`. Completed and failed turns, items, and ordering
 are unchanged by that status projection.
 
+For an explicit request to retrieve an already recorded answer by thread and
+turn ID, clients can call `thread/read` with `includeTurns: true` rather than
+start a model turn. Check the returned thread and turn IDs, completed status,
+and the expected answer item before using it. Missing or ambiguous history
+is not a successful lookup; keep the ordinary turn path available for work
+that actually requires inference. This does not route free-form chat input.
+
 ## MCP OAuth completion correlation
 
 Explicit `mcpServer/oauth/login` responses include an optional `loginId`, echoed
@@ -86,6 +93,5 @@ Existing journal caps and failure behavior remain in force. An abandoned span,
 overflow, missing events or absent phone observations is incomplete evidence,
 not a successful lookup. Handler completion is not a phone-rendering or delivery
 acknowledgment. This instrumentation diagnoses discovery; it does not change
-filesystem responses, permissions or limits. The mobile Git-panel failure was
-never reproduced or fixed; the user withdrew it on 2026-11-15 (KDR closed case
-[mobile-git-panel-20261115](../../../KDR/audits/closed-cases/mobile-git-panel-20261115/current-findings.txt)).
+filesystem responses, permissions or limits. For the original observations and disposition, see the
+[mobile Git-panel case](../../../KDR/audits/closed-cases/mobile-git-panel-20261115/current-findings.txt).

@@ -21,9 +21,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/openai/codex"
-Repository = "https://github.com/openai/codex"
-Issues = "https://github.com/openai/codex/issues"
+Homepage = "https://github.com/ikhdark/KD4"
+Repository = "https://github.com/ikhdark/KD4"
+Issues = "https://github.com/ikhdark/KD4/issues"
 
 [tool.hatch.build]
 exclude = [

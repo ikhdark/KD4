@@ -1,0 +1,137 @@
+(() => {
+  // Bounded workflows over the existing admitted dispatch and delivery paths.
+  const jsonPointer = (value) => typeof value === "string" &&
+    (value === "" || value.startsWith("/")) && !/~(?:[^01]|$)/.test(value);
+  const jsonScalar = (value) => value === null || typeof value === "string" ||
+    typeof value === "boolean" || Number.isSafeInteger(value);
+  const readJsonValue = async (path, pointer) => {
+    if (typeof path !== "string" || !path || !jsonPointer(pointer))
+      throw new TypeError("expected a file path and an RFC 6901 JSON pointer");
+    const result = await tools.read_file({ path, selectors: [{ kind: "json_pointer", pointer }] });
+    const row = result.results?.[0];
+    if (result.complete !== true || result.results?.length !== 1 ||
+        row?.status !== "ok" || row.complete !== true || !Object.hasOwn(row, "value"))
+      throw Object.assign(new Error("one complete JSON selection is required"), { evidence: result });
+    return { result, value: row.value };
+  };
+
+  const patchPath = p => typeof p === "string" && p.length > 0 &&
+    p.trim() === p && !/[\r\n\0]/.test(p);
+  const patchHash = h => typeof h === "string" && /^[a-f0-9]{64}$/.test(h);
+  const patchLimit = 64;
+  const apply = body => tools.apply_patch("*** Begin Patch\n" + body + "*** End Patch");
+
+  Object.defineProperty(globalThis, "apply_literal_edits", {
+    value: async function apply_literal_edits(from, to, files) {
+      if (typeof from !== "string" || !from || typeof to !== "string" ||
+          !Array.isArray(files) || !files.length || files.length > patchLimit)
+        throw new TypeError("expected a nonempty search literal, replacement text and 1–64 file selections");
+      const search = JSON.stringify(from), replacement = JSON.stringify(to);
+      const body = Array.from(files, file => {
+        const { path, source_sha256, count = 1 } = file ?? {};
+        if (!patchPath(path) || !patchHash(source_sha256) || !Number.isSafeInteger(count) || count < 0)
+          throw new TypeError("expected a patch-safe path, full source hash and nonnegative count");
+        return "*** Update File: " + path + "\n@@ codex-replace " + count +
+          " sha256:" + source_sha256 + "\n-" + search + "\n+" + replacement + "\n";
+      }).join("");
+      return apply(body);
+    },
+  });
+
+  Object.defineProperty(globalThis, "apply_patch_plan", {
+    value: async function apply_patch_plan({ update = [], add = [], guard = [] }) {
+      if (![update, add, guard].every(Array.isArray) || (!update.length && !add.length) ||
+          update.length + add.length + guard.length > patchLimit)
+        throw new TypeError("expected 1–64 total edit and guard rows, including an edit");
+      const tuple = (row, size) => {
+        if (!Array.isArray(row) || row.length !== size || !patchPath(row[0]))
+          throw new TypeError("expected a patch-safe path and exactly " + size + " tuple fields");
+        return row;
+      };
+      const plus = (lines, allowEmpty) => {
+        if (!Array.isArray(lines) || (!allowEmpty && !lines.length))
+          throw new TypeError("expected replacement lines");
+        return Array.from(lines, line => {
+          if (typeof line !== "string" || /[\r\n\0]/.test(line))
+            throw new TypeError("expected newline-free text lines");
+          return "+" + line + "\n";
+        }).join("");
+      };
+      const guards = Array.from(guard, row => {
+        const [path, hash] = tuple(row, 2);
+        if (!patchHash(hash)) throw new TypeError("expected a full dependency source hash");
+        return "*** Guard File: " + path + "\n*** Expect: sha256:" + hash + "\n";
+      });
+      const updates = Array.from(update, row => {
+        const [path, hash, start, end, lines] = tuple(row, 5);
+        if (!patchHash(hash) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
+            start < 1 || end < start)
+          throw new TypeError("expected a full source hash and an inclusive one-based range");
+        return "*** Update File: " + path + "\n@@ codex-range " + start + ":" + end +
+          " sha256:" + hash + "\n" + plus(lines, false);
+      });
+      const additions = Array.from(add, row => {
+        const [path, lines] = tuple(row, 2);
+        return "*** Add File: " + path + "\n" + plus(lines, true);
+      });
+      return apply([...guards, ...updates, ...additions].join(""));
+    },
+  });
+
+  Object.defineProperty(globalThis, "ensure_json_value", {
+    value: async function ensure_json_value({ path, pointer, value }) {
+      if (!jsonScalar(value) || typeof path !== "string" || path.trim() !== path ||
+          /[\r\n\0]/.test(path))
+        throw new TypeError("expected a patch-safe path and a JSON scalar (numbers must be safe integers)");
+      const before = await readJsonValue(path, pointer);
+      const type = (scalar) => scalar === null ? "null" : typeof scalar;
+      if (!jsonScalar(before.value) || type(before.value) !== type(value))
+        throw new TypeError("replacement must match the existing JSON scalar type");
+      const source_sha256 = before.result.source_sha256;
+      if (typeof source_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(source_sha256))
+        throw Object.assign(new Error("no current source identity"), { evidence: before.result });
+      if (before.value === value) return { status: "unchanged", value, source_sha256 };
+
+      const operation = JSON.stringify([{ op: "replace", path: pointer, value }]);
+      const patch = await tools.apply_patch("*** Begin Patch\n*** Update File: " + path +
+        "\n@@ codex-json sha256:" + source_sha256 + "\n+" + operation + "\n*** End Patch");
+      if (patch.success !== true || patch.changes_exact !== true || patch.outcome !== "committed")
+        throw Object.assign(new Error("guarded JSON update was not confirmed"), { evidence: patch });
+      // Never retry the completed write, even when readback fails or disagrees.
+      try {
+        const after = await readJsonValue(path, pointer);
+        if (after.value !== value) throw Object.assign(new Error("JSON value changed after update"), { evidence: after.result });
+        return { status: "verified", value: after.value, source_sha256: after.result.source_sha256 };
+      } catch (cause) {
+        throw Object.assign(new Error("guarded JSON update committed; readback did not verify it", { cause }),
+          { evidence: { patch, readback: cause.evidence } });
+      }
+    },
+  });
+  Object.defineProperty(globalThis, "emit_file_report", {
+    value: async function emit_file_report({ path, pointer = "", fields, format = "json" }) {
+      if (typeof path !== "string" || !path || !jsonPointer(pointer) || !Array.isArray(fields) ||
+          fields.length < 1 || fields.length > 64 ||
+          fields.some(field => !field || typeof field.name !== "string" || !jsonPointer(field.pointer)))
+        throw new TypeError("expected a file, a JSON pointer, and 1–64 named fields with relative JSON pointers");
+      // Ask the native index for each exact lexical address. Selecting only the
+      // parent object could collapse duplicate keys before template extraction.
+      const addresses = fields.map(field => pointer + field.pointer);
+      const selectors = [...new Set(addresses)].map(pointer => ({ kind: "json_pointer", pointer }));
+      const result = await tools.read_file({ path, selectors });
+      const rows = result.results;
+      if (result.complete !== true || rows?.length !== selectors.length ||
+          rows.some(row => row.status !== "ok" || row.complete !== true || !Object.hasOwn(row, "value")))
+        throw Object.assign(new Error("every report field requires a complete JSON selection"), { evidence: result });
+      const indexes = new Map(rows.map((row, index) => [row.selector?.pointer, index]));
+      if (addresses.some(address => !indexes.has(address)))
+        throw Object.assign(new Error("report selection identity mismatch"), { evidence: result });
+      const report = extract_result(result, {
+        fields: fields.map(({ name }, index) => ({ name, pointer: `/results/${indexes.get(addresses[index])}/value` })),
+        format,
+      });
+      text(report.text);
+      return report.provenance;
+    },
+  });
+})();

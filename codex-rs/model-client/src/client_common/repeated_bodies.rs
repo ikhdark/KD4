@@ -28,6 +28,8 @@ struct IncludedContent<'a> {
     requirements: HashMap<String, Vec<IncludedBody>>,
     sources: HashMap<String, Vec<(usize, IncludedBody)>>,
     artifact_sources: HashMap<(String, String), String>,
+    plan_calls: std::collections::HashSet<&'a str>,
+    plan_labels: HashMap<String, Value>,
 }
 
 #[derive(Clone)]
@@ -43,6 +45,12 @@ pub(super) fn deduplicate(source: &Arc<[ResponseItem]>) -> Arc<[ResponseItem]> {
     let mut result = Arc::clone(source);
     for (item_index, item) in source.iter().enumerate() {
         let (call_id, output) = match item {
+            ResponseItem::FunctionCall { name, namespace, call_id, .. }
+                if name == "update_plan" && namespace.as_deref().is_none_or(str::is_empty) =>
+            {
+                included.plan_calls.insert(call_id);
+                continue;
+            }
             ResponseItem::Message { id: Some(id), role, content, .. }
                 if role == "user" && id.starts_with("msg_user_") =>
             {
@@ -75,9 +83,13 @@ pub(super) fn deduplicate(source: &Arc<[ResponseItem]>) -> Arc<[ResponseItem]> {
                 })
                 .collect(),
         };
+        let is_direct_plan = included.plan_calls.remove(call_id.as_str())
+            && matches!(item, ResponseItem::FunctionCallOutput { .. })
+            && output.success == Some(true)
+            && matches!(&output.body, FunctionCallOutputBody::Text(_));
         for (content_index, text) in texts {
             let location = json!({"call_id":call_id,"content_index":content_index});
-            let Some(replacement) = included.project_text(text, &location) else {
+            let Some(replacement) = included.project_text(text, &location, is_direct_plan) else {
                 continue;
             };
             let output = match &mut Arc::make_mut(&mut result)[item_index] {
@@ -101,6 +113,46 @@ pub(super) fn deduplicate(source: &Arc<[ResponseItem]>) -> Arc<[ResponseItem]> {
 }
 
 impl IncludedContent<'_> {
+    /// Share identical labels only with an earlier literal direct plan
+    /// receipt in the current request. Statuses and authority remain current.
+    fn project_plan_labels(&mut self, value: &mut Value, location: &Value) -> bool {
+        let parsed = (|| {
+            let ids = value.get("step_ids")?.as_array()?;
+            let rows = value.pointer("/current_plan/plan")?.as_array()?;
+            if rows.is_empty() || ids.len() != rows.len() || rows.len() > 256 {
+                return None;
+            }
+            let labels = rows.iter().map(|row| row.get("step")?.as_str()).collect::<Option<Vec<_>>>()?;
+            let bytes = labels.iter().map(|label| label.len()).sum::<usize>();
+            (bytes >= MIN_BODY_BYTES).then(|| (json!([ids, labels]).to_string(), bytes))
+        })();
+        let Some((key, bytes)) = parsed else {
+            return false;
+        };
+        let Some(owner) = self.plan_labels.get(&key) else {
+            self.plan_labels.insert(key, location.clone());
+            return false;
+        };
+        let reference = json!({
+            "call_id": owner["call_id"], "content_index": owner["content_index"],
+            "order": "same step_ids; copy only step text"
+        });
+        if reference.to_string().len() + 64 >= bytes {
+            return false;
+        }
+        let Some(rows) = value.pointer_mut("/current_plan/plan").and_then(Value::as_array_mut) else {
+            return false;
+        };
+        for row in rows {
+            // Every row contained a string step field in the parsed literal.
+            if let Some(row) = row.as_object_mut() {
+                row.remove("step");
+            }
+        }
+        value["current_plan"]["steps_from"] = reference;
+        true
+    }
+
     /// Share a complete nonsource payload without hiding its surrounding
     /// status, timing, recovery or other changed result metadata.
     fn project_body(&mut self, text: &str, location: &Value) -> Option<Value> {
@@ -146,7 +198,7 @@ impl IncludedContent<'_> {
         Some(key)
     }
 
-    fn project_text(&mut self, text: &str, location: &Value) -> Option<String> {
+    fn project_text(&mut self, text: &str, location: &Value, is_plan: bool) -> Option<String> {
         if text.len() < MIN_BODY_BYTES {
             return None;
         }
@@ -224,7 +276,10 @@ impl IncludedContent<'_> {
                 }
             } else if let Ok(mut value) = serde_json::from_str::<Value>(line) {
                 frames.clear();
-                if self.project_json(&mut value, None, location, &mut frames) {
+                let shaped = self.project_json(&mut value, None, location, &mut frames);
+                let shared_plan = is_plan && cursor == 0 && line_end == text.len()
+                    && self.project_plan_labels(&mut value, location);
+                if shaped || shared_plan {
                     result.push_str(&value.to_string());
                     result.push_str(&text[cursor + line.len()..line_end]);
                     changed = true;
