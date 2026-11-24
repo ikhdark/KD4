@@ -160,6 +160,25 @@ enum PipeStdinMode {
     Null,
 }
 
+/// The Windows pipe owner's actual OS process-creation call failed.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct PipeSpawnError(pub io::Error);
+
+#[cfg(windows)]
+impl std::fmt::Display for PipeSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for PipeSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// Windows roots are created suspended and attached to their kill-on-close Job
 /// before they are allowed to run.
 async fn spawn_process_with_stdin_mode(
@@ -263,10 +282,14 @@ async fn spawn_process_with_stdin_mode(
         // handle setup, and waiter installation. An undeliverable session terminates on drop,
         // while its detached waiter retains admission until the child has been reaped.
         run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
-            let child = command.spawn()?;
-            Ok(runtime.block_on(finish_pipe_process_setup(child, managed)))
+            // Keep OS spawn refusal separate from waiter timeout and from
+            // failures attaching or configuring a process that did spawn.
+            Ok(command.spawn().map(|child| {
+                runtime.block_on(finish_pipe_process_setup(child, managed))
+            }))
         })
         .await?
+        .map_err(PipeSpawnError)?
     }
     #[cfg(not(windows))]
     {

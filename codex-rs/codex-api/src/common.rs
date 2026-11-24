@@ -316,8 +316,25 @@ pub struct ResponsesApiRequest {
     pub prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_ordered_client_metadata"
+    )]
     pub client_metadata: Option<HashMap<String, String>>,
+}
+
+// A retry can rebuild this map with a different hash seed. Preserve the HTTP
+// wire bytes without reusing stale metadata or changing the WebSocket format.
+fn serialize_ordered_client_metadata<S: serde::Serializer>(
+    metadata: &Option<HashMap<String, String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let Some(metadata) = metadata else {
+        return serializer.serialize_none();
+    };
+    let mut fields: Vec<_> = metadata.iter().collect();
+    fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    serializer.collect_map(fields)
 }
 
 impl From<&ResponsesApiRequest> for ResponseCreateWsRequest {

@@ -19,11 +19,13 @@ use serde_json::Map;
 use serde_json::Value;
 
 use crate::logging_client_handler::LoggingClientHandler;
+use crate::logging_client_handler::ProgressRoutes;
 use crate::rmcp_client::Elicitation;
 use crate::rmcp_client::ElicitationPauseRegistry;
 use crate::rmcp_client::ElicitationResponse;
 use crate::rmcp_client::SendElicitation;
 use crate::rmcp_client::SendProgress;
+use crate::rmcp_client::SendResourceChanged;
 use crate::rmcp_client::SendToolListChanged;
 
 const MCP_PROGRESS_TOKEN_META_KEY: &str = "progressToken";
@@ -54,6 +56,7 @@ impl ElicitationClientService {
         send_elicitation: SendElicitation,
         send_progress: SendProgress,
         send_tool_list_changed: SendToolListChanged,
+        send_resource_changed: SendResourceChanged,
         pause_state: ElicitationPauseRegistry,
     ) -> Self {
         let supports_openai_form = client_info
@@ -70,12 +73,22 @@ impl ElicitationClientService {
                 clone_send_elicitation(Arc::clone(&send_elicitation)),
                 send_progress,
                 Box::new(move || changed()),
+                send_resource_changed,
             ),
             supports_openai_form,
             send_elicitation,
             send_tool_list_changed,
             pause_state,
         }
+    }
+
+    pub(crate) fn with_fresh_progress_routes(mut self) -> Self {
+        self.handler.progress_routes = Arc::default();
+        self
+    }
+
+    pub(crate) fn progress_routes(&self) -> &Arc<ProgressRoutes> {
+        &self.handler.progress_routes
     }
 
     pub(crate) async fn notify_session_changed(&self) {

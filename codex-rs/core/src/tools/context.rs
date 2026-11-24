@@ -1670,6 +1670,48 @@ pub enum ExecShutdownStatus {
     ShutdownUncertain,
 }
 
+#[derive(Debug, Clone, Copy, serde::Deserialize, Serialize)]
+pub(crate) enum ExecOutputEncoding {
+    #[serde(rename = "windows-1252")]
+    Windows1252,
+    #[serde(rename = "utf-16le")]
+    Utf16Le,
+}
+
+impl ExecOutputEncoding {
+    fn decode(self, bytes: &[u8]) -> Option<String> {
+        match self {
+            Self::Windows1252 => {
+                const C1: [char; 32] = [
+                    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡',
+                    'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
+                    '\u{90}', '‘', '’', '“', '”', '•', '–', '—',
+                    '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
+                ];
+                Some(
+                    bytes
+                        .iter()
+                        .map(|&byte| match byte {
+                            0x80..=0x9f => C1[usize::from(byte - 0x80)],
+                            _ => char::from(byte),
+                        })
+                        .collect(),
+                )
+            }
+            Self::Utf16Le => {
+                if bytes.len() % 2 != 0 {
+                    return None;
+                }
+                char::decode_utf16(
+                    bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+                )
+                .collect::<Result<String, _>>()
+                .ok()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecCommandToolOutput {
     pub(crate) environment_receipt: Option<codex_utils_pty::process_observation::ProcessStartSnapshot>,
@@ -1939,6 +1981,10 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             streams_complete: Option<bool>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            output_encoding: Option<ExecOutputEncoding>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stream_decode_error: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             chunk_id: Option<String>,
             wall_time_seconds: f64,
             exit_code: Option<i32>,
@@ -2012,13 +2058,17 @@ impl ToolOutput for ExecCommandToolOutput {
         // The original arguments distinguish an explicit small cap from a
         // learned/default command limit. Neither defaults nor the direct-call
         // ceiling should defeat a deliberately raised cell budget.
-        let requested = match payload {
-            ToolPayload::Function { arguments } => serde_json::from_str::<JsonValue>(arguments)
-                .ok()
-                .and_then(|args| args["max_output_tokens"].as_u64())
-                .and_then(|limit| usize::try_from(limit).ok()),
+        let args = match payload {
+            ToolPayload::Function { arguments } => serde_json::from_str::<JsonValue>(arguments).ok(),
             _ => None,
         };
+        let requested = args
+            .as_ref()
+            .and_then(|args| args["max_output_tokens"].as_u64())
+            .and_then(|limit| usize::try_from(limit).ok());
+        let encoding = args.as_ref().and_then(|args| {
+            serde_json::from_value::<ExecOutputEncoding>(args.get("output_encoding")?.clone()).ok()
+        });
         let limits = resolve_projected_output_limits(
             Some(requested.unwrap_or(budget)),
             OutputOutcome::Success,
@@ -2048,7 +2098,33 @@ impl ToolOutput for ExecCommandToolOutput {
             && matches!(payload, ToolPayload::Function { arguments } if serde_json::from_str::<JsonValue>(arguments)
                 .is_ok_and(|args| args["artifact_only_on_success"].as_bool() == Some(true)
                     && args["tty"].as_bool() != Some(true) && args["pipe_stdin"].as_bool() != Some(true)));
-        let streams = self.stream_chunks.as_ref().filter(|_| !locator_only);
+        // Only decode finalized per-pipe bytes consumed by this receipt.
+        // Never reinterpret the merged transcript or replay prior poll bytes.
+        let decoded = encoding.filter(|_| !locator_only).and_then(|encoding| {
+            let snapshot = self.process_output.as_ref()?;
+            let ranges = self.stream_ranges.as_ref()?;
+            if !(self.process_exited
+                && self.process_id.is_none()
+                && self.error.is_none()
+                && snapshot.output_closed
+                && snapshot.streams_are_exact
+                && ranges[0] == (0..snapshot.stdout.len() as u64)
+                && ranges[1] == (0..snapshot.stderr.len() as u64)
+                && snapshot.stdout.len() + snapshot.stderr.len()
+                    <= crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES)
+            {
+                return None;
+            }
+            Some([
+                encoding.decode(&snapshot.stdout)?,
+                encoding.decode(&snapshot.stderr)?,
+            ])
+        });
+        let streams = if encoding.is_some() {
+            decoded.as_ref()
+        } else {
+            self.stream_chunks.as_ref().filter(|_| !locator_only)
+        };
         let stream_chunks_complete = streams.is_some();
         let streams_complete = Some(stream_chunks_complete && self.process_exited && self.process_id.is_none() && self.stream_ranges.as_ref()
             .is_some_and(|ranges| ranges.iter().all(|range| range.start == 0)));
@@ -2099,6 +2175,9 @@ impl ToolOutput for ExecCommandToolOutput {
             stream_ranges: self.stream_ranges.clone(),
             stream_chunks_complete,
             streams_complete,
+            output_encoding: encoding,
+            stream_decode_error: (encoding.is_some() && decoded.is_none() && !locator_only)
+                .then_some("complete separate streams are unavailable or invalid in the selected encoding"),
             recovery_selector,
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
             wall_time_seconds: self.wall_time.as_secs_f64(),

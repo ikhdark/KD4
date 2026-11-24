@@ -91,6 +91,19 @@ const MAX_MCP_SERVER_COLLECTION_ERROR_CHARS: usize = 240;
 const MAX_MCP_COLLECTION_PAGES: usize = 100;
 const MAX_MCP_COLLECTION_ITEMS: usize = 10_000;
 
+// Tool schemas come from an external server. Embedded references are fine;
+// validation must never perform I/O to resolve a reference.
+struct NoExternalSchemaRetrieval;
+
+impl jsonschema::Retrieve for NoExternalSchemaRetrieval {
+    fn retrieve(
+        &self,
+        _uri: &jsonschema::Uri<String>,
+    ) -> std::result::Result<JsonValue, Box<dyn std::error::Error + Send + Sync>> {
+        Err("external MCP output schema references are not supported".into())
+    }
+}
+
 // An exhaustive collection returns a retained prefix with its retry cursor on
 // late failure. Metadata travels with the page so single-server callers cannot
 // accidentally drop the incomplete status when extracting a successful prefix.
@@ -1778,11 +1791,33 @@ impl McpConnectionManager {
             ));
         }
 
+        let validator = client
+            .tool_output_schema(tool)
+            .map(|schema| {
+                jsonschema::options()
+                    .with_retriever(NoExternalSchemaRetrieval)
+                    .build(&JsonValue::Object(schema.as_ref().clone()))
+                    .map_err(|_| anyhow!(
+                        "MCP tool `{server}/{tool}` advertises an invalid or unsupported output schema; no call was sent"
+                    ))
+            })
+            .transpose()?;
         let result: rmcp::model::CallToolResult = client
             .client
             .call_tool(tool.to_string(), arguments, meta, Some(client.tool_timeout))
             .await
             .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;
+        if result.is_error != Some(true)
+            && let Some(validator) = validator
+            && !result
+                .structured_content
+                .as_ref()
+                .is_some_and(|content| validator.is_valid(content))
+        {
+            return Err(anyhow!(
+                "MCP tool `{server}/{tool}` returned missing or invalid structured content for its advertised output schema; the call was sent. Check its effects before retrying"
+            ));
+        }
 
         let content = result
             .content

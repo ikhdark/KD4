@@ -22,6 +22,15 @@ Example combining operations:
 *** End Patch
 ```
 
+Textual update hunks can follow a moved anchor when the adjacent preimage
+identifies a single site. A diagnostic may report that the exact replacement
+already follows a unique anchor; this is a refusal with no writes, not success
+for the rest of the patch. Hash mismatches still require reconciliation.
+Line edits preserve a UTF-8 BOM unless explicitly edited, keep unchanged line
+terminators byte-for-byte and use the replaced lines' terminators where present.
+Non-UTF-8 source is not supported. A successful update may flag newly introduced
+Rust or Python stub markers as bounded, non-blocking review advice.
+
 Count-guarded literal replacement:
 
 Use an explicit `*** Update File: <path>` for each file, with one or more `@@ codex-replace COUNT sha256:HASH` chunks, each followed by `-` followed by a JSON string containing the search text and `+` followed by a JSON string containing its replacement. For example, `-"old\ntext"` and `+"new\ntext"` encode multiline literals; generate these strings with `JSON.stringify` in Code Mode. HASH is the current whole-file raw UTF-8 `source_sha256`, never an excerpt or decoded UTF-16 hash. COUNT is the exact number of case-sensitive, non-overlapping occurrences in that file; 0 asserts absence. The search string must be nonempty; `+""` deletes matches. There is no regex, glob expansion, normalization or recursive replacement. Use only one Update File hunk per endpoint, including path aliases; do not mix literal replacement with other chunk forms. All chunks use the original file snapshot; matches from different chunks may not overlap. Literal replacement preserves all bytes outside matches, including mixed line endings, BOM and final-newline state; replacement bytes may intentionally change them. All file counts, revisions and candidate prerequisites are validated before any write. Use revision guards below for read-only dependencies and move destinations too.

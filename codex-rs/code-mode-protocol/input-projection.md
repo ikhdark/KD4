@@ -4,9 +4,11 @@ Use these opt-in recipes when the consumer needs a known subset of the result. T
 
 - **Diagnostic rows:** after checking that the input and all selections are complete, filter for the requested status **before** printing. Return all matching identities and diagnostics, including distinct failures. An empty array means no matches only for a complete, successful read. Preserve failures and recovery receipts instead of treating them as empty.
   For a complete uniform native structured page, Code Mode may print `value_columns` once and positional `rows[].value` arrays. Pair each cell with the corresponding JSON pointer; keep the original row numbers. Nulls and wide integers retain their exact representation. Missing fields, incomplete coverage, and parser errors remain in the ordinary shape. Native JavaScript and direct results still use keyed row values.
+  For a large JSONL file and a known sparse result, prefer a native `structured` selector with the requested field pointers and filter rather than reading every line into the cell. Treat an empty result as final only after complete coverage with `rows_exhausted: true`. If paged, follow the returned selector, check the same source revision on each page, and preserve row order and diagnosis. A full local read can be faster when selection needs several round trips and the full read fits.
 - **Schemas:** resolve a known tool by exact name; inspect its description or a detail section only when needed. Keep other tools discoverable. Do not enumerate and print the whole catalog to use one tool.
   The eager nested `read_file` and `read_tool_output` schemas name specialized selector kinds without repeating their detailed fields. Use `resolve_tool(name).section("arguments")` for those fields. Ordinary selector forms and any advertised direct schemas keep their full contracts.
 - **Overlapping reads:** for two known, overlapping ranges of the same source revision, request their union in one selection. Retain the origin and bounds so both original slices can be reconstructed. Do not merge across files, revisions or gaps that were not requested.
+  When concurrent consumers are known to need the same exact immutable artifact selection, retrieve it once and fan out the result. If independently assembled requests can overlap, share only an in-flight read for the same artifact and exact selector; don’t reuse settled errors or use an artifact read to stand in for refreshing a live file.
 - **Unchanged results:** reuse the existing request-local reference when its owner is present. Another marker or a duplicate cache is not needed.
 
 - **Progress after resume:** use the native plan as the durable owner. When only current progress is needed, project the latest revision, stable step IDs, statuses and unresolved obligations rather than printing every intermediate plan. Retain the original requirement pins and evidence; a display summary is not completion authority. Guard a subsequent status change with the recovered revision and step identity. Do not create a second checkpoint file solely to save input tokens.
@@ -203,7 +205,7 @@ When the consumer needs **every row and field**, an opt-in table can remove
 repeated field names without discarding values. Use it on a complete array of
 records from parsed JSON or a complete native selection, not on partial
 results, errors, or live tool receipts. Keep the owning receipt and its exact
-source identity separately. Unlike dictionary packing of repeated values,
+source identity separately. Unlike [string registers](#registers-for-repeated-strings),
 this recipe saves space when the *field names* repeat, even if the values
 are distinct.
 
@@ -233,3 +235,56 @@ are values, not missing fields. The function compares serialized UTF-8
 bytes, not model tokens; use it only when the consumer knows the table format.
 For a one-off cell, include the helper's own text when comparing the whole
 interaction; a smaller payload does not necessarily make the request smaller.
+
+## Registers for repeated strings
+
+If a consumer needs **every occurrence in order** across a serialization
+boundary, agree on this format before sending it. Keep the complete native
+receipt and source identity separately. For a consumer in the same Code Mode
+working state, use `store`/`load` and print only the needed evidence instead.
+Do not use registers for partial results, tool receipts, or a consumer that
+expects an ordinary array or cannot decode the packet.
+
+<!-- projectStringRegisters -->
+```js
+function packEvidenceStrings(values) {
+  if (!Array.isArray(values) || values.length < 2 || values.length > 256)
+    return values;
+  const indexes = new Map();
+  const strings = [];
+  const ids = [];
+  for (const value of values) {
+    if (typeof value !== "string") return values;
+    if (!indexes.has(value)) {
+      indexes.set(value, strings.length);
+      strings.push(value);
+    }
+    ids.push(indexes.get(value));
+  }
+  const packet = {format: "string-registers-v1", strings, ids};
+  const encoder = new TextEncoder();
+  const bytes = x => encoder.encode(JSON.stringify(x)).length;
+  return bytes(packet) < bytes(values) ? packet : values;
+}
+
+function unpackEvidenceStrings(packet) {
+  if (Array.isArray(packet)) return packet;
+  if (packet?.format !== "string-registers-v1" ||
+      !Array.isArray(packet.strings) || !Array.isArray(packet.ids) ||
+      packet.strings.length > 256 || packet.ids.length > 256 ||
+      [...packet.strings].some(value => typeof value !== "string"))
+    throw new TypeError("invalid string-register packet");
+  return Array.from(packet.ids, id => {
+    if (!Number.isSafeInteger(id) || !Object.hasOwn(packet.strings, id))
+      throw new RangeError("unallocated string register");
+    return packet.strings[id];
+  });
+}
+```
+
+Small, distinct, or mixed inputs use the ordinary representation unless the
+input is a complete string array and the packet is smaller in serialized
+UTF-8. Case, Unicode, empty strings, order, and duplicates are preserved; an
+invalid ID throws rather than substituting a missing value. Keep the default
+array when it is cheaper to send, including encoder/decoder text and any
+additional request. Serialized bytes are not model tokens or billing.

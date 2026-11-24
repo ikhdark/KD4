@@ -78,3 +78,85 @@ pub(super) async fn maybe_record_workflow_checkpoint(
     }
     Ok(())
 }
+
+/// Diagnose duplicate machine-readable definitions before the first sampling
+/// request. Never interpret prose or change the effective base instructions.
+pub(super) fn audit_effective_policy_preflight(text: &str) {
+    if !text.contains("<!-- policy:") {
+        return;
+    }
+    let mut definitions = std::collections::BTreeMap::new();
+    let mut open = None;
+    let mut offset = 0;
+    let mut fence = None;
+    for raw in text.split_inclusive('\n') {
+        let line_start = offset;
+        offset += raw.len();
+        let line = raw.trim_end();
+        let after_indent = line.trim_start_matches(' ');
+        if line.len() - after_indent.len() <= 3
+            && let Some(marker @ (b'`' | b'~')) = after_indent.bytes().next()
+        {
+            let count = after_indent.bytes().take_while(|&b| b == marker).count();
+            if count >= 3 {
+                match fence {
+                    None => fence = Some((marker, count)),
+                    Some((opened, width))
+                        if opened == marker
+                            && count >= width
+                            && after_indent[count..].is_empty() =>
+                    {
+                        fence = None
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        }
+        if fence.is_some() {
+            continue;
+        }
+        if let Some(id) = line
+            .strip_prefix("<!-- policy:")
+            .and_then(|s| s.strip_suffix(" -->"))
+        {
+            open = Some((id, offset));
+        } else if let Some(id) = line
+            .strip_prefix("<!-- /policy:")
+            .and_then(|s| s.strip_suffix(" -->"))
+            && let Some((opened, body_start)) = open.take()
+            && opened == id
+            && id.len() <= 80
+            && !id.is_empty()
+            && id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b".:_-".contains(&c))
+        {
+            let body = text[body_start..line_start].trim();
+            if !body.is_empty() {
+                use std::collections::btree_map::Entry;
+                match definitions.entry(id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert((body, false, false));
+                    }
+                    Entry::Occupied(mut entry) => {
+                        let (prior, redundant, conflicting) = entry.get_mut();
+                        if *prior == body && !*redundant {
+                            tracing::info!(
+                                policy_id = id,
+                                "instruction preflight: redundant policy id"
+                            );
+                            *redundant = true;
+                        } else if *prior != body && !*conflicting {
+                            tracing::warn!(
+                                policy_id = id,
+                                "instruction preflight: conflicting policy id"
+                            );
+                            *conflicting = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -65,6 +65,99 @@ class InferenceWorkflow:
         return await submit(request)
 
 
+def prepare_keyed_evidence(
+    rows: list[dict[str, str]],
+    required_keys: frozenset[str],
+    *,
+    fields: frozenset[str],
+    key_field: str,
+    render: Callable[[list[dict[str, str]]], str],
+) -> str:
+    """Render complete evidence for an explicit, independently keyed assignment.
+
+    The caller supplies a complete table and a pure renderer that changes
+    only the evidence rows. All rows for every required key are preserved in
+    order. Unknown shape, missing keys or less than 20% UTF-8 byte savings
+    leave the ordinary request unchanged. The helper neither submits work
+    nor infers which keys are required.
+    """
+    ordinary = render(rows)
+    if (
+        type(rows) is not list
+        or not required_keys
+        or key_field not in fields
+        or any(
+            type(row) is not dict
+            or row.keys() != fields
+            or any(type(value) is not str for value in row.values())
+            for row in rows
+        )
+    ):
+        return ordinary
+
+    selected = [row for row in rows if row[key_field] in required_keys]
+    if len(selected) == len(rows) or {row[key_field] for row in selected} != required_keys:
+        return ordinary
+
+    projected = render(selected)
+    return (
+        projected
+        if ordinary and len(projected.encode("utf-8")) * 5 <= len(ordinary.encode("utf-8")) * 4
+        else ordinary
+    )
+
+
+def exact_keyed_values(
+    rows: list[dict[str, str]],
+    required_keys: tuple[str, ...],
+    *,
+    key_field: str,
+    value_field: str,
+) -> dict[str, str] | None:
+    """Resolve an explicit lookup in a complete two-column string table.
+
+    Return values in assignment order only when each requested key has exactly
+    one row. Return None on unknown shape, missing or ambiguous keys, or an
+    invalid assignment. The caller owns table completeness and fallback.
+    This helper does not infer intent or submit a turn.
+    """
+    if (
+        type(rows) is not list
+        or type(required_keys) is not tuple
+        or not required_keys
+        or any(type(key) is not str or not key for key in required_keys)
+        or len(set(required_keys)) != len(required_keys)
+        or type(key_field) is not str
+        or type(value_field) is not str
+        or not key_field
+        or not value_field
+        or key_field == value_field
+    ):
+        return None
+
+    fields = {key_field, value_field}
+    wanted = set(required_keys)
+    candidates: dict[str, str] = {}
+    for row in rows:
+        if (
+            type(row) is not dict
+            or row.keys() != fields
+            or type(row[key_field]) is not str
+            or not row[key_field]
+            or type(row[value_field]) is not str
+        ):
+            return None
+        key = row[key_field]
+        if key not in wanted:
+            continue
+        if key in candidates:
+            return None
+        candidates[key] = row[value_field]
+    if candidates.keys() != wanted:
+        return None
+    return {key: candidates[key] for key in required_keys}
+
+
 async def latest_in_window(source: asyncio.Queue[_Input], *, window: float) -> _Input:
     """Consume the first event plus its bounded successors; return the latest.
 

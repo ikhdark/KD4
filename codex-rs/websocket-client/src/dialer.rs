@@ -17,7 +17,6 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::client_async_with_config;
 use tokio_tungstenite::proxy::connect_via_proxy;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
-use tokio_tungstenite::tungstenite::client::uri_mode;
 use tokio_tungstenite::tungstenite::error::TlsError;
 use tokio_tungstenite::tungstenite::error::UrlError;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
@@ -39,8 +38,6 @@ pub(crate) async fn connect(
     tcp_nodelay: TcpNodelay,
     direct_route_only: bool,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
-    // An explicit port must not let an unsupported scheme reach TCP or proxy setup.
-    uri_mode(request.uri())?;
     connect_route(request, config, tls_config, proxy_route, tcp_nodelay, direct_route_only)
         .await
         .map_err(redact_proxy_config_error)

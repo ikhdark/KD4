@@ -1948,6 +1948,8 @@ dependencies = [
  "tokio",
  "tree-sitter",
  "tree-sitter-bash",
+ "tree-sitter-python",
+ "tree-sitter-rust",
 ]
 
 [[package]]
@@ -2928,6 +2930,7 @@ dependencies = [
  "codex-utils-path-uri",
  "codex-utils-string",
  "futures",
+ "jsonschema",
  "rmcp",
  "serde",
  "serde_json",

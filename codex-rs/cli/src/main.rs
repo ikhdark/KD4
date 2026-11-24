@@ -302,6 +302,10 @@ struct CompletionCommand {
     /// Shell to generate completions for
     #[clap(value_enum, default_value_t = Shell::Bash)]
     shell: Shell,
+
+    /// Emit JSON for a slash-separated public command path, or "." for the root.
+    #[arg(long, value_name = "COMMAND_PATH", conflicts_with = "shell")]
+    describe: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -1747,6 +1751,29 @@ fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'sta
 
 fn print_completion(cmd: CompletionCommand) -> std::io::Result<()> {
     use std::io::Write as _;
+    if let Some(path) = cmd.describe {
+        let mut app = SharedCliOptions::scope_sandbox_selection(MultitoolCli::command());
+        app.build();
+        let mut target = &app;
+        if path != "." {
+            for name in path.split('/') {
+                target = target
+                    .find_subcommand(name)
+                    .filter(|child| !child.is_hide_set())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("unknown public command path: {path}"),
+                        )
+                    })?;
+            }
+        }
+        let json = describe_cli(target);
+        return write_stdout_with(|stdout| {
+            serde_json::to_writer(&mut *stdout, &json)?;
+            stdout.write_all(b"\n")
+        });
+    }
     let mut app = MultitoolCli::command();
     let name = "codex";
     // clap_complete's generators assume an infallible sink. Keep generation
@@ -1754,6 +1781,50 @@ fn print_completion(cmd: CompletionCommand) -> std::io::Result<()> {
     let mut script = Vec::new();
     generate(cmd.shell, &mut app, name, &mut script);
     write_stdout_with(|stdout| stdout.write_all(&script))
+}
+
+fn describe_cli(command: &clap::Command) -> serde_json::Value {
+    let arguments: Vec<_> = command
+        .get_arguments()
+        .filter(|arg| !arg.is_hide_set())
+        .map(|arg| {
+            let arity = arg.get_num_args().map(|range| {
+                serde_json::json!({
+                    "min": range.min_values(),
+                    "max": (range.max_values() != usize::MAX).then(|| range.max_values()),
+                })
+            });
+            let possible_values: Vec<_> = arg
+                .get_possible_values()
+                .into_iter()
+                .filter(|value| !value.is_hide_set())
+                .map(|value| value.get_name().to_owned())
+                .collect();
+            serde_json::json!({
+                "id": arg.get_id().as_str(),
+                "short": arg.get_short(),
+                "long": arg.get_long(),
+                "index": arg.get_index(),
+                "required": arg.is_required_set(),
+                "value_names": arg.get_value_names().map(|names|
+                    names.iter().map(|name| name.as_str()).collect::<Vec<_>>()),
+                "arity": arity,
+                "possible_values": possible_values,
+                "repeatable": matches!(arg.get_action(), clap::ArgAction::Append | clap::ArgAction::Count),
+            })
+        })
+        .collect();
+    let subcommands: Vec<_> = command
+        .get_subcommands()
+        .filter(|child| !child.is_hide_set())
+        .map(clap::Command::get_name)
+        .collect();
+    serde_json::json!({
+        "command": command.get_name(),
+        "arguments": arguments,
+        "subcommands": subcommands,
+        "subcommand_required": command.is_subcommand_required_set(),
+    })
 }
 
 

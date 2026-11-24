@@ -70,6 +70,25 @@ known steps.
 | Evidence still pending | Keep and collect the owned receipt before asking for a dependent choice. Continue unrelated ready work without consuming or restarting that receipt twice. |
 | Work remains before a final | Reconcile required IDs against current receipts before drafting. Execute ready work, resume live owners and make a bounded diagnostic correction when the evidence allows it. Leave genuine blockers unresolved and report their exact prerequisite. |
 
+For opt-in workflows with an objective outcome:
+
+- When a write depends on a read-only source, put that source revision in the
+  same native patch as a [read-only guard](../prompts/templates/apply_patch_tool_instructions.md).
+  A separate preflight read is not a dispatch precondition. If the guard
+  refuses, inspect the current dependency before deciding on a new write.
+- Compare complete native readback with the declared artifact contents before
+  reporting acceptance. A committed write is not evidence that it wrote the
+  right contents. For a named result field, use the native Code Mode
+  [selector and provenance](../code-mode-protocol/src/description/exec_reference.md)
+  rather than forwarding unrelated output; retain actionable errors.
+- If the user authorized compensation for a reversible write, keep its exact
+  preimage and committed post-write revision. Compensate only on the declared
+  failure with known effects, using that post-write revision as the native
+  write guard; verify the preimage after compensation. A stale revision,
+  unknown effect, or failed verification is not permission to retry or
+  overwrite someone else's work. This is opt-in compensation, not a
+  transaction or a change to normal partial-commit behavior.
+
 For example, if the requested answer is exactly one CSV field from a JSON
 record, put the complete acquisition and projection in the delivery cell:
 
@@ -115,7 +134,7 @@ not establish that an external effect did not happen.
 | Typed completion refused for unresolved requirements | [Receipt admission](src/tools/handlers/multi_agents_v2/task.rs) reports the plan revision and unsettled IDs. Return fulfilled IDs through [plan reconciliation](../tools/src/builtin_specs/plan_progress.md) only after their mapped work is complete; genuine blockers stay open. |
 | Ordinary completion with unresolved requirements | [Turn stop gate](src/session/turn_execution.rs) defers a final at most twice per instruction epoch. It can defer once more when a held exact user read has current native proof, retires a previously unresolved requirement and leaves a strictly smaller set of outstanding IDs. It neither dispatches work nor grants tool authority. |
 | Inter-agent mailbox admission and recovery | [Queue and turn transfer](src/session/input_queue.rs), [durable receiver envelopes](src/session/mailbox_storage.rs), [hard deletion](../thread-store/src/local/delete_thread.rs) |
-| History reconstruction and compaction | [session/rollout_reconstruction.rs](src/session/rollout_reconstruction.rs), [compact.rs](src/compact.rs), [compact_provenance.rs](src/compact_provenance.rs) |
+| History reconstruction and compaction | [session/rollout_reconstruction.rs](src/session/rollout_reconstruction.rs), [compact.rs](src/compact.rs), [compact_provenance.rs](src/compact_provenance.rs). When inline omission receipts overflow, the recovery sidecar points to the archived `/omissions` metadata; matching receipts select exact bodies without reading all of `/items`. |
 | Tool-output retirement under context pressure | [Context-limit continuation](src/session/turn.rs) may prefer a shorter rewritten request tail in the soft, post-response lane when the reviewed candidate has sufficient calibrated reclaim. Hard and projected pressure preserve the existing oldest-first decision and compaction fallback. [History and exact pin custody](../conversation/src/context_manager/history.rs), [eligible older outputs](../conversation/src/tool_history.rs). |
 | Bounded completion attribution | [Existing-test outline attribution](src/session/turn.rs) retains one shared analysis deadline and reports paths by gap (budget, parser recovery, or unavailable outline/worker). Parser recovery is not a compiler result; incomplete analysis does not prove an edit or that tests were unchanged. |
 | Live recovery evidence | [session/resume_inventory.rs](src/session/resume_inventory.rs), [unified_exec/process_inventory.rs](src/unified_exec/process_inventory.rs) |

@@ -139,8 +139,47 @@ function preview(spec, ts) {
       if (changes.length) throw new Error("moves that require rewriting the moved source are not supported");
       patch += "*** Move to: " + value + "\n";
     } else {
-      patch += "@@ codex-replace 1 sha256:" + expected + "\n-" +
-        JSON.stringify(text) + "\n+" + JSON.stringify(result) + "\n";
+      const chunk = (before, after, count = 1) =>
+        "@@ codex-replace " + count + " sha256:" + expected + "\n-" +
+        JSON.stringify(before) + "\n+" + JSON.stringify(after) + "\n";
+      const options = [chunk(text, result)];
+      const selected = changes.filter(({ span, newText }) =>
+        text.slice(span.start, span.start + span.length) !== newText).reverse();
+      if (selected.length) {
+        const start = selected[0].span.start;
+        const last = selected.at(-1).span;
+        const end = last.start + last.length;
+        const old = text.slice(start, end);
+        const after = result.slice(start, result.length - (text.length - end));
+        const utf8 = s => Buffer.from(s).toString("utf8") === s;
+        if (old && utf8(old) && utf8(after) && text.indexOf(old) === start &&
+            text.indexOf(old, end) === -1) options.push(chunk(old, after));
+        // Repeated literals may include comments or unrelated symbols: the
+        // native nonoverlapping matches must be exactly the service's spans.
+        const groups = new Map();
+        for (const { span, newText } of selected) {
+          const before = text.slice(span.start, span.start + span.length);
+          if (!before || !utf8(before) || !utf8(newText)) break;
+          const key = JSON.stringify([before, newText]);
+          if (!groups.has(key)) groups.set(key, { before, newText, starts: [] });
+          groups.get(key).starts.push(span.start);
+        }
+        const local = [];
+        let represented = 0;
+        for (const { before, newText, starts } of groups.values()) {
+          let cursor = 0;
+          if (!starts.every(start => {
+            if (text.indexOf(before, cursor) !== start) return false;
+            cursor = start + before.length;
+            return true;
+          }) || text.indexOf(before, cursor) !== -1) break;
+          local.push(chunk(before, newText, starts.length));
+          represented += starts.length;
+        }
+        if (represented === selected.length) options.push(local.join(""));
+      }
+      patch += options.reduce((best, value) =>
+        Buffer.byteLength(value) < Buffer.byteLength(best) ? value : best);
     }
   }
   return patch + "*** End Patch\n";

@@ -394,6 +394,11 @@ impl ExecCommandHandler {
             source,
         );
         let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;
+        if !nested && environment_args.output_encoding.is_some() {
+            return Err(command_argument_refusal(
+                "output_encoding is supported only for exec_command inside Code Mode".to_string(),
+            ));
+        }
         let turn_environment = crate::tools::handlers::wait_for_observed_tool_environment(
             &step_context.environments,
             environment_args.environment_id.as_deref(),
@@ -1358,6 +1363,18 @@ fn exec_command_error_output(
     let failure = match error {
         UnifiedExecError::LaunchInputRefused { kind, .. } if no_process_registered => {
             ToolFailure::handler_refusal(ToolFailureCode::InvalidInput, message, kind)
+        }
+        UnifiedExecError::CreateProcess {
+            refusal: Some(std::io::ErrorKind::PermissionDenied),
+            ..
+        } if no_process_registered => {
+            ToolFailure::no_effects(ToolFailureCode::PermissionDenied, message)
+        }
+        UnifiedExecError::CreateProcess {
+            refusal: Some(std::io::ErrorKind::NotFound),
+            ..
+        } if no_process_registered => {
+            ToolFailure::handler_refusal(ToolFailureCode::InvalidInput, message, "launch_not_found")
         }
         UnifiedExecError::CreateProcess { .. } if no_process_registered => {
             ToolFailure::no_effects(ToolFailureCode::RetryableFailure, message)

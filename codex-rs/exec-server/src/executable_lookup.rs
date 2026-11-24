@@ -132,6 +132,9 @@ pub(crate) async fn lookup_executable(
     params: &LookupExecutableParams,
 ) -> io::Result<LookupExecutableResponse> {
     let plan = prepare_lookup(params, MAX_CANDIDATES)?;
+    if params.all_matches {
+        return lookup_all(filesystem, params, plan).await;
+    }
     let path = filesystem
         .first_regular_file(&plan.candidates, params.sandbox.as_ref())
         .await
@@ -143,7 +146,65 @@ pub(crate) async fn lookup_executable(
     {
         return Err(io::Error::other(format!("{unresolved}; availability is unknown")));
     }
-    Ok(LookupExecutableResponse { path })
+    Ok(LookupExecutableResponse { path, matches: None })
+}
+
+async fn lookup_all(
+    filesystem: &dyn ExecutorFileSystem,
+    params: &LookupExecutableParams,
+    plan: LookupPlan,
+) -> io::Result<LookupExecutableResponse> {
+    use codex_file_system::{FileSystemLookup, FileSystemLookupResult};
+
+    let unknown = |error: &str| io::Error::other(format!("{error}; executable census is incomplete"));
+    if let Some(error) = plan.incomplete {
+        return Err(unknown(&error));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut candidate_bytes = 0usize;
+    let mut requests = Vec::new();
+    for path in plan.candidates {
+        if seen.insert(path.clone()) {
+            candidate_bytes += path.as_str().len();
+            if candidate_bytes > 4 * 1024 * 1024 {
+                return Err(unknown("candidate paths exceed 4 MiB"));
+            }
+            requests.push(FileSystemLookup::FirstRegularFile {
+                candidates: vec![path],
+            });
+        }
+    }
+    let mut matches = Vec::new();
+    let mut match_bytes = 0usize;
+    for batch in requests.chunks(32) {
+        let observed = filesystem
+            .lookup_batch(batch, params.sandbox.as_ref())
+            .await
+            .map_err(|error| unknown(&error.to_string()))?;
+        if observed.len() != batch.len() {
+            return Err(unknown("lookup batch result count mismatch"));
+        }
+        for outcome in observed {
+            match outcome {
+                FileSystemLookupResult::Resolved { path } => {
+                    match_bytes += path.as_str().len();
+                    if matches.len() == 64 || match_bytes > 32 * 1024 {
+                        return Err(unknown("matches exceed the 64 path / 32 KiB result bound"));
+                    }
+                    matches.push(path);
+                }
+                FileSystemLookupResult::Missing => {}
+                FileSystemLookupResult::Inaccessible { error }
+                | FileSystemLookupResult::Unsupported { error }
+                | FileSystemLookupResult::Invalid { error }
+                | FileSystemLookupResult::Unknown { error } => return Err(unknown(&error)),
+            }
+        }
+    }
+    Ok(LookupExecutableResponse {
+        path: matches.first().cloned(),
+        matches: Some(matches),
+    })
 }
 
 pub(crate) async fn lookup_executables(
@@ -161,7 +222,7 @@ pub(crate) async fn lookup_executables(
     let mut probes_left = 16_384usize;
     let mut bytes_left = 4 * 1024 * 1024usize;
     for name in &params.names {
-        let lookup = LookupExecutableParams { name: name.clone(), cwd: params.cwd.clone(), sandbox: None };
+        let lookup = LookupExecutableParams { name: name.clone(), all_matches: false, cwd: params.cwd.clone(), sandbox: None };
         match prepare_lookup(&lookup, MAX_CANDIDATES.min(probes_left)) {
             Err(error) => results.push(FileSystemLookupResult::from_result(Err(error))),
             Ok(mut plan) => {

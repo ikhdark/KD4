@@ -192,6 +192,7 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
             // bare executable to CreateProcess would also search an untrusted cwd.
             let lookup = codex_exec_server::LookupExecutableParams {
                 name: "rg".into(),
+                all_matches: false,
                 cwd: environment.cwd().clone(),
                 sandbox: Some(
                     invocation

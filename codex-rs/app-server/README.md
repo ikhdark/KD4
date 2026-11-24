@@ -41,6 +41,14 @@ and the expected answer item before using it. Missing or ambiguous history
 is not a successful lookup; keep the ordinary turn path available for work
 that actually requires inference. This does not route free-form chat input.
 
+When two independent branches are authorized to inherit the same completed
+parent history, use [`thread/fork`](../app-server-protocol-types/src/protocol/v2/thread.rs)
+on the original parent for each child instead of replaying the same seed turn
+in separate parents. Keep each child's turns on its own thread. This avoids
+duplicate inference for the seed; it does not share a provider response ID
+between siblings or guarantee provider prompt-cache hits. Start independent
+roots when the histories or authority differ.
+
 When the caller has authorized creating an exact command working directory,
 prefer `fs/createDirectory` (use `recursive: true` only when authorized to create
 its parents) over a shell preflight. Use an absolute path and require successful

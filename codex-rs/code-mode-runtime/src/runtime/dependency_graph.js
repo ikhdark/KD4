@@ -2,6 +2,7 @@
 // resource admission remain owned by the normal nested-tool runtime.
 (() => {
 const observeGraph = globalThis.__codex_graph_observation;
+const originalResolveTool = globalThis.resolve_tool;
 delete globalThis.__codex_graph_observation;
 Object.defineProperty(globalThis, "run_graph", {
   value: async function run_graph(nodes, { concurrency = 4, targets } = {}) {
@@ -135,14 +136,26 @@ Object.defineProperty(globalThis, "run_graph", {
       });
     }
     for (const [id, node] of graph) {
-      if (node.deps.some((dep) => dep === id || !graph.has(dep))) {
-        throw new TypeError(`missing or self dependency for ${id}`);
+      const dependency = node.deps.find((dep) => dep === id || !graph.has(dep));
+      if (dependency !== undefined) {
+        const error = new TypeError(`missing or self dependency for ${id}`);
+        error.graph_conflict = {
+          kind: dependency === id ? "self_dependency" : "missing_dependency",
+          node_id: id,
+          dependency_id: dependency,
+        };
+        throw error;
       }
     }
     const visited = new Set();
     const visiting = new Set();
     function visit(id) {
-      if (visiting.has(id)) throw new TypeError(`dependency cycle at ${id}`);
+      if (visiting.has(id)) {
+        const path = [...visiting];
+        const error = new TypeError(`dependency cycle at ${id}`);
+        error.graph_conflict = { kind: "dependency_cycle", cycle: [...path.slice(path.indexOf(id)), id] };
+        throw error;
+      }
       if (visited.has(id)) return;
       visiting.add(id);
       for (const dep of graph.get(id).deps) visit(dep);
@@ -177,14 +190,24 @@ Object.defineProperty(globalThis, "run_graph", {
       diagnosticBytes = 2; // The JSON array's brackets.
     // Snapshot once when a selected requirement needs it. Compute-only graphs
     // need no catalog; later invocations still observe the current catalog.
-    let capabilities;
+    let capabilities, missingNames;
     for (const id of selected) {
       for (const name of graph.get(id).requires) {
         capabilities ??= new Set(ALL_TOOL_NAMES);
         if (capabilities.has(name)) continue;
         // Discovery uses presentation names; retained canonical aliases use
         // exactly the same admitted, ambiguity-aware resolver as dispatch.
-        if (typeof globalThis.resolve_tool === "function" &&
+        const binding = Object.getOwnPropertyDescriptor(globalThis, "resolve_tool");
+        if (binding && Object.hasOwn(binding, "value") && binding.value === originalResolveTool &&
+            typeof originalResolveTool === "function") {
+          if (!missingNames?.has(name)) {
+            if (originalResolveTool(name) !== undefined) {
+              capabilities.add(name);
+              continue;
+            }
+            (missingNames ??= new Set()).add(name);
+          }
+        } else if (typeof globalThis.resolve_tool === "function" &&
             globalThis.resolve_tool(name) !== undefined) {
           capabilities.add(name);
           continue;
@@ -247,7 +270,12 @@ Object.defineProperty(globalThis, "run_graph", {
     const running = new Set();
     let remaining = selected.size,
       wake;
+    let hasNonfulfillment = false;
     function settled(id) {
+      // Ready nodes have only settled dependencies. Check individual statuses
+      // only after a dependency could have settled without fulfilling.
+      if (!hasNonfulfillment && results[id]?.status !== "fulfilled")
+        hasNonfulfillment = true;
       --remaining;
       for (const consumer of consumers.get(id)) {
         const count = remainingDeps.get(consumer) - 1;
@@ -339,7 +367,7 @@ Object.defineProperty(globalThis, "run_graph", {
         (a, b) => priority.get(a) - priority.get(b),
       )) {
         const node = graph.get(id);
-        if (node.deps.some((dep) => results[dep].status !== "fulfilled")) {
+        if (hasNonfulfillment && node.deps.some((dep) => results[dep].status !== "fulfilled")) {
           results[id] = {
             status: "skipped",
             reason: "dependency failed",

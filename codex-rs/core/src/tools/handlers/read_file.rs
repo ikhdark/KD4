@@ -529,7 +529,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             "if":{"required":["read_mode"], "properties":{"read_mode":{"const":"byte_ranges"}}},
             "then":{"required":["file_bytes","file_revision","retained_bytes","retained_artifact_complete"]},
             "else":{"if":{"required":["read_mode"], "properties":{"read_mode":{"const":"unsupported_text"}}},
-                "then":{"required":["file_bytes","classification","binary_recovery","retained_bytes","retained_artifact_complete"]},
+                "then":{"required":["file_bytes","classification","retained_bytes","retained_artifact_complete"],
+                    "anyOf":[{"required":["binary_recovery"]},{"required":["artifact_id","source_sha256","canonical_bytes"],
+                        "properties":{"artifact_id":{"type":"string"},"retained_artifact_complete":{"const":true}}}]},
                 "else":{"required":["source_sha256","canonical_bytes","total_lines"]}}
         }]);
         #[expect(
@@ -543,7 +545,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
             description: format!(
-                "Read a file without shell quoting. Unsupported display text is withheld before selection: read_mode:unsupported_text returns file_bytes, classification (kind/confidence/reason, not proof of binary), and bounded 256-byte hex/base64 binary_recovery recipes. Invalid UTF-8 alone is unknown encoding, not proven binary; BOM-marked UTF-16 is decoded before control-character classification. Original-byte pages encode unsupported text as data_base64 with per-result classification applying only to that range. UTF-8 and BOM-marked UTF-16LE/BE text snapshots are limited to {MAX_FILE_MIB} MiB for both original and decoded bytes. UTF-16 is strictly decoded to UTF-8 without the BOM; source_encoding names the original encoding, source_sha256 hashes original bytes including the BOM, and canonical_sha256/canonical_bytes identify the retained decoded UTF-8 snapshot. All snapshot selectors (including bytes, search offsets, lines and structure), canonical_range and read_tool_output recovery address that decoded UTF-8 snapshot, not UTF-16 bytes or code units. Use encoding:hex|base64 for original-byte offsets. UTF-16 decoded acquisition does not grant original-byte source_inspection evidence or authorize codex-range edits. Git revision reads remain UTF-8 only. Larger current filesystem files support bytes-only selectors via bounded seek reads (up to 64 KiB per script page), including binary or split UTF-8 via data_base64. These return read_mode:byte_ranges, file_bytes and file_revision, never a whole-file source_sha256, line count or retained snapshot; file_complete and retained_artifact_complete stay false. Use range_recovery.arguments with read_file, or pass if_file_revision plus byte selectors for other pages. Changed identity/metadata refuses the page; this is not an immutable snapshot. Line/search/structural selectors, host locators and Git revision reads retain the snapshot limit. Symbol, enclosing and search with enclosing:true support Rust (.rs) and Python (.py). Section outline/item IDs also support Markdown (.md, .markdown): headings have source-bound IDs, levels, parent IDs and exact byte ranges; sections include descendants until the next equal/shallower heading. Duplicate titles are distinct; fenced code is ignored and Setext headings are recognized. For other languages, use fixed-string search without enclosing or explicit line ranges; unsupported structural requests are rejected. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Omit revision for current contents; revision reads resolve immutable Git objects and reuse the same selectors and snapshots. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills.\n\nFor raw binary inspection of any current file size, set encoding:hex or encoding:base64 with explicit zero-based half-open bytes selectors. This always uses the same bounded revision-guarded range backend, returning data_hex or data_base64 and exact canonical_range offsets, never decoded text. At most 64 KiB of raw bytes per script call; direct pages may be smaller to fit delivery. Compatible byte ranges are merged before I/O within each revision-bound delivery group, then sliced and encoded at original selector boundaries. Live results retain selector_index (including duplicates); merging grants no extra coverage or revision guarantee. No execution, decompression, format detection or implicit decoding. range_recovery preserves encoding; use it with read_file, not read_tool_output.\n\n{}",
+                "Read a file without shell quoting. Unsupported display text is withheld before selection: read_mode:unsupported_text returns file_bytes and classification (kind/confidence/reason, not proof of binary). A small likely-binary file may have a complete immutable artifact_id and canonical_bytes for read_tool_output byte recovery; otherwise use the bounded 256-byte hex/base64 binary_recovery recipes. Invalid UTF-8 alone is unknown encoding, not proven binary; BOM-marked UTF-16 is decoded before control-character classification. Original-byte pages encode unsupported text as data_base64 with per-result classification applying only to that range. UTF-8 and BOM-marked UTF-16LE/BE text snapshots are limited to {MAX_FILE_MIB} MiB for both original and decoded bytes. UTF-16 is strictly decoded to UTF-8 without the BOM; source_encoding names the original encoding, source_sha256 hashes original bytes including the BOM, and canonical_sha256/canonical_bytes identify the retained decoded UTF-8 snapshot. All snapshot selectors (including bytes, search offsets, lines and structure), canonical_range and read_tool_output recovery address that decoded UTF-8 snapshot, not UTF-16 bytes or code units. Use encoding:hex|base64 for original-byte offsets. UTF-16 decoded acquisition does not grant original-byte source_inspection evidence or authorize codex-range edits. Git revision reads remain UTF-8 only. Larger current filesystem files support bytes-only selectors via bounded seek reads (up to 64 KiB per script page), including binary or split UTF-8 via data_base64. These return read_mode:byte_ranges, file_bytes and file_revision, never a whole-file source_sha256, line count or retained snapshot; file_complete and retained_artifact_complete stay false. Use range_recovery.arguments with read_file, or pass if_file_revision plus byte selectors for other pages. Changed identity/metadata refuses the page; this is not an immutable snapshot. Line/search/structural selectors, host locators and Git revision reads retain the snapshot limit. Symbol, enclosing and search with enclosing:true support Rust (.rs) and Python (.py). Section outline/item IDs also support Markdown (.md, .markdown): headings have source-bound IDs, levels, parent IDs and exact byte ranges; sections include descendants until the next equal/shallower heading. Duplicate titles are distinct; fenced code is ignored and Setext headings are recognized. For other languages, use fixed-string search without enclosing or explicit line ranges; unsupported structural requests are rejected. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Omit revision for current contents; revision reads resolve immutable Git objects and reuse the same selectors and snapshots. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills.\n\nFor raw binary inspection of any current file size, set encoding:hex or encoding:base64 with explicit zero-based half-open bytes selectors. This always uses the same bounded revision-guarded range backend, returning data_hex or data_base64 and exact canonical_range offsets, never decoded text. At most 64 KiB of raw bytes per script call; direct pages may be smaller to fit delivery. Compatible byte ranges are merged before I/O within each revision-bound delivery group, then sliced and encoded at original selector boundaries. Live results retain selector_index (including duplicates); merging grants no extra coverage or revision guarantee. No execution, decompression, format detection or implicit decoding. range_recovery preserves encoding; use it with read_file, not read_tool_output.\n\n{}",
                 include_str!("../../../templates/result_binding_checkpoint.md").trim(),
             ),
             strict: false,
@@ -1564,7 +1566,7 @@ enum EnvironmentFileRead {
     Ranges(JsonToolOutput),
 }
 
-fn unsupported_text_output(
+async fn unsupported_text_output(
     invocation: &ToolInvocation,
     path: &codex_utils_path_uri::PathUri,
     environment_id: &str,
@@ -1572,6 +1574,7 @@ fn unsupported_text_output(
     inspected_bytes: usize,
     revision: Option<&str>,
     classification: encoding::Classification,
+    snapshot: Option<Vec<u8>>,
 ) -> Result<EnvironmentFileRead, FunctionCallError> {
     let options = ranges::binary_recovery(path, environment_id, 0, file_bytes, revision);
     let mut output = json!({
@@ -1587,9 +1590,29 @@ fn unsupported_text_output(
     if let Some(revision) = revision {
         output["file_revision"] = json!(revision);
     }
-    let result = JsonToolOutput::with_success(output.clone(), Some(false))
+    let mut model = output.clone();
+    if let Some(bytes) = snapshot
+        && !invocation.cancellation_token.is_cancelled()
+    {
+        let canonical = std::sync::Arc::new(codex_tools::CanonicalToolResult::bytes(bytes));
+        let backing = invocation.session.source_snapshot_backing(canonical.exact_bytes, &canonical.sha256).await;
+        let artifact = invocation.session.create_source_snapshot_artifact(
+            invocation.call_id.clone(), std::sync::Arc::clone(&canonical), backing,
+        ).await;
+        if artifact.complete && let Some(id) = artifact.artifact_id() {
+            output["artifact_id"] = json!(id);
+            output["source_sha256"] = json!(canonical.sha256);
+            output["canonical_bytes"] = json!(canonical.exact_bytes);
+            output["retained_bytes"] = json!(canonical.exact_bytes);
+            output["retained_artifact_complete"] = json!(true);
+            output["delivery_note"] = json!("Binary bytes withheld. Use read_tool_output with this artifact_id and a bytes selector to recover the immutable original.");
+            model = codex_code_mode::model_visible_tool_result(&ToolName::plain("read_file"), &output)
+                .unwrap_or_else(|| output.clone());
+        }
+    }
+    let result = JsonToolOutput::with_success(output, Some(false))
         .with_code_mode_failure_as_data()
-        .with_model_value(output);
+        .with_model_value(model);
     crate::tools::context::ensure_exact_model_delivery(&result, invocation)?;
     Ok(EnvironmentFileRead::Ranges(result))
 }
@@ -1808,7 +1831,7 @@ async fn read_environment_file(
                                 "file exceeds the 8 MiB text snapshot limit; readable prefix does not establish whole-file encoding or format".into(), None,
                             ));
                         return unsupported_text_output(invocation, &path, &environment.environment_id,
-                            prefix.file_bytes, prefix.bytes.len(), Some(&prefix.revision), classification);
+                            prefix.file_bytes, prefix.bytes.len(), Some(&prefix.revision), classification, None).await;
                     }
                     return ranges::read_ranges(invocation, args, fs.as_ref(), &path, &sandbox,
                         &environment.environment_id).await.map(EnvironmentFileRead::Ranges);
@@ -1829,9 +1852,10 @@ async fn read_environment_file(
     let file_bytes = contents.len();
     let (contents, decoded) = match encoding::decode(contents, MAX_FILE_BYTES).await? {
         encoding::DecodedFile::Text(contents, decoded) => (contents, decoded),
-        encoding::DecodedFile::Unsupported(classification) => {
+        encoding::DecodedFile::Unsupported(classification, snapshot) => {
+            let snapshot = snapshot.filter(|_| args.selectors.is_none() && source_inspection.is_none());
             return unsupported_text_output(invocation, &path, &environment.environment_id,
-                file_bytes as u64, file_bytes, None, classification);
+                file_bytes as u64, file_bytes, None, classification, snapshot).await;
         }
     };
     if decoded.is_some() && source_inspection.take().is_some() {

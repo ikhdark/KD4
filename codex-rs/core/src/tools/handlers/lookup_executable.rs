@@ -25,6 +25,8 @@ pub(crate) struct LookupExecutableHandler;
 struct Arguments {
     name: Option<String>,
     names: Option<Vec<String>>,
+    #[serde(default)]
+    all_matches: bool,
     environment_id: Option<String>,
 }
 
@@ -40,12 +42,13 @@ impl ToolExecutor<ToolInvocation> for LookupExecutableHandler {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name: "lookup_executable".into(),
-            description: "Resolve a literal executable name/path (`name`) or 1-32 independent names/paths (`names`, mutually exclusive) using the selected Windows execution environment's PATH and PATHEXT, without starting a shell or launching the result. Bare names search PATH directories in order, then PATHEXT suffixes in order. A PATHEXT extension is checked as-is; another dotted name (python3.12) is checked as-is first, then with each PATHEXT suffix. The current directory is searched only when a PATH entry names it (for example `.`) or the name is a path; empty PATH entries are ignored. Relative paths and PATH entries use the selected environment cwd. Missing PATHEXT defaults to .COM;.EXE;.BAT;.CMD; empty PATHEXT stays empty. Uses the executor process environment, not shell profiles, aliases, functions or command-specific env overrides. Reads go through the selected environment's filesystem; inaccessible candidates, unresolvable (for example drive-relative) PATH entries, unsupported remote peers and probe-limit failures are errors, not proof of absence. Returns the first matching regular file or found:false. Availability at lookup time does not establish trust, launch permission, successful execution, or future availability. No permission or validation policy is changed.".into(),
+            description: "Resolve a literal executable name/path (`name`) or 1-32 independent names/paths (`names`, mutually exclusive) using the selected Windows execution environment's PATH and PATHEXT, without starting a shell or launching the result. Bare names search PATH directories in order, then PATHEXT suffixes in order. A PATHEXT extension is checked as-is; another dotted name (python3.12) is checked as-is first, then with each PATHEXT suffix. The current directory is searched only when a PATH entry names it (for example `.`) or the name is a path; empty PATH entries are ignored. Relative paths and PATH entries use the selected environment cwd. Missing PATHEXT defaults to .COM;.EXE;.BAT;.CMD; empty PATHEXT stays empty. Uses the executor process environment, not shell profiles, aliases, functions or command-specific env overrides. Reads go through the selected environment's filesystem; inaccessible candidates, unresolvable (for example drive-relative) PATH entries, unsupported remote peers and probe-limit failures are errors, not proof of absence. Returns the first matching regular file or found:false. Set all_matches:true with a single name for the full ordered path census and a shadowed flag. Availability at lookup time does not establish trust, launch permission, successful execution, or future availability. No permission or validation policy is changed.".into(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
                 ("name".into(), JsonSchema::string(Some("Single literal filename or absolute/cwd-relative path, 1-4096 UTF-8 bytes; mutually exclusive with names.".into()))),
                 ("names".into(), JsonSchema { min_items: Some(1), max_items: Some(32), ..JsonSchema::array(JsonSchema::string(None), Some("1-32 literal executable names/paths. Ordered independent results, including invalid or duplicate names; mutually exclusive with name. Missing is distinct from inaccessible/unknown. At most 16384 candidate probes and 4 MiB of candidate paths per batch; exhausted lookups are unknown, not missing.".into())) }),
+                ("all_matches".into(), JsonSchema::boolean(Some("With name only, return all distinct matching path strings in first-match order. Incomplete/unsupported census is an error, never an empty result. Different paths may reference the same underlying image.".into()))),
                 ("environment_id".into(), JsonSchema::string(Some("Omit to use the primary execution environment; never falls back to the host.".into()))),
             ]), None, Some(false.into())),
             output_schema: Some(json!({
@@ -53,6 +56,7 @@ impl ToolExecutor<ToolInvocation> for LookupExecutableHandler {
                 "type":"object", "additionalProperties":false,
                 "properties":{
                     "name":{"type":"string"}, "environment_id":{"type":"string"},
+                    "matches":{"type":"array","items":{"type":"string"}}, "shadowed":{"type":"boolean"},
                     "cwd":{"type":"string"}, "found":{"type":"boolean"},
                     "path":{"type":["string","null"]}, "availability_only":{"type":"boolean","const":true}
                 },
@@ -85,6 +89,7 @@ impl ToolExecutor<ToolInvocation> for LookupExecutableHandler {
             };
             let args: Arguments = parse_arguments(arguments)?;
             if args.name.is_some() == args.names.is_some()
+                || (args.all_matches && args.name.is_none())
                 || args.names.as_ref().is_some_and(|names| names.is_empty() || names.len() > 32)
             {
                 return Err(FunctionCallError::RespondToModel("provide name or names (1-32 entries), exclusively".into()));
@@ -133,6 +138,7 @@ impl ToolExecutor<ToolInvocation> for LookupExecutableHandler {
             let name = args.name.expect("exclusive name validated above");
             let params = LookupExecutableParams {
                 name: name.clone(),
+                all_matches: args.all_matches,
                 cwd: environment.cwd().clone(),
                 sandbox: Some(
                     invocation
@@ -146,11 +152,19 @@ impl ToolExecutor<ToolInvocation> for LookupExecutableHandler {
                 _ = invocation.cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("executable lookup cancelled".into())),
                 result = environment.environment.lookup_executable(params) => result.map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?,
             };
-            let output = JsonToolOutput::new(json!({
+            let mut result = json!({
                 "name":name, "environment_id":environment.environment_id,
                 "cwd":environment.cwd().inferred_native_path_string(), "found":response.path.is_some(),
                 "path":response.path.map(|path| path.inferred_native_path_string()), "availability_only":true,
-            }));
+            });
+            if args.all_matches {
+                let paths = response.matches.ok_or_else(|| FunctionCallError::RespondToModel(
+                    "selected executor did not report an all-match census".into()
+                ))?;
+                result["shadowed"] = json!(paths.len() > 1);
+                result["matches"] = json!(paths.into_iter().map(|path| path.inferred_native_path_string()).collect::<Vec<_>>());
+            }
+            let output = JsonToolOutput::new(result);
             crate::tools::context::ensure_exact_model_delivery(&output, &invocation)?;
             Ok(boxed_tool_output(output))
         };

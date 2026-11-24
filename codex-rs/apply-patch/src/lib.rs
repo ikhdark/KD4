@@ -3,6 +3,7 @@ mod invocation;
 mod json_edit;
 mod manifest;
 mod parser;
+mod placeholder;
 mod provenance;
 mod seek_sequence;
 mod source_hash;
@@ -699,6 +700,7 @@ async fn apply_hunks_with_verified_action(
                 let _ = write!(stderr, "{error}\n{}", delta.failure_summary());
                 return Err(ApplyPatchFailure::new(ApplyPatchError::from(error), delta));
             }
+            placeholder::advise(&delta, stdout);
             Ok(delta)
         }
         Err(error) => {
@@ -1707,7 +1709,8 @@ fn ensure_rebased_updates_keep_their_sites(
 /// line followed by its old lines, `source` does not contain exactly once at
 /// any match tier. Revision-bound edits are checked by their whole-file hash.
 fn chunk_without_unique_site(source: &str, chunks: &[UpdateFileChunk]) -> Option<usize> {
-    let lines = PreparedSource::new(source).logical_lines;
+    let source = PreparedSource::new(source);
+    let (lines, _) = source.line_view(chunks);
     chunks
         .iter()
         .position(|chunk| {
@@ -2029,11 +2032,33 @@ struct PreparedSource<'a> {
 impl<'a> PreparedSource<'a> {
     fn new(contents: &'a str) -> Self {
         let physical_lines = contents.split_inclusive('\n').map(String::from).collect::<Vec<_>>();
-        let logical_lines = physical_lines.iter().map(|line| line.strip_suffix("\r\n")
-            .or_else(|| line.strip_suffix('\n')).unwrap_or(line).to_string()).collect();
+        let logical_lines = physical_lines.iter().enumerate().map(|(index, line)| {
+            let line = if index == 0 { line.strip_prefix('\u{feff}').unwrap_or(line) } else { line };
+            line.strip_suffix("\r\n").or_else(|| line.strip_suffix('\n')).unwrap_or(line).to_string()
+        }).collect();
         let newline = if physical_lines.iter().find(|line| line.ends_with('\n'))
             .is_some_and(|line| line.ends_with("\r\n")) { "\r\n" } else { "\n" };
         Self { contents, physical_lines, logical_lines, newline, hash: std::cell::OnceCell::new() }
+    }
+
+    /// A BOM is outside the logical first line unless it is explicitly edited.
+    fn line_view(&self, chunks: &[UpdateFileChunk]) -> (std::borrow::Cow<'_, [String]>, bool) {
+        use std::borrow::Cow;
+
+        if !self.contents.starts_with('\u{feff}') {
+            return (Cow::Borrowed(&self.logical_lines), false);
+        }
+        let explicit = chunks.iter().any(|chunk| {
+            chunk.change_context.iter().chain(&chunk.old_lines).chain(&chunk.new_lines)
+                .any(|line| line.starts_with('\u{feff}'))
+        });
+        if explicit {
+            let mut lines = self.logical_lines.clone();
+            lines[0].insert(0, '\u{feff}');
+            (Cow::Owned(lines), false)
+        } else {
+            (Cow::Borrowed(&self.logical_lines), true)
+        }
     }
 }
 
@@ -2076,11 +2101,11 @@ fn new_contents_from_prepared(
 
     // Match logical lines, but keep the original physical lines for untouched
     // regions so updates do not normalize their line endings.
-    let newline = source.newline;
+    let (logical_lines, preserve_bom) = source.line_view(chunks);
 
     let path_text = path.inferred_native_path_string();
-    let mut replacements = compute_replacements_with_hash(
-        &source.logical_lines,
+    let replacements = compute_replacements_with_hash(
+        &logical_lines,
         original_contents,
         path,
         &path_text,
@@ -2088,28 +2113,11 @@ fn new_contents_from_prepared(
         chunks,
         &source.hash,
     )?;
-    for (_, _, lines) in &mut replacements {
-        for line in lines {
-            line.push_str(newline);
-        }
-    }
-    let mut new_lines = apply_replacements(source.physical_lines.clone(), &replacements);
-    let last_index = new_lines.len().saturating_sub(1);
-    for (index, line) in new_lines.iter_mut().enumerate() {
-        if index < last_index && !line.ends_with('\n') {
-            // Appending after an unterminated last line needs a separator.
-            line.push_str(newline);
-        }
-    }
-    if !original_contents.is_empty()
-        && !original_contents.ends_with('\n')
-        && let Some(last) = new_lines.last_mut()
-        && last.ends_with('\n')
-    {
-        let ending_len = if last.ends_with("\r\n") { 2 } else { 1 };
-        last.truncate(last.len() - ending_len);
-    }
-    Ok(new_lines.concat())
+    Ok(materialize_line_edits(
+        source,
+        preserve_bom,
+        replacements.iter().map(|(start, old_len, lines)| (*start, *old_len, lines.as_slice())),
+    ))
 }
 
 fn chunk_edit_operations(chunk: &UpdateFileChunk, pattern: &[String]) -> Result<Vec<similar::DiffOp>, ApplyPatchError> {
@@ -2775,10 +2783,27 @@ impl<'a> ChunkMatcher<'a> {
         ambiguity: &Ambiguity<'a>,
     ) -> std::result::Result<ChunkFlow, ApplyPatchError> {
         let candidates = self.candidate_starts(ambiguity);
+        let chunk = &self.chunks[chunk_index];
         if candidates.len() > DISAMBIGUATION_CANDIDATE_LIMIT {
+            // A repeated anchor alone may exceed the trial budget even though
+            // the anchor and its contiguous preimage identify exactly one site.
+            // Rule out even normalized alternatives before accepting an exact site.
+            if ambiguity.context && !chunk.old_lines.is_empty() {
+                let pattern = ambiguity.pattern.iter().chain(&chunk.old_lines).cloned().collect::<Vec<_>>();
+                let lines = &self.original_lines[ambiguity.start..];
+                let sites = seek_sequence::candidate_starts_at_any_tier(lines, &pattern, 2);
+                if let [offset] = sites.as_slice()
+                    && lines[*offset..*offset + pattern.len()] == pattern
+                {
+                    let anchor = ambiguity.start + offset;
+                    if !chunk.is_end_of_file || anchor + pattern.len() == self.original_lines.len() {
+                        self.place(chunk_index, ChunkSite { anchor: Some(anchor), start: anchor + 1 }, cursor, false)?;
+                        return Ok(ChunkFlow::Next);
+                    }
+                }
+            }
             return Err(self.ambiguous_error(chunk_index, ambiguity, &candidates, None));
         }
-        let chunk = &self.chunks[chunk_index];
         let mut placed = Vec::new();
         // Removed lines must match exact bytes, but that exactness never
         // chooses a location: a candidate that rejects this chunk's own edit
@@ -2855,12 +2880,10 @@ impl<'a> ChunkMatcher<'a> {
 
     /// The lines a trial writes, where a kept source line (with its own line
     /// ending) never equals a patched line, so equal outputs are equal bytes.
-    fn trial_output<'t>(&'t self, trial: &'t ChunkCursor) -> Option<Vec<(bool, &'t str)>> {
-        let mut output = self
-            .original_contents
-            .split_inclusive('\n')
-            .map(|line| (false, line))
-            .collect::<Vec<_>>();
+    fn trial_output<'t>(&'t self, trial: &'t ChunkCursor) -> Option<Vec<(bool, &'t str, &'static str)>> {
+        let physical = self.original_contents.split_inclusive('\n').collect::<Vec<_>>();
+        let newline = physical.iter().find_map(|line| line_ending(line)).unwrap_or("\n");
+        let mut output = physical.iter().map(|&line| (false, line, "")).collect::<Vec<_>>();
         if output.len() != self.original_lines.len() {
             return None;
         }
@@ -2870,7 +2893,10 @@ impl<'a> ChunkMatcher<'a> {
                 replacement
                     .new_lines
                     .iter()
-                    .map(|line| (true, line.as_str())),
+                    .enumerate()
+                    .map(|(index, line)| (true, line.as_str(), replacement_newline(
+                        &physical, newline, replacement.start, replacement.old_len, index,
+                    ))),
             );
         }
         Some(output)
@@ -3010,12 +3036,25 @@ impl<'a> ChunkMatcher<'a> {
         let lines = self.original_lines;
         let path = self.path;
         let expected = bounded_expected_lines(chunk.old_lines.iter().map(String::as_str));
+        let anchor = chunk.change_context.as_ref();
+        let new_end = position.saturating_add(chunk.new_lines.len());
+        let postimage_present = !chunk.new_lines.is_empty()
+            && chunk.old_lines != chunk.new_lines
+            && anchor == lines.get(position - 1)
+            && lines.get(position..new_end) == Some(chunk.new_lines.as_slice())
+            && (!chunk.is_end_of_file || new_end == lines.len())
+            && lines.iter().filter(|line| Some(*line) == anchor).take(2).count() == 1;
+        let guidance = if postimage_present {
+            "The exact replacement already follows this unique anchor. No edit is needed at this site unless a different result was intended."
+        } else {
+            "Include intervening source as context or use a current codex-range:"
+        };
         located_patch_mismatch(
             self.source(),
             chunk_index + 1,
             PatchContextMismatchKind::ExpectedLinesNotFound,
             format!(
-                "Expected lines must immediately follow the textual anchor in {path} at line {position}; no later sibling was searched. Include intervening source as context or use a current codex-range:\n{expected}"
+                "Expected lines must immediately follow the textual anchor in {path} at line {position}; no later sibling was searched. {guidance}\n{expected}"
             ),
             bounded_source_excerpt(
                 lines,
@@ -3646,22 +3685,73 @@ fn bounded_source_excerpt(
     (!rendered.is_empty()).then(|| (excerpt_start + 1, rendered_end, rendered))
 }
 
-/// Apply the `(start_index, old_len, new_lines)` replacements to `original_lines`,
-/// returning the modified file contents as a vector of lines.
-fn apply_replacements(
-    mut lines: Vec<String>,
-    replacements: &[(usize, usize, Vec<String>)],
-) -> Vec<String> {
-    // We must apply replacements in descending order so that earlier replacements
-    // don't shift the positions of later ones.
-    for (start_idx, old_len, new_segment) in replacements.iter().rev() {
-        let start_idx = *start_idx;
-        let old_len = *old_len;
+fn line_ending(line: &str) -> Option<&'static str> {
+    if line.ends_with("\r\n") { Some("\r\n") }
+    else if line.ends_with('\n') { Some("\n") }
+    else { None }
+}
 
-        lines.splice(start_idx..start_idx + old_len, new_segment.iter().cloned());
+fn replacement_newline(
+    lines: &[impl AsRef<str>], fallback: &'static str, start: usize, old_len: usize, index: usize,
+) -> &'static str {
+    let donor = if old_len > 0 {
+        Some(start + index.min(old_len - 1))
+    } else if start < lines.len() {
+        Some(start)
+    } else {
+        start.checked_sub(1)
+    };
+    donor.and_then(|index| line_ending(lines[index].as_ref())).unwrap_or(fallback)
+}
+
+/// Emit in original coordinates without moving or cloning unchanged suffixes.
+fn materialize_line_edits<'a>(
+    source: &PreparedSource<'_>,
+    preserve_bom: bool,
+    replacements: impl Iterator<Item = (usize, usize, &'a [String])>,
+) -> String {
+    let original = source.contents;
+    let physical = &source.physical_lines;
+    let mut result = String::with_capacity(original.len());
+    if preserve_bom {
+        result.push('\u{feff}');
     }
-
-    lines
+    let mut previous_line = false;
+    let mut append = |line: &str, ending: &str| {
+        if previous_line && !result.ends_with('\n') {
+            result.push_str(source.newline);
+        }
+        result.push_str(line);
+        result.push_str(ending);
+        previous_line = true;
+    };
+    let kept = |index: usize| {
+        let line = physical[index].as_str();
+        if index == 0 && preserve_bom {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        } else {
+            line
+        }
+    };
+    let mut cursor = 0;
+    for (start, old_len, lines) in replacements {
+        for index in cursor..start {
+            append(kept(index), "");
+        }
+        for (index, line) in lines.iter().enumerate() {
+            append(line, replacement_newline(physical, source.newline, start, old_len, index));
+        }
+        cursor = start + old_len;
+    }
+    for index in cursor..physical.len() {
+        append(kept(index), "");
+    }
+    if !original.is_empty() && !original.ends_with('\n')
+        && let Some(ending) = line_ending(&result)
+    {
+        result.truncate(result.len() - ending.len());
+    }
+    result
 }
 
 /// Intended result of a file update for apply_patch.

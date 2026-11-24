@@ -2508,6 +2508,13 @@ impl UnifiedExecProcessManager {
                     kind: "windows_launch_length",
                 };
             }
+            #[cfg(windows)]
+            if let Some(refusal) = error.downcast_ref::<codex_utils_pty::pipe::PipeSpawnError>() {
+                return UnifiedExecError::CreateProcess {
+                    message: error.to_string(),
+                    refusal: Some(refusal.0.kind()),
+                };
+            }
             UnifiedExecError::create_process(error.to_string())
         })?;
         spawn_lifecycle.after_spawn();

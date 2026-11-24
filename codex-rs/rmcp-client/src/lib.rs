@@ -41,6 +41,7 @@ pub use rmcp_client::ListToolsWithConnectorIdResult;
 pub use rmcp_client::RmcpClient;
 pub use rmcp_client::SendElicitation;
 pub use rmcp_client::SendProgress;
+pub use rmcp_client::SendResourceChanged;
 pub use rmcp_client::SendToolListChanged;
 pub use rmcp_client::ToolWithConnectorId;
 pub use rmcp_client::is_timeout_error;

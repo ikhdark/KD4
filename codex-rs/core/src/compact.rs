@@ -647,6 +647,7 @@ async fn run_compact_task_inner_impl(
         omitted_image_count,
         omitted_user_text,
         omitted_text,
+        overflow_omissions,
     ) = build_bounded_input_history(&task_items, false);
     bound_compaction_tool_outputs(sess.as_ref(), &mut retained_history).await?;
     let omission_receipt_ids = new_omission_receipt_ids(&retained_history, history.raw_items());
@@ -678,6 +679,7 @@ async fn run_compact_task_inner_impl(
         task_items,
         &summary_items,
         omitted_text || omitted_image_count > 0,
+        overflow_omissions,
     );
     let mut generated_summary_recovery = None;
     // Read-only owner snapshot; summary generation never mutates requirement
@@ -1743,6 +1745,7 @@ pub(crate) struct TaskInputCheckpoint {
     pub(crate) retained_images: usize,
     pub(crate) omitted_images: usize,
     pub(crate) omitted_text: bool,
+    pub(crate) overflow_omissions: Vec<serde_json::Value>,
 }
 
 impl TaskInputCheckpoint {
@@ -1754,12 +1757,17 @@ impl TaskInputCheckpoint {
 pub(crate) async fn persist_task_compaction_text_recovery(
     sess: &Session,
     source_items: &[ResponseItem],
-    omitted_text: bool,
+    needs_source_recovery: bool,
+    overflow_omissions: Vec<serde_json::Value>,
 ) -> CodexResult<Option<String>> {
-    if !omitted_text {
+    if !needs_source_recovery {
         return Ok(None);
     }
-    let canonical = compaction_text_recovery_for_items(task_compaction_items(source_items));
+    let canonical = compaction_text_recovery_with_source(
+        task_compaction_items(source_items),
+        &[],
+        overflow_omissions,
+    );
     persist_compaction_recovery(sess, canonical).await.map(Some)
 }
 
@@ -1956,6 +1964,7 @@ fn local_compaction_source_recovery(
     task_items: Vec<ResponseItem>,
     summarized_items: &[ResponseItem],
     omitted_text: bool,
+    overflow_omissions: Vec<serde_json::Value>,
 ) -> Option<tokio::task::JoinHandle<CanonicalToolResult>> {
     let has_source = summarized_items.iter().any(|item| {
         (is_compaction_model_generated_item(item)
@@ -1969,18 +1978,15 @@ fn local_compaction_source_recovery(
         // Only pure serialization runs here: all durable writes remain awaited
         // by compaction before it may publish replacement history.
         tokio::task::spawn_blocking(move || {
-            compaction_text_recovery_with_source(task_items, &summarized_items)
+            compaction_text_recovery_with_source(task_items, &summarized_items, overflow_omissions)
         })
     })
-}
-
-fn compaction_text_recovery_for_items(items: Vec<ResponseItem>) -> CanonicalToolResult {
-    compaction_text_recovery_with_source(items, &[])
 }
 
 fn compaction_text_recovery_with_source(
     items: Vec<ResponseItem>,
     summarized_items: &[ResponseItem],
+    overflow_omissions: Vec<serde_json::Value>,
 ) -> CanonicalToolResult {
     let exact_items = items
         .into_iter()
@@ -2010,6 +2016,9 @@ fn compaction_text_recovery_with_source(
         value["summary_is_lossless"] = false.into();
         value["instruction"] = "Source archive, not an open-work checklist. Summary omission is not resolution. Recover missing decision-relevant text with read_tool_output under /summarized_items or /items; do not repeat producers or recover irrelevant history.".into();
     }
+    if !overflow_omissions.is_empty() {
+        value["omissions"] = overflow_omissions.into();
+    }
     CanonicalToolResult::json(value)
 }
 
@@ -2037,6 +2046,15 @@ fn compaction_text_recovery_sidecar(
         value["source_selector"] =
             serde_json::json!({"kind":"json_pointer", "pointer":"/summarized_items"});
         value["instruction"] = "Generated summary completeness is unverified; omission is not resolution. Exact consumed assistant/tool text survives under /summarized_items; task input under /items. Recover only missing decision-relevant details with read_tool_output, not producers or irrelevant history.".into();
+    }
+    if canonical
+        .value
+        .as_ref()
+        .is_some_and(|value| value.get("omissions").is_some())
+    {
+        value["omission_selector"] =
+            serde_json::json!({"kind":"json_pointer", "pointer":"/omissions"});
+        value["omission_instruction"] = "Metadata for overflowed inline receipts only. For a matching record, read its recovery_selector using its artifact_id, or this artifact if null. An aggregate receipt is not an item selector.".into();
     }
     serde_json::to_string(&value).ok()
 }

@@ -187,6 +187,28 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
             projected.insert("retained_artifact_complete".into(), Value::Bool(complete));
         }
         projected.shift_remove("output_complete");
+        // SGR color is presentation, not command evidence. Keep the original
+        // receipt and its exact recovery route whenever this display differs.
+        // In particular, an incomplete or still-writing artifact cannot back
+        // a lossy preview, so leave those results untouched.
+        if tool.name == "exec_command"
+            && object.get("retained_artifact_complete") == Some(&Value::Bool(true))
+            && object["output_reference"]["capture_complete"] == true
+            && object["output_reference"]["missing_bytes"] == 0
+            && let Some(id) = object.get("raw_output_artifact_id").filter(|value| value.is_string())
+            && let Some(output) = object.get("output").and_then(Value::as_str)
+            && let Some(normalized) = strip_command_sgr(output)
+        {
+            projected.insert("output".into(), Value::String(normalized));
+            projected.insert("output_display_normalized".into(), Value::String("ansi_sgr_only".into()));
+            projected.insert("raw_output_artifact_id".into(), id.clone());
+            if let Some(bytes) = object.get("raw_output_artifact_bytes") {
+                projected.insert("raw_output_artifact_bytes".into(), bytes.clone());
+            }
+            if let Some(reference) = object.get("output_reference") {
+                projected.insert("output_reference".into(), reference.clone());
+            }
+        }
     } else if tool.namespace.is_none()
         && matches!(tool.name.as_str(), "read_file" | "read_tool_output")
     {
@@ -203,6 +225,20 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         }
         if object.get("artifact_id") == Some(&Value::Null) {
             projected.shift_remove("artifact_id");
+        }
+        // Explicit live-file byte recipes remain available to scripts. Don't
+        // print both those and an exact immutable binary recovery route.
+        if tool.name == "read_file"
+            && raw["read_mode"] == "unsupported_text"
+            && raw["classification"]["kind"] == "likely_binary"
+            && raw["retained_artifact_complete"] == true
+            && raw["artifact_id"].is_string()
+            && raw["file_bytes"].as_u64().is_some_and(|size| {
+                raw["retained_bytes"].as_u64() == Some(size)
+                    && raw["canonical_bytes"].as_u64() == Some(size)
+            })
+        {
+            projected.shift_remove("binary_recovery");
         }
         // Native results retain source identity for history and scripts.
         // Presentation need not repeat an exactly reconstructible file URI.
@@ -466,6 +502,37 @@ pub fn printed_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
         }
     }
     Some(projected)
+}
+
+/// Remove only complete CSI SGR color sequences. Unknown controls and partial
+/// sequences are evidence, not formatting, and stay visible.
+fn strip_command_sgr(output: &str) -> Option<String> {
+    let bytes = output.as_bytes();
+    let mut normalized = String::new();
+    let mut last = 0;
+    let mut cursor = 0;
+    while cursor + 2 < bytes.len() {
+        if bytes[cursor] != 0x1b || bytes[cursor + 1] != b'[' {
+            cursor += 1;
+            continue;
+        }
+        let mut end = cursor + 2;
+        while end < bytes.len() && (bytes[end].is_ascii_digit() || matches!(bytes[end], b';' | b':')) {
+            end += 1;
+        }
+        if end < bytes.len() && bytes[end] == b'm' {
+            normalized.push_str(&output[last..cursor]);
+            last = end + 1;
+            cursor = last;
+        } else {
+            cursor += 1;
+        }
+    }
+    if last == 0 {
+        return None;
+    }
+    normalized.push_str(&output[last..]);
+    Some(normalized)
 }
 
 fn is_complete_read(tool: &ToolName, raw: &Value) -> bool {
@@ -808,9 +875,14 @@ impl RoutineSuccess {
                             "recovery_scope",
                         ],
                     );
-                    // A complete transcript in view leaves nothing to recover, and a printed
-                    // route invites reading the same bytes back. Scripts keep the native route.
-                    if raw["retained_output_complete"] == true && raw["retained_output"].is_string() {
+                    // A drained poll can have a complete script-only transcript
+                    // and an empty displayed chunk. Keep the native route unless
+                    // the displayed output already contains the exact transcript.
+                    if raw["retained_output_complete"] == true
+                        && raw["retained_output"].as_str().is_some_and(|retained| {
+                            printed.get("output").and_then(Value::as_str) == Some(retained)
+                        })
+                    {
                         printed.shift_remove("recovery");
                     }
                 } else if printed.get("output").and_then(Value::as_str).is_some_and(str::is_empty) {

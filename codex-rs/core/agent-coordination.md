@@ -9,6 +9,11 @@ workflows do not add a background scheduler or transfer authority.
 ## Use one ownership view
 
 Give each assignment a stable task name and an explicit read/write scope.
+For distinct unresolved claims, scope each assignment to the evidence it
+owns rather than asking workers to repeat the whole investigation. Group
+complementary questions when the same inspection can answer them. A concise
+investigation can omit work outside its agreed scope; an exhaustive request
+must account for every required claim and preserve any independent checks.
 KD4 registers admitted assignments and current attempt bindings automatically.
 Keep the original spawn outcomes, including refusals and uncertain calls.
 When reconciling several admitted assignments, fetch one compact
@@ -76,6 +81,12 @@ const delivery = await send({targets: load("evidenceRecipients"), message: load(
 text({status: delivery.status, accepted: delivery.accepted_targets, failed: delivery.failed_targets});
 ```
 
+For a downstream task that does not require independent acquisition, reuse
+an established fact from the exact sealed attempt if its source still
+applies, and pass the fact with its receipt identity. If the source or
+authority cannot be established, acquire it normally. Never substitute a
+shared fact for evidence the recipient must acquire independently.
+
 Queue acceptance is not consumption and does not start a turn. Reconcile
 partial outcomes per recipient; do not resend to accepted targets. If the
 work requires a new turn, use an explicitly authorized follow-up.
@@ -87,6 +98,9 @@ monotonically increasing revisions. A new attempt has its own ID. Leave off
 this metadata for findings, blockers, errors, decisions, handoffs, and any
 transition a receiver must see. Keep ordinary messages as ordering barriers.
 This compacts queued progress only; it cannot retract consumed messages.
+After a confirmed no-effect refusal of optional progress metadata, send the
+still-relevant information as ordinary mail if it is otherwise authorized.
+Do not replay a message whose admission is partial or uncertain.
 
 ## Send only changed provisional statuses
 
@@ -184,3 +198,12 @@ for their scoped conclusions, evidence, limitations, and unresolved work.
 The owner reads the exact receipts and integrates those contributions into
 one final report. Keep separate reviews and user-requested independent
 reports; omit only duplicate drafts of that same synthesis.
+
+For an ordinary worker's complete, deterministic handoff, use [Code Mode
+direct delivery](../code-mode-protocol/src/description/exec_reference.md)
+when the same successful cell can acquire the required evidence and render
+the entire agreed result. This avoids a follow-up turn that only restates the
+cell output. Keep ordinary final synthesis when judgment, unresolved work,
+or additional verification remains. The parent still waits for and checks
+the exact sealed attempt; direct delivery does not accept the result or
+replace an explicitly required typed receipt.

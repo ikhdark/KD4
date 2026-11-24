@@ -839,6 +839,9 @@ pub(crate) fn run_turn<'a>(
                 // Resolve once: checkpoint references and this logical request
                 // must consume the same live policy, including explicit overrides.
                 let base_instructions = validation_mode_base_instructions(&turn_context).await;
+                if generation_id.ordinal == 0 {
+                    super::workflow_checkpoint::audit_effective_policy_preflight(&base_instructions.text);
+                }
                 // The partial/unavailable turn-diff warning tells the model not to claim
                 // unchanged files; deliver it once, at this request boundary, not only to the UI.
                 let (diff_warning, (file_edits, guidance_edits)) = {

@@ -209,8 +209,10 @@ When syntax determines the scope of a rewrite:
   Use an already installed trusted TypeScript module. Unresolved module
   references and edits outside the supplied project are refused.
 
-The Python and TypeScript previews write only a patch to stdout. Check
-successful, exact stdout and submit it to native `apply_patch` if intended;
+The Python and TypeScript previews write only a patch to stdout. They choose
+among verified local literals, a covering span and the whole file, minimizing
+encoded bytes among those representations while retaining the source guards.
+Check successful, exact stdout and submit it to native `apply_patch` if intended;
 continue only after inspecting its receipt. The previews do not apply or retry
 edits. Currency is checked on preview and native application. Native guards are
 preconditions, not multi-file atomic publication. For range edits and repeated
@@ -218,6 +220,27 @@ literal substitutions see the [Code Mode recipe reference](../codex-rs/code-mode
 for strict JSON use the existing
 [native JSON operations](../codex-rs/prompts/templates/apply_patch_tool_instructions.md)
 instead of reserializing the file.
+
+## Offline engineering artifacts
+
+Run [engineering_artifacts.py](maintenance/engineering_artifacts.py) with Python 3.13+
+and explicit local inputs (also callable through native Code Mode `exec_command`).
+
+- `python scripts/maintenance/engineering_artifacts.py lock-diff BEFORE AFTER`
+  parses Cargo v3/v4 files and reports package IDs, resolved dependencies and
+  checksum changes. Ambiguous dependency references are refused; no fetch,
+  workspace resolution, or write is performed.
+- `python scripts/maintenance/engineering_artifacts.py migrate INPUT.json RECIPE.json`
+  emits the migrated JSON without changing its input. A recipe is an object
+  with integer `from` and `to` versions and an ordered `operations` array
+  (`add`, `replace`, `remove`, or `move`, using object-key JSON Pointers).
+  The command checks `schema_version`, refuses destination collisions, and
+  advances the version only after all operations succeed.
+- `python scripts/maintenance/engineering_artifacts.py bundle ENTRIES.json NEW.zip`
+  takes an explicit JSON object mapping portable archive names to absolute file
+  paths. It produces a new ZIP and `manifest.json` with member sizes and SHA-256
+  hashes. Select only permitted, shareable inputs: the command does not discover
+  sources, redact bytes, execute recorded commands, or overwrite an archive.
 
 ## Other workflows
 

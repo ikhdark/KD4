@@ -115,6 +115,13 @@ pub(crate) fn create_exec_command_tool_for_policy(
             )),
         ),
         (
+            "output_encoding".to_string(),
+            JsonSchema::string_enum(
+                vec!["windows-1252".into(), "utf-16le".into()],
+                Some("Code Mode only: explicitly decode exact terminal stdout and stderr. Direct calls with this option are refused before launch. Requires complete non-PTY streams in this call. Raw output and artifacts are unchanged.".into()),
+            ),
+        ),
+        (
             "env".to_string(),
             JsonSchema {
                 description: Some("Environment overrides scoped to this command only; values are literal strings, never shell-expanded. Use with standalone program/args when shell assignments prevent command admission. Does not change the session or global environment.".to_string()),

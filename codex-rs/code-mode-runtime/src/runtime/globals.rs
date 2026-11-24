@@ -157,12 +157,16 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "__codex_helper_observation", observe_graph.into())?;
     // Keep helper registration capabilities private to the owned closures.
     let helpers = format!(
-        "((registerSearchProjection, registerCommandEvidence) => {{\n{}\n{}\n{}\n{}\n{}\n}})",
+        "((registerSearchProjection, registerCommandEvidence) => {{\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n}})",
         include_str!("search_pagination.js"),
         include_str!("orchestration.js"),
+        include_str!("source_retrieval.js"),
         include_str!("read_wave.js"),
         include_str!("file_workflows.js"),
         include_str!("context_evidence.js"),
+        include_str!("command_workflows.js"),
+        include_str!("engineering_diff.js"),
+        include_str!("diagnostic_inputs.js"),
     );
     let orchestration = v8::String::new(scope, &helpers)
         .ok_or_else(|| "failed to allocate orchestration helpers".to_string())?;

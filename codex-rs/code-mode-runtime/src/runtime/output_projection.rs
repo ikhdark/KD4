@@ -1470,9 +1470,58 @@ pub(super) fn register_search_projection_callback(
             }
         }
     }
+    if raw.get("complete") == Some(&Value::Bool(true)) {
+        for file in files {
+            changed |= project_search_line_ranges(file);
+        }
+    }
     if changed {
         let _ = register(scope, value, &raw, &projected, false);
     }
+}
+
+/// Display-only: omit exactly the integer line field, reconstructible in order
+/// from inclusive ranges. Search cursors, script values and previews are unchanged.
+fn project_search_line_ranges(file: &mut Value) -> bool {
+    let Some(fields) = file.as_object_mut() else { return false };
+    if fields.contains_key("line_ranges") {
+        return false;
+    }
+    let Some(lines) = fields.get_mut("lines").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    if lines.len() < 16 {
+        return false;
+    }
+    let mut ranges = Vec::<[u64; 2]>::new();
+    for line in lines.iter() {
+        let Some(number) = line.get("line").and_then(Value::as_u64) else {
+            return false;
+        };
+        if number == 0 {
+            return false;
+        }
+        if let Some(last) = ranges.last_mut() {
+            if number <= last[1] {
+                return false;
+            }
+            if last[1].checked_add(1) == Some(number) {
+                last[1] = number;
+                continue;
+            }
+        }
+        ranges.push([number, number]);
+        if ranges.len() > lines.len() / 4 {
+            return false;
+        }
+    }
+    for line in lines {
+        if let Some(fields) = line.as_object_mut() {
+            fields.remove("line");
+        }
+    }
+    fields.insert("line_ranges".to_owned(), serde_json::json!(ranges));
+    true
 }
 
 fn project_page_source(file: &mut Value, context: u64) -> bool {

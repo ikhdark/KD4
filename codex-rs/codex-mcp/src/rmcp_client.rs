@@ -65,6 +65,7 @@ use codex_rmcp_client::ExecutorStdioServerLauncher;
 use codex_rmcp_client::LocalStdioServerLauncher;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::SendProgress;
+use codex_rmcp_client::SendResourceChanged;
 use codex_rmcp_client::SendToolListChanged;
 use codex_rmcp_client::StdioServerLauncher;
 use codex_rmcp_client::ToolWithConnectorId;
@@ -179,6 +180,16 @@ impl ManagedClient {
         }
         let catalog = self.catalog.load_full();
         (catalog.generation == self.client.session_generation()).then_some(catalog)
+    }
+
+    pub(crate) fn tool_output_schema(&self, name: &str) -> Option<Arc<JsonObject>> {
+        // Only the negotiated catalog belongs to the live connection.
+        // A shared Apps snapshot can be seeded from a different connection.
+        self.current_catalog()?
+            .tools
+            .iter()
+            .find(|tool| tool.tool.name == name)
+            .and_then(|tool| tool.tool.output_schema.clone())
     }
 
     fn listed_tools(&self) -> Vec<ToolInfo> {
@@ -1522,6 +1533,13 @@ async fn start_server_task(
     let tool_catalog_refresh = tool_list_changed_tx.clone();
     let weak_client = Arc::downgrade(&client);
     let changed_generation = Arc::clone(&connection_generation);
+    let resource_generation = Arc::clone(&connection_generation);
+    let send_resource_changed: SendResourceChanged = Box::new(move || {
+        // The resource cache key is scoped to this server's connection generation.
+        // An update or list change must invalidate both cached content and discovery.
+        resource_generation.fetch_add(1, Ordering::AcqRel);
+        async {}.boxed()
+    });
     let changed_revision = Arc::clone(&tool_catalog_revision);
     let observed_session = Arc::new(AtomicU64::new(1));
     let send_tool_list_changed: SendToolListChanged = Box::new(move || {
@@ -1540,12 +1558,13 @@ async fn start_server_task(
     });
 
     let initialize_result = client
-        .initialize_with_tool_list_changed(
+        .initialize_with_notifications(
             params,
             startup_timeout,
             send_elicitation,
             send_progress,
             send_tool_list_changed,
+            send_resource_changed,
         )
         .await
         .map_err(StartupOutcomeError::from)?;

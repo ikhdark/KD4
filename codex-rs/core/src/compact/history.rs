@@ -568,7 +568,7 @@ fn is_artifact_pin_text(text: &str) -> bool {
 pub(crate) fn build_task_input_checkpoint_with_details(
     items: &[ResponseItem],
 ) -> TaskInputCheckpoint {
-    let (mut history, retained_images, omitted_images, _, omitted_text) =
+    let (mut history, retained_images, omitted_images, _, omitted_text, overflow_omissions) =
         build_bounded_input_history(task_compaction_items(items), true);
     if omitted_images > 0 {
         history.push(compaction_context_message(
@@ -580,13 +580,14 @@ pub(crate) fn build_task_input_checkpoint_with_details(
         retained_images,
         omitted_images,
         omitted_text,
+        overflow_omissions,
     }
 }
 
 pub(super) fn build_bounded_input_history(
     unresolved: impl AsRef<[ResponseItem]>,
     retain_handoff: bool,
-) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
+) -> (Vec<ResponseItem>, usize, usize, bool, bool, Vec<serde_json::Value>) {
     let unresolved = unresolved.as_ref();
     // Recovery stores only messages. Compute its indexes from the same input
     // before tool calls are filtered, rather than treating source indexes as
@@ -786,7 +787,7 @@ pub(super) fn build_bounded_input_history(
     // budget. Exact text remains recoverable from the mandatory sidecar.
     let new_omissions = omission_receipts.len() > inherited_receipt_count;
     let mut receipt_tokens = 0usize;
-    let mut omitted_receipt_count = 0usize;
+    let mut overflow_omissions = Vec::new();
     let mut first_omitted_index = None;
     for (index, receipt) in omission_receipts {
         let tokens = response_item_text_tokens(&receipt);
@@ -794,13 +795,20 @@ pub(super) fn build_bounded_input_history(
             receipt_tokens += tokens;
             indexed_items.push((index, receipt));
         } else {
-            omitted_receipt_count += 1;
-            first_omitted_index.get_or_insert(index);
+            // Only trusted prior bookkeeping and receipts created above enter
+            // this queue. Preserve inherited selectors and their original owner.
+            if let ResponseItem::Message { content, .. } = receipt
+                && let [ContentItem::InputText { text }] = content.as_slice()
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+            {
+                overflow_omissions.push(value);
+                first_omitted_index.get_or_insert(index);
+            }
         }
     }
     // Evicted inherited metadata forces retention before either publication path
     // replaces history. /items contains the prior sidecars and exact selectors.
-    let omitted_text = new_omissions || omitted_receipt_count > 0;
+    let omitted_text = new_omissions || !overflow_omissions.is_empty();
     if let Some(index) = first_omitted_index {
         indexed_items.push((
             index,
@@ -808,7 +816,7 @@ pub(super) fn build_bounded_input_history(
                 serde_json::json!({
                     "kind": COMPACT_TEXT_OMISSION_MARKER,
                     "unresolved": true,
-                    "additional_omitted_messages": omitted_receipt_count,
+                    "additional_omitted_messages": overflow_omissions.len(),
                     "artifact_id": serde_json::Value::Null,
                     "instruction": "Recover exact text from the compaction recovery artifact.",
                 })
@@ -838,6 +846,7 @@ pub(super) fn build_bounded_input_history(
         omitted_image_count,
         omitted_user_text,
         omitted_text,
+        overflow_omissions,
     )
 }
 

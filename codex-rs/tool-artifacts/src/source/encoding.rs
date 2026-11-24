@@ -19,7 +19,7 @@ pub async fn decode(
         return Ok(DecodedFile::Unsupported(Classification::unsupported(
             decoding_error("read_file does not decode UTF-32; use encoding:hex or encoding:base64 for original bytes", &bytes).to_string(),
             source_encoding,
-        )));
+        ), None));
     }
     let little_endian = match source_encoding {
         Some("utf-16le") => true,
@@ -40,7 +40,10 @@ pub async fn decode(
                         )
                         .to_string(),
                     );
-                    DecodedFile::Unsupported(classification)
+                    let snapshot = (classification.kind == "likely_binary"
+                        && error.as_bytes().len() <= 64 * 1024)
+                        .then(|| error.into_bytes());
+                    DecodedFile::Unsupported(classification, snapshot)
                 }
             });
         }
@@ -57,7 +60,7 @@ pub async fn decode(
         Err(error) => DecodedFile::Unsupported(Classification::unsupported(
             error.to_string(),
             source_encoding,
-        )),
+        ), None),
     })
 }
 fn decode_utf16(
@@ -137,7 +140,7 @@ impl Classification {
 
 pub enum DecodedFile {
     Text(String, Option<DecodedSource>),
-    Unsupported(Classification),
+    Unsupported(Classification, Option<Vec<u8>>),
 }
 
 fn bom_encoding(bytes: &[u8]) -> Option<&'static str> {
@@ -154,7 +157,7 @@ fn bom_encoding(bytes: &[u8]) -> Option<&'static str> {
 fn decoded_text(text: String, source: Option<DecodedSource>) -> DecodedFile {
     if let Some(mut classification) = classify_page(text.as_bytes(), false) {
         classification.encoding = Some(source.as_ref().map_or("utf-8", |source| source.encoding));
-        DecodedFile::Unsupported(classification)
+        DecodedFile::Unsupported(classification, None)
     } else {
         DecodedFile::Text(text, source)
     }

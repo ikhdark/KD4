@@ -157,6 +157,50 @@ Use `InferenceWorkflow` when **your application** knows which results are
 required and which branch should run. It does not change sampling inside a
 Codex turn, inspect task semantics, or launch autonomous work.
 
+For a complete, independently keyed evidence table, the application can use
+`prepare_keyed_evidence` before it submits a turn. Supply the exact required
+keys from the assignment, including every key for exhaustive work. Use this
+only when each row applies solely to its declared key and the renderer changes
+only which rows are sent; do not use it for partial reads, cross-key evidence
+or free-form intent inference.
+
+```python
+import json
+
+from openai_codex.inference import prepare_keyed_evidence
+
+body = prepare_keyed_evidence(
+    rows,
+    frozenset(assignment),
+    fields=frozenset({"requirement", "receipt", "revision", "observation"}),
+    key_field="requirement",
+    render=lambda evidence: json.dumps({"assignment": assignment, "evidence": evidence}),
+)
+```
+
+All relevant revisions, duplicates and contradictions stay in original order.
+Unknown table shape, a missing required key, or less than 20% rendered UTF-8
+byte savings keeps the original body. This is not a token limit, automatic
+routing, an answer cache, or a server retry; the ordinary submission still
+owns its errors and its configured inference settings.
+
+If the assignment is only an exact lookup (not interpretation), use
+[`exact_keyed_values`](../src/openai_codex/inference.py) instead. It returns
+a mapping in requested order without inference only for a complete,
+caller-supplied two-column string table with exactly one match per requested
+key. Unknown shape, missing keys and duplicate requested rows (even with equal
+values) return `None`. The caller must prove table completeness and keep its
+ordinary inference path for those cases; this does not route arbitrary prompts.
+
+```python
+from openai_codex.inference import exact_keyed_values
+
+answer = exact_keyed_values(
+    rows, ("invoice", "receipt"), key_field="id", value_field="value"
+)
+# If answer is None, handle the original request rather than a partial map.
+```
+
 ```python
 import asyncio
 

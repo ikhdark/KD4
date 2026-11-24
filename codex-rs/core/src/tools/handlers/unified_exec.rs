@@ -73,6 +73,8 @@ pub(crate) struct ExecCommandArgs {
 
 #[derive(Debug, Deserialize)]
 struct RawExecCommandArgs {
+    #[serde(default, rename = "output_encoding")]
+    _output_encoding: Option<crate::tools::context::ExecOutputEncoding>,
     #[serde(default)]
     env: std::collections::HashMap<String, String>,
     #[serde(default)]
@@ -297,6 +299,8 @@ pub(crate) fn validate_exec_command_arguments(arguments: &str) -> Result<(), Str
 
 #[derive(Debug, Deserialize)]
 struct ExecCommandEnvironmentArgs {
+    #[serde(default)]
+    output_encoding: Option<crate::tools::context::ExecOutputEncoding>,
     #[serde(default)]
     environment_id: Option<String>,
     // Keep this raw until after environment selection; relative paths must be

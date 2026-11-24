@@ -18,6 +18,7 @@ use tokio::io::AsyncWrite;
 use tokio_tungstenite::WebSocketStream as TungsteniteStream;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::uri_mode;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::handshake::client::Response;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -77,6 +78,9 @@ impl WebSocketConnector {
         request: Request,
         config: WebSocketConfig,
     ) -> Result<(WebSocketConnection, Response), WebSocketError> {
+        // Reject unsupported schemes (including URLs with explicit ports)
+        // before proxy discovery or admission of a physical dispatch.
+        uri_mode(request.uri())?;
         let route_url = request.uri().to_string();
         let proxy_route = self
             .http_client_factory

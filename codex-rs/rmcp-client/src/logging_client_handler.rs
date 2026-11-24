@@ -1,4 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+
+use codex_protocol::mcp::decode_tool_call_progress_token;
 
 use rmcp::ClientHandler;
 use rmcp::RoleClient;
@@ -14,7 +18,9 @@ use rmcp::model::LoggingLevel;
 #[allow(deprecated)]
 use rmcp::model::LoggingMessageNotificationParam;
 use rmcp::model::ProgressNotificationMethod;
+use rmcp::model::NumberOrString;
 use rmcp::model::ProgressNotificationParam;
+use rmcp::model::ProgressToken;
 use rmcp::model::ResourceUpdatedNotificationParam;
 use rmcp::service::NotificationContext;
 use rmcp::service::RequestContext;
@@ -26,7 +32,57 @@ use tracing::warn;
 use crate::rmcp_client::Elicitation;
 use crate::rmcp_client::SendElicitation;
 use crate::rmcp_client::SendProgress;
+use crate::rmcp_client::SendResourceChanged;
 use crate::rmcp_client::SendToolListChanged;
+
+// One table per transport session: rmcp's numeric tokens restart on reconnect.
+// The async gate covers only send-and-register, not tool execution or UI I/O.
+#[derive(Default)]
+pub(crate) struct ProgressRoutes {
+    pub(crate) registration: tokio::sync::Mutex<()>,
+    routes: Mutex<HashMap<ProgressToken, ProgressToken>>,
+}
+
+impl ProgressRoutes {
+    pub(crate) fn register(
+        self: &Arc<Self>,
+        wire: ProgressToken,
+        item: ProgressToken,
+    ) -> ProgressRouteLease {
+        self.routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(wire.clone(), item);
+        ProgressRouteLease {
+            routes: Arc::clone(self),
+            wire,
+        }
+    }
+
+    async fn resolve(&self, wire: &ProgressToken) -> Option<ProgressToken> {
+        let _registration = self.registration.lock().await;
+        self.routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(wire)
+            .cloned()
+    }
+}
+
+pub(crate) struct ProgressRouteLease {
+    routes: Arc<ProgressRoutes>,
+    wire: ProgressToken,
+}
+
+impl Drop for ProgressRouteLease {
+    fn drop(&mut self) {
+        self.routes
+            .routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.wire);
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct LoggingClientHandler {
@@ -34,6 +90,8 @@ pub(crate) struct LoggingClientHandler {
     send_elicitation: Arc<SendElicitation>,
     send_progress: Arc<SendProgress>,
     send_tool_list_changed: Arc<SendToolListChanged>,
+    send_resource_changed: Arc<SendResourceChanged>,
+    pub(crate) progress_routes: Arc<ProgressRoutes>,
 }
 
 impl LoggingClientHandler {
@@ -42,20 +100,31 @@ impl LoggingClientHandler {
         send_elicitation: SendElicitation,
         send_progress: SendProgress,
         send_tool_list_changed: SendToolListChanged,
+        send_resource_changed: SendResourceChanged,
     ) -> Self {
         Self {
             client_info,
             send_elicitation: Arc::new(send_elicitation),
             send_progress: Arc::new(send_progress),
             send_tool_list_changed: Arc::new(send_tool_list_changed),
+            send_resource_changed: Arc::new(send_resource_changed),
+            progress_routes: Arc::default(),
         }
     }
 
-    async fn handle_progress_notification(&self, params: ProgressNotificationParam) {
+    async fn handle_progress_notification(&self, mut params: ProgressNotificationParam) {
         info!(
             "MCP server progress notification (token: {:?}, progress: {}, total: {:?}, message: {:?})",
             params.progress_token, params.progress, params.total, params.message
         );
+        if let Some(token) = self.progress_routes.resolve(&params.progress_token).await {
+            params.progress_token = token;
+        } else if let NumberOrString::String(token) = &params.progress_token.0
+            && decode_tool_call_progress_token(token).is_some()
+        {
+            // Codex item identities are local routing data, not wire authority.
+            return;
+        }
         (self.send_progress)(params).await;
     }
 
@@ -102,10 +171,12 @@ impl ClientHandler for LoggingClientHandler {
         _context: NotificationContext<RoleClient>,
     ) {
         info!("MCP server resource updated (uri: {})", params.uri);
+        (self.send_resource_changed)().await;
     }
 
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
         info!("MCP server resource list changed");
+        (self.send_resource_changed)().await;
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {

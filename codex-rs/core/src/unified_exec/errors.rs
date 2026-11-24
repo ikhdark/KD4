@@ -10,7 +10,10 @@ pub(crate) enum UnifiedExecError {
         error: Box<codex_exec_server::ExecServerError>,
     },
     #[error("Failed to create unified exec process: {message}")]
-    CreateProcess { message: String },
+    CreateProcess {
+        message: String,
+        refusal: Option<std::io::ErrorKind>,
+    },
     #[error("{message}")]
     LaunchInputRefused { message: String, kind: &'static str },
     #[error("Command denied: {message}")]
@@ -59,7 +62,10 @@ pub(crate) enum UnifiedExecError {
 
 impl UnifiedExecError {
     pub(crate) fn create_process(message: String) -> Self {
-        Self::CreateProcess { message }
+        Self::CreateProcess {
+            message,
+            refusal: None,
+        }
     }
 
     pub(crate) fn process_failed(message: String) -> Self {

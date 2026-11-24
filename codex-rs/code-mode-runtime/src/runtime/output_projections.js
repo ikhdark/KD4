@@ -48,6 +48,56 @@
     return {observation: output(delta, full), base: next};
   }
 
+  // Both inputs must parse and have no duplicate object keys. Match actual
+  // JSON tokens, not parsed value equality (which can normalize distinct bytes).
+  function jsonTokenSignature(text) {
+    try {
+      const root = JSON.parse(text);
+      const stack = [root];
+      let keys = 0;
+      while (stack.length) {
+        const value = stack.pop();
+        if (value === null || typeof value !== "object") continue;
+        if (Array.isArray(value)) {
+          for (const member of value) stack.push(member);
+        } else {
+          for (const key of Object.keys(value)) {
+            keys++;
+            stack.push(value[key]);
+          }
+        }
+      }
+      let tokens = 0;
+      const signature = text.replace(/("(?:\\.|[^"\\])*")([ \t\r\n]*:)?|[ \t\r\n]+/gs,
+        (_, string, colon) => {
+          if (string === undefined) return "";
+          if (colon === undefined) return string;
+          tokens++;
+          return string + ":";
+        });
+      return tokens === keys ? signature : null;
+    } catch {
+      return null;
+    }
+  }
+  function isJsonLayoutOnly(before, after) {
+    if (before === after || before.length > 65536 || after.length > 65536) return false;
+    const prior = jsonTokenSignature(before);
+    return prior !== null && prior === jsonTokenSignature(after);
+  }
+
+  async function refreshJsonFile(path, previousBase, environment_id) {
+    const result = await refreshFile(path, previousBase, environment_id);
+    const next = result.base;
+    if (!/\.json$/i.test(path) || !next || result.observation.kind === "unchanged" ||
+        previousBase?.requestedPath !== path || previousBase.path !== next.path ||
+        previousBase.environment_id !== next.environment_id || !sha256(previousBase.sha) ||
+        typeof previousBase.text !== "string" || previousBase.sha === next.sha ||
+        !isJsonLayoutOnly(previousBase.text, next.text)) return result;
+    return {base: next, observation: output(
+      {kind: "json_layout_only", sha: next.sha, base: previousBase.sha}, result.observation)};
+  }
+
   function groupDiagnostics(r) {
     const original = nativeText(r);
     if (original === undefined || !r.artifact_id || r.retained_artifact_complete !== true)
@@ -92,6 +142,49 @@
       (d.name===selected.name && typeof d.path==="string" && path(d.path)===dir(selected)))
       .map(d=>({from:p.name, id:p.id, name:d.name, alias:d.rename??null, kind:d.kind??null,
         target:d.target??null, path:d.path??null, source:d.source??null})));
+  }
+
+  // Match the single-package projection's order, including all outgoing edges.
+  function cargoEdgesForPackages(m, keys) {
+    if (!Array.isArray(keys) || !keys.length || keys.length > 64 ||
+        !Array.isArray(m?.packages) || !Array.isArray(m.workspace_members))
+      throw new TypeError("Expected complete Cargo metadata and 1–64 package selectors");
+    if (keys.length === 1) return [cargoEdges(m, keys[0])];
+    const ids = new Set(m.workspace_members);
+    const members = m.packages.filter(p => ids.has(p.id));
+    if (members.length !== ids.size || new Set(members.map(p=>p.id)).size !== ids.size ||
+        members.some(p=>typeof p.manifest_path!=="string" || !Array.isArray(p.dependencies)))
+      throw new TypeError("Workspace metadata lacks member or dependency details");
+    const exact = new Map(members.map(p=>[p.id,p]));
+    const path = p => p.replaceAll("\\","/").replace(/\/$/,"");
+    const selected = keys.map(k => {
+      const matches = exact.has(k) ? [exact.get(k)] : members.filter(p=>p.name===k);
+      if (matches.length !== 1) throw new TypeError("Expected a unique workspace package; use its Cargo ID");
+      return matches[0];
+    });
+    const incoming = new Map(), edges = new Map();
+    for (const p of selected) {
+      if (edges.has(p.id)) continue;
+      edges.set(p.id, []);
+      const dir = path(p.manifest_path).replace(/\/[^/]+$/,"");
+      if (!incoming.has(p.name)) incoming.set(p.name, new Map());
+      const dirs = incoming.get(p.name);
+      if (!dirs.has(dir)) dirs.set(dir, []);
+      dirs.get(dir).push(p.id);
+    }
+    for (const p of members) {
+      const outward = edges.get(p.id);
+      for (const d of p.dependencies) {
+        const dirs = incoming.get(d.name);
+        const targets = dirs && typeof d.path === "string" ? dirs.get(path(d.path)) : undefined;
+        if (!outward && !targets) continue;
+        const row = {from:p.name, id:p.id, name:d.name, alias:d.rename??null, kind:d.kind??null,
+          target:d.target??null, path:d.path??null, source:d.source??null};
+        outward?.push(row);
+        for (const target of targets??[]) if (target!==p.id) edges.get(target).push(row);
+      }
+    }
+    return selected.map(p=>edges.get(p.id).map(row=>({...row})));
   }
 
   function repeatRuns(r) {
@@ -139,6 +232,11 @@
 
   // Pack opt-in, string-or-null columns in a single projected page. Keep the
   // owning selection and its continuation with the caller; this is presentation.
+  // Native structured JSON keeps wide integers as BigInt. Count their exact
+  // JSON decimal bytes without altering the packet or rounding through Number.
+  const structuredPacketBytes = packet => encode.encode(JSON.stringify(packet, (_key, value) =>
+    typeof value === "bigint" ? JSON.rawJSON(value.toString()) : value)).length;
+
   function packStructuredRows(page, fields) {
     if (!Array.isArray(fields) || fields.length < 1 || fields.length > 64 ||
         new Set(fields).size !== fields.length ||
@@ -168,14 +266,55 @@
     const rows = page.rows.map(r => ({...r, value:Object.fromEntries(Object.entries(r.value)
       .map(([f, v]) => [f, typeof v === "string" && columns.has(f) ? columns.get(f).get(v) : v]))}));
     const packed = {page:{...page, rows}, dictionaries};
-    // Native structured JSON keeps wide integers as BigInt. Count their exact
-    // JSON decimal bytes without altering the packet or rounding through Number.
-    const bytes = packet => encode.encode(JSON.stringify(packet, (_key, value) =>
-      typeof value === "bigint" ? JSON.rawJSON(value.toString()) : value)).length;
-    return bytes(packed) < bytes(plain) ? packed : plain;
+    return structuredPacketBytes(packed) < structuredPacketBytes(plain) ? packed : plain;
   }
 
-  function unpackStructuredRows({page, dictionaries}) {
+  // Opt-in: key positions follow the caller's field list; a missing key has
+  // no pair, while a present null has a pair. Reuse any value dictionaries.
+  function packSparseStructuredRows(page, fields) {
+    const baseline = packStructuredRows(page, fields);
+    if (page?.coverage_complete !== true || page.malformed_rows !== 0 ||
+        !Array.isArray(page.rows) || !page.rows.length || page.rows.length > 1000) return baseline;
+    const positions = new Map(fields.map((key, i) => [key, i]));
+    const rows = [];
+    for (const r of baseline.page.rows) {
+      if (!Number.isSafeInteger(r?.row) || !r.value ||
+          typeof r.value !== "object" || Array.isArray(r.value)) return baseline;
+      const value = [];
+      for (const [key, v] of Object.entries(r.value)) {
+        if (!positions.has(key)) return baseline;
+        value.push(positions.get(key), v);
+      }
+      rows.push({...r, value});
+    }
+    const packed = {...baseline, page:{...baseline.page, rows}, fields};
+    return structuredPacketBytes(packed) < structuredPacketBytes(baseline) ? packed : baseline;
+  }
+  function decodeSparseRows(page, fields) {
+    if (fields === undefined) return page;
+    if (!Array.isArray(fields) || fields.length < 1 || fields.length > 64 ||
+        new Set(fields).size !== fields.length ||
+        fields.some(f => typeof f !== "string" || (f !== "" && !f.startsWith("/")) || /~(?:[^01]|$)/.test(f)) ||
+        !Array.isArray(page?.rows) || page.rows.length > 1000)
+      throw new TypeError("Invalid sparse structured rows");
+    const rows = page.rows.map(r => {
+      if (!Number.isSafeInteger(r?.row) || !Array.isArray(r.value) || r.value.length % 2 ||
+          r.value.length > fields.length * 2) throw new TypeError("Invalid sparse row");
+      const pairs = [], seen = new Set();
+      for (let i = 0; i < r.value.length; i += 2) {
+        const index = r.value[i];
+        if (!Number.isSafeInteger(index) || !Object.hasOwn(fields, index) || seen.has(index))
+          throw new TypeError("Invalid sparse field index");
+        seen.add(index);
+        pairs.push([fields[index], r.value[i+1]]);
+      }
+      return {...r, value:Object.fromEntries(pairs)};
+    });
+    return {...page, rows};
+  }
+
+  function unpackStructuredRows({page, fields, dictionaries}) {
+    page = decodeSparseRows(page, fields);
     if (dictionaries === undefined) return page;
     if (!dictionaries || typeof dictionaries !== "object" || Array.isArray(dictionaries) ||
         !Array.isArray(page?.rows) || page.rows.length > 1000 || Object.keys(dictionaries).length > 64 ||
@@ -206,6 +345,6 @@
     return {exit_code:0, artifact_id:ref.artifact_id, bytes:ref.retained_bytes};
   }
 
-  return Object.freeze({readSymbols, refreshFile, groupDiagnostics, cargoEdges, repeatRuns,
-    factorContracts, processDelta, packStructuredRows, unpackStructuredRows, expectedCommand});
+  return Object.freeze({readSymbols, refreshFile, refreshJsonFile, groupDiagnostics, cargoEdges, cargoEdgesForPackages, repeatRuns,
+    factorContracts, processDelta, packStructuredRows, packSparseStructuredRows, unpackStructuredRows, expectedCommand});
 })()

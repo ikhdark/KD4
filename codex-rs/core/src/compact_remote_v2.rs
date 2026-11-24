@@ -671,10 +671,12 @@ async fn prepare_v2_retained_input_source(
     crate::compact::bound_compaction_tool_outputs(sess, &mut retained.items).await?;
     let omission_receipt_ids =
         crate::compact::new_omission_receipt_ids(&retained.items, prompt_input);
+    let needs_source_recovery = retained.needs_source_recovery();
     if let Some(text) = crate::compact::persist_task_compaction_text_recovery(
         sess,
         prompt_input,
-        retained.needs_source_recovery(),
+        needs_source_recovery,
+        std::mem::take(&mut retained.overflow_omissions),
     )
     .await?
     {

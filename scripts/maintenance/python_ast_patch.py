@@ -114,10 +114,37 @@ def patch(path, expected, edits):
         result = result[:start] + value + result[end:]
         boundary = start
     compile(result[bom:].decode("utf-8"), path, "exec")
-    before, after = (
-        json.dumps(data.decode("utf-8"), ensure_ascii=True) for data in (raw, result)
-    )
-    return f"*** Begin Patch\n*** Update File: {path}\n@@ codex-replace 1 sha256:{digest}\n-{before}\n+{after}\n*** End Patch\n"
+    def chunk(before, after, count=1):
+        old = json.dumps(before.decode("utf-8"), ensure_ascii=True)
+        new = json.dumps(after.decode("utf-8"), ensure_ascii=True)
+        return f"@@ codex-replace {count} sha256:{digest}\n-{old}\n+{new}\n"
+
+    options = [chunk(raw, result)]
+    changed = [(start, end, value) for start, end, value in spans
+               if raw[start:end] != value]
+    if changed:
+        start, end = changed[0][0], changed[-1][1]
+        if raw.count(raw[start:end]) == 1:
+            options.append(chunk(raw[start:end], result[start:len(result) - (len(raw) - end)]))
+        groups = {}
+        for start, end, value in changed:
+            groups.setdefault((raw[start:end], value), []).append(start)
+        local = []
+        for (before, after), starts in groups.items():
+            cursor = 0
+            for start in starts:
+                if raw.find(before, cursor) != start:
+                    break
+                cursor = start + len(before)
+            else:
+                if raw.find(before, cursor) == -1:
+                    local.append(chunk(before, after, len(starts)))
+                    continue
+            break
+        else:
+            options.append("".join(local))
+    chunks = min(options, key=len)
+    return f"*** Begin Patch\n*** Update File: {path}\n{chunks}*** End Patch\n"
 
 
 def unique_keys(pairs):

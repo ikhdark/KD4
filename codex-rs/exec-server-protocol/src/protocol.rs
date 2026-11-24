@@ -71,6 +71,8 @@ pub struct FsLookupBatchParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LookupExecutableParams {
     pub name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all_matches: bool,
     pub cwd: PathUri,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
@@ -80,6 +82,8 @@ pub struct LookupExecutableParams {
 pub struct LookupExecutableResponse {
     /// Availability at lookup time only, never trust, launch permission or execution proof.
     pub path: Option<PathUri>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<Vec<PathUri>>,
 }
 
 pub const FS_READ_FILE_METHOD: &str = "fs/readFile";

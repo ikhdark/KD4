@@ -23,7 +23,9 @@ not another instruction source.
 | Shared tool declarations and executor contracts | [tools](tools/); live handlers and registration are in [core/src/tools](core/src/tools/) |
 | Retained tool output, source snapshots and recovery | [tool-artifacts](tool-artifacts/) |
 | History, context projection and durable plan state | [conversation](conversation/); live installation remains in core |
-| Model requests and response streams | [model-client](model-client/); core supplies live turn state |
+| Model requests and response streams | [model-client](model-client/); core supplies live turn state. [Responses HTTP serialization](codex-api/src/common.rs) keeps unchanged client metadata in stable key order on retries; WebSocket serialization is unchanged. |
+| WebSocket destination admission | The [shared connector](websocket-client/src/lib.rs) rejects unsupported URI schemes before proxy resolution and outbound admission. Supported destinations still go through normal route and dispatch policy checks. |
+| Windows process launch refusal | The [unified exec command handler](core/src/tools/handlers/unified_exec/exec_command.rs) distinguishes native Windows pipe creation access refusal and missing launch inputs from ordinary exit or other startup failures. This does not infer sandbox policy from subprocess text. |
 | Request cache diagnostics (not provider-history admission) | [model-client/src/client/request_measurements.rs](model-client/src/client/request_measurements.rs); transport selection and ordered state lifetime remain in client.rs |
 | Completed-tool history disk compatibility and journal replay | [conversation/src/tool_history/persistence.rs](conversation/src/tool_history/persistence.rs); public loader/writer paths remain in tool_history |
 | Resolved runtime configuration | [runtime-config](runtime-config/); [config](config/) owns configuration support and the [layer loader](config/src/loader/README.md) |
@@ -34,6 +36,16 @@ not another instruction source.
 | Extension interfaces and built-ins | [ext](ext/), starting with the [extension API](ext/extension-api/src/lib.rs) |
 | Bundled skills | [Source assets](skills/src/assets/samples/); see [skills architecture](core/instruction-architecture.md#extensions-skills-apps-and-plugin-guidance) for staging, discovery and delivery |
 | Shared utilities | [utils](utils/); use a specific utility crate rather than a core facade |
+
+## CLI capability metadata
+
+`codex completion --describe app-server/generate-json-schema` emits JSON
+for one visible command, without invoking it. Use `.` for the root. It
+reports visible child commands, argument names and positions, value counts,
+enumerated choices, repeatability and unconditional requiredness from the
+[Clap command](cli/src/main.rs). Conditional requirements and runtime policy
+are not an invocation guarantee; the command parser remains authoritative.
+Plain `codex completion [SHELL]` still emits a shell script.
 
 ## Code Mode: client, host, runtime, contract
 

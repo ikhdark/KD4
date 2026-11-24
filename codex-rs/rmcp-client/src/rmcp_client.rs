@@ -486,10 +486,27 @@ async fn send_tracked_request(
     options: rmcp::service::PeerRequestOptions,
 ) -> std::result::Result<ServerResult, rmcp::service::ServiceError> {
     let _pause_registration = tracker.pause_registry.register(tracker.pause_state.clone());
+    let item_token = options
+        .meta
+        .as_ref()
+        .and_then(RequestMetaObject::get_progress_token)
+        .filter(|token| matches!(
+            &token.0,
+            rmcp::model::NumberOrString::String(value)
+                if codex_protocol::mcp::decode_tool_call_progress_token(value).is_some()
+        ));
+    let routes = service.service().progress_routes();
+    let registration = match item_token {
+        Some(_) => Some(routes.registration.lock().await),
+        None => None,
+    };
     let handle = service
         .peer()
         .send_request_with_option(request, options)
         .await?;
+    let _progress_route = item_token
+        .map(|token| routes.register(handle.progress_token.clone(), token));
+    drop(registration);
     let id = handle.id.clone();
     tracker.register(service, id.clone());
     let response = handle.await_response().await;
@@ -560,6 +577,9 @@ pub type SendProgress =
 
 /// Interface for forwarding `notifications/tools/list_changed` to the catalog owner.
 pub type SendToolListChanged = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// Interface for invalidating a server's resource cache on resource notifications.
+pub type SendResourceChanged = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 pub struct ToolWithConnectorId {
     pub tool: Tool,
@@ -740,11 +760,34 @@ impl RmcpClient {
         send_progress: SendProgress,
         send_tool_list_changed: SendToolListChanged,
     ) -> Result<InitializeResult> {
+        self.initialize_with_notifications(
+            params,
+            timeout,
+            send_elicitation,
+            send_progress,
+            send_tool_list_changed,
+            Box::new(|| async {}.boxed()),
+        )
+        .await
+    }
+
+    /// Performs initialization and forwards tool and resource change notifications.
+    #[instrument(level = "trace", skip_all)]
+    pub async fn initialize_with_notifications(
+        &self,
+        params: InitializeRequestParams,
+        timeout: Option<Duration>,
+        send_elicitation: SendElicitation,
+        send_progress: SendProgress,
+        send_tool_list_changed: SendToolListChanged,
+        send_resource_changed: SendResourceChanged,
+    ) -> Result<InitializeResult> {
         let client_service = ElicitationClientService::new(
             params.clone(),
             send_elicitation,
             send_progress,
             send_tool_list_changed,
+            send_resource_changed,
             self.elicitation_pause_state.clone(),
         );
         let pending_transport = {
@@ -1439,6 +1482,7 @@ impl RmcpClient {
         Option<OAuthPersistor>,
     )> {
         let deadline = timeout.map(|duration| Instant::now() + duration);
+        let client_service = client_service.with_fresh_progress_routes();
         let (transport, oauth_persistor, initialize_deadline) = match pending_transport {
             PendingTransport::Stdio { transport } => (
                 service::serve_client(client_service, transport).boxed(),
