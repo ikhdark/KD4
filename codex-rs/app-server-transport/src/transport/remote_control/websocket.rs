@@ -77,6 +77,9 @@ const REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
 const REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(60);
+/// Completed reassemblies larger than this are parsed by one owned blocking
+/// worker so the reader keeps servicing Pong/Ping/Close and shutdown meanwhile.
+const REASSEMBLED_DECODE_OFFLOAD_BYTES: usize = 64 * 1024;
 const REMOTE_CONTROL_ACCOUNT_ID_RETRY_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(1);
 const REMOTE_CONTROL_RECONNECT_BACKOFF_CAP: std::time::Duration =
@@ -1974,6 +1977,9 @@ impl RemoteControlWebsocket {
         let mut ingress_worker = AbortOnDropHandle::new(tokio::spawn(run_client_ingress(
             client_tracker, state.clone(), ingress_rx, shutdown_token.clone(),
         )));
+        // At most one ordinary frame read while a decode was pending. It is
+        // consumed before the socket and never admitted ahead of that decode.
+        let mut parked_frame = None;
         let mut pending = VecDeque::<PendingClientDelivery>::new();
         // Completed chunk operations awaiting admission are not yet committed
         // dedupe/cursor state, but a retransmission must not initialize twice.
@@ -2024,7 +2030,12 @@ impl RemoteControlWebsocket {
                     delivery.commit(&mut *state.lock().await, delivered);
                     continue;
                 }
-                incoming_message = websocket_reader.next() => {
+                incoming_message = async {
+                    match parked_frame.take() {
+                        Some(frame) => Some(frame),
+                        None => websocket_reader.next().await,
+                    }
+                } => {
                     match incoming_message {
                         Some(incoming_message) => incoming_message,
                         None => return Err(io::Error::new(ErrorKind::UnexpectedEof, "websocket stream ended")),
@@ -2102,7 +2113,29 @@ impl RemoteControlWebsocket {
                 ClientSegmentObservation::Reassembled(envelope, raw) => {
                     // Reassembly custody stays shared across sockets; parse without
                     // holding the state mutex needed by outbound ACK/admission.
-                    let message = match serde_json::from_slice(&raw) {
+                    // A large body is parsed on an owned blocking worker, but the
+                    // reader still awaits it here: admission order is unchanged.
+                    let decoded = if raw.len() > REASSEMBLED_DECODE_OFFLOAD_BYTES {
+                        match decode_reassembled_off_reader(
+                            raw,
+                            envelope.seq_id,
+                            received.map(|(_, ns)| ns),
+                            &mut websocket_reader,
+                            &mut parked_frame,
+                            &mut pong_deadline,
+                            pong_timeout,
+                            &shutdown_token,
+                            socket_generation,
+                        )
+                        .await?
+                        {
+                            Some(decoded) => decoded,
+                            None => return Ok(()),
+                        }
+                    } else {
+                        serde_json::from_slice(&raw)
+                    };
+                    let message = match decoded {
                         Ok(message) => message,
                         Err(error) => {
                             warn!(%error, "dropping invalid reassembled remote-control message");
@@ -2178,6 +2211,88 @@ impl RemoteControlWebsocket {
                 in_flight_chunks.insert(key.clone(), ordinal);
             }
             pending.push_back(PendingClientDelivery { delivery, client_message_key, ordinal, completion, bytes, control, committed });
+        }
+    }
+}
+
+/// Parse a completed reassembly on an owned blocking worker while the reader
+/// keeps servicing Pong, Ping, Close, read errors and shutdown.
+///
+/// Ordering and admission are unchanged: the caller awaits this result before
+/// anything else is admitted, one ordinary successor frame at most is parked
+/// (and handed back through `parked_frame`) so TCP is never read further ahead,
+/// and a Close, error, Pong timeout or shutdown aborts and joins the worker so
+/// no decode outlives the reader. Returns `Ok(None)` on shutdown.
+#[allow(clippy::too_many_arguments)]
+async fn decode_reassembled_off_reader(
+    raw: Arc<Vec<u8>>,
+    inbound_seq_id: Option<u64>,
+    final_fragment_ns: Option<u128>,
+    websocket_reader: &mut SplitStream<WebSocketConnection>,
+    parked_frame: &mut Option<Result<tungstenite::Message, tungstenite::Error>>,
+    pong_deadline: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+    pong_timeout: std::time::Duration,
+    shutdown_token: &CancellationToken,
+    socket_generation: Option<uuid::Uuid>,
+) -> io::Result<Option<serde_json::Result<codex_app_server_protocol_types::JSONRPCMessage>>> {
+    let decode_attempt = uuid::Uuid::now_v7();
+    let bytes = raw.len();
+    let mut job = AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
+        let started_ns = codex_protocol::timing::process_monotonic_ns();
+        let decoded = serde_json::from_slice::<codex_app_server_protocol_types::JSONRPCMessage>(&raw);
+        observe_socket(socket_generation, "mobile_reassembled_decode_finished", serde_json::json!({
+            "decode_attempt": decode_attempt, "inbound_seq_id": inbound_seq_id, "bytes": bytes,
+            "final_fragment_ns": final_fragment_ns, "started_ns": started_ns,
+            "finished_ns": codex_protocol::timing::process_monotonic_ns(), "decoded": decoded.is_ok(),
+        }));
+        decoded
+    }));
+    macro_rules! abandon {
+        ($result:expr) => {{
+            job.abort();
+            let _ = (&mut job).await;
+            return $result;
+        }};
+    }
+    loop {
+        tokio::select! {
+            _ = shutdown_token.cancelled() => abandon!(Ok(None)),
+            _ = &mut *pong_deadline => abandon!(Err(io::Error::new(
+                ErrorKind::TimedOut, "remote control websocket pong timeout"))),
+            frame = websocket_reader.next(), if parked_frame.is_none() => {
+                let polled_ns = codex_protocol::timing::process_monotonic_ns();
+                match frame {
+                    Some(Ok(tungstenite::Message::Pong(_))) => {
+                        pong_deadline.as_mut().reset(tokio::time::Instant::now() + pong_timeout);
+                        observe_socket(socket_generation, "mobile_reassembled_decode_control", serde_json::json!({
+                            "frame": "pong", "received_ns": polled_ns, "pending_decode_attempt": decode_attempt,
+                        }));
+                    }
+                    Some(Ok(tungstenite::Message::Ping(_))) => {
+                        observe_socket(socket_generation, "mobile_reassembled_decode_control", serde_json::json!({
+                            "frame": "ping", "received_ns": polled_ns, "pending_decode_attempt": decode_attempt,
+                        }));
+                    }
+                    Some(Ok(tungstenite::Message::Close(frame))) => {
+                        observe_socket(socket_generation, "mobile_socket_peer_close", serde_json::json!({
+                            "close_code": frame.map(|frame| u16::from(frame.code)),
+                            "received_ns": polled_ns, "pending_decode_attempt": decode_attempt,
+                        }));
+                        abandon!(Err(io::Error::new(ErrorKind::ConnectionAborted, "websocket disconnected")));
+                    }
+                    Some(Err(error)) => {
+                        let kind = match &error {
+                            tungstenite::Error::Io(error) => error.kind(),
+                            tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => ErrorKind::ConnectionAborted,
+                            _ => ErrorKind::InvalidData,
+                        };
+                        abandon!(Err(io::Error::new(kind, error)));
+                    }
+                    None => abandon!(Err(io::Error::new(ErrorKind::UnexpectedEof, "websocket stream ended"))),
+                    Some(frame @ Ok(_)) => *parked_frame = Some(frame),
+                }
+            }
+            result = &mut job => return result.map(Some).map_err(io::Error::other),
         }
     }
 }
