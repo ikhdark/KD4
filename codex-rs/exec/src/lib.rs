@@ -11,6 +11,7 @@ mod event_processor_with_human_output;
 pub(crate) mod event_processor_with_jsonl_output;
 pub(crate) mod exec_events;
 mod recovery;
+mod strict_output_schema;
 
 pub use cli::Cli;
 pub use cli::Command;
@@ -80,6 +81,7 @@ use codex_login::default_client::set_default_originator;
 use codex_login::enforce_login_restrictions;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_otel::set_parent_from_context;
 use codex_otel::traceparent_context_from_env;
 use codex_protocol::SessionId;
@@ -907,9 +909,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
     let task_id = {
         let InitialOperation {
             items,
-            output_schema,
+            mut output_schema,
             allow_no_prose,
         } = initial_operation;
+        if config.model_provider_id == OPENAI_PROVIDER_ID
+            && let Some(schema) = &mut output_schema
+        {
+            strict_output_schema::lower_disjoint_output_records(schema);
+        }
             event_processor.record_turn_submission();
             let response: TurnStartResponse = send_request_with_response(
                 &client,

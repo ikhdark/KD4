@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use codex_git_utils::DiffComparison;
+use codex_git_utils::DiffInspection;
 use codex_git_utils::DiffRequest;
 use codex_git_utils::DiffSourceRequest;
 use codex_git_utils::RangeTraversal;
@@ -92,9 +93,17 @@ const DEFAULT_MAX_COMMITS: usize = 50;
 struct Arguments {
     comparison: Option<DiffComparison>,
     #[serde(default)]
+    layer_view: bool,
+    if_layer_sha256: Option<String>,
+    #[serde(default)]
     include_history: bool,
+    #[serde(default)]
+    use_merge_base: bool,
+    #[serde(default)]
+    select_after_renames: bool,
     base: Option<String>,
     head: Option<String>,
+    literal_history: Option<String>,
     #[serde(default)]
     paths: Vec<String>,
     max_patch_bytes: Option<usize>,
@@ -127,7 +136,7 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
         };
         let mut properties = BTreeMap::from([
             ("base".to_string(), JsonSchema::string(Some("Base commit revision, resolved once to an immutable commit/tree; required for revision comparisons.".into()))),
-            ("head".to_string(), JsonSchema::string(Some("Head commit revision, resolved once; endpoint diff is base tree to head tree, not merge-base to head.".into()))),
+            ("head".to_string(), JsonSchema::string(Some("Head commit revision, resolved once; by default the diff is base tree to head tree.".into()))),
             ("paths".to_string(), JsonSchema {
                 max_items: Some(64),
                 ..JsonSchema::array(JsonSchema::string(None), Some("Literal, case-sensitive repository-root-relative file/directory paths; omitted means all tracked changes. Paths matching nothing at either endpoint are listed in unmatched_paths. For ranges, limits endpoint diff only, never commit selection.".into()))
@@ -142,18 +151,23 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
             vec!["base".to_string(), "head".to_string()]
         } else {
             properties.insert("comparison".to_string(), JsonSchema::string_enum(vec![json!("staged"), json!("unstaged"), json!("revisions")], Some("Required. staged: captured HEAD (or unborn empty tree) to live index; unstaged: live index to working tree; revisions: explicit base/head commit trees. Never combines staged and unstaged.".into())));
+            properties.insert("literal_history".to_string(), JsonSchema::string(Some("Opt-in Git text patch history for one case-sensitive literal of 1–256 UTF-8 bytes, no CR/LF/NUL. Requires comparison:revisions, head and 1–64 literal paths, without base or diff/history options other than max_commits (1–100, default 50). Counts added and deleted matching lines, not occurrences or context. Uses Git path-limited history, no merge diffs or rename following; refuses ambiguous or shallow history.".into())));
             properties.insert("include_history".to_string(), JsonSchema::boolean(Some("Default false. With comparison:revisions and explicit base/head, also summarize base..head commits, ancestry/merge bases and shallow-history uncertainty. Returns the commit-range result with endpoint_diff separate from reachability history; paths limit only that diff. Enables traversal/max_commits, excludes source_ranges, and defaults max_patch_bytes/max_files to 8192/30 instead of 16384/50. Reversions can have commits but no endpoint changes; statistics are never summed across commits.".into())));
+            properties.insert("use_merge_base".to_string(), JsonSchema::boolean(Some("Default false. For revisions without include_history, compare the sole common ancestor tree to the captured head tree. Returns the original requested base as merge_base_selection.requested_base; from identifies the ancestor. Shallow, unrelated, ambiguous or unavailable ancestry is refused; no fetches.".into())));
+            properties.insert("select_after_renames".to_string(), JsonSchema::boolean(Some("Default false. For revisions without include_history and with paths, detect renames across the full captured diff before selecting literal old or new endpoints. Full capture limits still apply; displayed totals and source ranges describe selected files.".into())));
             properties.insert("source_ranges".to_string(), JsonSchema::object(BTreeMap::from([
                 ("context_lines".into(), bounded(0, 100, "Surrounding lines per hunk side; default 3. Both source and patch use this context.".into())),
                 ("max_bytes".into(), bounded(0, 131_072, "Maximum combined old/new source text bytes; default 16384. Whole hunks only, at most 1000 returned; omitted ranges remain explicitly incomplete. Independent of max_patch_bytes.".into())),
                 ("if_diff_sha256".into(), JsonSchema::string(Some("Optional diff_sha256 from a previous git_diff with identical paths/context. Refuse stale coordinates if any captured content, endpoint commit or metadata differs. Omit only when requesting newly resolved hunks rather than reusing prior coordinates.".into()))),
             ]), None, Some(false.into())));
+            properties.insert("layer_view".into(), JsonSchema::boolean(Some("Default false. Opt in to the exact file layer observation using comparison:staged and one paths entry instead of diff options. Returns raw hex bytes and SHA-256 as read (including CRLF); committed and index layers include Git OID/mode. Missing layers are null. Regular files only, up to 4096 bytes per layer. Non-atomic; observation checks may refuse detected changes. Git administrative/nested paths and unmerged entries are refused.".into())));
+            properties.insert("if_layer_sha256".into(), JsonSchema::string(Some("Optional observation_sha256 from a prior layer_view of the same exact path. Refuse a changed observation; this is not an atomic snapshot token.".into())));
             vec!["comparison".to_string()]
         };
         let purpose = if self.range {
             "Summarize base..head commits separately from the base-tree to head-tree endpoint diff. Reversions can produce commits with zero endpoint changes. Ancestry booleans, all merge bases, shallow-history uncertainty and all-parent/first-parent traversal are explicit. Non-ancestor ranges are allowed; paths never filter commits. No per-commit statistics are summed."
         } else {
-            "Inspect one explicit Git comparison: staged, unstaged, or two immutable revisions. For revisions, include_history:true also returns the base..head commit-range summary with endpoint_diff separate from commit history; traversal/max_commits apply only to history. Otherwise optional source_ranges resolves hunks into exact old/new source text and line ranges with configurable context from the SAME Git capture, binding each side to its path/mode/blob OID, including deletions and renames. Zero line_count denotes an anchor, not a source line. Working-tree blob IDs identify captured normalized content, not stored/recoverable objects or current raw bytes. diff_sha256 binds the full capture even when patch/files are truncated; use source_ranges.if_diff_sha256 with matching paths/context to reject stale coordinates. Binary/non-UTF-8/non-regular source ranges remain explicitly unavailable; pure renames/mode changes have no source hunks. Coverage is only changed lines with context, never complete behavioral review or read_file history/retention credit. Returns comparison endpoints, status/modes/raw OIDs, rename similarity, binary flags and exact Git patch hunks; never reconstructs diffs from turn patch tracking."
+            "Inspect one explicit Git comparison: staged, unstaged, or two immutable revisions. For staged with exactly one literal path, layer_view:true is a separate non-atomic observation of committed, index and raw worktree contents, including untracked or missing layers. For revisions, use_merge_base:true selects the sole common ancestor instead of the supplied base as the left diff endpoint; it cannot be combined with include_history. For revisions, include_history:true also returns the base..head commit-range summary with endpoint_diff separate from commit history; traversal/max_commits apply only to history. Otherwise optional source_ranges resolves hunks into exact old/new source text and line ranges with configurable context from the SAME Git capture, binding each side to its path/mode/blob OID, including deletions and renames. Zero line_count denotes an anchor, not a source line. Working-tree blob IDs identify captured normalized content, not stored/recoverable objects or current raw bytes. diff_sha256 binds the full capture even when patch/files are truncated; use source_ranges.if_diff_sha256 with matching paths/context to reject stale coordinates. Binary/non-UTF-8/non-regular source ranges remain explicitly unavailable; pure renames/mode changes have no source hunks. Coverage is only changed lines with context, never complete behavioral review or read_file history/retention credit. Returns comparison endpoints, status/modes/raw OIDs, rename similarity, binary flags and exact Git patch hunks; never reconstructs diffs from turn patch tracking."
         };
         ToolSpec::Function(ResponsesApiTool {
             name: if self.range {
@@ -163,7 +177,7 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
             }
             .into(),
             description: format!(
-                "{purpose} Untracked files are excluded. Mutable index/working-tree endpoints are observations, not coherent snapshots or content identities; raw all-zero OIDs mean unavailable. Unstaged comparisons cover checked-out submodule commits, not dirty submodule work trees. Patch encoding is utf8, or hex for non-UTF-8 bytes. Full selected totals remain separate from explicit file/patch/commit truncation; bounded stderr warnings keep their start and end, including Git's rename-limit diagnostics, and mark omitted bytes. Rename detection uses 50% similarity and a 1000-candidate limit. Git's built-in EOL/encoding normalization is preserved, but configured clean/process filters, external diff and textconv are disabled. Local full-disk-read environments only. No fetches or repository writes. Unsupported/missing history, conflicts, non-UTF-8 paths, timeout or capture above 8 MiB fail explicitly, never as no changes. Default limits fit the default direct-response budget; larger limits suit Code Mode, and a direct response that cannot fit fails undelivered. Use narrower paths for oversized diffs; there is no retained patch recovery handle."
+                "{purpose} Ordinary diffs exclude untracked files. Mutable index/working-tree endpoints are observations, not coherent snapshots or content identities; raw all-zero OIDs mean unavailable. Unstaged comparisons cover checked-out submodule commits, not dirty submodule work trees. Patch encoding is utf8, or hex for non-UTF-8 bytes. Full selected totals remain separate from explicit file/patch/commit truncation; bounded stderr warnings keep their start and end, including Git's rename-limit diagnostics, and mark omitted bytes. Rename detection uses 50% similarity and a 1000-candidate limit. Git's built-in EOL/encoding normalization is preserved, but configured clean/process filters, external diff and textconv are disabled. Local full-disk-read environments only. No fetches or repository writes. Unsupported/missing history, conflicts, non-UTF-8 paths, timeout or capture above 8 MiB fail explicitly, never as no changes. Default limits fit the default direct-response budget; larger limits suit Code Mode, and a direct response that cannot fit fails undelivered. Use narrower paths for oversized diffs; there is no retained patch recovery handle."
             ),
             strict: false,
             defer_loading: None,
@@ -171,7 +185,7 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
             output_schema: Some(if self.range {
                 output_schema(true)
             } else {
-                json!({"oneOf": [output_schema(false), output_schema(true)]})
+                json!({"oneOf": [output_schema(false), output_schema(true), layer_output_schema(), literal_history_schema()]})
             }.into()),
         })
     }
@@ -185,9 +199,10 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
             };
             let args: Arguments = parse_arguments(arguments)?;
             let range = self.range || args.include_history;
+            let literal_history = args.literal_history.is_some();
             if self.range && (args.comparison.is_some() || args.include_history)
                 || range && args.source_ranges.is_some()
-                || !range && (args.traversal.is_some() || args.max_commits.is_some())
+                || !range && (args.traversal.is_some() || !literal_history && args.max_commits.is_some())
             {
                 return Err(FunctionCallError::RespondToModel(
                     "arguments do not match the selected Git inspection tool".into(),
@@ -200,9 +215,40 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                     FunctionCallError::RespondToModel("comparison is required".into())
                 })?
             };
+            if literal_history
+                && (range
+                    || comparison != DiffComparison::Revisions
+                    || args.base.is_some()
+                    || args.use_merge_base
+                    || args.select_after_renames
+                    || args.max_patch_bytes.is_some()
+                    || args.max_files.is_some()
+                    || args.source_ranges.is_some()
+                    || args.traversal.is_some())
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "literal_history requires comparison:revisions with head and paths; only max_commits may be combined".into(),
+                ));
+            }
             if args.include_history && !matches!(comparison, DiffComparison::Revisions) {
                 return Err(FunctionCallError::RespondToModel(
                     "include_history requires comparison:revisions with base and head".into(),
+                ));
+            }
+            if args.use_merge_base && (range || comparison != DiffComparison::Revisions) {
+                return Err(FunctionCallError::RespondToModel(
+                    "use_merge_base requires comparison:revisions without include_history".into(),
+                ));
+            }
+            if args.if_layer_sha256.is_some() && !args.layer_view
+                || args.layer_view
+                    && (range || literal_history || comparison != DiffComparison::Staged || args.use_merge_base
+                        || args.select_after_renames || args.paths.len() != 1 || args.base.is_some() || args.head.is_some()
+                        || args.source_ranges.is_some() || args.max_files.is_some()
+                        || args.max_patch_bytes.is_some())
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "layer_view requires comparison:staged, one exact paths entry, and no diff options".into(),
                 ));
             }
             let environment = prepare_git_read(
@@ -217,9 +263,34 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                 .to_abs_path()
                 .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
                 .to_path_buf();
+            if args.layer_view {
+                let operation = DiffInspection::inspect_path_layers(
+                    cwd,
+                    args.paths.into_iter().next().expect("one validated path"),
+                    args.if_layer_sha256,
+                );
+                let layers = tokio::select! {
+                    _ = invocation.cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("Git layer inspection cancelled; no repository writes were requested".into())),
+                    result = operation => result.map_err(FunctionCallError::RespondToModel)?,
+                };
+                let value = serde_json::to_value(layers)
+                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                return git_read_output(value, &environment.environment_id, &invocation, || {
+                    "Git layer observation exceeds the delivery budget; nothing was delivered".into()
+                });
+            }
             let (default_patch, default_files) = default_limits(range);
+            if args.select_after_renames
+                && (range || comparison != DiffComparison::Revisions || args.paths.is_empty())
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "select_after_renames requires comparison:revisions without include_history and with paths".into(),
+                ));
+            }
             let request = DiffRequest {
                 comparison,
+                use_merge_base: args.use_merge_base,
+                select_after_renames: args.select_after_renames,
                 base: args.base,
                 head: args.head,
                 paths: args.paths,
@@ -228,7 +299,17 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                 source_ranges: args.source_ranges,
             };
             let operation = async {
-                if range {
+                if let Some(literal) = args.literal_history {
+                    serde_json::to_value(
+                        request
+                            .inspect_literal_history(
+                                cwd,
+                                literal,
+                                args.max_commits.unwrap_or(DEFAULT_MAX_COMMITS),
+                            )
+                            .await?,
+                    )
+                } else if range {
                     serde_json::to_value(
                         codex_git_utils::summarize_commit_range(
                             cwd,
@@ -253,7 +334,9 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                 &invocation,
                 || format!(
                     "Git inspection result exceeds the current model delivery budget; nothing was delivered. Retry with smaller {} or narrower paths.",
-                    if range {
+                    if literal_history {
+                        "max_commits"
+                    } else if range {
                         "max_patch_bytes, max_files or max_commits"
                     } else {
                         "max_patch_bytes or max_files"
@@ -277,6 +360,36 @@ impl CoreToolRuntime for GitInspectionHandler {
     }
 }
 
+fn layer_output_schema() -> serde_json::Value {
+    let string = json!({"type":"string"});
+    let integer = json!({"type":"integer","minimum":0,"maximum":4096});
+    let blob = json!({"type":["object","null"],"additionalProperties":false,
+        "properties":{"mode":string,"oid":string,"bytes":integer,"data_hex":string,"sha256":string},
+        "required":["mode","oid","bytes","data_hex","sha256"]});
+    json!({"type":"object","additionalProperties":false,"properties":{
+        "repository_root":string,"path":string,"commit_oid":string,"observation_sha256":string,
+        "atomic_snapshot":{"const":false},"committed":blob,"index":blob,"environment_id":string,
+        "worktree":{"type":["object","null"],"additionalProperties":false,
+            "properties":{"bytes":integer,"data_hex":string,"sha256":string},
+            "required":["bytes","data_hex","sha256"]}},
+        "required":["repository_root","path","commit_oid","observation_sha256","atomic_snapshot",
+            "committed","index","environment_id","worktree"]})
+}
+
+fn literal_history_schema() -> serde_json::Value {
+    let string = json!({"type":"string"});
+    let count = json!({"type":"integer","minimum":0});
+    json!({"type":"object","additionalProperties":false,"properties":{
+        "environment_id":string,"head_commit_oid":string,"literal":string,
+        "paths":{"type":"array","items":string},
+        "commits_truncated":{"type":"boolean"},
+        "commits":{"type":"array","items":{"type":"object","additionalProperties":false,
+            "properties":{"commit_oid":string,"added_matching_lines":count,"removed_matching_lines":count,
+                "direction":{"type":"string","enum":["introduced","removed","mixed"]}},
+            "required":["commit_oid","added_matching_lines","removed_matching_lines","direction"]}}},
+        "required":["environment_id","head_commit_oid","literal","paths","commits","commits_truncated"]})
+}
+
 fn output_schema(range: bool) -> serde_json::Value {
     let string = json!({"type":"string"});
     let boolean = json!({"type":"boolean"});
@@ -293,7 +406,7 @@ fn output_schema(range: bool) -> serde_json::Value {
         "required":["status","old_path","new_path","old_mode","new_mode","old_oid","new_oid","similarity_percent","binary","additions","deletions"]});
     let mut diff = json!({"type":"object","additionalProperties":false,"properties":{
         "repository_root":string,"comparison":{"type":"string","enum":["staged","unstaged","revisions"]},
-        "from":endpoint,"to":endpoint,"paths":strings,"unmatched_paths":strings,"git_args":strings,"filter_policy":string,
+        "from":endpoint,"to":endpoint,"paths":strings,"unmatched_paths":strings,"git_args":strings,"filter_policy":string,"path_selection":{"type":"string","enum":["post_rename"]},
         "untracked_included":boolean,"coherent_snapshot_verified":boolean,
         "total_files":integer,"files":{"type":"array","items":file},"files_truncated":boolean,
         "additions":integer,"deletions":integer,"binary_files":integer,"patch":string,
@@ -319,6 +432,10 @@ fn output_schema(range: bool) -> serde_json::Value {
             "required":["old","new","hunks","total_hunks","ranges_complete","unavailable_reason"]}}},
         "required":["coverage","behavioral_review_complete","coordinate_space","context_lines","files","files_truncated","ranges_complete","returned_source_bytes"]});
     if !range {
+        diff["properties"]["merge_base_selection"] = json!({
+            "type":"object","additionalProperties":false,"properties":{"requested_base":endpoint},
+            "required":["requested_base"]
+        });
         diff["properties"]["environment_id"] = string;
         if let Some(required) = diff["required"].as_array_mut() {
             required.push(json!("environment_id"));

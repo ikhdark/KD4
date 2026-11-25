@@ -165,12 +165,11 @@ input was cached. Unknown usage, new user input and insufficient physical headro
 do not qualify. Prepared-prompt admission rechecks the waiver; continued pressure
 and provider overflow still take the existing compaction paths.
 
-The [compaction history commit](src/session/mod.rs) allows at most eight
-pending `SessionStart(compact)` occurrences per session. Each successful
-commit retains its own occurrence in FIFO order for an ordinary turn; startup
-sources do not count toward the limit. If the queue is full, compaction is
-refused before the replacement checkpoint is persisted or installed. Run an
-ordinary turn to drain the pending hooks before retrying. The immediate
+The [compaction history commit](src/session/mod.rs) records one pending
+`SessionStart(compact)` occurrence after each successful replacement. The
+[session state](src/state/session.rs) counts these occurrences in constant
+space rather than refusing compaction due to a hook backlog. The next ordinary
+turn processes them individually after any pending startup source. The immediate
 `PostCompact` gate still follows each successful commit.
 
 The original parent paths keep explicit compatibility re-exports. Follow these

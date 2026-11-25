@@ -842,6 +842,8 @@ function Get-LocalPublishBuildInputSnapshot {
     $utf8 = [Text.UTF8Encoding]::new($false)
     $empty = [byte[]]::new(0)
     $newestWriteUtc = $null
+    $sourceFiles = [ordered]@{}
+    [long]$sourceBytes = 0
     try {
         $recipeFingerprint = Get-LocalPublishBuildRecipeFingerprint -RepoRoot $RepoRoot
         $prefixBytes = $utf8.GetBytes("codex-local-publish-inputs-v4`nhead=$(([string]$headCommit[0]).Trim())`nrecipe=$recipeFingerprint`n")
@@ -872,6 +874,8 @@ function Get-LocalPublishBuildInputSnapshot {
             if (-not (Test-Sha256Text -Value $fileSha256)) {
                 return $null
             }
+            $sourceFiles[$normalized] = $fileSha256
+            $sourceBytes += $fileInfo.Length
             $headerBytes = $utf8.GetBytes(
                 "file:$($pathBytes.Length):${normalized}:$($fileInfo.Length):$fileSha256`n"
             )
@@ -882,6 +886,9 @@ function Get-LocalPublishBuildInputSnapshot {
         return [pscustomobject]@{
             Fingerprint = [BitConverter]::ToString($sha256.Hash).Replace("-", "").ToLowerInvariant()
             NewestWriteUtc = $newestWriteUtc
+            SourceFiles = $sourceFiles
+            SourceBytes = $sourceBytes
+            Head = ([string]$headCommit[0]).Trim()
         }
     }
     catch {
@@ -919,12 +926,14 @@ function Read-BuildStamp {
         $codexSha256 = $stamp.PSObject.Properties["codexSha256"]
         $codeModeHostSha256 = $stamp.PSObject.Properties["codeModeHostSha256"]
         $writtenAtUtc = $stamp.PSObject.Properties["writtenAtUtc"]
+        $receiptSha256 = $stamp.PSObject.Properties["buildReceiptSha256"]
         if (
             $null -eq $schemaVersion -or [string]$schemaVersion.Value -cne "4" -or
             $null -eq $profile -or [string]::IsNullOrWhiteSpace([string]$profile.Value) -or
             $null -eq $sourceFingerprint -or -not (Test-Sha256Text -Value $sourceFingerprint.Value) -or
             $null -eq $codexSha256 -or -not (Test-Sha256Text -Value $codexSha256.Value) -or
             $null -eq $codeModeHostSha256 -or -not (Test-Sha256Text -Value $codeModeHostSha256.Value) -or
+            ($null -ne $receiptSha256 -and -not (Test-Sha256Text -Value $receiptSha256.Value)) -or
             $null -eq $writtenAtUtc -or [string]::IsNullOrWhiteSpace([string]$writtenAtUtc.Value)
         ) {
             return $null
@@ -959,6 +968,7 @@ function Read-BuildStamp {
             SourceNewestWriteUtc = if ($null -eq $sourceNewestWriteUtc) { $null } else { $sourceNewestWriteUtc.Value }
             CodexSha256 = ([string]$codexSha256.Value).ToLowerInvariant()
             CodeModeHostSha256 = ([string]$codeModeHostSha256.Value).ToLowerInvariant()
+            BuildReceiptSha256 = if ($null -ne $receiptSha256) { ([string]$receiptSha256.Value).ToLowerInvariant() }
         }
     }
     catch {
@@ -1024,11 +1034,31 @@ function Get-AutoSkipBuildDecision {
         return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact differs from stamped build"; SourceSnapshot = $SourceSnapshot; StampedArtifactsCurrent = $false }
     }
 
+    $buildReceipt = $null
+    if ($stamp.BuildReceiptSha256) {
+        try {
+            $buildReceipt = Resolve-ManifestBuildReceipt -Entry ([pscustomobject]@{
+                Path = Join-Path (Split-Path -Parent $SourceExe) "build-receipt.json"
+                Sha256 = $stamp.BuildReceiptSha256
+            }) -RoleDigests @{
+                "entrypoint" = $stamp.CodexSha256; "code-mode-host" = $stamp.CodeModeHostSha256
+            } -RoleSizes @{
+                "entrypoint" = [IO.FileInfo]::new($SourceExe).Length
+                "code-mode-host" = [IO.FileInfo]::new($SourceCodeModeHostExe).Length
+            }
+        }
+        catch {
+            return [pscustomobject]@{ CanSkip = $false; Reason = "build receipt invalid: $($_.Exception.Message)"; SourceSnapshot = $SourceSnapshot; StampedArtifactsCurrent = $true }
+        }
+    }
     return [pscustomobject]@{
         CanSkip = $true
         Reason = "source artifacts and tracked publish inputs match build stamp"
         SourceSnapshot = $SourceSnapshot
         StampedArtifactsCurrent = $true
+        BuildReceipt = $buildReceipt
+        CodexSha256 = $stamp.CodexSha256
+        CodeModeHostSha256 = $stamp.CodeModeHostSha256
     }
 }
 
@@ -1065,30 +1095,74 @@ function Get-BuildStampNewestWriteUtc {
     }
 }
 
+function Write-LocalPublishBuildReceipt {
+    param([string]$RepoRoot, [object]$Snapshot, [hashtable]$Build, [string]$SourceExe, [string]$SourceCodeModeHostExe)
+
+    $binaries = @(
+        foreach ($path in @($SourceExe, $SourceCodeModeHostExe)) {
+            $before = [IO.FileInfo]::new($path)
+            if (-not $before.Exists) { throw "Cannot bind absent Cargo artifact: $path" }
+            $file = Get-VerifiedFileHashObservation -Path $path -Before $before
+            if ($null -eq $file) { throw "Cargo artifact changed while recording the build receipt: $path" }
+            [ordered]@{ name = $before.Name; bytes = $file.Length; sha256 = $file.Sha256; cargoPath = $path }
+        }
+    )
+    # The managed build receipt's manifest identity is the ordered path/NUL/hash
+    # inventory, separate from the publisher's source-and-recipe skip key.
+    $manifest = [Text.StringBuilder]::new()
+    foreach ($name in $Snapshot.SourceFiles.Keys) {
+        [void]$manifest.Append($name).Append([char]0).Append($Snapshot.SourceFiles[$name]).Append([char]10)
+    }
+    $receipt = [ordered]@{
+        version = 1
+        createdUtc = [DateTime]::UtcNow.ToString("o")
+        producer = "kd4-local-publisher"
+        exitCode = 0
+        command = $Build.Command
+        sourceRoot = $RepoRoot
+        buildRoot = $RepoRoot
+        sourceRevision = $Snapshot.Head
+        sourceManifest = [ordered]@{
+            sha256 = Get-TextSha256 -Value $manifest.ToString()
+            files = $Snapshot.SourceFiles.Count
+            bytes = $Snapshot.SourceBytes
+        }
+        sourceFiles = $Snapshot.SourceFiles
+        sourceClosure = @{ reusable = $false; gaps = @("Local publisher input inventory is not a managed frozen-build closure.") }
+        buildContext = $Build.Context
+        resolvedCompileSettings = $Build.Artifacts
+        rustc = $Build.Rustc
+        targetDir = $Build.TargetDir
+        binaries = $binaries
+    }
+    $path = Join-Path (Split-Path -Parent $SourceExe) "build-receipt.json"
+    $temp = "$path.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temp, ($receipt | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
+        $hash = Get-FileSha256 -Path $temp
+        $null = Resolve-ManifestBuildReceipt -Entry @{ Path = $temp; Sha256 = $hash } -RoleDigests @{
+            "entrypoint" = $binaries[0].sha256; "code-mode-host" = $binaries[1].sha256
+        } -RoleSizes @{ "entrypoint" = $binaries[0].bytes; "code-mode-host" = $binaries[1].bytes }
+        [IO.File]::Move($temp, $path)
+        return [pscustomobject]@{ Path = $path; Sha256 = $hash; Binaries = $binaries }
+    }
+    finally {
+        if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+    }
+}
+
 function Write-BuildStamp {
     param(
         [string]$StampPath,
         [string]$Profile,
         [string]$SourceFingerprint,
-        [string]$SourceExe,
-        [string]$SourceCodeModeHostExe,
+        [object]$BuildReceipt,
         [AllowNull()]
         [object]$SourceNewestUtc
     )
 
     if (-not (Test-Sha256Text -Value $SourceFingerprint)) {
         throw "Cannot write local publish build stamp without a valid source fingerprint."
-    }
-    $codexSha256 = Get-FileSha256 -Path $SourceExe
-    $codeModeHostSha256 = Get-FileSha256 -Path $SourceCodeModeHostExe
-    if (
-        -not (Test-Sha256Text -Value $codexSha256) -or
-        -not (Test-Sha256Text -Value $codeModeHostSha256)
-    ) {
-        $missingArtifact = @($SourceExe, $SourceCodeModeHostExe) |
-            Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) } |
-            Select-Object -First 1
-        throw "Cannot write local publish build stamp because a built source artifact is missing: $missingArtifact"
     }
 
     $parent = Split-Path -Parent $StampPath
@@ -1098,8 +1172,9 @@ function Write-BuildStamp {
         profile = $Profile
         sourceFingerprint = $SourceFingerprint
         sourceNewestWriteUtc = if ($null -eq $SourceNewestUtc) { $null } else { ([DateTime]$SourceNewestUtc).ToString("o") }
-        codexSha256 = $codexSha256
-        codeModeHostSha256 = $codeModeHostSha256
+        codexSha256 = $BuildReceipt.Binaries[0].sha256
+        codeModeHostSha256 = $BuildReceipt.Binaries[1].sha256
+        buildReceiptSha256 = $BuildReceipt.Sha256
         writtenAtUtc = [DateTime]::UtcNow.ToString("o")
     }
     $temporaryPath = "$StampPath.$([Guid]::NewGuid().ToString('N')).tmp"
@@ -3171,7 +3246,8 @@ function Format-CargoCommandForProof {
 function Invoke-CargoForPublish {
     param(
         [string[]]$CommandArgs,
-        [string]$FailureDescription
+        [string]$FailureDescription,
+        [hashtable]$Observation
     )
 
     $program = $CommandArgs[0]
@@ -3183,7 +3259,18 @@ function Invoke-CargoForPublish {
     $ErrorActionPreference = "Continue"
     $exitCode = 1
     try {
-        & $program @programArgs
+        & $program @programArgs | ForEach-Object {
+            if ($_ -notlike '{"reason":*') { Write-Output $_; return }
+            $message = $_ | ConvertFrom-Json
+            if ($message.reason -ne "compiler-artifact" -or -not $message.executable) { return }
+            $name = [IO.Path]::GetFileName([string]$message.executable)
+            if ($name -in @("codex.exe", "codex-code-mode-host.exe")) {
+                $Observation.Artifacts[$name] = [ordered]@{
+                    package = $message.package_id; executable = $message.executable
+                    profile = $message.profile; features = $message.features; fresh = $message.fresh
+                }
+            }
+        }
         $exitCode = $LASTEXITCODE
     }
     finally {
@@ -3219,10 +3306,87 @@ function Get-LocalPublishCargoConfigLines {
     return $lines.ToArray()
 }
 
+function Get-LocalPublishCargoObservation {
+    param([string]$RepoRoot, [string]$CodexRs, [string]$Profile, [object]$Pgo,
+        [string]$ConfigPath, [string[]]$ConfigLines, [string[]]$CommandArgs, [string]$TargetDir)
+
+    # Capture only selected compile inputs, never general Cargo env/config
+    # values (which may include registry credentials).
+    $environment = [ordered]@{}
+    foreach ($entry in (Get-ChildItem Env: | Sort-Object Name)) {
+        if ($entry.Name -match '^(CARGO_PROFILE_.+|CARGO_TARGET_.+_(LINKER|RUSTFLAGS)|CARGO_BUILD_(RUST.*|TARGET)|RUSTC(_BOOTSTRAP|_WRAPPER|_WORKSPACE_WRAPPER)?|RUSTUP_(TOOLCHAIN|HOME)|CARGO_HOME|CARGO_INCREMENTAL|CARGO_ENCODED_RUSTFLAGS|RUSTFLAGS|CODEX_BUILD_(COMMIT|DIRTY|PROFILE|TIMESTAMP)|CODEX_RELEASE_VERSION|SOURCE_DATE_EPOCH|RUSTY_V8_ARCHIVE_SHA256)$') {
+            $environment[$entry.Name] = $entry.Value
+        }
+    }
+    $configs = [ordered]@{}
+    $directories = @()
+    for ($directory = $CodexRs; $directory; $directory = [IO.Path]::GetDirectoryName($directory)) {
+        $directories += $directory
+    }
+    $cargoHome = if ($env:CARGO_HOME) {
+        if ([IO.Path]::IsPathRooted($env:CARGO_HOME)) { $env:CARGO_HOME } else { Join-Path $CodexRs $env:CARGO_HOME }
+    } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".cargo" }
+    $configPaths = @(
+        foreach ($directory in $directories) {
+            foreach ($name in @(".cargo/config", ".cargo/config.toml", "rust-toolchain", "rust-toolchain.toml")) { Join-Path $directory $name }
+        }
+        if ($cargoHome) { Join-Path $cargoHome "config"; Join-Path $cargoHome "config.toml" }
+        if ($ConfigPath) { $ConfigPath }
+    )
+    foreach ($path in $configPaths) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) { $configs[$path] = Get-FileSha256 -Path $path }
+    }
+    $compiler = if ($env:RUSTC) { $env:RUSTC } elseif ($env:CARGO_BUILD_RUSTC) { $env:CARGO_BUILD_RUSTC } else { "rustc" }
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $rustc = @(& $compiler -Vv 2>$null) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or -not $rustc) { throw "Could not identify the local publish compiler: $compiler" }
+        $cargoVersion = @(& $CommandArgs[0] --version --verbose 2>$null) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or -not $cargoVersion) { throw "Could not identify the local publish Cargo." }
+        $linkers = [ordered]@{}
+        $target = if ($null -ne $Pgo) { $Pgo.target } elseif ($env:CARGO_BUILD_TARGET) {
+            $env:CARGO_BUILD_TARGET
+        } elseif ($rustc -match '(?m)^host: (\S+)') { $Matches[1] }
+        foreach ($name in $environment.Keys) {
+            if (-not $target -or $name -ne "CARGO_TARGET_$($target.Replace('-', '_'))_LINKER") { continue }
+            $linker = $environment[$name]
+            $tool = Get-Command $linker -CommandType Application -ErrorAction SilentlyContinue
+            if ($null -ne $tool) {
+                $version = @(& $tool.Source --version 2>$null) -join "`n"
+                $linkers[$name] = @{ path = $tool.Source; sha256 = Get-FileSha256 -Path $tool.Source; version = if ($LASTEXITCODE -eq 0) { $version } }
+            }
+        }
+    }
+    finally { $ErrorActionPreference = $oldErrorActionPreference }
+
+    $options = @("--profile", $Profile)
+    if ($null -ne $Pgo) { $options += @("--target", $Pgo.target) }
+    # The command preserves the exact temporary path; compare profiles by
+    # the effective options and the separate digest of each --config input.
+    return @{
+        Command = $CommandArgs
+        TargetDir = $TargetDir
+        Rustc = $rustc
+        Artifacts = [ordered]@{}
+        Context = [ordered]@{
+            sourceRoot = $RepoRoot; workingDirectory = $CodexRs
+            selectedManifest = (Join-Path $CodexRs "Cargo.toml")
+            packages = @("codex-cli", "codex-code-mode-host"); options = $options
+            environment = $environment; configs = $configs
+            toolchainSelection = @{
+                cargo = $cargoVersion; rustcProbe = $compiler; rustc = $rustc; linkers = $linkers
+            }
+            cargoBuildConfig = @{ publisherOverlay = $ConfigLines; pgo = $Pgo }
+        }
+    }
+}
+
 function Invoke-CodexBuild {
     param(
         [string]$RepoRoot,
         [string]$Profile,
+        [ref]$BuildObservation,
         [switch]$DryRun
     )
 
@@ -3261,7 +3425,7 @@ function Invoke-CodexBuild {
             }
         }
         $publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host")
-        $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $Profile)
+        $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $Profile, "--message-format=json-render-diagnostics")
         if ($null -ne $pgo) { $buildArgs += @("--target", $pgo.target) }
 
         $codexRs = Join-Path $RepoRoot "codex-rs"
@@ -3332,7 +3496,22 @@ function Invoke-CodexBuild {
             Write-ProofLine "cargoTargetDir" $publishTargetDir
             Push-Location -LiteralPath $codexRs
             $locationPushed = $true
-            Invoke-CargoForPublish -CommandArgs $buildCommandArgs -FailureDescription "cargo build"
+            $buildCommandArgs[0] = (Get-Command $buildCommandArgs[0] -CommandType Application -ErrorAction Stop).Source
+            $observation = Get-LocalPublishCargoObservation -RepoRoot $RepoRoot -CodexRs $codexRs -Profile $Profile -Pgo $pgo `
+                -ConfigPath $publishCargoConfigPath -ConfigLines $cargoConfigLines -CommandArgs $buildCommandArgs -TargetDir $publishTargetDir
+            Invoke-CargoForPublish -CommandArgs $buildCommandArgs -FailureDescription "cargo build" -Observation $observation
+            foreach ($path in $observation.Context.configs.Keys) {
+                if ((Get-FileSha256 -Path $path) -cne $observation.Context.configs[$path]) {
+                    throw "Cargo configuration changed during the local publish build; no build receipt was written: $path"
+                }
+            }
+            foreach ($name in @("codex.exe", "codex-code-mode-host.exe")) {
+                $expected = Join-Path (Get-LocalPublishArtifactDirectory -RepoRoot $RepoRoot -Profile $Profile) $name
+                if (-not $observation.Artifacts.Contains($name) -or $observation.Artifacts[$name].executable -ine $expected) {
+                    throw "Cargo did not report the expected publication artifact: $expected"
+                }
+            }
+            $BuildObservation.Value = $observation
         }
         finally {
             if ($locationPushed) { Pop-Location }
@@ -3986,6 +4165,8 @@ if (-not $DryRun) {
 
 $sourceBuildStampMustRemainValid = $false
 $buildInputSnapshotBefore = $null
+$localBuildReceipt = $null
+$localBuildReceiptPath = if ($null -eq $sourceBundle) { Join-Path (Split-Path -Parent $SourceExe) "build-receipt.json" }
 if ($SkipBuild -and $null -eq $sourceBundle) {
     $rawSkipDecision = Get-AutoSkipBuildDecision `
         -RepoRoot $repoRoot -StampPath $buildStampPath -Profile $Profile `
@@ -4006,6 +4187,7 @@ if ($AutoSkipBuild -and -not $SkipBuild) {
         -SourceCodeModeHostExe $SourceCodeModeHostExe
     $buildInputSnapshotBefore = $autoSkipBuildDecision.SourceSnapshot
     if ($autoSkipBuildDecision.CanSkip) {
+        $localBuildReceipt = $autoSkipBuildDecision.BuildReceipt
         $SkipBuild = $true
         $sourceBuildStampMustRemainValid = $true
         Write-ProofLine "autoSkipBuild" "true"
@@ -4032,8 +4214,10 @@ if (-not $SkipBuild) {
             throw "Could not fingerprint local publish inputs before the build; refusing to produce an unbound build."
         }
         Remove-BuildStamp -StampPath $buildStampPath
+        if ([IO.File]::Exists($localBuildReceiptPath)) { [IO.File]::Delete($localBuildReceiptPath) }
     }
-    Invoke-CodexBuild -RepoRoot $repoRoot -Profile $Profile -DryRun:$DryRun
+    $buildObservation = $null
+    Invoke-CodexBuild -RepoRoot $repoRoot -Profile $Profile -BuildObservation ([ref]$buildObservation) -DryRun:$DryRun
     if (-not $DryRun -and $null -ne $buildInputFingerprintBefore) {
         $buildInputSnapshotAfter = Get-LocalPublishBuildInputSnapshot -RepoRoot $repoRoot
         $buildInputFingerprintAfter = if ($null -eq $buildInputSnapshotAfter) {
@@ -4048,14 +4232,14 @@ if (-not $SkipBuild) {
         if ($buildInputFingerprintBefore -cne $buildInputFingerprintAfter) {
             throw "Local publish inputs changed during the build; rerun publish so the artifacts match one source snapshot."
         }
-        $builtSourceNewestUtc = $buildInputSnapshotAfter.NewestWriteUtc
+        $localBuildReceipt = Write-LocalPublishBuildReceipt -RepoRoot $repoRoot -Snapshot $buildInputSnapshotAfter `
+            -Build $buildObservation -SourceExe $SourceExe -SourceCodeModeHostExe $SourceCodeModeHostExe
         Write-BuildStamp `
-            -StampPath (Get-BuildStampPath -RepoRoot $repoRoot -Profile $Profile) `
+            -StampPath $buildStampPath `
             -Profile $Profile `
             -SourceFingerprint $buildInputFingerprintAfter `
-            -SourceExe $SourceExe `
-            -SourceCodeModeHostExe $SourceCodeModeHostExe `
-            -SourceNewestUtc $builtSourceNewestUtc
+            -BuildReceipt $localBuildReceipt `
+            -SourceNewestUtc $buildInputSnapshotAfter.NewestWriteUtc
         $sourceBuildStampMustRemainValid = $true
         Write-ProofLine "buildStamp" "written: content and artifact hashes recorded"
     }
@@ -4069,6 +4253,10 @@ if ($BuildOnly) {
     Write-ProofLine "builtCodexPath" (Get-BuiltCodexPath -RepoRoot $repoRoot -Profile $Profile)
     Write-ProofLine "builtCodeModeHostPath" (Get-BuiltCodeModeHostPath -RepoRoot $repoRoot -Profile $Profile)
     Write-ProofLine "buildStampPath" $buildStampPath
+    if ($null -ne $localBuildReceipt) {
+        Write-ProofLine "buildReceiptPath" $localBuildReceipt.Path
+        Write-ProofLine "sourceBuildReceiptSha256" $localBuildReceipt.Sha256
+    }
     exit 0
 }
 
@@ -4505,13 +4693,16 @@ if ($sourceBuildFreshnessProvenByStamp) {
         -SourceExe $SourceExe `
         -SourceCodeModeHostExe $SourceCodeModeHostExe
     Write-ProofLine "sourceBuildStampPublishGate" "runtime bundle: $($publishGateDecision.Reason)"
-    if (-not $publishGateDecision.CanSkip) {
+    if (-not $publishGateDecision.CanSkip -or $publishGateDecision.CodexSha256 -cne $sourceSha256 -or
+        $publishGateDecision.CodeModeHostSha256 -cne $sourceCodeModeHostSha256) {
         throw "The content-bound build stamp no longer matches the source bundle immediately before publishing the runtime bundle. Rerun $publishCommand."
     }
 }
 try {
     Initialize-CodexBackupRoot -BackupDir $BackupDir
-    $sourceBuildReceipt = if ($null -ne $sourceBundle) { $sourceBundle.BuildReceipt }
+    $sourceBuildReceipt = if ($null -ne $sourceBundle) { $sourceBundle.BuildReceipt } elseif ($null -ne $publishGateDecision) {
+        $publishGateDecision.BuildReceipt
+    }
     $publishTransaction = New-CodexRuntimeBundleTransaction `
         -BuildReceipt $sourceBuildReceipt `
         -JournalPath $publishTransactionJournalPath `

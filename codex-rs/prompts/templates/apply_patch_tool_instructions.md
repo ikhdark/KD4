@@ -5,7 +5,7 @@ Operation headers:
 - `*** Update File: <path>`: patch a file with one or more `@@` hunks, or rename it without hunks.
 - Put `*** Move to: <new path>` immediately after an Update header to rename it.
 
-In a hunk, prefix unchanged context with a space, removals with `-`, and additions with `+`. Include only enough context to identify the change uniquely; one line before and after is often sufficient. Do not duplicate overlapping context between adjacent hunks. A textual `@@` anchor names an existing source line, not a containing scope: old/context lines must immediately follow it. Include every intervening line as context, or use a current `codex-range` for a distant or ambiguous edit; anchors never search later sibling bodies.
+In a hunk, prefix unchanged context with a space, removals with `-`, and additions with `+`. Include only enough context to identify the change uniquely; one line before and after is often sufficient. Do not duplicate overlapping context between adjacent hunks. A textual `@@` anchor names an existing source line, not a containing scope: old/context lines normally immediately follow it. A unique exact anchor can recover up to eight intervening blank lines if the complete preimage still matches exactly. Include every intervening line as context, or use a current `codex-range` for a distant or ambiguous edit; anchors never search later sibling bodies.
 
 Example combining operations:
 

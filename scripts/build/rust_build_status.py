@@ -2817,14 +2817,16 @@ def _cargo_launch_subcommand(command: Sequence[str]) -> int | None:
     return None if relative_index is None else offset + relative_index
 
 
-def _cargo_command_with_message_format(command: Sequence[str]) -> list[str]:
+def _cargo_command_with_message_format(
+    command: Sequence[str], option: str = "--freeze-bundle",
+) -> list[str]:
     result = list(command)
     options = result[: result.index("--")] if "--" in result else result
     if any(token == "--message-format" or token.startswith("--message-format=") for token in options):
-        raise ValueError("--freeze-bundle sets Cargo's --message-format; remove it from the command")
+        raise ValueError(f"{option} sets Cargo's --message-format; remove it from the command")
     index = _cargo_launch_subcommand(result)
     if index is None:
-        raise ValueError("--freeze-bundle requires a Cargo command")
+        raise ValueError(f"{option} requires a Cargo command")
     return [*result[: index + 1], FREEZE_MESSAGE_FORMAT, *result[index + 1 :]]
 
 
@@ -2844,6 +2846,7 @@ def _build_unit_dir(path: Path, crate: str) -> Path | None:
 def _cargo_executables(
     messages: Path, freshness: dict[str, object] | None = None,
     *, link_crates: Sequence[str] = (), link_artifacts: list[dict[str, object]] | None = None,
+    observe_units: bool = False,
 ) -> list[Path]:
     executables: dict[str, Path] = {}
     with messages.open(encoding="utf-8", errors="replace") as stream:
@@ -2857,13 +2860,18 @@ def _cargo_executables(
             if message.get("reason") == "compiler-artifact":
                 if freshness is not None:
                     freshness["status"] = "observed"
-                    freshness.setdefault("artifacts", []).append({
+                    artifact = {
                         "packageId": message.get("package_id"),
                         "target": message.get("target"),
                         "profile": message.get("profile"),
                         "fresh": message.get("fresh"),
                         "cause": "not reported by Cargo compiler-artifact messages",
-                    })
+                    }
+                    if observe_units:
+                        artifact.update(features=message.get("features"),
+                                        manifestPath=message.get("manifest_path"),
+                                        filenames=message.get("filenames"))
+                    freshness.setdefault("artifacts", []).append(artifact)
                 crate = (message.get("target") or {}).get("name")
                 if link_artifacts is not None and crate in link_crates:
                     for name in message.get("filenames", []):
@@ -3451,6 +3459,7 @@ def run_in_cargo_lane(
     source_mirror: str = "auto",
     freeze_bundle_dir: Path | None = None,
     record_link_crates: Sequence[str] = (),
+    observe_units: bool = False,
     rebuild: bool = False,
     materialize_internal_file_links: bool = False,
 ) -> int:
@@ -3466,6 +3475,13 @@ def run_in_cargo_lane(
         raise ValueError(f"unknown source mirror mode {source_mirror!r}")
     if materialize_internal_file_links and source_mirror != "always":
         raise ValueError("internal file links require --source-mirror always")
+    if observe_units:
+        cargo_index = _cargo_launch_subcommand(command)
+        if timing_path is None or cargo_index is None or command[cargo_index] not in {"build", "check", "b", "c"}:
+            raise ValueError("--observe-units requires --timing-json and a Cargo build or check")
+        # Freshness is a property of this Cargo invocation, not a cached bundle.
+        _cargo_command_with_message_format(command, "--observe-units")
+        rebuild = True
     if record_link_crates:
         if freeze_bundle_dir is None or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in record_link_crates):
             raise ValueError("--record-link-crate needs crate names and an explicit --freeze-bundle")
@@ -3682,8 +3698,10 @@ def run_in_cargo_lane(
             except OSError as error:
                 print(f"warning: could not request Cargo maintenance: {error}", file=sys.stderr)
             messages_path = None
-            if freeze:
-                child_command = _cargo_command_with_message_format(child_command)
+            if freeze or observe_units:
+                child_command = _cargo_command_with_message_format(
+                    child_command, "--observe-units" if observe_units else "--freeze-bundle",
+                )
                 messages_path = target_dir / f".cargo-messages-{uuid.uuid4().hex}.jsonl"
             try:
                 with (
@@ -3719,7 +3737,8 @@ def run_in_cargo_lane(
                 link_artifacts: list[dict[str, object]] = []
                 executables = (
                     _cargo_executables(messages_path, cache_reuse["cargoFreshness"],
-                        link_crates=record_link_crates if code == 0 else (), link_artifacts=link_artifacts)
+                        link_crates=record_link_crates if code == 0 else (),
+                        link_artifacts=link_artifacts, observe_units=observe_units)
                     if messages_path is not None else []
                 )
                 if code == 0 and set(record_link_crates) != {row["crate"] for row in link_artifacts}:
@@ -3731,8 +3750,8 @@ def run_in_cargo_lane(
                         )
                     except OSError as error:
                         print(f"warning: could not record lane build context: {error}", file=sys.stderr)
-                if code == 0 and messages_path is not None:
-                    assert source is not None
+                if code == 0 and freeze:
+                    assert source is not None and messages_path is not None
                     if skipped is None:
                         manifest = {key: mirror[key] for key in ("sha256", "files", "bytes")}
                     else:
@@ -4583,6 +4602,11 @@ def main(argv: list[str] | None = None) -> int:
         "At least one artifact is required. Sealed snapshots without it freeze executables into the local bundle store.",
     )
     run_lane_parser.add_argument(
+        "--observe-units", action="store_true",
+        help="With --timing-json, retain observed Cargo build/check unit freshness and outputs; "
+        "runs Cargo even when a frozen bundle matches.",
+    )
+    run_lane_parser.add_argument(
         "--record-link-crate", action="append", default=[],
         help="With --freeze-bundle, retain exact Cargo rlibs/fingerprints and source hashes for a named crate; repeatable. No binary-only reuse.",
     )
@@ -4705,6 +4729,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_mirror=args.source_mirror,
                 freeze_bundle_dir=args.freeze_bundle,
                 record_link_crates=args.record_link_crate,
+                observe_units=args.observe_units,
                 rebuild=args.rebuild,
                 materialize_internal_file_links=args.materialize_internal_file_links,
             )

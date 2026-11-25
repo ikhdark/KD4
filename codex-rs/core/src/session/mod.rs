@@ -5512,8 +5512,6 @@ impl Session {
         compacted_item: CompactedItem,
         operation: codex_protocol::protocol::CompactionOperation,
     ) -> CodexResult<()> {
-        const MAX_PENDING_COMPACT_SESSION_START_HOOKS: usize = 8;
-
         let session = Arc::clone(self);
         let turn_context = Arc::clone(turn_context);
         session
@@ -5533,15 +5531,6 @@ impl Session {
                 .map_err(|_| {
                     CodexErr::Fatal("durable history commit gate is closed".to_string())
                 })?;
-            // Only compaction commits add Compact sources, so the gate protects this
-            // slot until publication. The ordinary turn consumer can only free slots.
-            if session.state.lock().await.pending_compact_session_start_count()
-                >= MAX_PENDING_COMPACT_SESSION_START_HOOKS
-            {
-                return Err(CodexErr::Fatal(format!(
-                    "Compaction was not committed: {MAX_PENDING_COMPACT_SESSION_START_HOOKS} deferred SessionStart(compact) hooks are pending. Run a regular turn before retrying compaction."
-                )));
-            }
             let _tool_history_io_permit = if turn_context.config.completed_tool_history_projection {
                 Some(session.acquire_tool_history_io_permit().await?)
             } else {

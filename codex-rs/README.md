@@ -64,6 +64,26 @@ These similarly named crates serve different sides of the process boundary:
 Follow the client and host sides when changing their shared contract; a
 re-export in `code-mode` does not make that crate the implementation owner.
 
+For a known, authorized file-local compile check, compose the guarded patch and
+check in one Code Mode cell. Start the check only after a committed receipt;
+keep compiler diagnostics and exit status alongside the patch receipt. A check
+failure does not roll back a committed edit. This is opt-in, not an automatic
+check on every edit.
+
+For repeated queries whose setup dominates runtime, use one explicitly owned
+process with `pipe_stdin: true` instead of rebuilding interpreter or database
+state for each query. Send one framed request at a time using its session ID and
+incarnation. If a reply has not arrived, use a bounded `wait_for_output` on the
+same handle rather than resending input. Close stdin and collect the terminal
+receipt when finished. Use ordinary stateless commands when reuse is unnecessary.
+See the [Code Mode process helpers](code-mode-protocol/src/description/exec_reference.md#helpers).
+
+When isolation is required, prefer an explicitly selected Git worktree to a
+fresh clone of the same repository. Give each session its own working directory.
+Use [managed session workspaces](../../KDR/scripts/build/README.md#session-workspaces)
+when the isolated checkout needs to carry existing uncommitted changes. These
+are checkout boundaries, not OS sandboxes; KD4 does not create them implicitly.
+
 ## App server: service, handlers, wire models
 
 - [app-server](app-server/) owns service startup and connection orchestration.

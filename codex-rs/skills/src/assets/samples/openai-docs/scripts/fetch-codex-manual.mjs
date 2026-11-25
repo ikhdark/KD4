@@ -21,6 +21,7 @@ const DEFAULT_CACHE_DIR_NAME = "openai-docs-cache";
 const CACHE_FILE_NAME = "codex-manual.md";
 const OUTLINE_FILE_NAME = "codex-manual.outline.md";
 const HASH_HEADER = "x-content-sha256";
+const VALIDATOR_FILE_NAME = "codex-manual.validators-v1.json";
 const USER_AGENT = "codex-openai-docs";
 const execFileAsync = promisify(execFile);
 
@@ -56,7 +57,8 @@ const responseHeaders = (headers) => ({
   },
 });
 
-const makeResponse = ({ body, headers, status }) => ({
+const makeResponse = ({ body, headers, status, url }) => ({
+  url,
   headers: responseHeaders(headers),
   ok: status >= 200 && status < 300,
   status,
@@ -107,7 +109,7 @@ const tempFilePath = (cacheDir, suffix) =>
       .slice(2)}${suffix}`
   );
 
-const requestManualWithCurl = async (url, { cacheDir, method, timeoutMs }) => {
+const requestManualWithCurl = async (url, { cacheDir, method, timeoutMs, conditional }) => {
   const headerPath = tempFilePath(cacheDir, ".headers");
   const bodyPath = tempFilePath(cacheDir, ".body");
   const curlNames =
@@ -122,6 +124,8 @@ const requestManualWithCurl = async (url, { cacheDir, method, timeoutMs }) => {
     bodyPath,
     "--user-agent",
     USER_AGENT,
+    "--write-out",
+    "%{url_effective}",
     "--max-time",
     String(Math.max(1, Math.ceil(timeoutMs / 1000))),
   ];
@@ -131,18 +135,17 @@ const requestManualWithCurl = async (url, { cacheDir, method, timeoutMs }) => {
   } else {
     args.push("--request", method);
   }
-  args.push(url);
+  if (conditional) args.push("--header", conditional.join(": "));
+  args.push("--", url);
 
   let lastError;
   for (const curlName of curlNames) {
     try {
-      await execFileAsync(curlName, args, { windowsHide: true });
-      const [rawHeaders, body] = await Promise.all([
-        readFile(headerPath, "utf8"),
-        readFile(bodyPath, "utf8"),
-      ]);
-      const { headers, status } = parseCurlHeaders(rawHeaders);
-      return makeResponse({ body, headers, status });
+      const { stdout: effectiveUrl } = await execFileAsync(curlName, args, { windowsHide: true });
+      const { headers, status } = parseCurlHeaders(await readFile(headerPath, "utf8"));
+      // curl may not create an output file when the server sends no body.
+      const body = status === 304 ? "" : await readFile(bodyPath, "utf8");
+      return makeResponse({ body, headers, status, url: effectiveUrl });
     } catch (error) {
       lastError = error;
       if (error?.code !== "ENOENT") break;
@@ -164,7 +167,7 @@ const requestManualWithCurl = async (url, { cacheDir, method, timeoutMs }) => {
   });
 };
 
-const requestManualWithFetch = async (url, { method, timeoutMs }) => {
+const requestManualWithFetch = async (url, { method, timeoutMs, conditional }) => {
   if (typeof fetch !== "function") {
     throw new ManualFetchError(
       "Native fetch is unavailable in this Node runtime."
@@ -175,7 +178,7 @@ const requestManualWithFetch = async (url, { method, timeoutMs }) => {
     async (signal) => {
       const response = await fetch(url, {
         method,
-        headers: { "User-Agent": USER_AGENT },
+        headers: { "User-Agent": USER_AGENT, ...(conditional ? Object.fromEntries([conditional]) : {}) },
         signal,
       });
       // Fetch resolves at headers; keep the deadline active through the body.
@@ -183,29 +186,30 @@ const requestManualWithFetch = async (url, { method, timeoutMs }) => {
         body: await response.text(),
         headers: response.headers,
         status: response.status,
+        url: response.url,
       });
     },
     timeoutMs
   );
 };
 
-const requestManual = async (url, { cacheDir, method, timeoutMs }) => {
+const requestManual = async (url, { cacheDir, method, timeoutMs, conditional }) => {
   const preferCurl = Boolean(proxyConfigured()) || typeof fetch !== "function";
   const transports = preferCurl
     ? [
-        () => requestManualWithCurl(url, { cacheDir, method, timeoutMs }),
-        () => requestManualWithFetch(url, { method, timeoutMs }),
+        () => requestManualWithCurl(url, { cacheDir, method, timeoutMs, conditional }),
+        () => requestManualWithFetch(url, { method, timeoutMs, conditional }),
       ]
     : [
-        () => requestManualWithFetch(url, { method, timeoutMs }),
-        () => requestManualWithCurl(url, { cacheDir, method, timeoutMs }),
+        () => requestManualWithFetch(url, { method, timeoutMs, conditional }),
+        () => requestManualWithCurl(url, { cacheDir, method, timeoutMs, conditional }),
       ];
 
   let lastError;
   for (const transport of transports) {
     try {
       const response = await transport();
-      if (!response.ok) {
+      if (!response.ok && !(conditional && response.status === 304)) {
         throw new ManualFetchError(
           `${method} ${url} failed with HTTP ${response.status}.`
         );
@@ -420,6 +424,103 @@ const writeOutline = async (cacheDir, outlineText) => {
   await rename(tmpPath, outlineFilePath(cacheDir));
 };
 
+const validatorPath = (cacheDir) => path.join(cacheDir, VALIDATOR_FILE_NAME);
+const conditionalHeader = ({ etag, lastModified }) => {
+  if (typeof etag === "string" && /^(W\/)?"[!\x23-\x7e\x80-\xff]*"$/.test(etag)) {
+    return ["If-None-Match", etag];
+  }
+  const timestamp = Date.parse(lastModified);
+  return Number.isFinite(timestamp) && new Date(timestamp).toUTCString() === lastModified
+    ? ["If-Modified-Since", lastModified] : null;
+};
+
+const readValidator = async (cacheDir, url) => {
+  try {
+    const record = JSON.parse(await readFile(validatorPath(cacheDir), "utf8"));
+    return record.url === url && typeof record.effectiveUrl === "string" &&
+      /^[a-f0-9]{64}$/.test(record.sha) && conditionalHeader(record) ? record : null;
+  } catch {
+    return null;
+  }
+};
+
+const mayStoreValidator = (response) => {
+  const policy = (response.headers.get("cache-control") ?? "").split(",")
+    .map((part) => part.trim().split("=")[0].toLowerCase());
+  const vary = (response.headers.get("vary") ?? "").split(",")
+    .map((part) => part.trim().toLowerCase());
+  return policy.includes("public") && !policy.includes("private") &&
+    !policy.includes("no-store") && !response.headers.get("set-cookie") &&
+    vary.every((name) => !name || name === "accept");
+};
+
+const updateValidator = async (cacheDir, url, response, sha, outline, prior) => {
+  const target = validatorPath(cacheDir);
+  const record = {
+    url, effectiveUrl: response.url, sha,
+    etag: response.headers.get("etag") ?? prior?.etag ?? null,
+    lastModified: response.headers.get("last-modified") ?? prior?.lastModified ?? null,
+    outlineSha: sha256(outline.text), lineCount: outline.lineCount,
+    headingCount: outline.headingCount,
+  };
+  if (!response.url || !mayStoreValidator(response) || !conditionalHeader(record)) {
+    await rm(target, { force: true }).catch(() => {});
+    return;
+  }
+  const next = JSON.stringify(record);
+  if (prior && JSON.stringify(prior) === next) return;
+  const tmp = tempFilePath(cacheDir, ".validators.tmp");
+  try {
+    await writeFile(tmp, next, "utf8");
+    await rename(tmp, target);
+  } catch {
+    await rm(tmp, { force: true }).catch(() => {});
+  }
+};
+
+const readValidatedOutline = async (cacheDir, prior) => {
+  try {
+    const file = await readFile(outlineFilePath(cacheDir), "utf8");
+    const text = file.slice("# Codex Manual Outline\n\n".length, -1);
+    if (file !== outlineMarkdown({text}) || sha256(text) !== prior.outlineSha ||
+        !Number.isSafeInteger(prior.lineCount) || prior.lineCount < 1 ||
+        !Number.isSafeInteger(prior.headingCount) || prior.headingCount < 0) return null;
+    return { text, lineCount: prior.lineCount, headingCount: prior.headingCount };
+  } catch {
+    return null;
+  }
+};
+
+const revalidateManual = async (cacheDir, url, timeoutMs, prior) => {
+  if (!prior) return null;
+  const cached = await readCachedManual(cacheDir, prior.sha);
+  if (cached === null) return null;
+  const conditional = conditionalHeader(prior);
+  const response = await requestManual(url, {
+    cacheDir, method: "GET", timeoutMs, conditional,
+  }).catch(() => null);
+  if (!response || response.url !== prior.effectiveUrl) return null;
+
+  if (response.status === 304) {
+    const etag = response.headers.get("etag");
+    const hash = response.headers.get(HASH_HEADER);
+    if ((conditional[0] === "If-None-Match" && etag &&
+        etag.replace(/^W\//, "") !== prior.etag.replace(/^W\//, "")) ||
+        (hash && hash.toLowerCase() !== prior.sha)) return null;
+    return { response, expectedSha256: prior.sha, manualText: cached,
+      cacheStatus: "hit", prior };
+  }
+  if (response.status !== 200) return null;
+  const expectedSha256 = readHeaderSha(response);
+  if (expectedSha256 === prior.sha) {
+    const body = await response.text();
+    if (sha256(body) !== expectedSha256) return null;
+    return { response, expectedSha256, manualText: cached, cacheStatus: "hit" };
+  }
+  return { response, expectedSha256, manualText: await response.text(),
+    cacheStatus: "updated" };
+};
+
 const fetchCodexManual = async ({
   manualUrl = DEFAULT_MANUAL_URL,
   cacheDir,
@@ -434,65 +535,43 @@ const fetchCodexManual = async ({
   }
   await mkdir(resolvedCacheDir, { recursive: true });
 
-  const headResponse = await requestManual(manualUrl, {
-    cacheDir: resolvedCacheDir,
-    method: "HEAD",
-    timeoutMs,
-  });
-  const expectedSha256 = readHeaderSha(headResponse);
+  const options = { cacheDir: resolvedCacheDir, timeoutMs };
+  const previous = await readValidator(resolvedCacheDir, manualUrl);
+  let retrieved = await revalidateManual(resolvedCacheDir, manualUrl, timeoutMs, previous);
+
+  if (!retrieved) {
+    const headResponse = await requestManual(manualUrl, { ...options, method: "HEAD" });
+    const expectedSha256 = readHeaderSha(headResponse);
+    const cached = await readCachedManual(resolvedCacheDir, expectedSha256);
+    if (cached !== null) {
+      retrieved = { response: headResponse, expectedSha256, manualText: cached, cacheStatus: "hit" };
+    } else {
+      const response = await requestManual(manualUrl, { ...options, method: "GET" });
+      if (readHeaderSha(response) !== expectedSha256) {
+        throw new ManualFetchError(`${HASH_HEADER} changed between HEAD and GET for ${manualUrl}.`);
+      }
+      retrieved = { response, expectedSha256, manualText: await response.text(), cacheStatus: "updated" };
+    }
+  }
+
+  const { response, expectedSha256, manualText, cacheStatus, prior } = retrieved;
+  // A hit already hashed the local bytes; a complete download must be verified
+  // before it can replace either the local manual or its derived outline.
+  const actualSha256 = cacheStatus === "hit" ? expectedSha256 : sha256(manualText);
+  if (actualSha256 !== expectedSha256) {
+    throw new ManualFetchError(`${HASH_HEADER} did not match the fetched manual body for ${manualUrl}.`);
+  }
+  if (cacheStatus === "updated") await writeCachedManual(resolvedCacheDir, manualText);
+  const validated = prior ? await readValidatedOutline(resolvedCacheDir, prior) : null;
+  const outline = validated ?? buildOutline(manualText);
+  const outlineText = outlineMarkdown(outline);
+  if (!validated) await writeOutline(resolvedCacheDir, outlineText);
+  await updateValidator(resolvedCacheDir, manualUrl, response, expectedSha256, outline, prior);
+
   const manualPath = cacheFilePath(resolvedCacheDir);
   const outlinePath = outlineFilePath(resolvedCacheDir);
   const checkedAt = new Date().toISOString();
-
-  const cachedManual = await readCachedManual(resolvedCacheDir, expectedSha256);
-  if (cachedManual !== null) {
-    const outline = buildOutline(cachedManual);
-    const outlineText = outlineMarkdown(outline);
-    await writeOutline(resolvedCacheDir, outlineText);
-
-    return {
-      outlineText,
-      status: {
-        manualUrl,
-        headerSha256: expectedSha256,
-        fetchedManualSha256: expectedSha256,
-        manualHashMatches: true,
-        cacheStatus: "hit",
-        cacheDir: resolvedCacheDir,
-        manualPath,
-        outlinePath,
-        checkedAt,
-        lineCount: outline.lineCount,
-        headingCount: outline.headingCount,
-      },
-    };
-  }
-
-  const getResponse = await requestManual(manualUrl, {
-    cacheDir: resolvedCacheDir,
-    method: "GET",
-    timeoutMs,
-  });
-  const getHeaderSha256 = readHeaderSha(getResponse);
-  if (getHeaderSha256 !== expectedSha256) {
-    throw new ManualFetchError(
-      `${HASH_HEADER} changed between HEAD and GET for ${manualUrl}.`
-    );
-  }
-
-  const manualText = await getResponse.text();
-  const actualSha256 = sha256(manualText);
-  const manualHashMatches = actualSha256 === expectedSha256;
-  if (!manualHashMatches) {
-    throw new ManualFetchError(
-      `${HASH_HEADER} did not match the fetched manual body for ${manualUrl}.`
-    );
-  }
-
-  await writeCachedManual(resolvedCacheDir, manualText);
-  const outline = buildOutline(manualText);
-  const outlineText = outlineMarkdown(outline);
-  await writeOutline(resolvedCacheDir, outlineText);
+  const manualHashMatches = true;
 
   return {
     outlineText,
@@ -501,7 +580,7 @@ const fetchCodexManual = async ({
       headerSha256: expectedSha256,
       fetchedManualSha256: actualSha256,
       manualHashMatches,
-      cacheStatus: "updated",
+      cacheStatus,
       cacheDir: resolvedCacheDir,
       manualPath,
       outlinePath,

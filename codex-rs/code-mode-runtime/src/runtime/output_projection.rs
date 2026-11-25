@@ -1472,7 +1472,12 @@ pub(super) fn register_search_projection_callback(
     }
     if raw.get("complete") == Some(&Value::Bool(true)) {
         for file in files {
-            changed |= project_search_line_ranges(file);
+            if project_search_line_ranges(file) {
+                changed = true;
+                if !paged {
+                    project_uniform_search_previews(file);
+                }
+            }
         }
     }
     if changed {
@@ -1522,6 +1527,35 @@ fn project_search_line_ranges(file: &mut Value) -> bool {
     }
     fields.insert("line_ranges".to_owned(), serde_json::json!(ranges));
     true
+}
+
+/// Pack only plain previews whose exact per-line pattern counts are uniform.
+fn project_uniform_search_previews(file: &mut Value) {
+    let Some(fields) = file.as_object_mut() else { return };
+    if ["source", "hydration", "line_texts", "line_pattern_counts"]
+        .iter()
+        .any(|field| fields.contains_key(*field))
+    {
+        return;
+    }
+    let Some(lines) = fields.get_mut("lines").and_then(Value::as_array_mut) else { return };
+    let Some(counts) = lines.first().and_then(|line| line.get("pattern_counts")).filter(|v| v.is_array()) else {
+        return;
+    };
+    if !lines.iter().all(|line| {
+        line.as_object().is_some_and(|row| {
+            row.len() == 2
+                && row.get("text").is_some_and(Value::is_string)
+                && row.get("pattern_counts") == Some(counts)
+        })
+    }) {
+        return;
+    }
+    let counts = counts.clone();
+    let texts = lines.iter_mut().map(|row| row["text"].take()).collect();
+    fields.remove("lines");
+    fields.insert("line_texts".to_owned(), Value::Array(texts));
+    fields.insert("line_pattern_counts".to_owned(), counts);
 }
 
 fn project_page_source(file: &mut Value, context: u64) -> bool {

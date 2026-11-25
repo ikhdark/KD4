@@ -149,7 +149,7 @@ const __codex_paginate_search = (search) => {
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const present = (result, pattern, contextLines) => {
     if (Array.isArray(pattern) || result.pagination ||
-        (result.complete && result.files.some(file => file.lines?.length >= 16))) {
+        (result.complete && result.files?.some(file => file.lines?.length >= 16))) {
       registerSearchProjection(result, contextLines);
     }
     return result;

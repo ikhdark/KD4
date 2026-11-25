@@ -90,6 +90,19 @@ External `-SkipBuild -SourceBundleManifest` bundles use their verified target,
 version, inventory identity, and file digests rather than scanning the unrelated
 local Cargo checkout. Locally built bundles still require content-bound stamps.
 
+A local Cargo build also writes `build-receipt.json` beside the CLI and Code Mode
+host. It records the actual Cargo invocation, compiler/toolchain probes, selected
+compile environment and linker identities, Cargo-reported executable profile
+settings, configuration digests and the publisher's exact temporary overlay,
+and the publisher source-file inventory. The receipt names both executables
+by size and SHA-256; the freshness stamp separately binds its digest so
+auto-skip can reuse the original evidence, not recreate it from the new shell.
+An authenticated receipt travels with both executables when the runtime bundle
+is replaced. A legacy stamp without a receipt does not authenticate any adjacent
+sidecar. An already-current installed pair is still a no-op. The receipt is
+not a trace of every compiler/linker subprocess, a reusable managed frozen
+bundle, or a record of dynamically selected session instructions.
+
 The local publisher does not download a missing Rusty V8 archive by default.
 Reuse its Cargo cache, pass `-RustyV8Archive` or `RUSTY_V8_ARCHIVE` with an
 existing local archive, or opt into `-AllowRustyV8Download` only when downloading

@@ -303,8 +303,11 @@ pub fn summarize_shell_output_for_model_with_streams(
             high = mid - 1;
         }
     }
+    let render = |selected: &[(usize, &str)], budget| {
+        render_selected_lines(builder.clone(), selected, budget, line_count, false)
+    };
     let mut line_budget = low;
-    let mut summary = render_selected_lines(builder.clone(), &selected, line_budget, line_count)?;
+    let mut summary = render(&selected, line_budget)?;
     if let Some(limit) = options.applied_token_limit
         && codex_utils_string::approx_token_count_exceeds(&summary, limit)
     {
@@ -312,7 +315,7 @@ pub fn summarize_shell_output_for_model_with_streams(
             // Every line is selected; abbreviate the long ones further before
             // omitting any whole line.
             let fits = |budget| {
-                render_selected_lines(builder.clone(), &selected, budget, line_count).filter(
+                render(&selected, budget).filter(
                     |rendered| !codex_utils_string::approx_token_count_exceeds(rendered, limit),
                 )
             };
@@ -355,7 +358,7 @@ pub fn summarize_shell_output_for_model_with_streams(
                         .any(|diagnostic| index.abs_diff(*diagnostic) <= FOCUS_CONTEXT_LINES)
             });
         selected = kept;
-        summary = render_selected_lines(builder.clone(), &selected, line_budget, line_count)?;
+        summary = render(&selected, line_budget)?;
         if !codex_utils_string::approx_token_count_exceeds(&summary, limit) {
             // Pruning is coarse. Return the remaining budget to the pruned
             // lines, nearest the tail first, so an output slightly over the
@@ -368,8 +371,7 @@ pub fn summarize_shell_output_for_model_with_streams(
                 let mut candidate = selected.clone();
                 candidate.extend_from_slice(&pruned[..mid]);
                 candidate.sort_unstable_by_key(|(index, _)| *index);
-                let rendered =
-                    render_selected_lines(builder.clone(), &candidate, line_budget, line_count)?;
+                let rendered = render(&candidate, line_budget)?;
                 if codex_utils_string::approx_token_count_exceeds(&rendered, limit) {
                     high = mid - 1;
                 } else {
@@ -379,7 +381,7 @@ pub fn summarize_shell_output_for_model_with_streams(
             }
             return (summary.len() < output.len()).then_some(summary);
         }
-        let minimum = render_selected_lines(builder.clone(), &selected, 0, line_count)?;
+        let minimum = render(&selected, 0)?;
         if codex_utils_string::approx_token_count_exceeds(&minimum, limit) {
             // Even metadata does not fit. Use ordinary truncation/recovery.
             return None;
@@ -389,7 +391,7 @@ pub fn summarize_shell_output_for_model_with_streams(
         summary = minimum;
         while low < high {
             let mid = low + (high - low).div_ceil(2);
-            let candidate = render_selected_lines(builder.clone(), &selected, mid, line_count)?;
+            let candidate = render(&selected, mid)?;
             if codex_utils_string::approx_token_count_exceeds(&candidate, limit) {
                 high = mid - 1;
             } else {
@@ -402,6 +404,22 @@ pub fn summarize_shell_output_for_model_with_streams(
         if line_budget == 0 {
             return None;
         }
+    } else if validation
+        && line_budget >= 24
+        && selected.windows(3).any(|run| {
+            let (index, line) = run[0];
+            line.len() >= 24 && run[1] == (index + 1, line) && run[2] == (index + 2, line)
+        })
+        && let Some(folded) =
+            render_selected_lines(builder, &selected, line_budget, line_count, true)
+        && folded.len() < summary.len()
+        && options.applied_token_limit.is_none_or(|limit| {
+            !codex_utils_string::approx_token_count_exceeds(&folded, limit)
+        })
+    {
+        // Fold after ordinary selection and budget fitting, never inside the
+        // search that adds or removes selected diagnostic context.
+        summary = folded;
     }
     (summary.len() < output.len()).then_some(summary)
 }
@@ -879,10 +897,34 @@ fn render_selected_lines(
     selected: &[(usize, &str)],
     line_budget: usize,
     line_count: usize,
+    collapse_adjacent: bool,
 ) -> Option<String> {
     let mut previous = None;
     let mut emitted_source_lines = 0;
-    for &(index, line) in selected {
+    let mut remaining = selected;
+    while let Some((&(index, line), rest)) = remaining.split_first() {
+        // Only collapse a consecutive run actually selected for display.
+        // Never make separated occurrences or distinct diagnostic lines equal.
+        let count = if collapse_adjacent && line.len() >= 24 {
+            let kind = classify_line(line);
+            if kind.critical || kind.advisory || kind.status {
+                1
+            } else {
+                let mut next = index + 1;
+                let count = rest
+                    .iter()
+                    .take_while(|&&(candidate, value)| {
+                        let same = candidate == next && value == line;
+                        next += 1;
+                        same
+                    })
+                    .count()
+                    + 1;
+                if count >= 3 { count } else { 1 }
+            }
+        } else {
+            1
+        };
         let before_gap = (builder.text.len(), builder.lines);
         if let Some(previous_index) = previous
             && index != previous_index + 1
@@ -898,16 +940,22 @@ fn render_selected_lines(
         {
             builder.capped |= line.len() > line_budget;
             let line = summarize_oversized_line(line, line_budget);
-            if !builder.push_line(format!("{:>5}: {line}", index + 1)) {
+            let rendered = if count > 1 {
+                format!("{:>5}: [×{count}, through line {}] {line}", index + 1, index + count)
+            } else {
+                format!("{:>5}: {line}", index + 1)
+            };
+            if !builder.push_line(rendered) {
                 // A gap describes the next retained line. Keep the pair atomic
                 // when the gap uses the last available byte or line slot.
                 builder.text.truncate(before_gap.0);
                 builder.lines = before_gap.1;
                 break;
             }
-            emitted_source_lines += 1;
+            emitted_source_lines += count;
         }
-        previous = Some(index);
+        previous = Some(index + count - 1);
+        remaining = &remaining[count..];
     }
     builder.finish(emitted_source_lines, line_count)
 }

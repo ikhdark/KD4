@@ -20,6 +20,8 @@ Published product answers use the manual, permitted Docs MCP/official web fallba
 
 Resolve `<skill-dir>` to this skill's directory. The helper checks `$TMPDIR/openai-docs-cache`, `%TEMP%\\openai-docs-cache`, then `%TMP%\\openai-docs-cache`; only non-Windows hosts also try `/private/tmp/openai-docs-cache` and `/tmp/openai-docs-cache`. Workspace-only write access does not establish permission to write a temp cache. Use `--cache-dir <cache-dir>` when needed.
 
+For eligible public responses, the helper remembers the HTTP validator and the SHA-verified outline. Refresh still checks the server: a `304 Not Modified` can reuse the outline, while a changed response is hashed before publication. Older caches, a changed redirect target, and missing or invalid cache metadata fall back to the existing HEAD/GET flow. Private, `no-store`, and unsupported response variants don't get a validator record.
+
 The helper uses curl if native fetch is unavailable or proxy environment variables are present; no shell-specific proxy prefix is needed. On Windows it checks TEMP/TMP automatically. After successful retrieval, use the returned paths rather than searching the skill folder for product facts.
 
 ## Diagnostics

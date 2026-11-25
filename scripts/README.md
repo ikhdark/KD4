@@ -157,6 +157,11 @@ invocation-scoped compiler-cache receipt, that cache's outcome remains unobserve
 (shared counters cannot attribute a build). Frozen reuse runs neither Cargo nor
 the compiler cache; absent compiler identity cannot establish an exact bundle hit.
 
+For actual invocation freshness, use `run-lane --timing-json FILE --observe-units
+-- cargo build ...` (or `cargo check`). This opt-in executes Cargo even if a
+frozen bundle is available, recording per-artifact freshness, features, manifest
+and outputs. Cargo reports the freshness decision, not its cause.
+
 For a snapshot, set `$KD4` and `$SNAPSHOT` to their absolute repository roots,
 run from `$SNAPSHOT\codex-rs`, and supply the exact original Cargo command
 (replace the example arguments with those used for that build):
@@ -192,6 +197,8 @@ When syntax determines the scope of a rewrite:
   (replace a top-level literal), and `function.FUNCTION.assignment.NAME`
   (replace the literal right operand of a binary expression in a direct named
   assignment). Missing, duplicate and unsupported selectors refuse the plan.
+  Short literal patches are used only when native matches select the intended
+  AST spans; otherwise the preview uses a guarded whole-source replacement.
 - Use an installed `ast-grep scan --inline-rules RULE --json=compact PATH` to
   preview a structural rewrite. Target the smallest syntax node (for example
   the name of a keyword argument under a specific receiver call, not the whole

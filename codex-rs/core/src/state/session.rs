@@ -211,7 +211,8 @@ pub(crate) struct SessionState {
     pub(crate) startup_transport: Option<SessionStartupTransportHandle>,
     pub(crate) workflow_checkpoint: WorkflowCheckpointState,
     pub(crate) active_connector_selection: HashSet<String>,
-    pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
+    pending_initial_session_start_source: Option<codex_hooks::SessionStartSource>,
+    pending_compact_session_starts: u64,
     granted_permissions_by_approval_scope_id: HashMap<String, UriAdditionalPermissionProfile>,
     next_turn_is_first: bool,
     pending_context_baseline: Option<ContextBaselineCandidate>,
@@ -243,7 +244,8 @@ impl SessionState {
             startup_transport: None,
             workflow_checkpoint: WorkflowCheckpointState::default(),
             active_connector_selection: HashSet::new(),
-            pending_session_start_sources: VecDeque::new(),
+            pending_initial_session_start_source: None,
+            pending_compact_session_starts: 0,
             granted_permissions_by_approval_scope_id: HashMap::new(),
             next_turn_is_first: true,
             pending_context_baseline: None,
@@ -552,24 +554,32 @@ impl SessionState {
         self.active_connector_selection.clear();
     }
 
-    pub(crate) fn pending_compact_session_start_count(&self) -> usize {
-        self.pending_session_start_sources
-            .iter()
-            .filter(|source| matches!(source, codex_hooks::SessionStartSource::Compact))
-            .count()
-    }
-
     pub(crate) fn queue_pending_session_start_source(
         &mut self,
         value: codex_hooks::SessionStartSource,
     ) {
-        self.pending_session_start_sources.push_back(value);
+        if matches!(value, codex_hooks::SessionStartSource::Compact) {
+            // Compaction occurrences have no per-entry payload. Keep one
+            // dispatch per commit without growing the queue or blocking history.
+            self.pending_compact_session_starts += 1;
+        } else {
+            // Session initialization queues exactly one source before any
+            // compaction can commit.
+            self.pending_initial_session_start_source = Some(value);
+        }
     }
 
     pub(crate) fn take_pending_session_start_source(
         &mut self,
     ) -> Option<codex_hooks::SessionStartSource> {
-        self.pending_session_start_sources.pop_front()
+        if let Some(source) = self.pending_initial_session_start_source.take() {
+            return Some(source);
+        }
+        if self.pending_compact_session_starts == 0 {
+            return None;
+        }
+        self.pending_compact_session_starts -= 1;
+        Some(codex_hooks::SessionStartSource::Compact)
     }
 
     pub(crate) fn record_granted_permissions(

@@ -1459,7 +1459,7 @@ fn historical_reversal_candidates(
             // Check before endpoint_change clones any source buffers. On a
             // partial input, do not blame an intermediate edit later undone.
             return vec![codex_git_utils::ReversalCandidate {
-                path: PathBuf::new(), lines: Vec::new(),
+                path: PathBuf::new(), lines: Vec::new(), text: None,
             }];
         }
         let endpoint = delta.endpoint_change(change);
@@ -1475,7 +1475,7 @@ fn historical_reversal_candidates(
             .or_insert((baseline.unwrap_or(old), new));
     }
     if net.len() > 8 {
-        return vec![codex_git_utils::ReversalCandidate { path: PathBuf::new(), lines: Vec::new() }];
+        return vec![codex_git_utils::ReversalCandidate { path: PathBuf::new(), lines: Vec::new(), text: None }];
     }
     let mut candidates = Vec::new();
     for (path, (old, new)) in net {
@@ -1485,8 +1485,11 @@ fn historical_reversal_candidates(
             (!previous.contains(text) && text.chars().any(char::is_alphanumeric))
                 .then(|| (index + 1, text.to_owned()))
         }).collect::<Vec<_>>();
+        let text = (!old.is_empty() && !new.is_empty() && old != new
+            && old.lines().take(513).count() <= 512 && new.lines().take(513).count() <= 512)
+            .then(|| (old.to_owned(), new.to_owned()));
         if !lines.is_empty() {
-            candidates.push(codex_git_utils::ReversalCandidate { path, lines });
+            candidates.push(codex_git_utils::ReversalCandidate { path, lines, text });
         }
     }
     candidates
@@ -1522,6 +1525,14 @@ async fn patch_reversal_warnings(
         warning["scope"] = serde_json::json!("32 path-relevant first-parent commits within 30 days; same path, trimmed-line equality, not semantic equivalence");
         warning
     }).collect::<Vec<_>>();
+    diagnostics.extend(check.exact.into_iter().map(|matched| serde_json::json!({
+        "kind": "mechanical_patch_reversal",
+        "advisory_only": true,
+        "path": matched.path,
+        "reversed_commit": matched.commit,
+        "line": matched.line,
+        "basis": "This replacement exactly reverses a hunk at the same location in the latest content change to this path."
+    })));
     if !check.skipped.is_empty() {
         diagnostics.push(serde_json::json!({
             "kind": "historical_reversal_check_skipped", "advisory_only": true,

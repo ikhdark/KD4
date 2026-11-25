@@ -270,12 +270,7 @@ Object.defineProperty(globalThis, "run_graph", {
     const running = new Set();
     let remaining = selected.size,
       wake;
-    let hasNonfulfillment = false;
     function settled(id) {
-      // Ready nodes have only settled dependencies. Check individual statuses
-      // only after a dependency could have settled without fulfilling.
-      if (!hasNonfulfillment && results[id]?.status !== "fulfilled")
-        hasNonfulfillment = true;
       --remaining;
       for (const consumer of consumers.get(id)) {
         const count = remainingDeps.get(consumer) - 1;
@@ -367,7 +362,7 @@ Object.defineProperty(globalThis, "run_graph", {
         (a, b) => priority.get(a) - priority.get(b),
       )) {
         const node = graph.get(id);
-        if (hasNonfulfillment && node.deps.some((dep) => results[dep].status !== "fulfilled")) {
+        if (node.deps.some((dep) => results[dep].status !== "fulfilled")) {
           results[id] = {
             status: "skipped",
             reason: "dependency failed",

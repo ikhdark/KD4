@@ -24,6 +24,7 @@ use super::parse_args_with_default;
 use super::parse_arguments;
 use super::serialize_function_output;
 use super::take_server_result;
+use super::validate_optional_opaque_selector;
 
 pub struct ListMcpResourcesHandler;
 
@@ -81,9 +82,30 @@ impl ListMcpResourcesHandler {
                 )))
             })?
             .unwrap_or_default();
+        let stop_after_uri_prefix = selectors
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .and_then(|object| object.remove("stop_after_uri_prefix"))
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|err| {
+                super::settled_recovery_failure(FunctionCallError::RespondToModel(format!(
+                    "failed to parse function arguments: {err}"
+                )))
+            })?;
+        let stop_after_uri_prefix =
+            validate_optional_opaque_selector("stop_after_uri_prefix", stop_after_uri_prefix)?;
         let args: ListResourcesArgs = parse_args_with_default(selectors)?;
         let args = args.normalize()?;
         ensure_cursor_has_server(args.server.as_deref(), args.cursor.as_deref())?;
+        if stop_after_uri_prefix.is_some()
+            && (args.server.is_none() || args.cursor.is_some() || kind == ResourceListKind::Templates)
+        {
+            return Err(super::settled_recovery_failure(FunctionCallError::RespondToModel(
+                "stop_after_uri_prefix requires a server and can only list concrete resources without a cursor"
+                    .to_string(),
+            )));
+        }
         if kind == ResourceListKind::Templates {
             return ListMcpResourceTemplatesHandler
                 .handle_parsed_call(invocation, args, arguments)
@@ -121,9 +143,15 @@ impl ListMcpResourcesHandler {
                     let result = list_mcp_server_page(
                         cursor.clone(),
                         || async {
-                            let collection = manager
-                                .list_all_resources(|candidate| candidate == server_name)
-                                .await;
+                            let collection = if let Some(prefix) = stop_after_uri_prefix.as_deref() {
+                                manager
+                                    .list_resources_through_uri_prefix(&server_name, prefix)
+                                    .await
+                            } else {
+                                manager
+                                    .list_all_resources(|candidate| candidate == server_name)
+                                    .await
+                            };
                             take_server_result(
                                 collection,
                                 &server_name,

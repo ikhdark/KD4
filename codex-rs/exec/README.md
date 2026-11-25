@@ -30,4 +30,9 @@ Do not treat `null` as `"none"`, or successful compilation as native
 verification. For a mixed-phase consumer, an evidence-rich report, or a
 required narrative, use ordinary `codex exec` or supply a custom schema with
 `--output-schema`. An explicit schema takes precedence on either command.
+For the built-in OpenAI provider, exec can submit a direct property of a closed
+output object as `anyOf` rather than `oneOf` when every closed branch requires
+a different singleton string `kind` value. At most one branch can match, so
+strict validation retains the same accepted values. Schemas with reference
+keywords, overlapping tags, and other providers keep their original schemas.
 `codex exec -- verify` still sends the bare word as a normal prose prompt.

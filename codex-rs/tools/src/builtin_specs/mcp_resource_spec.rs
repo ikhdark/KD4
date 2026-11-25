@@ -19,6 +19,13 @@ pub fn create_list_mcp_resources_tool() -> ToolSpec {
             )),
         ),
         (
+            "stop_after_uri_prefix".to_string(),
+            JsonSchema::string(Some(
+                "With an explicit server, concrete resources and no cursor: collect complete pages through the first page containing a URI with this exact nonempty prefix. Keep all visited rows in order and use nextCursor for any unvisited suffix. With no match, collect to the ordinary end, bound or failure."
+                    .to_string(),
+            )),
+        ),
+        (
             "kind".to_string(),
             JsonSchema::string_enum(
                 vec![serde_json::json!("resources"), serde_json::json!("templates")],

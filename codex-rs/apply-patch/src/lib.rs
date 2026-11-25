@@ -2589,7 +2589,9 @@ impl<'a> ChunkMatcher<'a> {
             return Ok(site(ChunkSite { anchor, start }));
         }
         if let Some(anchor_index) = anchor {
-            return match self.following_anchor(chunk_index, anchor_index) {
+            return match self.following_anchor(chunk_index, anchor_index)
+                .or_else(|| self.following_anchor_after_blank_lines(chunk_index, anchor_index))
+            {
                 Some(start) => Ok(site(ChunkSite {
                     anchor: Some(anchor_index),
                     start,
@@ -2640,7 +2642,7 @@ impl<'a> ChunkMatcher<'a> {
         Err(Missing::Lines)
     }
 
-    /// A textual anchor binds the following contiguous preimage, not an
+    /// The normal textual-anchor path binds the contiguous preimage, not an
     /// unbounded search through later siblings. Include intervening lines as
     /// context, or use a revision-bound range for a distant edit.
     fn following_anchor(&self, chunk_index: usize, anchor_index: usize) -> Option<usize> {
@@ -2661,6 +2663,42 @@ impl<'a> ChunkMatcher<'a> {
         .ok()
         .flatten()
         .filter(|start| !chunk.is_end_of_file || start + chunk.old_lines.len() == lines.len())
+    }
+
+    /// Recover a formatting-only gap without changing the bytes used for the
+    /// anchor or the preimage. A second anchor at any existing matching tier
+    /// would make this fallback unsafe, even if only one was chosen earlier.
+    fn following_anchor_after_blank_lines(
+        &self,
+        chunk_index: usize,
+        anchor_index: usize,
+    ) -> Option<usize> {
+        const MAX_BLANK_LINES: usize = 8;
+        let chunk = &self.chunks[chunk_index];
+        let context = chunk.change_context.as_ref()?;
+        let lines = self.original_lines;
+        if &lines[anchor_index] != context || chunk.old_lines.first()?.trim().is_empty() {
+            return None;
+        }
+        let start = anchor_index + 1;
+        let blank_count = lines[start..]
+            .iter()
+            .take(MAX_BLANK_LINES + 1)
+            .take_while(|line| line.trim_matches([' ', '\t']).is_empty())
+            .count();
+        if !(1..=MAX_BLANK_LINES).contains(&blank_count) {
+            return None;
+        }
+        let start = start + blank_count;
+        let end = start.checked_add(chunk.old_lines.len())?;
+        if (chunk.is_end_of_file && end != lines.len())
+            || lines.get(start..end)? != chunk.old_lines
+            || seek_sequence::candidate_starts_at_any_tier(lines, std::slice::from_ref(context), 2)
+                .as_slice() != [anchor_index]
+        {
+            return None;
+        }
+        Some(start)
     }
 
     /// Record a located chunk's replacements. A relocated chunk leaves the

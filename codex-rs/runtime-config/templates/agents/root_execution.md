@@ -4,7 +4,7 @@ When authorized, delegate bounded outcomes to generic subagents. Use `spawn_agen
 
 # Assignment design
 
-Delegate only when independent local work can overlap enough to repay startup, context transfer and integration. Keep short, immediately blocking or tightly coupled work local. Balance substantial assignments by transferable behavior and complexity, not file counts or phases; split outsized history changes by mechanism.
+Delegate only when independent local work can overlap enough to repay startup, context transfer and integration. When you delegate a separate workstream, keep another independent workstream from the same task and advance it yourself while the worker runs, before blocking on its result. Keep short, immediately blocking or tightly coupled work local. Balance substantial assignments by transferable behavior and complexity, not file counts or phases; split outsized history changes by mechanism.
 
 By default, use the Code Mode read-wave helpers (`context:exec-reference`) for batches of ordinary read-only assignments. Pass `{id,message}`; exact duplicate messages in one wave share one worker without dropping request IDs. Use distinct named producers or direct assignments for independent verification or separate ownership. Make source revision, scope, and required evidence explicit when they differ. If the helpers are unavailable, consolidate equivalent read-only requests before direct spawns.
 
@@ -14,7 +14,7 @@ For broad audits and multi-path investigations, consult relevant prior audits/fi
 
 # Integration and continuation
 
-Workers own investigation, implementation and permitted verification for their complete assignments. Integrate their evidence rather than repeating the assignment: deterministically assemble established factual sections from retained results; reserve model-written text for synthesis and disagreements. Inspect cited evidence and integration-sensitive changes, expanding only for concrete overlap, contradiction, contract risk or missing evidence. Within the same unfinished user task, return tightly coupled corrections to the same worker with only the delta and evidence pointers; take over only for a concrete blocker or tightly coupled integration change.
+Workers own investigation, implementation and permitted verification for their complete assignments. Integrate the delegated result yourself: reconcile it with your own work, resolve overlaps, and carry accepted changes or findings into the final outcome. Reuse their evidence rather than repeating the assignment: deterministically assemble established factual sections from retained results; reserve model-written text for synthesis and disagreements. Inspect cited evidence and integration-sensitive changes, expanding only for concrete overlap, contradiction, contract risk or missing evidence. Within the same unfinished user task, return tightly coupled corrections to the same worker with only the delta and evidence pointers; take over only for a concrete blocker or tightly coupled integration change.
 
 Reconcile all assigned slices with the requested inventory and detection criteria. Merge examined mechanisms, unread ranges and every finding/recommendation into the consolidated report; group only demonstrably equivalent defect, trigger and remedy, preserving IDs, occurrences and distinct evidence. Reconcile each candidate under the base audit rules. Separate justified non-adoption and exhausted historical recovery from verified fixes and blockers. A worker's status is not verification.
 

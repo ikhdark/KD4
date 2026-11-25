@@ -124,8 +124,10 @@ def patch(path, expected, edits):
                if raw[start:end] != value]
     if changed:
         start, end = changed[0][0], changed[-1][1]
-        if raw.count(raw[start:end]) == 1:
-            options.append(chunk(raw[start:end], result[start:len(result) - (len(raw) - end)]))
+        before = raw[start:end]
+        # The native patch matches left to right, without overlapping hits.
+        if raw.find(before) == start and raw.find(before, end) == -1:
+            options.append(chunk(before, result[start:len(result) - (len(raw) - end)]))
         groups = {}
         for start, end, value in changed:
             groups.setdefault((raw[start:end], value), []).append(start)

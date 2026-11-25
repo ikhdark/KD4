@@ -182,14 +182,17 @@ impl ManagedClient {
         (catalog.generation == self.client.session_generation()).then_some(catalog)
     }
 
-    pub(crate) fn tool_output_schema(&self, name: &str) -> Option<Arc<JsonObject>> {
-        // Only the negotiated catalog belongs to the live connection.
+    pub(crate) fn tool_output_contract(&self, name: &str) -> Result<(u64, Option<Arc<JsonObject>>)> {
         // A shared Apps snapshot can be seeded from a different connection.
-        self.current_catalog()?
+        let catalog = self
+            .current_catalog()
+            .ok_or_else(|| anyhow!("MCP tool catalog is not current; no call was sent"))?;
+        let schema = catalog
             .tools
             .iter()
             .find(|tool| tool.tool.name == name)
-            .and_then(|tool| tool.tool.output_schema.clone())
+            .and_then(|tool| tool.tool.output_schema.clone());
+        Ok((catalog.generation, schema))
     }
 
     fn listed_tools(&self) -> Vec<ToolInfo> {

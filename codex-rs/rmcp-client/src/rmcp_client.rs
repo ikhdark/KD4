@@ -861,26 +861,31 @@ impl RmcpClient {
         timeout: Option<Duration>,
     ) -> Result<(ListToolsResult, Duration)> {
         let result = self
-            .run_service_operation_with_timing("tools/list", timeout, move |service, tracker| {
-                let request = params
-                    .clone()
-                    .map(ListToolsRequest::with_param)
-                    .unwrap_or_default();
-                async move {
-                    match send_tracked_request(
-                        service,
-                        tracker,
-                        ClientRequest::ListToolsRequest(request),
-                        rmcp::service::PeerRequestOptions::no_options(),
-                    )
-                    .await?
-                    {
-                        ServerResult::ListToolsResult(result) => Ok(result),
-                        _ => Err(rmcp::service::ServiceError::UnexpectedResponse),
+            .run_service_operation_with_timing(
+                "tools/list",
+                timeout,
+                None,
+                move |service, tracker| {
+                    let request = params
+                        .clone()
+                        .map(ListToolsRequest::with_param)
+                        .unwrap_or_default();
+                    async move {
+                        match send_tracked_request(
+                            service,
+                            tracker,
+                            ClientRequest::ListToolsRequest(request),
+                            rmcp::service::PeerRequestOptions::no_options(),
+                        )
+                        .await?
+                        {
+                            ServerResult::ListToolsResult(result) => Ok(result),
+                            _ => Err(rmcp::service::ServiceError::UnexpectedResponse),
+                        }
                     }
-                }
-                .boxed()
-            })
+                    .boxed()
+                },
+            )
             .await;
         let persist_start = Instant::now();
         let result = self.finish_oauth_operation(result).await;
@@ -1032,6 +1037,31 @@ impl RmcpClient {
         meta: Option<serde_json::Value>,
         timeout: Option<Duration>,
     ) -> Result<CallToolResult> {
+        self.call_tool_with_generation(name, arguments, meta, timeout, None)
+            .await
+    }
+
+    /// Use the same transport generation that supplied the caller's tool contract.
+    pub async fn call_tool_for_generation(
+        &self,
+        name: String,
+        arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+        timeout: Option<Duration>,
+        generation: u64,
+    ) -> Result<CallToolResult> {
+        self.call_tool_with_generation(name, arguments, meta, timeout, Some(generation))
+            .await
+    }
+
+    async fn call_tool_with_generation(
+        &self,
+        name: String,
+        arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+        timeout: Option<Duration>,
+        expected_generation: Option<u64>,
+    ) -> Result<CallToolResult> {
         let arguments = match arguments {
             Some(Value::Object(map)) => Some(map),
             Some(other) => {
@@ -1055,34 +1085,41 @@ impl RmcpClient {
         let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let operation_attempted = Arc::clone(&attempted);
         let result = self
-            .run_service_operation("tools/call", timeout, move |service, tracker| {
-                let rmcp_params = rmcp_params.clone();
-                let meta = meta.clone();
-                let attempted = Arc::clone(&operation_attempted);
-                async move {
-                    let mut options = rmcp::service::PeerRequestOptions::no_options();
-                    options.meta = meta;
-                    // Once handed to the transport, a send/response error is
-                    // not proof that a possibly effectful call did not run.
-                    attempted.store(true, std::sync::atomic::Ordering::Release);
-                    let result = send_tracked_request(
-                        service,
-                        tracker,
-                        ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
-                            rmcp_params,
-                        )),
-                        options,
-                    )
-                    .await?;
-                    match result {
-                        ServerResult::CallToolResult(result) => Ok(result),
-                        _ => Err(rmcp::service::ServiceError::UnexpectedResponse),
+            .run_service_operation_with_timing(
+                "tools/call",
+                timeout,
+                expected_generation,
+                move |service, tracker| {
+                    let rmcp_params = rmcp_params.clone();
+                    let meta = meta.clone();
+                    let attempted = Arc::clone(&operation_attempted);
+                    async move {
+                        let mut options = rmcp::service::PeerRequestOptions::no_options();
+                        options.meta = meta;
+                        // Once handed to the transport, a send/response error is
+                        // not proof that a possibly effectful call did not run.
+                        attempted.store(true, std::sync::atomic::Ordering::Release);
+                        let result = send_tracked_request(
+                            service,
+                            tracker,
+                            ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                                rmcp_params,
+                            )),
+                            options,
+                        )
+                        .await?;
+                        match result {
+                            ServerResult::CallToolResult(result) => Ok(result),
+                            _ => Err(rmcp::service::ServiceError::UnexpectedResponse),
+                        }
                     }
-                }
-                .boxed()
-            })
+                    .boxed()
+                },
+            )
             .await;
-        let result = self.finish_oauth_operation(result).await;
+        let result = self
+            .finish_oauth_operation(result.map(|(result, _)| result))
+            .await;
         result.map_err(|source| {
             if attempted.load(std::sync::atomic::Ordering::Acquire) && !is_timeout_error(&source) {
                 ClientOperationError::CompletionUnknown { source }.into()
@@ -1148,8 +1185,18 @@ impl RmcpClient {
         self.finish_oauth_operation(response).await
     }
 
-    async fn service(&self) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
+    async fn service(&self) -> Result<Arc<RunningClientService>> {
+        self.service_for_generation(None).await
+    }
+
+    async fn service_for_generation(
+        &self,
+        expected_generation: Option<u64>,
+    ) -> Result<Arc<RunningClientService>> {
         let guard = self.state.lock().await;
+        if expected_generation.is_some_and(|expected| expected != self.session_generation()) {
+            anyhow::bail!("MCP tool catalog changed before dispatch; no call was sent");
+        }
         match &*guard {
             ClientState::Ready { service, .. } => Ok(Arc::clone(service)),
             ClientState::Connecting { .. } => Err(anyhow!("MCP client not initialized")),
@@ -1577,7 +1624,7 @@ impl RmcpClient {
         F: Fn(Arc<RunningClientService>, OperationRequestTracker) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
     {
-        self.run_service_operation_with_timing(label, timeout, operation)
+        self.run_service_operation_with_timing(label, timeout, None, operation)
             .await
             .map(|(result, _)| result)
     }
@@ -1586,6 +1633,7 @@ impl RmcpClient {
         &self,
         label: &str,
         timeout: Option<Duration>,
+        expected_generation: Option<u64>,
         operation: F,
     ) -> Result<(T, Duration)>
     where
@@ -1595,8 +1643,12 @@ impl RmcpClient {
         let tracker = OperationRequestTracker::new(self.elicitation_pause_state.clone());
         let started = tracker.pause_state.timing.borrow().active_time();
         let mut cancellation_guard = OperationCancellationGuard::new(tracker.clone());
-        let operation_future =
-            self.run_service_operation_with_recovery(label, tracker.clone(), &operation);
+        let operation_future = self.run_service_operation_with_recovery(
+            label,
+            tracker.clone(),
+            expected_generation,
+            &operation,
+        );
         let result = match timeout {
             Some(duration) => match active_time_timeout(
                 duration,
@@ -1634,13 +1686,14 @@ impl RmcpClient {
         &self,
         label: &str,
         tracker: OperationRequestTracker,
+        expected_generation: Option<u64>,
         operation: &F,
     ) -> Result<T>
     where
         F: Fn(Arc<RunningClientService>, OperationRequestTracker) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
     {
-        let service = self.service().await?;
+        let service = self.service_for_generation(expected_generation).await?;
         match Self::run_service_operation_with_transient_retries(
             Arc::clone(&service),
             label,

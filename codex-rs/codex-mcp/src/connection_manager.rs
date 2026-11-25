@@ -109,6 +109,7 @@ impl jsonschema::Retrieve for NoExternalSchemaRetrieval {
 // accidentally drop the incomplete status when extracting a successful prefix.
 async fn collect_resource_pages<T, F, Fut>(
     budget: Duration,
+    stop_after_page: impl Fn(&[T]) -> bool,
     mut fetch: F,
 ) -> Result<(Vec<T>, Option<String>, Option<rmcp::model::MetaObject>)>
 where
@@ -137,6 +138,7 @@ where
         if items.len().saturating_add(page_items.len()) > MAX_MCP_COLLECTION_ITEMS {
             break "collection item limit reached; retry the unconsumed page".to_string();
         }
+        let stop = stop_after_page(&page_items);
         items.extend(page_items);
         completed_pages += 1;
         cursor = next;
@@ -145,6 +147,9 @@ where
         };
         if !seen.insert(next.clone()) {
             break "server returned a repeated continuation cursor".to_string();
+        }
+        if stop {
+            return Ok((items, cursor, None));
         }
     };
     if completed_pages == 0 {
@@ -1388,6 +1393,25 @@ impl McpConnectionManager {
         &self,
         include_server: impl Fn(&str) -> bool,
     ) -> McpServerCollection<ListResourcesResult> {
+        self.list_resources_with_stop(include_server, None).await
+    }
+
+    /// Returns complete ordered pages through the first raw URI prefix match.
+    /// An unvisited suffix has the server's opaque continuation cursor.
+    pub async fn list_resources_through_uri_prefix(
+        &self,
+        server: &str,
+        uri_prefix: &str,
+    ) -> McpServerCollection<ListResourcesResult> {
+        self.list_resources_with_stop(|candidate| candidate == server, Some(uri_prefix))
+            .await
+    }
+
+    async fn list_resources_with_stop(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+        uri_prefix: Option<&str>,
+    ) -> McpServerCollection<ListResourcesResult> {
         let mut join_set = JoinSet::new();
         let mut collection = McpServerCollection::default();
         let mut task_servers = HashMap::new();
@@ -1401,6 +1425,7 @@ impl McpConnectionManager {
             let server_name = server_name.clone();
             let async_managed_client = async_managed_client.clone();
             let task_server = server_name.clone();
+            let uri_prefix = uri_prefix.map(str::to_owned);
             let abort_handle = join_set.spawn(async move {
                 async_managed_client.reconnect_failed_startup().await;
                 let managed_client = match async_managed_client.client_for_operation().await {
@@ -1423,6 +1448,11 @@ impl McpConnectionManager {
                 let client = &managed_client.client;
                 let result = collect_resource_pages(
                     managed_client.tool_timeout,
+                    |page: &[rmcp::model::Resource]| {
+                        uri_prefix.as_deref().is_some_and(|prefix| {
+                            page.iter().any(|resource| resource.uri.starts_with(prefix))
+                        })
+                    },
                     |cursor, remaining| async move {
                         let params = cursor.map(|cursor| {
                             PaginatedRequestParams::default().with_cursor(Some(cursor))
@@ -1617,6 +1647,7 @@ impl McpConnectionManager {
                 let client = &managed_client.client;
                 let result = collect_resource_pages(
                     managed_client.tool_timeout,
+                    |_| false,
                     |cursor, remaining| async move {
                         let params = cursor.map(|cursor| {
                             PaginatedRequestParams::default().with_cursor(Some(cursor))
@@ -1791,8 +1822,10 @@ impl McpConnectionManager {
             ));
         }
 
-        let validator = client
-            .tool_output_schema(tool)
+        let (generation, schema) = client
+            .tool_output_contract(tool)
+            .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;
+        let validator = schema
             .map(|schema| {
                 jsonschema::options()
                     .with_retriever(NoExternalSchemaRetrieval)
@@ -1804,7 +1837,13 @@ impl McpConnectionManager {
             .transpose()?;
         let result: rmcp::model::CallToolResult = client
             .client
-            .call_tool(tool.to_string(), arguments, meta, Some(client.tool_timeout))
+            .call_tool_for_generation(
+                tool.to_string(),
+                arguments,
+                meta,
+                Some(client.tool_timeout),
+                generation,
+            )
             .await
             .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;
         if result.is_error != Some(true)

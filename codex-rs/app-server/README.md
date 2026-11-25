@@ -56,6 +56,23 @@ creation before launching in that directory. An existing directory is accepted;
 an obstructing file is an error, not permission to overwrite it, substitute a
 different working directory, or restart an unrelated process.
 
+## Reasoning effort in explicit client workflows
+
+A client that already knows its phase can opt into a per-phase effort schedule
+without changing the thread's model. Pass a supported `effort` in
+[`turn/start`](../app-server-protocol-types/src/protocol/v2/turn.rs): use low for
+routine, bounded work; medium for implementation; and high for diagnosis,
+architecture, or a repair phase triggered by an observed verification failure.
+Keep the caller's explicit effort override and use its ordinary setting when the
+phase is unknown or the model does not support the selected effort. Do not infer
+a phase from model text or checklist labels.
+
+The override persists: omitting `effort` does not reset it. Set it explicitly on
+each phase transition and restore the original effort on the next ordinary turn
+if reusing the thread. On supported Responses Lite routes, a configuration update
+can carry the latest effort while the top-level reasoning field stays pinned;
+the top-level field alone does not establish the phase's effective setting.
+
 ## Soft reserve for explicitly optional client work
 
 A client that submits its own phases can defer a discretionary `turn/start`
