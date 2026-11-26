@@ -59,6 +59,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         Some(client_session) => client_session,
         None => owned_client_session.insert(sess.services.model_client.new_session()),
     };
+    let request_effort = sess.compaction_request_reasoning_effort(turn_context).await;
     let build_prompt = |prepared: &crate::context_manager::PreparedPromptInput| {
         let mut prompt = build_projected_prompt(
             sess.as_ref(),
@@ -69,7 +70,12 @@ pub(super) async fn run_remote_compact_v2_attempt(
         );
         prompt.output_schema = None;
         prompt.output_schema_strict = true;
-        append_compaction_trigger(&mut prompt);
+        let effort_update = Session::compaction_reasoning_effort_update(
+            turn_context,
+            &prompt.input,
+            request_effort.as_ref(),
+        );
+        append_compaction_trigger(&mut prompt, effort_update);
         prompt
     };
     let (mut prompt, estimated_deleted_tokens) = {
@@ -257,11 +263,16 @@ fn largest_compaction_request_input(prompt: &Prompt) -> Arc<[ResponseItem]> {
         .unwrap_or_else(|| Arc::clone(&prompt.input))
 }
 
-fn append_compaction_trigger(prompt: &mut Prompt) {
-    prompt.prompt_provenance = prompt.prompt_provenance.with_appended_items(
-        &[ResponseItem::CompactionTrigger {}],
-        &prompt.stable_context_manifest,
-    );
+/// Appends the trigger, preceded by the selected effort's update when sampling
+/// has not recorded it yet, so the compaction runs at the turn's effort.
+fn append_compaction_trigger(prompt: &mut Prompt, effort_update: Option<ResponseItem>) {
+    let suffix: Vec<ResponseItem> = effort_update
+        .into_iter()
+        .chain([ResponseItem::CompactionTrigger {}])
+        .collect();
+    prompt.prompt_provenance = prompt
+        .prompt_provenance
+        .with_appended_items(&suffix, &prompt.stable_context_manifest);
     // The suffix changes History even though the projected prefix is unchanged.
     prompt.digests.history = None;
     // Preserve sharing established by prompt projection. Pointer identity is
@@ -281,7 +292,7 @@ fn append_compaction_trigger(prompt: &mut Prompt) {
             *input = Arc::clone(replacement);
         } else {
             let mut items = input.to_vec();
-            items.push(ResponseItem::CompactionTrigger {});
+            items.extend(suffix.iter().cloned());
             let replacement: Arc<[ResponseItem]> = items.into();
             appended.push((Arc::clone(input), Arc::clone(&replacement)));
             *input = replacement;

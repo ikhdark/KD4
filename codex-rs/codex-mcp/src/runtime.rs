@@ -35,6 +35,7 @@ pub struct McpRuntimeContext {
     environment_manager: Arc<EnvironmentManager>,
     local_stdio_fallback_cwd: PathBuf,
     selected_environments: std::collections::HashMap<String, Option<Arc<Environment>>>,
+    defer_optional_stdio_startup: bool,
 }
 
 impl McpRuntimeContext {
@@ -46,7 +47,19 @@ impl McpRuntimeContext {
             environment_manager,
             local_stdio_fallback_cwd,
             selected_environments: Default::default(),
+            defer_optional_stdio_startup: false,
         }
+    }
+
+    /// Optional local stdio servers whose identical catalog is already known in
+    /// this process start on first use instead of at session creation.
+    pub fn with_deferred_optional_stdio_startup(mut self, defer: bool) -> Self {
+        self.defer_optional_stdio_startup = defer;
+        self
+    }
+
+    pub fn defers_optional_stdio_startup(&self) -> bool {
+        self.defer_optional_stdio_startup
     }
 
     pub fn with_selected_environments(

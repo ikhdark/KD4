@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -58,14 +59,70 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
         }
         // Preserve the established best-effort scan outside these lexical forms,
         // including nested commands that the restricted AST parser does not lower.
-        PowershellInvocation::InlineCommand { script, .. } => shlex_split(script)
-            .map(|tokens| is_dangerous_powershell_script_tokens(&tokens))
-            .unwrap_or(true),
+        PowershellInvocation::InlineCommand { script, .. } => {
+            shlex_split(&mark_statement_newlines(script))
+                .map(|tokens| is_dangerous_powershell_script_tokens(&tokens))
+                .unwrap_or(true)
+        }
         PowershellInvocation::Opaque
         | PowershellInvocation::Bare
         | PowershellInvocation::Empty
         | PowershellInvocation::Invalid => true,
     }
+}
+
+/// shlex treats a newline as whitespace, so the segment checks below would
+/// join `-Force` on one line with a delete cmdlet on the next. Replace each
+/// unquoted, unbracketed newline that ends a PowerShell statement with an
+/// explicit `;` word. A newline inside quotes or brackets, after a possible
+/// continuation such as `,` or `|`, before any content, or anywhere in a
+/// script with typographic quotes stays whitespace, keeping the established
+/// conservative join.
+fn mark_statement_newlines(script: &str) -> Cow<'_, str> {
+    const TYPOGRAPHIC_QUOTES: [char; 7] = [
+        '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}', '\u{201C}', '\u{201D}', '\u{201E}',
+    ];
+    if !script.contains(['\n', '\r']) || script.contains(TYPOGRAPHIC_QUOTES) {
+        return Cow::Borrowed(script);
+    }
+    let mut marked = String::with_capacity(script.len() + 8);
+    let mut quote = None;
+    // `None` once a closing bracket has no opener; never split after that.
+    let mut depth = Some(0usize);
+    // Last significant character since the previous line break.
+    let mut last = None;
+    for ch in script.chars() {
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+                last = Some(ch);
+            }
+            marked.push(ch);
+            continue;
+        }
+        match ch {
+            '\n' | '\r' => {
+                let ends_statement = depth == Some(0)
+                    && last.is_some_and(|c: char| {
+                        c.is_alphanumeric() || matches!(c, '_' | '\'' | '"' | ')' | ']' | '}')
+                    });
+                last = None;
+                if ends_statement {
+                    marked.push_str(" ; ");
+                    continue;
+                }
+            }
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth = depth.map(|depth| depth + 1),
+            ')' | ']' | '}' => depth = depth.and_then(|depth| depth.checked_sub(1)),
+            _ => {}
+        }
+        if !ch.is_whitespace() {
+            last = Some(ch);
+        }
+        marked.push(ch);
+    }
+    Cow::Owned(marked)
 }
 
 /// Inspect one command already lowered by the restricted PowerShell AST parser.

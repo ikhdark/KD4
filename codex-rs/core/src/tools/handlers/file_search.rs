@@ -269,7 +269,14 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
             };
             // Confirm custody settlement even after a successful root exit; a PATH
             // shim must not leave a descendant behind this read-only operation.
-            let cleanup_error = process.session.terminate().err().map(|error| error.to_string());
+            // Job-tree termination waits for the tree to empty (up to seconds on
+            // Windows); keep it and the handle's drop off the runtime worker.
+            let session = process.session;
+            let cleanup_error = tokio::task::spawn_blocking(move || session.terminate())
+                .await
+                .map_err(|error| format!("file search cleanup worker failed: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()))
+                .err();
             let roots = args.paths.iter().map(|requested| {
                 let resolved = environment.cwd().join(requested);
                 match resolved {

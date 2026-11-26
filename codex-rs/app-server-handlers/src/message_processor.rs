@@ -1882,7 +1882,7 @@ impl MessageProcessor {
                         .map(|response| Some(response.into())),
                     ClientRequest::FuzzyFileSearchSessionStart { params, .. } => self
                         .search_processor
-                        .fuzzy_file_search_session_start_response(connection_id, params)
+                        .fuzzy_file_search_session_start_response(connection_id, params, &rpc_gate)
                         .await
                         .map(|response| Some(response.into())),
                     ClientRequest::FuzzyFileSearchSessionUpdate { params, .. } => self

@@ -91,6 +91,16 @@ Queue acceptance is not consumption and does not start a turn. Reconcile
 partial outcomes per recipient; do not resend to accepted targets. If the
 work requires a new turn, use an explicitly authorized follow-up.
 
+When a typed bound writer's `apply_patch` receipt settles as exactly
+committed, KD4 queues one advisory (`kdr_at14_settled_source_change`: source
+path, new SHA-256, operation ID, writer assignment and attempt) to each other
+active typed task in the same repository and workspace whose read scope covers
+a committed path inside the writer's write scope. It starts no turn, grants no
+scope and is not a lock: a copy you already read is stale, so re-read the path
+before relying on it. Unknown, unchanged, failed, inexact, unbound,
+out-of-scope and other-workspace writes publish nothing, and delivery is best
+effort.
+
 KD4 automatically coalesces safe queued revisions when the producer identifies
 progress that is useful and entirely replaceable. Send `progress:
 {task_id, attempt_id, revision}` with stable task and attempt IDs and
@@ -111,6 +121,9 @@ version-2 report's `evidence` field. An unchanged report uses empty `set` and
 `remove`. For a full report instead, put the complete map in that field. This
 recipe is for `F00`–`F99` statuses (`pass`, `fail`, or `unknown`); it is not a
 replacement for detailed findings, source references, or terminal receipts.
+Host periodic rows (see "Recover progress from a cut-off worker") are
+numbered apart from a worker's own, so the baseline is version 1 and the delta
+version 2 whenever the worker publishes them.
 
 The parent retrieves both exact versions with `agents.agent_task`
 (`operation:"partial_result"`, with the same assignment and attempt IDs
@@ -149,6 +162,32 @@ reconstructed map is provisional before and after recovery; acceptance
 still depends on the separate source-backed receipt. If a consumer does not
 have this decoder or needs an independent snapshot, publish the full map.
 
+## Recover progress from a cut-off worker
+
+A typed bound worker that never publishes a partial result still leaves the
+parent retrievable progress. After every 25th model generation of the attempt
+KD4 publishes a provisional partial result whose summary starts `Host periodic
+partial at generation N (period 25)`. Its sources are the newest eight
+recorded tool outputs (call ID and SHA-256 of the recorded output text, not
+worker claims) and its limitations say it is host-synthesized, not worker
+analysis. Retrieve it like any partial result; it never accepts, seals or
+completes work, so a provider error, interruption or restart leaves the
+receipt and attempt state unchanged and the attempt still needs its own
+receipt or a decision. It is a checkpoint, not the full read history: the
+task record remains the source for the complete list of recorded calls.
+
+Host rows are numbered apart from a worker's own publications, from version
+1,000,001, and never advance the `expected_version` a worker holds: its first
+partial result is version 1 and each later one follows the version it
+received, with or without a host row. KD4 writes a host row only while the
+attempt has no partial result from the worker, so one never follows it.
+Without a version, retrieval returns the worker's latest partial result if it
+published one, else the latest host row; request a host row by the exact
+version its observation names. A worker that passes a host row's number as
+`expected_version` is refused with that explanation. The generation count
+belongs to the session's current attempt, so a new attempt or a reloaded
+session counts again from the start.
+
 ## Dispatch only after evidence is ready
 
 For a root's typed spawn with one live, current typed prerequisite in the
@@ -165,6 +204,9 @@ Ordinary workers receive a task capsule by default instead of the parent's
 history. The launch capsule may omit an empty diagnostic source manifest;
 its hash and dependency pins remain, and the stored capsule is unchanged.
 Typed contracts and nonempty source manifests retain their launch data.
+Committed capsules are immutable: reads still accept capsules stored before
+`workspace_strategy` was removed, when that field is the only difference
+from the current canonical form.
 
 ### Settle an already-running redundant assignment
 

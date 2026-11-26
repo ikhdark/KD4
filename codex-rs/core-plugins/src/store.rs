@@ -94,11 +94,26 @@ impl<G> PendingPluginInstall<G> {
             .map_err(|err| PluginStoreError::io("failed to bind plugin marketplace source", err))
     }
 
-    pub(crate) fn commit(mut self) -> Result<PluginInstallResult, PluginStoreError> {
+    pub(crate) fn commit(self) -> Result<PluginInstallResult, PluginStoreError> {
+        self.commit_or_restore(|| {})
+    }
+
+    /// Commit like [`Self::commit`]. If the commit boundary fails, run
+    /// `before_rollback` while publication and entry ownership are still held,
+    /// so state written for this install is undone before its files roll back.
+    pub(crate) fn commit_or_restore(
+        mut self,
+        before_rollback: impl FnOnce(),
+    ) -> Result<PluginInstallResult, PluginStoreError> {
         // Removing the pending marker is the durable commit boundary. On failure,
         // retain rollback ownership instead of reporting an unreadable install as success.
-        fs::remove_file(self.target_root.join(".codex-install-owner"))
-            .map_err(|err| PluginStoreError::io("failed to commit plugin publication", err))?;
+        if let Err(err) = fs::remove_file(self.target_root.join(".codex-install-owner")) {
+            before_rollback();
+            return Err(PluginStoreError::io(
+                "failed to commit plugin publication",
+                err,
+            ));
+        }
         self.committed = true;
         Ok(self.result.clone())
     }

@@ -166,10 +166,20 @@ pub async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) if err.kind() == ErrorKind::ConnectionRefused => {}
         Err(err) => {
-            if !tokio::fs::try_exists(socket_path).await.unwrap_or(false) {
-                return Ok(());
-            }
-            return Err(err);
+            // Only a successful probe may prove absence. A failed probe (access,
+            // I/O or path error) says nothing about the pathname, so surface it
+            // instead of treating the endpoint as clean and binding over it.
+            return match tokio::fs::try_exists(socket_path).await {
+                Ok(false) => Ok(()),
+                Ok(true) => Err(err),
+                Err(probe_err) => Err(std::io::Error::new(
+                    probe_err.kind(),
+                    format!(
+                        "could not determine whether control socket {} exists after connect failed ({err}): {probe_err}",
+                        socket_path.display()
+                    ),
+                )),
+            };
         }
     }
 

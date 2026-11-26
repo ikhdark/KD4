@@ -210,14 +210,23 @@ impl ToolExecutor<ToolInvocation> for WaitProcessesHandler {
                 let filter = &filter;
                 let durable_records = durable_records.clone();
                 pending.push(async move {
+                    let mut durable_error = None;
                     if manager.process_incarnation(handle.session_id).await.is_none() {
                         let receipt = match session.services.command_execution
                             .completed_process_result(handle.session_id, handle.incarnation).await
                         {
                             Some(receipt) => Some(receipt),
-                            None => durable_records.await.and_then(|records|
-                                crate::session::Session::durable_process_result(
-                                    &records, handle.session_id, handle.incarnation)),
+                            None => match durable_records.await {
+                                Ok(Some(records)) => crate::session::Session::durable_process_result(
+                                    &records, handle.session_id, handle.incarnation),
+                                Ok(None) => None,
+                                // Unreadable history is not an absent receipt:
+                                // report it with the fallback observation.
+                                Err(cause) => {
+                                    durable_error = Some(cause);
+                                    None
+                                }
+                            },
                         };
                         if let Some(receipt) = receipt {
                             return (index, json!({
@@ -229,20 +238,21 @@ impl ToolExecutor<ToolInvocation> for WaitProcessesHandler {
                             }));
                         }
                     }
-                    (
-                        index,
-                        outcome(
-                            handle,
-                            manager
-                                .filtered_process_events(
-                                    handle.session_id,
-                                    handle.incarnation,
-                                    filter,
-                                    Some(deadline),
-                                )
-                                .await,
-                        ),
-                    )
+                    let mut value = outcome(
+                        handle,
+                        manager
+                            .filtered_process_events(
+                                handle.session_id,
+                                handle.incarnation,
+                                filter,
+                                Some(deadline),
+                            )
+                            .await,
+                    );
+                    if let Some(cause) = durable_error {
+                        value["durable_evidence_error"] = json!(cause);
+                    }
+                    (index, value)
                 });
             }
             // Reuse call-scoped observers, never consuming write_stdin/racing

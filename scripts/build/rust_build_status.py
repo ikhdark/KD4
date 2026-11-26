@@ -170,15 +170,17 @@ LANE_COORDINATION_DENIED_LIMIT_SECONDS = 30.0
 # Lanes of one family (`core-tests`, `core-tests-2`, ...) that may build at
 # once when cold overflow is allowed. Each lane holds a whole Cargo target, so
 # the bound limits memory and disk; maintenance keeps as many lanes warm.
-DEFAULT_MAX_ACTIVE_LANES_PER_BASE = 2
+DEFAULT_MAX_ACTIVE_LANES_PER_BASE = 8
 
 
-def max_active_lanes_per_base(env: Mapping[str, str] = os.environ) -> int:
+def max_active_lanes_per_base(
+    env: Mapping[str, str] = os.environ, *, default: int = DEFAULT_MAX_ACTIVE_LANES_PER_BASE
+) -> int:
     """`CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE`, at least one lane."""
     try:
         value = int(env.get("CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE", "").strip())
     except ValueError:
-        return DEFAULT_MAX_ACTIVE_LANES_PER_BASE
+        return default
     return max(1, value)
 
 
@@ -2126,9 +2128,9 @@ def maintain_cargo_lanes(repo_root: Path, lane_root: Path) -> None:
         os.environ["CODEX_CARGO_LANES_ROOT"] = str(lane_root)
         prune_stale_lanes(
             repo_root=repo_root,
-            # Keep every lane that may build at once warm, so overflow
-            # siblings are not rebuilt cold after each maintenance pass.
-            keep_warm_per_base=max_active_lanes_per_base(),
+            # Automatic maintenance keeps two by default. The existing
+            # environment override still applies to both policies if set.
+            keep_warm_per_base=max_active_lanes_per_base(default=2),
             max_age_days=setting("CODEX_CARGO_LANE_MAX_AGE_DAYS", 7, 1),
             max_lane_bytes=setting("CODEX_CARGO_LANE_MAX_LANE_BYTES", 0) or None,
             max_total_lane_bytes=setting("CODEX_CARGO_LANE_MAX_TOTAL_BYTES", 0) or None,
@@ -3454,7 +3456,7 @@ def run_in_cargo_lane(
     lock_timeout_seconds: float = LANE_COORDINATION_GRACE_SECONDS,
     timing_path: Path | None = None,
     warm_wait_seconds: float = 0.0,
-    allow_cold_overflow: bool = False,
+    allow_cold_overflow: bool | None = None,
     max_active_lanes: int | None = None,
     source_mirror: str = "auto",
     freeze_bundle_dir: Path | None = None,
@@ -3622,9 +3624,9 @@ def run_in_cargo_lane(
             build_context["sourceRoot"] = source_identity
             assert source is not None
             rank = _mirror_slot_distance(mirrors_root, source.entries)
-            # A busy slot never blocks while the family has room: the next slot
-            # starts cold once, then concurrent snapshot builds stay warm.
-            allow_cold_overflow = True
+            # Expand by default, but honor an explicit warm-only request.
+            if allow_cold_overflow is None:
+                allow_cold_overflow = True
             max_active_lanes = max_active_lanes or max_active_lanes_per_base()
         else:
             record["sourceMirrorSkipped"] = skipped
@@ -3641,7 +3643,7 @@ def run_in_cargo_lane(
         with reserve_cargo_lane(
             repo_root=owner_root, requested_lane=requested_lane, command=command,
             lane_root=lane_root, lock_timeout_seconds=lock_timeout_seconds,
-            warm_wait_seconds=warm_wait_seconds, allow_cold_overflow=allow_cold_overflow,
+            warm_wait_seconds=warm_wait_seconds, allow_cold_overflow=bool(allow_cold_overflow),
             build_context=build_context, max_active_lanes=max_active_lanes,
             source_identity=source_identity, rank=rank, admit=admission,
             progress=record["laneReservation"],
@@ -4059,7 +4061,7 @@ def protected_warm_lane_names(
     base_by_name = warm_lane_base_map({path.name for path in lane_dirs})
     grouped: dict[str, list[Path]] = {}
     for path in lane_dirs:
-        if is_timestamped_lane(path.name):
+        if is_timestamped_lane(path.name) or not _is_warm_lane_dir(path):
             continue
         # Fold base keys so differently-cased invocations of the same lane
         # base group together on the case-insensitive filesystem.
@@ -4559,11 +4561,14 @@ def main(argv: list[str] | None = None) -> int:
         default=0.0,
         help="Wait this long before optional cold overflow; without overflow, wait until a lane is free.",
     )
-    run_lane_parser.add_argument(
-        "--allow-cold-overflow",
-        action="store_true",
-        help="Allow a cold sibling build after the warm-lane wait; may duplicate compilation. "
-        "Lanes of the family that build at once stay within --max-active-lanes.",
+    overflow_options = run_lane_parser.add_mutually_exclusive_group()
+    overflow_options.add_argument(
+        "--allow-cold-overflow", action="store_true", default=None,
+        help="Allow a cold sibling after the warm wait (also the default for mirrored builds).",
+    )
+    overflow_options.add_argument(
+        "--no-cold-overflow", dest="allow_cold_overflow", action="store_false",
+        help="Wait for a busy reusable lane instead of starting a cold sibling, including for mirrors.",
     )
     run_lane_parser.add_argument(
         "--max-active-lanes",

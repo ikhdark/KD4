@@ -63,14 +63,39 @@ accumulated request snapshots from being retained while opening a task.
 Ordinary history payloads, unknown formats and malformed references retain
 canonical decoding/error handling. Full `for_each_rollout_item` readers and
 diagnostic/export paths still hydrate and verify the saved diagnostic bodies.
-Append preflight still reads, verifies and enrolls every referenced dependency
-while the writer locks are held. The append metadata visitor does not consume
-replay captures. For a strictly recognized current-format replay record, preflight
-validates the authenticated JSON with the existing serde parser while retaining
-only the typed envelope. If the shape or encoding is not recognized, the exact
-same bytes still go through the existing Value/RawValue decoders; ordinary
-captures already parsed as Value can still be discarded before the typed decode.
-Neither path changes dependency enrollment or payload-before-rollout syncing.
+Append preflight still reads, verifies and enrolls every referenced history
+dependency while the writer locks are held. The append visitors do not consume
+replay captures, so a recognized current-format `context_replay` reference is
+only checked for a regular body file of its recorded size and enrolled for the
+durable barrier; the body is not read, hashed or parsed. A missing or wrong-size
+body still counts as an unresolved payload. Damage that preserves the size is
+reported by the full diagnostic readers above, which still verify every body.
+Unknown formats and malformed references go through the existing read, verify
+and Value/RawValue decoders, and captures already parsed as Value can still be
+discarded before the typed decode. Neither path changes dependency enrollment or
+payload-before-rollout syncing.
+
+A request replay capture of an immutable prepared prompt is written while the
+request is dispatched; the model client joins it before delivering the
+attempt's first response event, so the capture still precedes that attempt's
+response items. A failed capture fails the attempt with a non-retryable error
+and none of its response is consumed, although the request may already have
+been sent. A capture without a prepared snapshot is still retained before
+dispatch.
+
+Before an overlapped dispatch, a small typed `pre_send_marker_v1` context-replay
+row (attempt identity, transport and model only; no request body or snapshot)
+is appended and synced first, so a request is never sent without at least that
+durable record. If the marker cannot commit, the attempt fails with the
+non-retryable `context replay pre-send marker failed` error and nothing is
+sent. The full capture still follows concurrently and its failure stays fatal,
+unchanged. The marker is a diagnostic `context_replay` row like the full
+capture (excluded from operational history), so one marker row precedes each
+overlapped full capture of a persistent session; a non-persistent session
+writes none. The marker commit is attributed to the persistence local phase.
+Its measured cost over 96 matched pairs of 100-turn sessions was about 3.4
+percent of process CPU (median pair ratio 1.034) and a median 4 ms per turn of
+wall time.
 
 ## Opt-in append writer-open timing
 
@@ -91,7 +116,9 @@ dispatch and are not a complete decomposition of preflight. Candidate and
 completed-read byte counts are totals for that attempt, including repeated
 references, not distinct artifacts. The projected replay count measures records
 accepted by the fast parser before the canonical typed decode, not a count of
-records committed to storage. The diagnostic does not relax validation
+records committed to storage. `replay_size_checked` counts current-format replay
+references that were size-checked instead of read (present bodies are enrolled);
+their bytes are not in the completed-read total. The diagnostic does not relax validation
 or change which records are read, retained or synced.
 
 ## Opt-in seven-day archive retention

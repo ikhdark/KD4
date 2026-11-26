@@ -105,13 +105,21 @@ impl FeedbackRequestProcessor {
         let mut snapshot = self.feedback.snapshot(conversation_id);
         let thread_id = snapshot.thread_id.clone();
         let prepare_logs = async {
-            let feedback_thread_ids = if include_logs {
+            let (logs_settled, feedback_thread_ids) = if include_logs {
+                // Bounded: the flush is queued behind every pending insert batch, and each
+                // batch can wait out the SQLite busy timeout when the logs database is locked.
+                // When the flush cannot be confirmed, the SQLite rows may lack the newest
+                // entries, so the independent in-memory log buffer is used instead.
                 let flush = async {
                     if let Some(log_db) = self.log_db.as_ref()
-                        && let Err(err) = log_db.flush().await
+                        && let Err(err) = log_db
+                            .flush_within(codex_state::log_db::REQUEST_FLUSH_TIMEOUT)
+                            .await
                     {
                         tracing::warn!(%err, "failed to flush SQLite logs");
+                        return false;
                     }
+                    true
                 };
                 let discover = async {
                     match conversation_id {
@@ -131,7 +139,7 @@ impl FeedbackRequestProcessor {
                         None => Vec::new(),
                     }
                 };
-                let (_, feedback_thread_ids) = tokio::join!(flush, discover);
+                let (logs_settled, feedback_thread_ids) = tokio::join!(flush, discover);
                 let mut feedback_thread_ids = feedback_thread_ids;
                 let original_len = feedback_thread_ids.len();
                 if let Some(conversation_id) = conversation_id {
@@ -143,9 +151,9 @@ impl FeedbackRequestProcessor {
                         );
                     }
                 }
-                feedback_thread_ids
+                (logs_settled, feedback_thread_ids)
             } else {
-                Vec::new()
+                (true, Vec::new())
             };
             let query_logs = async {
                 let state_db_ctx = self.state_db.clone();
@@ -232,7 +240,7 @@ impl FeedbackRequestProcessor {
             };
             let (attachment_paths, sqlite_feedback_logs) =
                 tokio::join!(prepare_attachments, query_logs);
-            (attachment_paths, sqlite_feedback_logs)
+            (attachment_paths, sqlite_feedback_logs, logs_settled)
         };
         let prepare_doctor = async {
             if include_logs {
@@ -241,15 +249,17 @@ impl FeedbackRequestProcessor {
                 None
             }
         };
-        let ((attachment_paths, sqlite_feedback_logs), doctor_report) =
+        let ((attachment_paths, sqlite_feedback_logs, logs_settled), doctor_report) =
             tokio::join!(prepare_logs, prepare_doctor);
 
-        // A successful query can still return old rows after a batch was lost.
+        // A successful query can still return old rows after a batch was lost, or when
+        // the bounded flush did not confirm that the newest entries were inserted.
         // Preserve the independent memory buffer rather than overriding it with incomplete logs.
-        let sqlite_feedback_logs = if self
-            .log_db
-            .as_ref()
-            .is_some_and(LogDbLayer::has_write_failure)
+        let sqlite_feedback_logs = if !logs_settled
+            || self
+                .log_db
+                .as_ref()
+                .is_some_and(LogDbLayer::has_write_failure)
         {
             None
         } else {

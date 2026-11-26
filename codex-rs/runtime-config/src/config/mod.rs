@@ -730,6 +730,7 @@ pub struct Config {
     /// Optional fixed port to use for the local HTTP callback server used during MCP OAuth login.
     ///
     /// When unset, Codex will bind to an ephemeral port chosen by the OS.
+    /// Plugin-install OAuth logins that share a fixed port run one at a time.
     pub mcp_oauth_callback_port: Option<u16>,
 
     /// Optional redirect URI to use during MCP OAuth login.

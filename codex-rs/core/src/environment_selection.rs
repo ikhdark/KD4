@@ -651,8 +651,16 @@ impl TurnEnvironmentSnapshot {
         selections
     }
 
-    pub(crate) fn primary_filesystem(&self) -> Option<Arc<dyn ExecutorFileSystem>> {
+    /// Returns the primary environment's filesystem for discovery that walks a
+    /// host-native cwd, such as repository skill roots.
+    ///
+    /// A primary environment whose cwd does not use the host path convention
+    /// cannot be projected onto the host (see `TurnContext::cwd`), so the host
+    /// fallback cwd must not be paired with its filesystem: that would search an
+    /// unrelated tree on the foreign environment.
+    pub(crate) fn primary_host_path_filesystem(&self) -> Option<Arc<dyn ExecutorFileSystem>> {
         self.primary()
+            .filter(|environment| environment.cwd().to_abs_path().is_ok())
             .map(|environment| environment.environment.get_filesystem())
     }
 

@@ -68,6 +68,7 @@ pub use measurements::ModelRequestOwnerGuard;
 mod operations;
 mod performance;
 pub mod retries;
+mod wall_clock;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
 // Schema 37 counts retries/fallbacks only at unique physical transport entry.
@@ -946,6 +947,31 @@ impl TurnTimingSnapshot {
         };
         timing.dependency_graph = dependency::snapshot(&timing);
         timing
+    }
+}
+
+/// Adds the derived `wallClockProfile` to a terminal record's existing
+/// `performanceObservations`, after its accepted-final tail is attached.
+/// Checkpoints and records without that object are left unchanged.
+pub fn attach_wall_clock_profile(timing: &mut TurnTiming) {
+    if timing
+        .activity_timeline
+        .as_ref()
+        .is_none_or(|timeline| timeline.tail_unknown)
+        || !timing
+            .performance_observations
+            .as_ref()
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return;
+    }
+    let profile = wall_clock::snapshot(timing);
+    if let Some(observations) = timing
+        .performance_observations
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        observations.insert("wallClockProfile".to_owned(), profile);
     }
 }
 

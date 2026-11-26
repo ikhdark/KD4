@@ -298,7 +298,11 @@ fn build_tool_specs_and_registry(
     let mut phases = crate::StartupPhaseLog::start("router_specs");
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
-    restrict_worker_tool_exposure(turn_context, &mut planned_tools.runtimes);
+    restrict_worker_tool_exposure(
+        turn_context,
+        &mut planned_tools.runtimes,
+        context.exposure_identity.worker_patch_exposed,
+    );
     phases.mark("tool_sources");
     promote_deferred_tools(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
@@ -1256,7 +1260,11 @@ fn conflicting_namespace_metadata<'a>(
     conflicts
 }
 
-fn restrict_worker_tool_exposure(turn_context: &TurnContext, runtimes: &mut [RegisteredTool]) {
+fn restrict_worker_tool_exposure(
+    turn_context: &TurnContext,
+    runtimes: &mut [RegisteredTool],
+    patch_exposed: bool,
+) {
     if !matches!(turn_context.session_source, SessionSource::SubAgent(_)) {
         return;
     }
@@ -1269,6 +1277,10 @@ fn restrict_worker_tool_exposure(turn_context: &TurnContext, runtimes: &mut [Reg
                 || tool.tool_name().name == "apply_patch");
         if !available {
             tool.set_exposure(ToolExposure::Hidden);
+        } else if !patch_exposed && tool.tool_name().name == "apply_patch" {
+            // A worker that authorization always refuses for apply_patch does not
+            // advertise it; the runtime stays registered for the typed refusal.
+            tool.set_exposure(ToolExposure::Compatibility);
         }
     }
 }
@@ -1286,7 +1298,11 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
     add_collaboration_tools(context, planned_tools);
     // Group only eligible operations: hiding a compatibility target after its
     // group was built would leave an invalid Code Mode routing reference.
-    restrict_worker_tool_exposure(context.step_context.turn.as_ref(), &mut planned_tools.runtimes);
+    restrict_worker_tool_exposure(
+        context.step_context.turn.as_ref(),
+        &mut planned_tools.runtimes,
+        context.exposure_identity.worker_patch_exposed,
+    );
     crate::tools::handlers::native_tools::consolidate_native_tools(
         &mut planned_tools.runtimes,
         search_tool_enabled(context.step_context.turn.as_ref()),

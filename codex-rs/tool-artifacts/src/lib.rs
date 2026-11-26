@@ -131,10 +131,12 @@ const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_RETENTION_INDEX_ROOTS: usize = 4;
 // Artifacts referenced by durable thread history stay protected, so a root
-// holds far more records than the unprotected retention limit. Past this cap
-// every commit falls back to full-root scans (~0.3s each on Windows at 11K
-// records), so size it for protected growth; memory tracks actual records
-// (~0.8 KB each).
+// holds far more records than the unprotected retention limit. Only evictable
+// records are indexed and counted here; protected records are validated by
+// every listing but never indexed, so durable history growth cannot push the
+// root past this cap. Past it every commit falls back to full-root scans (~0.3s
+// each on Windows at 11K records, far longer at 260K), holding the per-root
+// commit permit; memory tracks actual records (~0.8 KB each).
 const MAX_RETENTION_INDEX_RECORDS: usize = 262_144;
 const RETENTION_RECONCILIATION_INTERVAL: u64 = 128;
 const EXTERNAL_RETENTION_RECONCILIATION_INTERVAL: std::time::Duration =
@@ -680,6 +682,12 @@ impl RetentionIndex {
     // must not resolve filesystem paths while that shared mutex is held.
     fn insert(&mut self, record: ArtifactRetentionRecord) -> bool {
         self.remove(&record.path);
+        // Protected history is never evicted and charges no budget, so it is not
+        // indexed: its growth must not exhaust the bounded index and push every
+        // commit into full-root scans. Clearing a marker publishes the record again.
+        if record.protected {
+            return true;
+        }
         let Some(thread_bytes) = self
             .threads
             .get(&record.thread_directory)
@@ -1215,15 +1223,17 @@ struct ThreadRetentionListing {
     records: Vec<ArtifactRetentionRecord>,
     /// Artifacts whose transaction markers were listed.
     transactions: Vec<PathBuf>,
+    /// Evictable records when collected; otherwise every listed log.
     candidates: u64,
-    /// More logs were listed than the record budget allowed.
+    /// More evictable records were listed than the record budget allowed.
     over_budget: bool,
 }
 
 /// Lists one thread directory. Listing metadata carries size, times, and link
 /// attributes, so this opens no files; per-artifact opens took ~6 s at 14.5K
-/// records. Records are collected only while at most `record_budget` logs have
-/// been listed. Listings can run without the shared lock, so an entry may
+/// records. With a `record_budget`, every family's marker is validated but only
+/// evictable (unprotected) records are returned and charged to that budget.
+/// Listings can run without the shared lock, so an entry may
 /// vanish mid-listing. Returns `None` when the directory no longer exists.
 fn list_thread_retention_directory_blocking(
     directory: &Path,
@@ -1240,7 +1250,7 @@ fn list_thread_retention_directory_blocking(
         candidates: 0,
         over_budget: false,
     };
-    let mut collect = record_budget.is_some();
+    let collect = record_budget.is_some();
     let mut artifacts_by_stem =
         std::collections::HashMap::<String, (u64, Option<(PathBuf, std::fs::Metadata)>)>::new();
     let mut markers = std::collections::HashMap::<String, (PathBuf, std::fs::Metadata)>::new();
@@ -1259,11 +1269,6 @@ fn list_thread_retention_directory_blocking(
         let is_log = extension == Some("log");
         if is_log {
             listing.candidates = listing.candidates.saturating_add(1);
-            if collect && record_budget.is_some_and(|budget| listing.candidates as usize > budget) {
-                collect = false;
-                listing.over_budget = true;
-                artifacts_by_stem.clear();
-            }
         }
         if !collect {
             continue;
@@ -1312,12 +1317,17 @@ fn list_thread_retention_directory_blocking(
             let Some((path, metadata)) = log else {
                 continue;
             };
-            listing.records.push(listed_retention_record(
-                &path,
-                bytes,
-                &metadata,
-                markers.get(&stem),
-            )?);
+            let record = listed_retention_record(&path, bytes, &metadata, markers.get(&stem))?;
+            // Marker validation above still applies; only evictable records are
+            // indexed and charged to the index budget.
+            if !record.protected {
+                listing.records.push(record);
+            }
+        }
+        listing.candidates = listing.records.len() as u64;
+        if record_budget.is_some_and(|budget| listing.records.len() > budget) {
+            listing.over_budget = true;
+            listing.records.clear();
         }
     }
     Ok(Some(listing))
@@ -9032,7 +9042,8 @@ fn apply_thread_retention_listing(
         .into_iter()
         .map(|record| (record.path.clone(), record))
         .collect::<BTreeMap<_, _>>();
-    // Reconcile protected records too, without scanning unrelated thread directories.
+    // Records that vanished or gained protection leave the index, without
+    // scanning unrelated thread directories.
     let vanished = index
         .records
         .range(directory.to_path_buf()..)
@@ -9404,9 +9415,10 @@ async fn enforce_retention_after_upsert(
 /// A thread directory stays addressable only while its thread can be resumed:
 /// `read_tool_output` resolves the caller's own directory, and only a rollout
 /// can bring that caller back. Without one, the directory's protection markers
-/// pin it forever and grow the shared root past its index capacity, so every
-/// later artifact write pays a full-root scan. The grace period keeps live
-/// threads whose rollout is not materialized, in any process, out of reach.
+/// pin it forever, growing the shared root's disk use and the cost of every
+/// full-root rescan (protected records are not indexed, so they no longer
+/// exhaust the index). The grace period keeps live threads whose rollout is not
+/// materialized, in any process, out of reach.
 const UNRESUMABLE_THREAD_ARTIFACT_GRACE: std::time::Duration =
     std::time::Duration::from_secs(7 * 24 * 60 * 60);
 const UNRESUMABLE_THREAD_ARTIFACT_SWEEP_INTERVAL: std::time::Duration =

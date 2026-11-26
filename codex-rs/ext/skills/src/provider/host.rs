@@ -90,7 +90,11 @@ impl SkillProvider for HostSkillProvider {
                 )));
             };
 
-            let contents = host_snapshot.read_skill_text(skill).await.map_err(|err| {
+            let contents = match request.max_text_bytes {
+                Some(max_bytes) => host_snapshot.read_skill_text_prefix(skill, max_bytes).await,
+                None => host_snapshot.read_skill_text(skill).await,
+            }
+            .map_err(|err| {
                 SkillProviderError::new(format!(
                     "failed to read host skill resource {}: {err}",
                     request.resource.as_str()

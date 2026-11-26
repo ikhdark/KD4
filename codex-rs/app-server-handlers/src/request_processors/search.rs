@@ -4,6 +4,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use crate::connection_rpc_gate::ConnectionRpcGate;
+use crate::error_code::capacity_error;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::fuzzy_file_search::FuzzyFileSearchSession;
@@ -21,6 +23,11 @@ use codex_app_server_protocol_types::FuzzyFileSearchSessionUpdateParams;
 use codex_app_server_protocol_types::FuzzyFileSearchSessionUpdateResponse;
 use codex_app_server_protocol_types::JSONRPCErrorError;
 use tokio::sync::Mutex;
+
+// Each live session owns search workers and a file index until it is stopped
+// or its connection closes, so the registry is bounded like fs/watch.
+const FUZZY_SESSIONS_PER_CONNECTION: usize = 32;
+const FUZZY_SESSIONS_PER_SERVER: usize = 256;
 
 /// Cancellation flags of in-flight fuzzy searches, keyed by connection and
 /// cancellation token.
@@ -113,25 +120,53 @@ impl SearchRequestProcessor {
         &self,
         connection_id: ConnectionId,
         params: FuzzyFileSearchSessionStartParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<FuzzyFileSearchSessionStartResponse, JSONRPCErrorError> {
         let FuzzyFileSearchSessionStartParams { session_id, roots } = params;
         if session_id.is_empty() {
             return Err(invalid_request("sessionId must not be empty"));
         }
 
+        let key = (connection_id, session_id.clone());
+        let mut sessions = self.fuzzy_search_sessions.lock().await;
+        // Replacing a live session keeps the count; only a new key is admitted
+        // against the same per-connection and per-server bounds as fs/watch.
+        if !sessions.contains_key(&key) {
+            let limit = if sessions.len() >= FUZZY_SESSIONS_PER_SERVER {
+                Some("server")
+            } else if sessions
+                .keys()
+                .filter(|(owner, _)| *owner == connection_id)
+                .count()
+                >= FUZZY_SESSIONS_PER_CONNECTION
+            {
+                Some("connection")
+            } else {
+                None
+            };
+            if let Some(scope) = limit {
+                return Err(capacity_error(
+                    "fuzzyFileSearchSessionCapacity",
+                    scope,
+                    "fuzzy file search session capacity reached; stop an existing session before retrying",
+                ));
+            }
+        }
+
         let session = start_fuzzy_file_search_session(
             connection_id,
-            session_id.clone(),
+            session_id,
             roots,
             self.outgoing.clone(),
         )
         .map_err(|err| {
             internal_error(format!("failed to start fuzzy file search session: {err}"))
         })?;
-        self.fuzzy_search_sessions
-            .lock()
-            .await
-            .insert((connection_id, session_id), session);
+        // Commit under the connection close fence so a session cannot be
+        // registered after `connection_closed` has already swept this owner.
+        rpc_gate
+            .try_commit(|| sessions.insert(key, session))
+            .ok_or_else(|| invalid_request("connection is closed"))?;
         Ok(FuzzyFileSearchSessionStartResponse {})
     }
 

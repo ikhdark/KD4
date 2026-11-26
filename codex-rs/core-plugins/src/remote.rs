@@ -92,6 +92,8 @@ const REMOTE_INSTALLED_PLUGIN_INVENTORY_TIMEOUT: Duration = Duration::from_secs(
 const MAX_REMOTE_INSTALLED_PLUGIN_INVENTORY_PAGES: usize = 100;
 const RECOMMENDED_PLUGINS_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_PLUGIN_LIST_PAGE_LIMIT: u32 = 200;
+/// Upper bound on pages followed for one aggregate catalog listing.
+const MAX_REMOTE_PLUGIN_LIST_PAGES: usize = 100;
 const MAX_RECOMMENDED_PLUGINS: usize = 50;
 const MAX_RECOMMENDED_PLUGIN_NAME_LEN: usize = 64;
 const MAX_RECOMMENDED_PLUGIN_DISPLAY_NAME_LEN: usize = 64;
@@ -1932,7 +1934,7 @@ async fn fetch_directory_plugins_for_scope_with_optional_collection_with_client(
     let mut plugins = Vec::new();
     let mut page_token = None;
     let mut seen_page_tokens = HashSet::new();
-    loop {
+    for _ in 0..MAX_REMOTE_PLUGIN_LIST_PAGES {
         let response = get_remote_plugin_list_page(
             client,
             config,
@@ -1944,7 +1946,7 @@ async fn fetch_directory_plugins_for_scope_with_optional_collection_with_client(
         .await?;
         plugins.extend(response.plugins);
         let Some(next_page_token) = response.pagination.next_page_token else {
-            break;
+            return Ok(plugins);
         };
         if !seen_page_tokens.insert(next_page_token.clone()) {
             return Err(RemotePluginCatalogError::UnexpectedResponse(
@@ -1953,7 +1955,11 @@ async fn fetch_directory_plugins_for_scope_with_optional_collection_with_client(
         }
         page_token = Some(next_page_token);
     }
-    Ok(plugins)
+    // Callers cache and merge the aggregate as the complete catalog, so an
+    // unfinished listing is an error rather than a truncated success.
+    Err(RemotePluginCatalogError::UnexpectedResponse(format!(
+        "remote plugin catalog exceeded {MAX_REMOTE_PLUGIN_LIST_PAGES} pages"
+    )))
 }
 
 async fn fetch_shared_workspace_plugins_with_client(
@@ -1964,13 +1970,13 @@ async fn fetch_shared_workspace_plugins_with_client(
     let mut plugins = Vec::new();
     let mut page_token = None;
     let mut seen_page_tokens = HashSet::new();
-    loop {
+    for _ in 0..MAX_REMOTE_PLUGIN_LIST_PAGES {
         let response =
             get_remote_shared_workspace_plugins_page(client, config, auth, page_token.as_deref())
                 .await?;
         plugins.extend(response.plugins);
         let Some(next_page_token) = response.pagination.next_page_token else {
-            break;
+            return Ok(plugins);
         };
         if !seen_page_tokens.insert(next_page_token.clone()) {
             return Err(RemotePluginCatalogError::UnexpectedResponse(
@@ -1979,7 +1985,9 @@ async fn fetch_shared_workspace_plugins_with_client(
         }
         page_token = Some(next_page_token);
     }
-    Ok(plugins)
+    Err(RemotePluginCatalogError::UnexpectedResponse(format!(
+        "remote shared workspace plugin listing exceeded {MAX_REMOTE_PLUGIN_LIST_PAGES} pages"
+    )))
 }
 
 async fn fetch_installed_plugins_for_scope(

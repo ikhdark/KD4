@@ -26,7 +26,7 @@ Approval policy, validation restrictions and project/hook trust remain separate.
 | Rust workspace owners and process boundaries | [Rust navigation](codex-rs/README.md) |
 | Core runtime ownership and request flow | [Core navigation](codex-rs/core/README.md) |
 | App-server protocol types, projections and schemas | [Protocol navigation](codex-rs/app-server-protocol/README.md) |
-| Turn timing | [Critical-path timing](codex-rs/core/critical-path-timing.md), [response-start timing](codex-rs/core/response-start-timing.md) |
+| Turn timing | [Critical-path timing](codex-rs/core/critical-path-timing.md), [response-start timing](codex-rs/core/response-start-timing.md), [wall-clock profile](codex-rs/turn-timing/WALL_CLOCK_PROFILE.md) |
 | App-server queue | [Thread queue](codex-rs/app-server/THREAD_QUEUE.md) |
 | Execution service | [Exec server](codex-rs/exec-server/README.md) |
 | Session persistence | [Rollout storage](codex-rs/rollout/README.md) |

@@ -718,9 +718,9 @@ impl Handler {
                     scan_cursor = wake_read.latest_event_id;
                     continue;
                 }
-                // The child's result mail precedes these durable completion events
-                // in the parent's mailbox and wins the wake; the events then end the
-                // next wait at once with nothing new. Fold them the same way.
+                // Once the child's result mail has won a wake, these durable
+                // completion events would end the next wait at once with nothing
+                // new. Fold them the same way.
                 if drain_outcome == WaitOutcome::DurableActivity
                     && hydrated_assignments.failures.is_empty()
                     && before_delivery!(is_delivered_completion_only(store, &wake_read, &hydrated_assignments, &consuming_agent_path), cursor)
@@ -746,6 +746,36 @@ impl Handler {
                         folded_completion_events.saturating_add(wake_read.updated_agents.len());
                     scan_cursor = wake_read.latest_event_id;
                     continue;
+                }
+                // The completion forwarder commits these durable events before it
+                // enqueues the result mail (session/mod.rs
+                // maybe_notify_parent_of_terminal_turn), so the events can win the
+                // wake while the mail is still in flight. Returning now would wake
+                // the caller into a request without the result and cost another
+                // wait. Give in-flight mail one bounded window; if it arrives, end
+                // as the mailbox wake that the fold above already expects and leave
+                // these events for that fold. Otherwise return them unchanged.
+                if drain_outcome == WaitOutcome::DurableActivity
+                    && hydrated_assignments.failures.is_empty()
+                    && before_delivery!(is_undelivered_completion_only(store, &wake_read, &hydrated_assignments, &consuming_agent_path), cursor)
+                {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation_token.cancelled() => {
+                            turn.turn_timing_state
+                                .record_internally_drained_waits(drained_event_pages);
+                            return Err(FunctionCallError::RespondToModel(
+                                "wait_agent cancelled".to_string(),
+                            ));
+                        }
+                        outcome = input.next() => {
+                            turn.turn_timing_state
+                                .record_internally_drained_waits(drained_event_pages);
+                            return Ok(input_only_result(&turn, outcome, cursor, wait_started));
+                        }
+                        _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {}
+                        _ = tokio::time::sleep(COMPLETION_MAIL_GRACE) => {}
+                    }
                 }
                 break (drain_outcome, wake_read, hydrated_assignments, None);
             };
@@ -1631,6 +1661,72 @@ async fn is_delivered_completion_only(
         any_completion = true;
     }
     any_completion
+}
+
+/// Bounded window for result mail whose completion events already committed.
+const COMPLETION_MAIL_GRACE: Duration = Duration::from_millis(1_000);
+
+/// Admission and completion bookkeeping where at least one completed attempt's
+/// result mail to this consumer is still in flight (its retained terminal
+/// outcome is unacknowledged) and every other completion was already delivered
+/// here. Anything else, including pending gates or a next action, stays visible.
+async fn is_undelivered_completion_only(
+    store: &codex_agent_task_store::LocalAgentTaskStore,
+    wake_read: &WakeRead,
+    hydrated: &HydratedAssignments,
+    consuming_agent_path: &str,
+) -> bool {
+    use codex_agent_task_store::ObservationKind;
+    if wake_read.lost_to_retention_count != 0 || wake_read.updated_agents.is_empty() {
+        return false;
+    }
+    let is_child = |agent_path: &str| {
+        agent_path
+            .rsplit_once('/')
+            .is_some_and(|(parent, _)| parent == consuming_agent_path)
+    };
+    let mut checked = HashMap::new();
+    let mut any_in_flight = false;
+    for event in &wake_read.updated_agents {
+        match event.reason {
+            ObservationKind::Accepted => continue,
+            ObservationKind::HostCompletion
+            | ObservationKind::Completed
+            | ObservationKind::ReceiptSealed => {}
+            _ => return false,
+        }
+        let Some(task) = hydrated.tasks.get(&event.assignment_id) else {
+            return false;
+        };
+        if task.current_attempt.attempt_id == event.attempt_id
+            && (!task.current_attempt.state.is_terminal()
+                || has_pending_required_gates(task)
+                || task.workspace_status.next_required_action.is_some())
+        {
+            return false;
+        }
+        let in_flight = match checked.get(&event.attempt_id) {
+            Some(state) => *state,
+            None => {
+                let state = match store.undelivered_terminal_outcome_agent_path(event.attempt_id).await {
+                    Ok(Some(agent_path)) if is_child(&agent_path) => Some(true),
+                    Ok(None) => match store.delivered_terminal_outcome_agent_path(event.attempt_id).await {
+                        Ok(Some(agent_path)) if is_child(&agent_path) => Some(false),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                checked.insert(event.attempt_id, state);
+                state
+            }
+        };
+        match in_flight {
+            Some(true) => any_in_flight = true,
+            Some(false) => {}
+            None => return false,
+        }
+    }
+    any_in_flight
 }
 
 #[derive(Default)]

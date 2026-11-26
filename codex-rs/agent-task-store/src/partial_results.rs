@@ -6,6 +6,12 @@ use serde::Deserialize;
 
 const MAX_PARTIAL_RESULT_BYTES: usize = 64 * 1024;
 
+/// Host-synthesized periodic rows are numbered `HOST_PARTIAL_VERSION_BASE + n`
+/// (n = 1, 2, ...), apart from a worker's own publications (versions 1 up to
+/// this base, exclusive). They never advance the `expected_version` a worker
+/// holds, so a worker's first publication is version 1 whatever host rows exist.
+pub const HOST_PARTIAL_VERSION_BASE: u32 = 1_000_000;
+
 /// Worker-declared identity, not host-verified acquisition or freshness proof.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -94,7 +100,9 @@ impl PartialResultDraft {
 impl LocalAgentTaskStore {
     /// Compare-and-append under the existing writer lock. An identical replay
     /// of the immediately committed version is idempotent, including lost replies.
-    /// `InvalidAssignment` is a draft or version refusal before any write.
+    /// `InvalidAssignment` is a draft or version refusal before any write. The
+    /// sequence compared with `expected_version` is the worker's own range
+    /// (versions below `HOST_PARTIAL_VERSION_BASE`); host rows never enter it.
     pub async fn publish_agent_partial_result(
         &self,
         root_session_id: String,
@@ -108,8 +116,9 @@ impl LocalAgentTaskStore {
         let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
         TaskActor::RootSession(root_session_id).require_root_for(&assignment.root_session_id)?;
         let latest = sqlx::query_scalar::<_, String>(
-            "SELECT body_json FROM partial_results WHERE attempt_id = ? ORDER BY version DESC LIMIT 1",
-        ).bind(attempt_id.to_string()).fetch_optional(&mut *transaction).await?
+            "SELECT body_json FROM partial_results WHERE attempt_id = ? AND version < ? ORDER BY version DESC LIMIT 1",
+        ).bind(attempt_id.to_string()).bind(i64::from(HOST_PARTIAL_VERSION_BASE))
+            .fetch_optional(&mut *transaction).await?
             .map(|body| decode::<AgentPartialResult>(&body)).transpose()?;
         let current_version = latest.as_ref().map_or(0, |result| result.version);
         let version = expected_version.checked_add(1).ok_or_else(|| {
@@ -122,10 +131,73 @@ impl LocalAgentTaskStore {
             {
                 return Ok(latest);
             }
+            let host_hint = if expected_version >= HOST_PARTIAL_VERSION_BASE {
+                format!(
+                    "; versions from {} are host periodic rows numbered apart from a worker's own, which start at 1",
+                    HOST_PARTIAL_VERSION_BASE + 1
+                )
+            } else {
+                String::new()
+            };
             return Err(StoreError::InvalidAssignment(format!(
-                "partial result version conflict: expected {expected_version}, current {current_version}; retrieve the retained result before publishing again",
+                "partial result version conflict: expected {expected_version}, current {current_version}; retrieve the retained result before publishing again{host_hint}",
             )));
         }
+        if version >= HOST_PARTIAL_VERSION_BASE {
+            return Err(StoreError::InvalidAssignment(
+                "partial result version exhausted".into(),
+            ));
+        }
+        self.commit_partial_result_tx(transaction, &assignment, attempt_id, version, draft)
+            .await
+    }
+
+    /// Host-synthesized periodic checkpoint. It is numbered after
+    /// `HOST_PARTIAL_VERSION_BASE`, so it never advances the `expected_version`
+    /// a worker holds, and it is written only while the attempt has no worker
+    /// row: `Ok(None)` means the worker publishes for itself and nothing was
+    /// written. The check and the append share one writer-locked transaction.
+    pub async fn publish_host_partial_result(
+        &self,
+        root_session_id: String,
+        attempt_id: AttemptId,
+        draft: PartialResultDraft,
+    ) -> StoreResult<Option<AgentPartialResult>> {
+        draft.validate()?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let attempt = require_active_current_attempt_tx(&mut transaction, attempt_id).await?;
+        let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+        TaskActor::RootSession(root_session_id).require_root_for(&assignment.root_session_id)?;
+        let worker_rows = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM partial_results WHERE attempt_id = ? AND version < ?",
+        ).bind(attempt_id.to_string()).bind(i64::from(HOST_PARTIAL_VERSION_BASE))
+            .fetch_one(&mut *transaction).await?;
+        if worker_rows > 0 {
+            return Ok(None);
+        }
+        let latest_host = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(version) FROM partial_results WHERE attempt_id = ? AND version >= ?",
+        ).bind(attempt_id.to_string()).bind(i64::from(HOST_PARTIAL_VERSION_BASE))
+            .fetch_one(&mut *transaction).await?;
+        let version = u32::try_from(
+            latest_host.unwrap_or_else(|| i64::from(HOST_PARTIAL_VERSION_BASE)) + 1,
+        ).map_err(|_| StoreError::InvalidAssignment("partial result version exhausted".into()))?;
+        self.commit_partial_result_tx(transaction, &assignment, attempt_id, version, draft)
+            .await
+            .map(Some)
+    }
+
+    /// Insert one row, renew the workspace lease and append the wake observation
+    /// in the caller's writer-locked transaction, then commit; shared by worker
+    /// and host publication.
+    async fn commit_partial_result_tx(
+        &self,
+        mut transaction: sqlx::Transaction<'_, sqlx::Sqlite>,
+        assignment: &Assignment,
+        attempt_id: AttemptId,
+        version: u32,
+        draft: PartialResultDraft,
+    ) -> StoreResult<AgentPartialResult> {
         let result = AgentPartialResult {
             schema_version: 1,
             assignment_id: assignment.assignment_id,
@@ -162,7 +234,7 @@ impl LocalAgentTaskStore {
         .execute(&mut *transaction)
         .await?;
         append_observation_tx(
-            &mut transaction, &assignment, attempt_id, ObservationKind::PartialResult,
+            &mut transaction, assignment, attempt_id, ObservationKind::PartialResult,
             format!("Provisional partial result v{version}; retrieve with get_agent_partial_result assignment_id={} attempt_id={attempt_id} version={version}. This is not accepted evidence or terminal completion.", assignment.assignment_id),
             None,
         ).await?;
@@ -173,6 +245,8 @@ impl LocalAgentTaskStore {
 
     /// Read the latest or an exact immutable version, including historical
     /// attempts. Root scope and assignment/attempt identity share one snapshot.
+    /// Without a version, the worker's own latest row is returned if it has
+    /// published, else the latest host periodic row.
     pub async fn get_agent_partial_result(
         &self,
         root_session_id: String,
@@ -203,8 +277,9 @@ impl LocalAgentTaskStore {
             ).bind(attempt.attempt_id.to_string()).bind(i64::from(version))
                 .fetch_optional(&mut *transaction).await?,
             None => sqlx::query_scalar::<_, String>(
-                "SELECT body_json FROM partial_results WHERE attempt_id = ? ORDER BY version DESC LIMIT 1",
-            ).bind(attempt.attempt_id.to_string()).fetch_optional(&mut *transaction).await?,
+                "SELECT body_json FROM partial_results WHERE attempt_id = ? ORDER BY (version >= ?) ASC, version DESC LIMIT 1",
+            ).bind(attempt.attempt_id.to_string()).bind(i64::from(HOST_PARTIAL_VERSION_BASE))
+                .fetch_optional(&mut *transaction).await?,
         };
         transaction.commit().await?;
         body.map(|body| decode(&body)).transpose()

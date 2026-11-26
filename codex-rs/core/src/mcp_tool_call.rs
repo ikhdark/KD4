@@ -1068,6 +1068,12 @@ impl EventPreviewBudget {
                         break;
                     }
                     let key = self.text(key);
+                    // A key cut at the budget can equal an earlier delivered key;
+                    // stop instead of replacing that property with a truncated value.
+                    if output.contains_key(&key) {
+                        self.truncated = true;
+                        break;
+                    }
                     output.insert(key, self.project(value, depth + 1));
                 }
                 JsonValue::Object(output)

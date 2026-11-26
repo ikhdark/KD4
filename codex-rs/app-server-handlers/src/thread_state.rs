@@ -26,6 +26,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
@@ -38,7 +39,39 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const MAX_TRACKED_IN_FLIGHT_TASKS: usize = 1_024;
+/// Item ids of rolled-back turns retained per thread so a late legacy tool end
+/// is still dropped instead of creating a phantom item. Past this bound the
+/// oldest ids are forgotten first: a late end follows its own turn's abort
+/// promptly, so the most recently rolled-back items are the ones that matter.
+const MAX_ROLLED_BACK_WAIT_IDS: usize = 4_096;
 pub(crate) const THREAD_LISTENER_COMMAND_CAPACITY: usize = 256;
+
+/// First-in first-out set of rolled-back item ids, bounded by
+/// `MAX_ROLLED_BACK_WAIT_IDS`.
+#[derive(Default)]
+struct RolledBackWaitIds {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl RolledBackWaitIds {
+    fn extend(&mut self, ids: impl IntoIterator<Item = String>) {
+        for id in ids {
+            if self.ids.insert(id.clone()) {
+                self.order.push_back(id);
+            }
+        }
+        while self.order.len() > MAX_ROLLED_BACK_WAIT_IDS {
+            if let Some(forgotten) = self.order.pop_front() {
+                self.ids.remove(&forgotten);
+            }
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InFlightTaskReference {
@@ -644,7 +677,7 @@ pub(crate) struct ThreadState {
     turn_index: ThreadTurnIndex,
     turn_index_source_partial: bool,
     turn_index_rollback_generation: u64,
-    rolled_back_wait_ids: HashSet<String>,
+    rolled_back_wait_ids: RolledBackWaitIds,
     turn_origin_tracker: TurnOriginTracker,
     listener_thread: Option<Weak<CodexThread>>,
     watch_registration: WatchRegistration,
@@ -839,8 +872,17 @@ impl ThreadState {
         self.turn_index_rollback_generation
     }
 
-    /// Commits an asynchronous history read only if no rollback invalidated it.
-    /// Another reader may already have initialized the live index; never replace it.
+    /// Whether history read at `expected_generation` may seed the index. Core
+    /// commits a rollback marker to the rollout before this listener consumes
+    /// its live ThreadRolledBack, so a read during a pending rollback may
+    /// already reflect it and the live event would remove those turns again.
+    fn history_seed_is_current(&self, expected_generation: u64) -> bool {
+        self.turn_index_rollback_generation == expected_generation && !self.has_pending_rollback()
+    }
+
+    /// Commits an asynchronous history read only if no rollback invalidated it
+    /// or is still pending. Another reader may already have initialized the
+    /// live index; never replace it.
     pub(crate) fn try_seed_turn_index_from_history(
         &mut self,
         items: &[RolloutItem],
@@ -853,7 +895,7 @@ impl ThreadState {
             return Err(());
         }
         if self.turn_index_source_partial {
-            if self.turn_index_rollback_generation != expected_generation {
+            if !self.history_seed_is_current(expected_generation) {
                 return Err(());
             }
             self.seed_turn_index_from_checked_history(items, false);
@@ -862,7 +904,7 @@ impl ThreadState {
         if self.turn_index.initialized {
             return Ok(());
         }
-        if self.turn_index_rollback_generation != expected_generation {
+        if !self.history_seed_is_current(expected_generation) {
             return Err(());
         }
         self.seed_turn_index_from_checked_history(items, false);
@@ -1145,7 +1187,7 @@ impl ThreadState {
             return false;
         }
         if !self.turn_index.initialized || self.turn_index_source_partial {
-            if self.turn_index_rollback_generation != history_generation {
+            if !self.history_seed_is_current(history_generation) {
                 return false;
             }
             self.seed_turn_index_from_history(items);

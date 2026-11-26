@@ -669,6 +669,30 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         })
     }
 
+    // Reach the direct backend's batched probe owners; the trait defaults on
+    // this wrapper would issue one guarded blocking task per candidate.
+    fn first_regular_file<'a>(
+        &'a self,
+        candidates: &'a [PathUri],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<PathUri>> {
+        Box::pin(async move {
+            let _ = sandbox;
+            self.file_system.first_regular_file(candidates, None).await
+        })
+    }
+
+    fn lookup_batch<'a>(
+        &'a self,
+        requests: &'a [codex_file_system::FileSystemLookup],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<codex_file_system::FileSystemLookupResult>> {
+        Box::pin(async move {
+            let _ = sandbox;
+            self.file_system.lookup_batch(requests, None).await
+        })
+    }
+
     fn mutate_file_if_matches<'a>(
         &'a self,
         path: &'a PathUri,
@@ -1197,6 +1221,57 @@ impl ExecutorFileSystem for DirectFileSystem {
         })
     }
 
+    fn walk<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: WalkOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
+        Box::pin(async move {
+            // A no-follow walk pins its root chain once and holds it until the
+            // walk ends; each directory read then re-checks that chain through
+            // the held handles and pins only its own components below the root.
+            // If the root cannot be pinned, every read keeps the full per-read
+            // chain, so the first enumeration reports the same refusal as before.
+            let _pinned_root = if options.follow_directory_symlinks {
+                None
+            } else {
+                pin_walk_root(path).await
+            };
+            self.walk_via_directory_reads(path, options, sandbox).await
+        })
+    }
+
+    fn walk_read_ahead(&self) -> usize {
+        LOCAL_WALK_READ_AHEAD
+    }
+
+    /// Every request in one blocking task, in order, with the trait default's
+    /// per-request semantics (guarded metadata probes, stored-name lookup and
+    /// canonicalization); parent canonicalization is shared across candidates.
+    fn lookup_batch<'a>(
+        &'a self,
+        requests: &'a [codex_file_system::FileSystemLookup],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<codex_file_system::FileSystemLookupResult>> {
+        let _ = sandbox;
+        Box::pin(lookup_batch_direct(requests.to_vec()))
+    }
+
+    /// The trait default's ordered probe sequence in one blocking task instead
+    /// of one guarded task per PATH x PATHEXT candidate.
+    fn first_regular_file<'a>(
+        &'a self,
+        candidates: &'a [PathUri],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<PathUri>> {
+        let _ = sandbox;
+        let candidates = candidates.to_vec();
+        Box::pin(run_cancellable_file_system_task(move |cancel| {
+            codex_file_system::with_guard_memo(|| first_regular_file_sync(&candidates, &cancel))
+        }))
+    }
+
     fn mutate_file_if_matches<'a>(
         &'a self,
         path: &'a PathUri,
@@ -1536,29 +1611,25 @@ fn checksum_file_sync(
     let mut hasher = sha2::Sha256::new();
     let mut diagnostics = include_text_diagnostics
         .then(codex_file_system::TextDiagnosticsScanner::default);
-    let mut buffer = vec![0u8; FILE_READ_CHUNK_SIZE];
-    let mut check = vec![0u8; FILE_READ_CHUNK_SIZE];
-    let mut file_bytes = 0u64;
-    loop {
-        check_file_system_cancelled(cancel)?;
-        let read = read_full_at(&file, file_bytes, &mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        if read_full_at(&file, file_bytes, &mut check[..read])? != read
-            || buffer[..read] != check[..read]
-        {
-            return Ok(None);
-        }
-        file_bytes += read as u64;
-        if file_bytes > metadata.len() {
-            return Ok(None);
-        }
-        hasher.update(&buffer[..read]);
+    let mut consume = |chunk: &[u8]| {
+        hasher.update(chunk);
         if let Some(diagnostics) = &mut diagnostics {
-            diagnostics.push(&buffer[..read]);
+            diagnostics.push(chunk);
         }
+    };
+    // Files spanning more than two read chunks overlap acquisition of later
+    // chunks with hashing; smaller files keep the single-thread loop.
+    let mut outcome = ChunkedChecksum::Unavailable;
+    if metadata.len() > PIPELINED_CHECKSUM_MIN_BYTES {
+        outcome = checksum_chunks_pipelined(&file, metadata.len(), cancel, &mut consume)?;
     }
+    if matches!(outcome, ChunkedChecksum::Unavailable) {
+        outcome = checksum_chunks_sequential(&file, metadata.len(), cancel, &mut consume)?;
+    }
+    let file_bytes = match outcome {
+        ChunkedChecksum::Complete(file_bytes) => file_bytes,
+        ChunkedChecksum::Changed | ChunkedChecksum::Unavailable => return Ok(None),
+    };
     if file_bytes != metadata.len() || revision != file_range_revision(&file, &file.metadata()?)? {
         return Ok(None);
     }
@@ -1584,6 +1655,131 @@ fn checksum_file_sync(
         revision,
         text_diagnostics: diagnostics.map(codex_file_system::TextDiagnosticsScanner::finish),
     }))
+}
+
+/// Checksums of larger files pipeline chunk acquisition with hashing (measured
+/// on 64 MiB: -27%, kd4-io-filesystem-latency-ab); small files gain nothing.
+const PIPELINED_CHECKSUM_MIN_BYTES: u64 = 2 * FILE_READ_CHUNK_SIZE as u64;
+
+enum ChunkedChecksum {
+    /// Every chunk agreed on both reads and was consumed; total bytes.
+    Complete(u64),
+    /// Two reads disagreed or the file grew past its opened length.
+    Changed,
+    /// The pipelined reader could not start; nothing was consumed.
+    Unavailable,
+}
+
+/// Each chunk is consumed only when two positional reads agree.
+fn checksum_chunks_sequential(
+    file: &std::fs::File,
+    expected_len: u64,
+    cancel: &CancellationToken,
+    consume: &mut dyn FnMut(&[u8]),
+) -> io::Result<ChunkedChecksum> {
+    let mut buffer = vec![0u8; FILE_READ_CHUNK_SIZE];
+    let mut check = vec![0u8; FILE_READ_CHUNK_SIZE];
+    let mut file_bytes = 0u64;
+    loop {
+        check_file_system_cancelled(cancel)?;
+        let read = read_full_at(file, file_bytes, &mut buffer)?;
+        if read == 0 {
+            return Ok(ChunkedChecksum::Complete(file_bytes));
+        }
+        if read_full_at(file, file_bytes, &mut check[..read])? != read
+            || buffer[..read] != check[..read]
+        {
+            return Ok(ChunkedChecksum::Changed);
+        }
+        file_bytes += read as u64;
+        if file_bytes > expected_len {
+            return Ok(ChunkedChecksum::Changed);
+        }
+        consume(&buffer[..read]);
+    }
+}
+
+/// The sequential contract, with a scoped reader thread acquiring and
+/// double-checking the next chunks (at most three buffers) while this thread
+/// consumes the current one. Chunks are consumed strictly in file order.
+fn checksum_chunks_pipelined(
+    file: &std::fs::File,
+    expected_len: u64,
+    cancel: &CancellationToken,
+    consume: &mut dyn FnMut(&[u8]),
+) -> io::Result<ChunkedChecksum> {
+    use std::sync::mpsc;
+    enum Chunk {
+        Data(Vec<u8>, usize),
+        Changed,
+        End,
+    }
+    std::thread::scope(|scope| {
+        let (full_tx, full_rx) = mpsc::sync_channel::<io::Result<Chunk>>(2);
+        let (empty_tx, empty_rx) = mpsc::channel::<Vec<u8>>();
+        for _ in 0..3 {
+            let _ = empty_tx.send(vec![0u8; FILE_READ_CHUNK_SIZE]);
+        }
+        let reader = std::thread::Builder::new()
+            .name("checksum-reader".into())
+            .spawn_scoped(scope, move || {
+                let mut check = vec![0u8; FILE_READ_CHUNK_SIZE];
+                let mut offset = 0u64;
+                loop {
+                    if let Err(error) = check_file_system_cancelled(cancel) {
+                        let _ = full_tx.send(Err(error));
+                        return;
+                    }
+                    let Ok(mut buffer) = empty_rx.recv() else {
+                        return;
+                    };
+                    let chunk = (|| {
+                        let read = read_full_at(file, offset, &mut buffer)?;
+                        if read == 0 {
+                            return Ok(Chunk::End);
+                        }
+                        if read_full_at(file, offset, &mut check[..read])? != read
+                            || buffer[..read] != check[..read]
+                        {
+                            return Ok(Chunk::Changed);
+                        }
+                        offset += read as u64;
+                        Ok(Chunk::Data(std::mem::take(&mut buffer), read))
+                    })();
+                    let last = !matches!(chunk, Ok(Chunk::Data(..)));
+                    if full_tx.send(chunk).is_err() || last {
+                        return;
+                    }
+                }
+            });
+        if reader.is_err() {
+            return Ok(ChunkedChecksum::Unavailable);
+        }
+        let mut file_bytes = 0u64;
+        let outcome = loop {
+            if let Err(error) = check_file_system_cancelled(cancel) {
+                break Err(error);
+            }
+            match full_rx.recv() {
+                Ok(Ok(Chunk::Data(buffer, read))) => {
+                    file_bytes += read as u64;
+                    if file_bytes > expected_len {
+                        break Ok(ChunkedChecksum::Changed);
+                    }
+                    consume(&buffer[..read]);
+                    let _ = empty_tx.send(buffer);
+                }
+                Ok(Ok(Chunk::End)) => break Ok(ChunkedChecksum::Complete(file_bytes)),
+                Ok(Ok(Chunk::Changed)) => break Ok(ChunkedChecksum::Changed),
+                Ok(Err(error)) => break Err(error),
+                Err(_) => break Err(io::Error::other("checksum reader stopped")),
+            }
+        };
+        // Release the reader before the scope joins it.
+        drop(empty_tx);
+        drop(full_rx);
+        outcome
+    })
 }
 
 fn file_range_revision(file: &std::fs::File, metadata: &std::fs::Metadata) -> io::Result<String> {
@@ -1953,10 +2149,27 @@ fn read_directory_for_walk<'a>(
         let path = path.to_abs_path()?;
         run_cancellable_file_system_task(move |cancel| {
             let _directories = if no_follow {
-                codex_file_system::lock_directory_chain(path.as_path())
-                    .map_err(|error| refused_walk_directory_error(path.as_path(), error))?
+                match pinned_walk_root_for(path.as_path()) {
+                    // The walk holds the root chain (rename/delete denied), so
+                    // re-check it through those handles and pin only the
+                    // components below the root, with the same checks.
+                    Some(pinned) => codex_file_system::validate_pinned_directories(&pinned.handles)
+                        .and_then(|()| {
+                            codex_file_system::lock_directory_components_below(
+                                &pinned.root,
+                                path.as_path(),
+                            )
+                        })
+                        .map(|below| (Some(pinned), below))
+                        .map_err(|error| refused_walk_directory_error(path.as_path(), error))?,
+                    None => (
+                        None,
+                        codex_file_system::lock_directory_chain(path.as_path())
+                            .map_err(|error| refused_walk_directory_error(path.as_path(), error))?,
+                    ),
+                }
             } else {
-                Vec::new()
+                (None, Vec::new())
             };
             read_directory_sync(
                 path.as_path(),
@@ -2032,6 +2245,146 @@ fn read_directory_for_walk<'a>(
         })
         .await
     })
+}
+
+/// Local no-follow directory reads kept in flight by a walk (measured with the
+/// KDR io_list_tree workload: 4 outperformed 1 and 8; kd4-io-filesystem-latency-ab).
+const LOCAL_WALK_READ_AHEAD: usize = 4;
+
+/// Root chain pinned by one no-follow walk for its whole duration.
+struct PinnedWalkRoot {
+    root: PathBuf,
+    handles: Vec<std::fs::File>,
+}
+
+/// Walks currently holding a pinned root. Entries are weak: a walk that ends
+/// or is cancelled releases its handles, and later reads no longer find it.
+static PINNED_WALK_ROOTS: std::sync::Mutex<Vec<std::sync::Weak<PinnedWalkRoot>>> =
+    std::sync::Mutex::new(Vec::new());
+
+async fn pin_walk_root(path: &PathUri) -> Option<Arc<PinnedWalkRoot>> {
+    let root = path.to_abs_path().ok()?.as_path().to_path_buf();
+    let pinned_root = root.clone();
+    let handles = tokio::task::spawn_blocking(move || {
+        codex_file_system::lock_directory_chain(&pinned_root)
+    })
+    .await
+    .ok()?
+    .ok()?;
+    let pinned = Arc::new(PinnedWalkRoot { root, handles });
+    let mut roots = PINNED_WALK_ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    roots.retain(|root| root.strong_count() > 0);
+    roots.push(Arc::downgrade(&pinned));
+    Some(pinned)
+}
+
+/// The deepest live pinned walk root containing `path`, if any.
+fn pinned_walk_root_for(path: &Path) -> Option<Arc<PinnedWalkRoot>> {
+    PINNED_WALK_ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter(|pinned| path.starts_with(&pinned.root))
+        .max_by_key(|pinned| pinned.root.components().count())
+}
+
+async fn lookup_batch_direct(
+    requests: Vec<codex_file_system::FileSystemLookup>,
+) -> FileSystemResult<Vec<codex_file_system::FileSystemLookupResult>> {
+    use codex_file_system::FileSystemLookup;
+    use codex_file_system::FileSystemLookupResult;
+    codex_file_system::validate_lookup_batch(&requests)?;
+    run_cancellable_file_system_task(move |cancel| {
+        codex_file_system::with_guard_memo(|| {
+            let mut results = Vec::with_capacity(requests.len());
+            for request in &requests {
+                check_file_system_cancelled(&cancel)?;
+                let result = match request {
+                    FileSystemLookup::Canonicalize { path } => canonicalize_sync(path).map(Some),
+                    FileSystemLookup::FirstRegularFile { candidates } => {
+                        first_regular_file_sync(candidates, &cancel)
+                    }
+                };
+                results.push(FileSystemLookupResult::from_result(result));
+            }
+            Ok(results)
+        })
+    })
+    .await
+}
+
+/// [`DirectFileSystem::canonicalize`] without its blocking-pool hop.
+fn canonicalize_sync(path: &PathUri) -> io::Result<PathUri> {
+    let path = path.to_abs_path()?;
+    let canonical = AbsolutePathBuf::from_absolute_path(std::fs::canonicalize(path.as_path())?)?;
+    Ok(PathUri::from_abs_path(&canonical))
+}
+
+/// The first candidate that is a regular file, following links, in order;
+/// missing candidates are skipped and any other probe error stops the search.
+/// Same probes as [`DirectFileSystem::get_metadata`] per candidate, then the
+/// stored file-name case for a non-link match.
+fn first_regular_file_sync(candidates: &[PathUri], cancel: &CancellationToken) -> io::Result<Option<PathUri>> {
+    for candidate in candidates {
+        check_file_system_cancelled(cancel)?;
+        let probed = (|| -> io::Result<FileMetadata> {
+            let path = candidate.to_abs_path()?;
+            let _capture = codex_file_system::guard_patch_read(path.as_path())?;
+            let symlink_metadata = std::fs::symlink_metadata(path.as_path())?;
+            if symlink_metadata.file_type().is_symlink() {
+                let metadata = match std::fs::metadata(path.as_path()) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => symlink_metadata,
+                    Err(error) => return Err(error),
+                };
+                Ok(file_metadata(&metadata, true))
+            } else {
+                Ok(file_metadata(&symlink_metadata, false))
+            }
+        })();
+        let metadata = match probed {
+            Ok(metadata) => metadata,
+            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+                continue;
+            }
+            Err(error) => {
+                // Wrapping the diagnostic drops raw_os_error; retain Windows
+                // sharing-denial semantics in the portable kind.
+                let kind = if matches!(error.raw_os_error(), Some(32 | 33)) {
+                    io::ErrorKind::PermissionDenied
+                } else {
+                    error.kind()
+                };
+                return Err(io::Error::new(
+                    kind,
+                    format!(
+                        "unable to inspect candidate {}: {error}",
+                        candidate.inferred_native_path_string()
+                    ),
+                ));
+            }
+        };
+        if !metadata.is_file {
+            continue;
+        }
+        // Report git.exe rather than a PATHEXT spelling such as git.EXE.
+        // A link keeps its own name; canonicalization names its target.
+        let stored = if metadata.is_symlink {
+            None
+        } else {
+            canonicalize_sync(candidate)
+                .ok()
+                .and_then(|canonical| canonical.basename())
+                .zip(candidate.basename())
+                .filter(|(stored, requested)| stored != requested && stored.eq_ignore_ascii_case(requested))
+                .and_then(|(stored, _)| candidate.parent()?.join(&stored).ok())
+        };
+        return Ok(Some(stored.unwrap_or_else(|| candidate.clone())));
+    }
+    Ok(None)
 }
 
 /// The no-follow guard refuses links and non-directories as PermissionDenied,

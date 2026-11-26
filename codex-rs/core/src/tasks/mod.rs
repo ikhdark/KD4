@@ -1769,6 +1769,7 @@ impl Session {
             timing.measurement_evidence.get_or_insert_with(|| serde_json::json!({"schemaVersion":1}))["finalRequest"] =
                 turn_context.turn_timing_state.accepted_final_request(message);
         }
+        crate::turn_timing::attach_wall_clock_profile(&mut timing);
         if let Some(disposition) = turn_context.extension_data.get::<codex_protocol::protocol::TurnTaskDisposition>() {
             timing.completion_assessment.get_or_insert_with(Default::default)
                 .task_disposition = Some((*disposition).clone());
@@ -2155,12 +2156,13 @@ impl Session {
             .complete_snapshot(&self.thread_id.to_string(), &turn_context.sub_id);
         let mut archived_timing = timing_snapshot.protocol_timing();
         turn_context.turn_timing_state.retain_overflow_details(&mut archived_timing, turn_context.config.ephemeral).await;
-        let timing = crate::turn_timing::retain_turn_timing_details(
+        let mut timing = crate::turn_timing::retain_turn_timing_details(
             archived_timing,
             &turn_context.config.codex_home,
             &self.thread_id.to_string(),
         )
         .await;
+        crate::turn_timing::attach_wall_clock_profile(&mut timing);
         let event = if let Some(reason) = finalization.abort_reason.clone() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),

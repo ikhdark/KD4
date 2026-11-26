@@ -58,6 +58,21 @@ pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30
 pub(crate) const WEBSOCKET_MESSAGE_TIMEOUT: Duration =
     Duration::from_secs(60 + (MAX_JSONRPC_MESSAGE_LEN / (64 * 1024)) as u64);
 
+// Per-frame stdio write policy, the same rate and slack as the WebSocket
+// whole-message policy above but scaled by the serialized frame length instead of
+// assuming the largest frame. A peer that stops reading must not pin the writer
+// and every response queued behind it: when the deadline expires the connection
+// is disconnected (a partial frame is never resumed), which also releases the
+// queued responses. At `MAX_JSONRPC_MESSAGE_LEN` this equals
+// `WEBSOCKET_MESSAGE_TIMEOUT`.
+const STDIO_WRITE_BASE_TIMEOUT: Duration = Duration::from_secs(60);
+const STDIO_WRITE_MIN_BYTES_PER_SECOND: usize = 64 * 1024;
+
+fn stdio_message_write_timeout(frame_len: usize) -> Duration {
+    STDIO_WRITE_BASE_TIMEOUT
+        + Duration::from_secs((frame_len / STDIO_WRITE_MIN_BYTES_PER_SECOND) as u64)
+}
+
 /// Reader limits for WebSockets that carry one JSON-RPC message per frame.
 ///
 /// Tungstenite writes each message as a single frame, so its default 16 MiB
@@ -193,7 +208,7 @@ fn spawn_stdio_child_supervisor(
                     Ok(_) => {
                         // wait() released the root handle: its numeric PID is no
                         // longer a safe cleanup identity. The Job still owns descendants.
-                        if let Err(err) = managed_root.terminate() {
+                        if let Err(err) = terminate_managed_root(&managed_root).await {
                             debug!("failed to terminate exec-server stdio descendants: {err}");
                         }
                     }
@@ -223,13 +238,24 @@ async fn wait_for_stdio_termination(terminate_rx: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Job termination waits (up to seconds) for the tree to empty; run it on the
+/// blocking pool so the supervisor never stalls a shared runtime worker.
+async fn terminate_managed_root(managed_root: &Arc<ManagedRootProcess>) -> std::io::Result<()> {
+    let owner = Arc::clone(managed_root);
+    codex_utils_pty::run_windows_process_operation(
+        codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT,
+        move || owner.terminate(),
+    )
+    .await
+}
+
 async fn terminate_stdio_child(
     child_process: &mut Child,
-    managed_root: &ManagedRootProcess,
+    managed_root: &Arc<ManagedRootProcess>,
 ) {
     let mut wait_timeout = STDIO_TERMINATION_GRACE_PERIOD;
     loop {
-        if let Err(err) = managed_root.terminate() {
+        if let Err(err) = terminate_managed_root(managed_root).await {
             debug!("failed to terminate managed exec-server stdio process tree: {err}");
             kill_direct_child(child_process, "kill");
         }
@@ -654,9 +680,19 @@ where
 {
     let encoded =
         serialize_jsonrpc_message(message).map_err(|err| std::io::Error::other(err.to_string()))?;
-    writer.write_all(encoded.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await
+    let deadline = stdio_message_write_timeout(encoded.len());
+    timeout(deadline, async {
+        writer.write_all(encoded.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("stdio message write deadline of {deadline:?} expired"),
+        ))
+    })
 }
 
 async fn send_websocket_jsonrpc_message<W, M, E>(

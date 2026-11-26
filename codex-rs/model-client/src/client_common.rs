@@ -502,6 +502,11 @@ pub struct ResponseStream {
     /// provider stream reached its own terminal event.
     pub consumer_dropped: CancellationToken,
     pub(crate) text_delivery: Option<Arc<TurnTimingState>>,
+    /// A retained request capture that overlapped dispatch. It is joined before
+    /// the first event is delivered; a capture failure is delivered as that
+    /// capture's own non-retryable error instead of any provider event.
+    pub(crate) pending_capture:
+        Option<tokio_util::task::AbortOnDropHandle<codex_protocol::error::Result<()>>>,
 }
 
 pub use codex_api::ResponseAttemptIdentity;
@@ -516,6 +521,23 @@ impl Stream for ResponseStream {
     type Item = Result<ResponseEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(capture) = self.pending_capture.as_mut() {
+            let joined = match std::future::Future::poll(Pin::new(capture), cx) {
+                Poll::Ready(joined) => joined,
+                Poll::Pending => return Poll::Pending,
+            };
+            self.pending_capture = None;
+            let failure = match joined {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) => Some(codex_protocol::error::CodexErr::Fatal(format!(
+                    "context replay capture task failed: {error}"
+                ))),
+            };
+            if let Some(error) = failure {
+                return Poll::Ready(Some(Err(error)));
+            }
+        }
         if self.text_delivery.is_none() {
             return self.rx_event.poll_recv(cx);
         }

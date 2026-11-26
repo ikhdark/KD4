@@ -37,6 +37,7 @@ use crate::provider::HostSkillProvider;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
 use crate::render::MAX_SELECTED_PROMPT_BYTES;
+use crate::render::MAX_SELECTED_PROMPT_READ_BYTES;
 use crate::render::available_skills_fragment;
 use crate::render::main_prompt_fragment;
 use crate::render::selected_prompt_budgets;
@@ -622,6 +623,14 @@ impl<C> SkillsExtension<C> {
                     },
                     host_snapshot,
                     mcp_resources: session_store.get::<McpResourceClient>(),
+                    // Only host and executor sources are read from a file system
+                    // that can stop at the prompt cap; the orchestrator's cached
+                    // read and its cursors need the complete resource.
+                    max_text_bytes: matches!(
+                        entry.authority.kind,
+                        SkillSourceKind::Host | SkillSourceKind::Executor
+                    )
+                    .then_some(MAX_SELECTED_PROMPT_READ_BYTES),
                 },
             )
             .await

@@ -102,7 +102,8 @@ pub struct UpdateFileChunk {
     pub change_context: Option<String>,
 
     /// A contiguous block of lines that should be replaced with `new_lines`.
-    /// With a textual `change_context`, `old_lines` must immediately follow it.
+    /// With a textual `change_context`, `old_lines` normally must immediately
+    /// follow it; a unique exact anchor may cross up to eight blank lines.
     pub old_lines: Vec<String>,
     pub new_lines: Vec<String>,
     /// Original marker intent, retained because equal repeated lines can have

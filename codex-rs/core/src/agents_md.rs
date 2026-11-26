@@ -164,18 +164,19 @@ impl ProjectDocOmissionRecovery {
         }
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Serialize omission artifact publication so concurrent notices reuse one recoverable manifest identity"
-    )]
     async fn notice(&self, config: &Config, documents: &[ProjectDocOmission]) -> String {
+        const RECOVERY_UNAVAILABLE: &str = "\nPath manifest recovery unavailable; inspect the named environments before relying on omitted instructions.";
         let (notice, overflow) = project_doc_omission_notice(documents, "");
         if !overflow {
             return notice;
         }
         let canonical =
             codex_tools::CanonicalToolResult::json(serde_json::json!({"documents":documents}));
-        let mut cached = self.cached.lock().await;
+        // Serialize omission artifact publication so concurrent notices reuse
+        // one recoverable manifest identity. The owned guard moves into the
+        // publication task: a cancelled caller must not leave a protected
+        // durable receipt that no cache entry names, so the task still records it.
+        let mut cached = Arc::clone(&self.cached).lock_owned().await;
         if let Some(receipt) = cached.as_ref()
             && receipt.home == config.codex_home.as_path()
             && receipt.hash == canonical.sha256
@@ -183,34 +184,45 @@ impl ProjectDocOmissionRecovery {
         {
             return receipt.notice.clone();
         }
-        let artifact = crate::tools::command_output_artifact::create_durable_receipt_artifact(
-            config.codex_home.as_path(),
-            &self.thread_id,
-            &canonical,
-        )
-        .await;
-        let recovery = if artifact.complete {
-            artifact.artifact_id().map(|id| format!(
-                "\nRecover omitted paths with read_tool_output: {}",
-                serde_json::json!({"artifact_id":id,"selectors":[{"kind":"json_pointer","pointer":"/documents"}]}),
-            ))
-        } else {
-            None
-        };
-        let notice = project_doc_omission_notice(documents, recovery.as_deref()
-            .unwrap_or("\nPath manifest recovery unavailable; inspect the named environments before relying on omitted instructions.")).0;
-        if recovery.is_some()
-            && let Some(artifact_id) = artifact.artifact_id()
-        {
-            *cached = Some(ProjectDocManifestReceipt {
-                home: config.codex_home.to_path_buf(),
-                hash: canonical.sha256,
-                bytes: canonical.exact_bytes,
-                artifact_id,
-                notice: notice.clone(),
-            });
-        }
-        notice
+        let home = config.codex_home.to_path_buf();
+        let thread_id = self.thread_id.clone();
+        let owned_documents = documents.to_vec();
+        let publication = tokio::spawn(async move {
+            let artifact = crate::tools::command_output_artifact::create_durable_receipt_artifact(
+                home.as_path(),
+                &thread_id,
+                &canonical,
+            )
+            .await;
+            let recovery = if artifact.complete {
+                artifact.artifact_id().map(|id| format!(
+                    "\nRecover omitted paths with read_tool_output: {}",
+                    serde_json::json!({"artifact_id":id,"selectors":[{"kind":"json_pointer","pointer":"/documents"}]}),
+                ))
+            } else {
+                None
+            };
+            let notice = project_doc_omission_notice(
+                &owned_documents,
+                recovery.as_deref().unwrap_or(RECOVERY_UNAVAILABLE),
+            )
+            .0;
+            if recovery.is_some()
+                && let Some(artifact_id) = artifact.artifact_id()
+            {
+                *cached = Some(ProjectDocManifestReceipt {
+                    home,
+                    hash: canonical.sha256,
+                    bytes: canonical.exact_bytes,
+                    artifact_id,
+                    notice: notice.clone(),
+                });
+            }
+            notice
+        });
+        publication
+            .await
+            .unwrap_or_else(|_| project_doc_omission_notice(documents, RECOVERY_UNAVAILABLE).0)
     }
 }
 

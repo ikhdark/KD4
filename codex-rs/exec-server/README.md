@@ -33,6 +33,23 @@ Noise reconnects, registry HTTP, and executor rendezvous connections; direct API
 clients supply it in their connection arguments. Legacy constructors explicitly
 retain environment-proxy defaults when no application configuration is supplied.
 
+## Delivery deadlines
+
+WebSocket and stdio writers allow one JSON-RPC frame 60 seconds plus its length
+at 64 KiB/s (`WEBSOCKET_MESSAGE_TIMEOUT` is the value for the largest frame). When
+a stdio peer stops reading and the deadline expires, the connection disconnects and
+the replies queued behind the frame are released; a partial frame is never resumed.
+The peak held while the peer stalls is unchanged: queued replies are bounded by
+count, not bytes, until the deadline fires.
+
+Native client calls to bounded read-only file methods fail with a timeout instead
+of waiting for a withheld reply, without retrying. `fs/open`, `fs/readBlock`,
+`fs/getMetadata`, `fs/canonicalize` and `fs/readDirectory` allow 30 seconds;
+`fs/readFile`, `fs/readFileBounded` and `fs/readFileRange` add the 64 KiB/s transfer
+time of their maximum reply (the request's byte cap, at most the file payload
+limit). Mutators, `fs/close`, `fs/walk`, `fs/lookupBatch`, `fs/checksumFile`,
+process, HTTP and environment methods keep their own policies.
+
 ## Capability manifests
 
 `initialize` returns an optional `capabilityManifest`; initialized clients can
@@ -73,3 +90,25 @@ evidence, and unsupported methods must not fall back to a weaker operation.
 KD4 executes commands and filesystem requests directly with the server account's
 access. Legacy sandbox fields remain parseable but never select native sandbox
 setup, wrappers or filesystem policy enforcement.
+
+## Local directory walks
+
+A local no-follow walk (for example `list_files`) pins its root's directory
+chain once and holds it until the walk ends; each directory read re-checks that
+chain through the held handles and pins only the components below the root,
+instead of reopening every ancestor from the drive root. The held handles deny
+rename and delete of those directories for the walk's duration. If the root
+cannot be pinned, reads fall back to the full per-read chain and report the
+same refusal. The local backend also keeps up to four directory reads in flight
+for the front of the breadth-first queue; entries are still consumed in queue
+order with the same entry budgets, sorting, truncation and error reporting as a
+sequential walk. Remote and follow-symlink walks remain one read at a time.
+
+Local executable lookups (`first_regular_file`, including the PATH x PATHEXT
+search behind `rg` resolution) and `lookup_batch` path canonicalization run all
+probes of one request in a single blocking task, in the same order and with the
+same patch-capture guard per candidate; the guard reuses each parent directory's
+canonical spelling within that task. Local `checksum_file` of a file larger than
+2 MiB reads and double-checks the next chunks on a scoped reader thread while
+hashing the current one; smaller files, and any reader that cannot start, use
+the single-thread loop. Both keep the existing change detection and results.

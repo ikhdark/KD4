@@ -84,6 +84,34 @@ use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
 
+/// Catalog of an optional local stdio server that started successfully in this
+/// process, keyed by its exact configuration and fallback working directory.
+/// Deferring sessions advertise it instead of starting an identical server.
+pub(crate) struct DeferredCatalog {
+    pub(crate) tools: Vec<ToolInfo>,
+    pub(crate) supports_resources: bool,
+}
+
+static DEFERRED_CATALOGS: std::sync::LazyLock<StdMutex<HashMap<String, Arc<DeferredCatalog>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn deferred_catalog_key(
+    server_name: &str,
+    server: &EffectiveMcpServer,
+    runtime_context: &McpRuntimeContext,
+) -> Option<String> {
+    let config = server.configured_config()?;
+    if !config.is_local_environment()
+        || !matches!(config.transport, McpServerTransportConfig::Stdio { .. })
+    {
+        return None;
+    }
+    Some(format!(
+        "{server_name}\u{1f}{config:?}\u{1f}{}",
+        runtime_context.local_fallback_cwd().display()
+    ))
+}
+
 const MCP_UI_META_KEY: &str = "ui";
 const MCP_UI_VISIBILITY_META_KEY: &str = "visibility";
 const MCP_UI_MODEL_VISIBILITY: &str = "model";
@@ -379,6 +407,10 @@ impl McpConnectionManager {
         let uses_chatgpt_auth = server
             .configured_config()
             .is_some_and(|config| matches!(&config.auth, McpServerAuth::ChatGpt));
+        if previous_server == server && !uses_chatgpt_auth && client.is_deferred_unstarted() {
+            // Reuse the unstarted deferred owner; a health check would start it.
+            return Some(client);
+        }
         if previous_server != server
             || uses_chatgpt_auth
             || !client.startup_complete.load(Ordering::Acquire)
@@ -398,6 +430,10 @@ impl McpConnectionManager {
         let mut pending = Vec::new();
         let mut failed = Vec::new();
         for (name, client) in &self.clients {
+            if client.is_deferred_unstarted() {
+                // Its identical catalog is already advertised; nothing is pending.
+                continue;
+            }
             if !client.startup_complete.load(Ordering::Acquire)
                 || client
                     .startup_reconnect
@@ -424,6 +460,14 @@ impl McpConnectionManager {
     /// Returns the coarse negotiated resources capability for fully started servers.
     pub async fn has_ready_server_with_resources(&self) -> bool {
         for client in self.clients.values() {
+            if client.is_deferred_unstarted()
+                && client
+                    .deferred_catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.supports_resources)
+            {
+                return true;
+            }
             if !client.startup_complete.load(Ordering::Acquire) {
                 continue;
             }
@@ -634,12 +678,33 @@ impl McpConnectionManager {
                 continue;
             }
             let cancel_token = startup_cancellation_token.child_token();
+            // Every eager success records the catalog; only deferring sessions
+            // (spawned agents) reuse it instead of starting their own server.
+            let deferred_key = (discover_tools && !server.required())
+                .then(|| deferred_catalog_key(&server_name, &server, &runtime_context))
+                .flatten();
+            let deferred_catalog = deferred_key
+                .as_ref()
+                .filter(|_| runtime_context.defers_optional_stdio_startup())
+                .and_then(|key| {
+                    DEFERRED_CATALOGS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(key)
+                        .cloned()
+                });
             let _ = emit_update(
                 startup_submit_id.as_str(),
                 &tx_event,
                 McpStartupUpdateEvent {
                     server: server_name.clone(),
-                    status: McpStartupStatus::Starting,
+                    // A deferred server advertises its identical catalog now and
+                    // starts on first use.
+                    status: if deferred_catalog.is_some() {
+                        McpStartupStatus::Ready
+                    } else {
+                        McpStartupStatus::Starting
+                    },
                 },
             )
             .await;
@@ -709,6 +774,14 @@ impl McpConnectionManager {
                 discover_tools,
             )
             .await;
+            if let Some(catalog) = deferred_catalog {
+                // The startup future stays unpolled until an operation needs it.
+                manager
+                    .clients
+                    .insert(server_name.clone(), async_managed_client.with_deferred_catalog(catalog));
+                reused_server_names.push(server_name);
+                continue;
+            }
             manager
                 .clients
                 .insert(server_name.clone(), async_managed_client.clone());
@@ -720,6 +793,20 @@ impl McpConnectionManager {
             let auth_runtime_context = runtime_context.clone();
             join_set.spawn(async move {
                 let mut outcome = async_managed_client.client().await;
+                if let (Ok(client), Some(key)) = (&outcome, deferred_key)
+                    && let Some(catalog) = client.current_catalog()
+                {
+                    DEFERRED_CATALOGS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            key,
+                            Arc::new(DeferredCatalog {
+                                tools: client.listed_tools(),
+                                supports_resources: catalog.server_supports_resources_capability,
+                            }),
+                        );
+                }
                 // Discovery is diagnostic only: the transport performs actual
                 // authentication. Healthy servers need no extra OAuth request,
                 // and a slow provider must not block session initialization.
@@ -813,7 +900,13 @@ impl McpConnectionManager {
     /// client owns its startup/tool-discovery deadlines and cancellation; join
     /// them concurrently rather than imposing a readiness-dependent short poll.
     pub async fn wait_for_startup(&self) {
-        let server_names = self.clients.keys().cloned().collect::<Vec<_>>();
+        // Deferred servers already advertise their catalog; waiting would start them.
+        let server_names = self
+            .clients
+            .iter()
+            .filter(|(_, client)| !client.is_deferred_unstarted())
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
         self.wait_for_startup_for_servers(&server_names).await;
     }
 
@@ -1356,8 +1449,15 @@ impl McpConnectionManager {
             fetch_ticket,
         ) {
             (Some(cache_context), Some(fetch_ticket)) => {
+                // The check above precedes the publication queue. Re-check inside
+                // it so a session replaced while waiting cannot publish its tools.
+                let publication_client = Arc::clone(&managed_client.client);
+                let generation = catalog.generation;
                 cache_context
-                    .publish_if_newest_accepted(fetch_ticket, &catalog.server_info, tools)
+                    .publish_if_newest_accepted(fetch_ticket, &catalog.server_info, tools, move || {
+                        publication_client.session_generation() == generation
+                            && publication_client.managed_auth_scope_is_current()
+                    })
                     .await
             }
             (None, None) => tools,

@@ -70,6 +70,9 @@ pub(crate) struct ToolExposureIdentity {
     /// approval parameters the shell tools advertise.
     pub(crate) shell_approval_surface: (bool, bool),
     pub(crate) native_environment_contract: NativeEnvironmentContract,
+    /// False narrows only the advertisement of apply_patch for an unbound or
+    /// read-only (empty write scope) worker; authorization is unchanged.
+    pub(crate) worker_patch_exposed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +88,7 @@ pub(crate) struct DynamicToolExposureIdentity {
     pub(crate) windows_shell_guidance: bool,
     pub(crate) shell_approval_surface: (bool, bool),
     pub(crate) native_environment_contract: NativeEnvironmentContract,
+    pub(crate) worker_patch_exposed: bool,
 }
 
 impl ToolExposureIdentity {
@@ -101,6 +105,7 @@ impl ToolExposureIdentity {
             windows_shell_guidance: self.windows_shell_guidance,
             shell_approval_surface: self.shell_approval_surface,
             native_environment_contract: self.native_environment_contract,
+            worker_patch_exposed: self.worker_patch_exposed,
         }
     }
 }
@@ -123,6 +128,7 @@ impl Default for ToolExposureIdentity {
             windows_shell_guidance: true,
             shell_approval_surface: (false, false),
             native_environment_contract: NativeEnvironmentContract::default(),
+            worker_patch_exposed: true,
         }
     }
 }

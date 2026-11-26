@@ -2576,6 +2576,10 @@ impl ToolCallRuntime {
                 workspace_admission.native_additions = additions;
                 // Passive process observations serialize at the handle's interaction lock.
                 // Share only with readers; a possible completion hook still needs exclusion.
+                // The same shell-aware read-only proof that grants shared
+                // known-root admission also joins the unknown-root read cohort,
+                // so read-only commands outside a repository no longer take the
+                // global exclusive gate one at a time. Writers still exclude them.
                 workspace_admission.native_read_cohort = !post_hook_may_run
                     && (passive_poll || (matches!(
                         evidence_call.tool_name.name.as_str(),
@@ -2583,7 +2587,12 @@ impl ToolCallRuntime {
                     )
                     && router.permits_shared_workspace_observation(&evidence_call)
                     && workspace_admission_classification.source_scope_complete
-                    && !workspace_admission_classification.source_dependencies.is_empty()));
+                    && !workspace_admission_classification.source_dependencies.is_empty())
+                    || (read_only
+                        && matches!(
+                            router.semantic_capabilities(&evidence_call.tool_name).command,
+                            Some(crate::tools::registry::CommandArgumentFormat::Exec)
+                        )));
                 if tracks_workspace {
                     // Like the gates: an uncontended acquisition is not
                     // contention, even when Tokio's coop budget defers lock().

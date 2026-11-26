@@ -161,6 +161,17 @@ impl SkillLoadOutcome {
         fs.read_file_text(&path, self.sandbox_for_skill(skill)).await
     }
 
+    pub(crate) async fn read_skill_text_prefix(
+        &self,
+        skill: &SkillMetadata,
+        max_bytes: usize,
+    ) -> io::Result<String> {
+        let _installation_read = self.acquire_skill_read_lease(skill)?;
+        let fs = self.file_system_for_skill(skill).unwrap_or_else(|| Arc::clone(&LOCAL_FS));
+        let path = PathUri::from_abs_path(&skill.path_to_skills_md);
+        fs.read_file_text_prefix(&path, max_bytes, self.sandbox_for_skill(skill)).await
+    }
+
     pub(crate) fn sandbox_for_skill(
         &self,
         skill: &SkillMetadata,
@@ -216,6 +227,17 @@ impl HostSkillsSnapshot {
 
     pub async fn read_skill_text(&self, skill: &SkillMetadata) -> io::Result<String> {
         self.outcome.read_skill_text(skill).await
+    }
+
+    /// Reads at most the first `max_bytes` bytes of a skill's `SKILL.md` as text
+    /// through the provider that discovered it, without materializing the rest.
+    /// See [`ExecutorFileSystem::read_file_text_prefix`] for the prefix contract.
+    pub async fn read_skill_text_prefix(
+        &self,
+        skill: &SkillMetadata,
+        max_bytes: usize,
+    ) -> io::Result<String> {
+        self.outcome.read_skill_text_prefix(skill, max_bytes).await
     }
 
     /// Reads a skill's `SKILL.md` through the provider that discovered it,

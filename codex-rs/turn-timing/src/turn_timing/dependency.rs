@@ -27,7 +27,7 @@ fn ns(ms: Option<u64>) -> Option<u64> {
 
 // A stopped local sampling owner has an exact endpoint even when the provider
 // never completed. Keep that evidence reference; do not populate completedMs.
-fn request_end(timing: &TurnTiming, request: &codex_protocol::protocol::TurnTimingModelRequest) -> Option<u64> {
+pub(super) fn request_end(timing: &TurnTiming, request: &codex_protocol::protocol::TurnTimingModelRequest) -> Option<u64> {
     if request.completed_ms.is_some() { return request.completed_ms; }
     let packet = timing.measurement_evidence.as_ref()?.get("requestOwnerClosures")?;
     if packet["complete"] != true || packet["schemaVersion"] != 1 { return None; }
@@ -141,7 +141,7 @@ fn delivered_release_ms(timing: &TurnTiming, call: &codex_protocol::protocol::Tu
 // A cancelled/interrupted tool whose dispatch owner exited without any
 // delivery/release boundary has an exact typed cessation. It never replaces a
 // recorded delivery or release, and it is not tool success or output delivery.
-fn tool_owner_end(timing: &TurnTiming, call: &codex_protocol::protocol::TurnTimingToolCall) -> Option<u64> {
+pub(super) fn tool_owner_end(timing: &TurnTiming, call: &codex_protocol::protocol::TurnTimingToolCall) -> Option<u64> {
     let outcome = call.outcome.as_deref()?;
     let typed_owner_cut = match call.source {
         TurnTimingToolCallSource::Direct => matches!(outcome, "cancelled" | "interrupted"),

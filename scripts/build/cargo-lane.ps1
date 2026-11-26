@@ -584,7 +584,7 @@ function Invoke-CargoLanePrune {
         }
 
         $maxAgeDays = Get-EnvIntValue -Name "CODEX_CARGO_LANE_MAX_AGE_DAYS" -DefaultValue 7 -MinimumValue 1
-        # Keep as many warm lanes per family as may build at once (rust_build_status.py).
+        # Preserve the automatic retention default independently of the lane cap.
         $keepWarmPerBase = Get-EnvIntValue -Name "CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE" -DefaultValue 2 -MinimumValue 1
         $maxLaneBytes = Get-EnvInt64Value -Name "CODEX_CARGO_LANE_MAX_LANE_BYTES" -DefaultValue 0 -MinimumValue 0
         # Recursive disk accounting is opt-in on the build path. Use target-prune
@@ -714,6 +714,7 @@ function Try-AcquireCargoLaneReservation {
         [string]$BaseLane,
         [switch]$AllowColdOverflow,
         [string[]]$ActiveNames = @(),
+        [int]$MaxActiveLanes = 0,
         [double]$CoordinationWaitSeconds = 0
     )
 
@@ -763,6 +764,16 @@ function Try-AcquireCargoLaneReservation {
             $warm[$candidate] = -not (Test-CargoLanesRootReparsePoint -LanesRoot $target) -and (Test-CargoLaneWarm -Target $target)
         }
         $unique = @($candidates | Select-Object -Unique)
+        if ($MaxActiveLanes -gt 0) {
+            $inUse = 0
+            foreach ($candidate in $unique) {
+                $target = Join-Path $LaneRoot $candidate
+                if ((Test-CargoLockBusy -TargetDir $target) -or (Test-LaneActiveLockBusy -TargetDir $target)) {
+                    $inUse++
+                    if ($inUse -ge $MaxActiveLanes) { return $null }
+                }
+            }
+        }
         $coldOrder = @($BaseLane) + @(2..65 | ForEach-Object { "$BaseLane-$_" })
         $candidates = @($unique | Where-Object { $warm[$_] }) + @($coldOrder | Where-Object { -not $warm[$_] })
         $busy = $false
@@ -836,13 +847,16 @@ function Acquire-CargoLaneReservation {
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $announced = $false
     $retryMilliseconds = 10
+    $maxActiveLanes = if ($AllowColdOverflow) {
+        Get-EnvIntValue -Name "CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE" -DefaultValue 8 -MinimumValue 1
+    } else { 0 }
     while ($true) {
         $expired = $watch.Elapsed.TotalSeconds -ge $WarmWaitSeconds
         # Match Python admission: unrelated lane probes get a one-second
         # grace, not a zero-wait failure or a fresh budget on every retry.
         $remaining = [Math]::Max(0, [Math]::Max(1, $WarmWaitSeconds) - $watch.Elapsed.TotalSeconds)
         $remaining = [Math]::Min(1, $remaining)
-        $reservation = Try-AcquireCargoLaneReservation -LaneRoot $LaneRoot -BaseLane $BaseLane -ActiveNames $ActiveNames -AllowColdOverflow:($AllowColdOverflow -and $expired) -CoordinationWaitSeconds $remaining
+        $reservation = Try-AcquireCargoLaneReservation -LaneRoot $LaneRoot -BaseLane $BaseLane -ActiveNames $ActiveNames -AllowColdOverflow:($AllowColdOverflow -and $expired) -MaxActiveLanes $maxActiveLanes -CoordinationWaitSeconds $remaining
         if ($null -ne $reservation) { return $reservation }
         if ($watch.Elapsed.TotalSeconds -ge $WarmWaitSeconds) {
             return $null

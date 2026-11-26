@@ -213,6 +213,62 @@ impl RawOutputArtifactTask {
         Some(capture)
     }
 
+    /// Async owners call this instead of [`Self::spawn_with_target`]. Copying a
+    /// previous log is disk I/O, so it runs on a blocking worker, never on the
+    /// async executor.
+    pub async fn spawn_with_target_off_executor(
+        state: Option<Arc<Mutex<RawOutputArtifact>>>,
+        ready: CancellationToken,
+        target: Option<RawOutputArtifact>,
+    ) -> Option<Self> {
+        if !matches!(target, Some(RawOutputArtifact::Stored { .. })) {
+            return Self::spawn_with_target(state, ready, target);
+        }
+        let ready_on_failure = ready.clone();
+        match tokio::task::spawn_blocking(move || Self::spawn_with_target(state, ready, target)).await {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::warn!(%error, "command output capture setup worker failed");
+                ready_on_failure.cancel();
+                None
+            }
+        }
+    }
+
+    /// Async owners call this instead of [`Self::write_chunk`]. A chunk that
+    /// stays in the write buffer is appended inline. A chunk that would open
+    /// the log or reach the disk is written on a blocking worker and awaited, as
+    /// the legacy exec owner does: this keeps per-chunk disk backpressure
+    /// without stalling the async executor.
+    pub async fn write_chunk_off_executor(task: &mut Option<Self>, output: &[u8]) {
+        let Some(current) = task.as_mut() else { return; };
+        if !current.write_reaches_disk(output.len()) {
+            current.write_chunk(output);
+            return;
+        }
+        let Some(mut owned) = task.take() else { return; };
+        let bytes = output.to_vec();
+        match tokio::task::spawn_blocking(move || {
+            owned.write_chunk(&bytes);
+            owned
+        })
+        .await
+        {
+            Ok(owned) => *task = Some(owned),
+            // The worker dropped the task while unwinding, which already
+            // published the capture as ended before finalization.
+            Err(error) => tracing::warn!(%error, "command output capture worker failed"),
+        }
+    }
+
+    fn write_reaches_disk(&self, len: usize) -> bool {
+        if len == 0 { return false; }
+        match &self.writer {
+            None => self.failure.is_none(),
+            Some(writer) => writer.buffer().len().saturating_add(len) > writer.capacity(),
+        }
+    }
+
     pub fn write_chunk(&mut self, output: &[u8]) {
         if output.is_empty() { return; }
         // Keep the exact prefix up to the ceiling; count, never store, the rest.

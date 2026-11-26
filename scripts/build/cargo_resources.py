@@ -3,6 +3,7 @@
 Cargo jobs are selected once. Named owning jobs enforce a shared, adaptive CPU
 ceiling for whole trees; physical/commit admission is predictive, not an OOM
 guarantee. No daemon, priority changes, machine setup, or hard memory limits.
+Refused requests that fit are admitted in arrival order (see _waiters).
 """
 from __future__ import annotations
 
@@ -33,9 +34,14 @@ def _integer(env, name, default, minimum=1, maximum=None):
 
 def resource_root(env):
     owner = Path(__file__).resolve().parents[2]
-    kdr = owner if owner.name.lower() == "kdr" else owner.parent / "KDR"
     if PREFIX + "RESOURCE_ROOT" in env:
         return Path(env[PREFIX + "RESOURCE_ROOT"]).absolute()
+    if (owner.parent.name == "workspaces" and owner.parent.parent.name == ".builds"
+            and owner.parent.parent.parent.name.casefold() == "kdr"):
+        # KDR-managed snapshots must share the main resource pool.
+        kdr = owner.parent.parent.parent
+    else:
+        kdr = owner if owner.name.lower() == "kdr" else owner.parent / "KDR"
     legacy = kdr / ".local/benchmarks/builds"
     if legacy.exists():
         raise ValueError(f"managed build storage must be moved from {legacy} to {kdr / '.builds'}; refusing a second resource pool")
@@ -43,7 +49,7 @@ def resource_root(env):
 
 
 def policy(env):
-    max_active = _integer(env, "MAX_ACTIVE", 4)
+    max_active = _integer(env, "MAX_ACTIVE", 6)
     return {
         "maxActive": max_active,
         "maxCold": _integer(env, "MAX_COLD", max_active),
@@ -54,6 +60,11 @@ def policy(env):
         "physicalReserveBytes": _integer(env, "PHYSICAL_RESERVE_MIB", 2048) * 1024 ** 2,
         "commitReserveBytes": _integer(env, "COMMIT_RESERVE_MIB", 2048) * 1024 ** 2,
     }
+
+
+def arrival_order_enabled(env):
+    """`CODEX_CARGO_BUILD_FIFO=off` restores unordered admission (no ticket, no yielding)."""
+    return env.get(PREFIX + "FIFO", "on").strip().casefold() not in ("off", "0", "false", "no")
 
 
 class ResourceCoordinationTimeout(TimeoutError):
@@ -267,6 +278,81 @@ def _rebalance(api, rows):
                 api.set_cpu(handle, rate)
 
 
+def _admission(own, cold, rows, memory, future):
+    """The admission formula for one request against active rows (policy, cold)."""
+    policies = [own] + [row["policy"] for row in rows]
+    available = min(
+        memory["availablePhysicalBytes"] - max(p["physicalReserveBytes"] for p in policies),
+        memory["commitLimitBytes"] - memory["commitBytes"] - max(p["commitReserveBytes"] for p in policies),
+    ) - future
+    jobs = max(1, (os.cpu_count() or 1) * min(p["cpuPercent"] for p in policies) // (100 * (len(rows) + 1)))
+    base = own["coldBaseBytes" if cold else "warmBaseBytes"]
+    jobs = min(jobs, (available - base) // own["memoryPerJobBytes"])
+    reason = (
+        "active_build_limit" if len(rows) >= min(p["maxActive"] for p in policies) else
+        "cold_build_limit" if cold and sum(row["cold"] for row in rows) >= min(p["maxCold"] for p in policies) else
+        "physical_or_commit_headroom" if jobs < 1 else None
+    )
+    return reason, jobs, base, available
+
+
+# A refused request keeps an arrival ticket, waiters/<arrival_ns>-<token>.json,
+# refreshed (mtime) on each of its passes. Tickets are read and written only
+# under coordination.lock. A ticket not refreshed within WAITER_ACTIVE_SECONDS
+# (dead, abandoned, cancelled or lane-blocked owner) holds nobody back.
+WAITER_ACTIVE_SECONDS = 1.0
+WAITER_PRUNE_SECONDS = 60.0
+_WAITER_NAME = re.compile(r"\d{20}-[0-9a-f]{32}\.json")
+_POLICY_FIELDS = ("maxActive", "maxCold", "cpuPercent", "memoryPerJobBytes", "coldBaseBytes",
+                  "warmBaseBytes", "physicalReserveBytes", "commitReserveBytes")
+
+
+def _waiter(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(data, dict) or data.get("schemaVersion") != 1 or type(data.get("cold")) is not bool
+            or not isinstance(data.get("policy"), dict)
+            or any(type(data["policy"].get(key)) is not int or data["policy"][key] < 1 for key in _POLICY_FIELDS)):
+        return None  # Unrecognized or partially written: never holds anyone back.
+    return data
+
+
+def _waiters(root, own_name):
+    """Live waiters that arrived before own_name, oldest first.
+
+    A refused request yields only to older waiters that the unchanged formula
+    would admit (simulated in arrival order); an older waiter refused by a cap or
+    headroom never holds back a later request that fits. Long-stale tickets are
+    removed here, under coordination.
+    """
+    folder = root / "waiters"
+    try:
+        names = sorted(entry.name for entry in os.scandir(folder))
+    except FileNotFoundError:
+        return []
+    now = time.time()
+    older = []
+    for name in names:
+        if name == own_name or not _WAITER_NAME.fullmatch(name):
+            continue
+        path = folder / name
+        try:
+            # Stat the file itself: directory-entry timestamps can lag on NTFS.
+            age = abs(now - os.stat(path).st_mtime)  # A clock step back must not keep a dead ticket live.
+        except OSError:
+            continue
+        if age > WAITER_PRUNE_SECONDS:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        elif age <= WAITER_ACTIVE_SECONDS and name < own_name:
+            waiter = _waiter(path)
+            if waiter is not None:
+                older.append(waiter)
+    return older
+
+
 def _jobs_value(value, logical):
     if value == "default":
         return logical
@@ -355,6 +441,9 @@ class BuildLease:
         self.finished = False
         self.receipt_path = self.root / "receipts" / (self.token + ".json")
         self.record["receiptPath"] = str(self.receipt_path)
+        self.ordered = arrival_order_enabled(env)
+        self.waiter_path = None  # Named at the first coordinated pass; a pruned ticket keeps its place.
+        self.waiter_cold = None  # The registered ticket's cold value; None while no ticket exists.
 
     def acquire(self, *, wait=True):
         if self.wait_started is None:
@@ -382,25 +471,31 @@ class BuildLease:
                 continue
             with coordination:
                 rows = _active(self.api, self.root)
-                policies = [self.policy] + [row["policy"] for row in rows]
                 memory = self.api.snapshot()
                 future = 0
                 for row in rows:
                     with self.api.job(row["jobName"]) as job:
                         used = self.api.job_memory(job) if job else 0
                     future += max(0, row["reservedBytes"] - used)
-                available = min(
-                    memory["availablePhysicalBytes"] - max(p["physicalReserveBytes"] for p in policies),
-                    memory["commitLimitBytes"] - memory["commitBytes"] - max(p["commitReserveBytes"] for p in policies),
-                ) - future
-                jobs = max(1, (os.cpu_count() or 1) * min(p["cpuPercent"] for p in policies) // (100 * (len(rows) + 1)))
-                base = self.policy["coldBaseBytes" if self.cold else "warmBaseBytes"]
-                jobs = min(jobs, (available - base) // self.policy["memoryPerJobBytes"])
-                reason = (
-                    "active_build_limit" if len(rows) >= min(p["maxActive"] for p in policies) else
-                    "cold_build_limit" if self.cold and sum(row["cold"] for row in rows) >= min(p["maxCold"] for p in policies) else
-                    "physical_or_commit_headroom" if jobs < 1 else None
-                )
+                reason, jobs, base, available = _admission(self.policy, self.cold, rows, memory, future)
+                ahead = []
+                if self.ordered:
+                    if self.waiter_path is None:
+                        self.waiter_path = self.root / "waiters" / f"{time.time_ns():020d}-{self.token}.json"
+                    reserved = 0
+                    for waiter in _waiters(self.root, self.waiter_path.name):
+                        verdict, granted, start, _ = _admission(
+                            waiter["policy"], waiter["cold"], rows + ahead, memory, future + reserved)
+                        if verdict is None:
+                            ahead.append(waiter)
+                            reserved += start + granted * waiter["policy"]["memoryPerJobBytes"]
+                    if ahead and reason is None:
+                        queued, granted, _, _ = _admission(
+                            self.policy, self.cold, rows + ahead, memory, future + reserved)
+                        if queued is None:
+                            jobs = granted  # Leave the admissible older waiters their reservations.
+                        else:
+                            reason = "earlier_waiter"
                 if reason is None:
                     self.command, jobs = budget_command(self.record["command"], jobs, self.env)
                     self.row = {"schemaVersion": 1, "jobName": self.job_name, "pid": os.getpid(),
@@ -410,12 +505,15 @@ class BuildLease:
                     if self.handle is None:
                         raise RuntimeError("new resource lease unexpectedly exists")
                     write_json_atomic(self.path, self.row, exclusive=True)
+                    self._dequeue()
                     _rebalance(self.api, rows + [self.row])
                     self.record.update(status="admitted", jobs=jobs, cold=self.cold,
                         policy=self.policy, admissionMemory=memory, reservedBytes=self.row["reservedBytes"],
                         resourceWaitMs=(time.perf_counter() - started) * 1000,
                         waitReasons=sorted(reasons), activeAtAdmission=len(rows) + 1)
                     return True
+                if self.ordered:
+                    self._enqueue()
                 now = time.perf_counter()
                 if reason not in reasons:
                     print(f"waiting for global Cargo resources: {reason}", file=sys.stderr)
@@ -427,15 +525,59 @@ class BuildLease:
                     holders = ", ".join(
                         f"pid {row.get('pid', '?')} ({'cold' if row['cold'] else 'warm'}, {row['jobs']} jobs, "
                         f"{row['reservedBytes'] / GIB:.1f} GiB reserved)" for row in rows) or "none"
+                    earlier = f"; {len(ahead)} earlier admissible request(s) first" if ahead else ""
                     print(f"still waiting for global Cargo resources: {reason} after {now - started:.0f}s; "
                           f"{len(rows)} active build(s): {holders}; admission headroom {available / GIB:.1f} GiB, "
-                          f"one job needs {(base + self.policy['memoryPerJobBytes']) / GIB:.1f} GiB", file=sys.stderr)
+                          f"one job needs {(base + self.policy['memoryPerJobBytes']) / GIB:.1f} GiB{earlier}", file=sys.stderr)
                 self.record.update(status="waiting", waitReasons=sorted(reasons),
                                    resourceWaitMs=(time.perf_counter() - started) * 1000)
             if not wait:
                 return False
             # Never hold coordination while sleeping or waiting on a lane/tree.
             time.sleep(0.25)
+
+    def _enqueue(self):
+        """Register or refresh this request's arrival ticket; under coordination."""
+        cold = bool(self.cold)
+        if self.waiter_cold == cold:
+            try:
+                os.utime(self.waiter_path)
+                return
+            except FileNotFoundError:
+                pass  # Pruned while away (e.g. lane-blocked): re-register in the same place.
+            except OSError as error:
+                self.record["waiterError"] = f"{type(error).__name__}: {error}"
+                return
+        try:
+            if self.waiter_cold is None:
+                _safe_directory(self.waiter_path.parent)
+            self.waiter_path.write_text(json.dumps({"schemaVersion": 1, "pid": os.getpid(), "cold": cold,
+                                                    "policy": self.policy}), encoding="utf-8")
+            self.waiter_cold = cold
+        except (OSError, ValueError) as error:
+            # Without a ticket this request is simply unordered, as before.
+            self.record["waiterError"] = f"{type(error).__name__}: {error}"
+
+    def _dequeue(self):
+        """Remove this request's arrival ticket; under coordination."""
+        if self.waiter_cold is None:
+            return
+        try:
+            self.waiter_path.unlink(missing_ok=True)
+            self.waiter_cold = None
+        except OSError as error:
+            # An unrefreshed ticket stops counting within WAITER_ACTIVE_SECONDS.
+            self.record["waiterError"] = f"{type(error).__name__}: {error}"
+
+    def _withdraw(self):
+        """Leave the arrival order when a request ends without admission."""
+        if self.waiter_cold is None:
+            return
+        try:
+            with self.api.coordination(self.root, cancellable=False):
+                self._dequeue()
+        except ResourceCoordinationTimeout:
+            self._dequeue()  # Best effort; a reader's open handle can refuse it.
 
     def ready(self, job):
         self.job = job
@@ -535,7 +677,10 @@ class BuildLease:
         # Lease finalization is single-owner even if its receipt write fails.
         self.finished = True
         try:
-            self.release(quarantined=quarantined)
+            try:
+                self._withdraw()
+            finally:
+                self.release(quarantined=quarantined)
         finally:
             record = self.record
             record["samples"] = self.rows

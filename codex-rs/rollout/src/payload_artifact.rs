@@ -612,6 +612,39 @@ pub(crate) fn store_replay(
     .ok_or_else(|| io::Error::other("spooled record exceeds rollout payload size limit"))
 }
 
+/// Append preflight for one well-formed current context replay reference: the body
+/// must exist at its recorded size, then it is enrolled for the durable barrier.
+/// It is not read, hashed or parsed; append visitors never consume replay bodies,
+/// and full diagnostic readers still hydrate and verify them.
+pub(crate) fn enroll_replay_reference(path: &Path, line: &str) -> io::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Reference<'a> {
+        #[serde(borrow)]
+        payload: Payload<'a>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Payload<'a> {
+        sha256: &'a str,
+        bytes: u64,
+    }
+    let reference: Reference<'_> = serde_json::from_str(line).map_err(io::Error::other)?;
+    let Payload { sha256, bytes } = reference.payload;
+    if sha256.len() != 64
+        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || bytes > MAX_PAYLOAD_BYTES
+    {
+        return Err(io::Error::other("invalid rollout payload reference"));
+    }
+    let metadata = std::fs::symlink_metadata(root(path).join(format!("{sha256}.json")))?;
+    if !metadata.file_type().is_file() || metadata.len() != bytes {
+        return Err(io::Error::other(
+            "rollout payload is missing, replaced, or incomplete",
+        ));
+    }
+    enroll_payload_for_sync(path, sha256);
+    Ok(())
+}
+
 /// Records whose complete body may exceed queue admission. They are spooled to
 /// the artifact store before admission; refusing one would lose a turn boundary.
 pub(crate) fn is_spooled_before_admission(item: &RolloutItem) -> bool {
@@ -760,6 +793,8 @@ pub(crate) struct AppendPayloadTiming {
     pub(crate) sha256: Duration,
     pub(crate) parse: Duration,
     pub(crate) plain_replay_projected: usize,
+    /// Current-format replay references enrolled after a presence/size check only.
+    pub(crate) replay_size_checked: usize,
     pub(crate) enroll: Duration,
     pub(crate) envelope: Duration,
 }
@@ -772,6 +807,7 @@ impl AppendPayloadTiming {
         self.sha256 += other.sha256;
         self.parse += other.parse;
         self.plain_replay_projected += other.plain_replay_projected;
+        self.replay_size_checked += other.replay_size_checked;
         self.enroll += other.enroll;
         self.envelope += other.envelope;
     }

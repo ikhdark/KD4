@@ -2136,8 +2136,10 @@ pub type AttemptPreparedCallback = Arc<
         + Sync,
 >;
 
-/// Local-only evidence from the selected, normalized request, before transport I/O.
-/// The core sink owns persistence; no HTTP headers or authentication are captured.
+/// Local-only evidence from the selected, normalized request. The core sink
+/// owns persistence; no HTTP headers or authentication are captured. A capture
+/// of an immutable prepared snapshot is retained concurrently with transport
+/// I/O and joined before the attempt's first response event is delivered.
 #[derive(Debug)]
 pub struct RetainedRequestCapture {
     pub identity: ResponseAttemptIdentity,
@@ -2148,6 +2150,12 @@ pub struct RetainedRequestCapture {
     pub logical_request: ResponsesApiRequest,
     pub transport_request: Option<ResponsesWsRequest>,
     pub replay_snapshot: Option<codex_conversation::context_manager::SamplingReplaySnapshot>,
+    /// Whether dispatch proceeded while this capture was being retained.
+    pub dispatch_overlapped: bool,
+    /// Whether this is the small typed pre-send marker committed durably before
+    /// an overlapped dispatch (no snapshot, no transport request). The full
+    /// capture still follows.
+    pub pre_send_marker: bool,
 }
 
 pub type RetainedRequestCaptureCallback = Arc<
@@ -2218,6 +2226,9 @@ pub struct ModelClientSession {
     accepted_websocket_ancestry: bool,
     websocket_ancestry_auth_mode: Option<AuthMode>,
     pending_websocket_preconnect: Option<AbortOnDropHandle<Result<Option<WebsocketSession>>>>,
+    /// The pending dial is a recovery-backoff prewarm: dispatch adopts only an already
+    /// connected socket and otherwise connects exactly as it would without the prewarm.
+    pending_websocket_preconnect_opportunistic: bool,
     preconnect_failure_setup: Option<Arc<StdMutex<Option<WebsocketSetupFingerprint>>>>,
     failed_websocket_setup: Option<WebsocketSetupFingerprint>,
     dispatched_account: Option<crate::account_identity::AccountChangeIdentity>,
@@ -2752,6 +2763,55 @@ impl ModelClient {
         Ok(())
     }
 
+    /// Start a retained capture without awaiting it. The returned owner aborts
+    /// the capture if the attempt is dropped, exactly like an inline await.
+    fn spawn_request_capture(&self, capture: RetainedRequestCapture) -> Option<PendingRequestCapture> {
+        let callback = self.state.retained_capture.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).0.clone()?;
+        Some(AbortOnDropHandle::new(tokio::spawn(callback(capture))))
+    }
+
+    /// Retain an immutable prepared capture concurrently with dispatch; keep
+    /// a live-history capture ahead of transport so its snapshot basis holds.
+    async fn retain_or_overlap_request_capture(
+        &self,
+        mut capture: RetainedRequestCapture,
+        turn_timing: Option<&Arc<TurnTimingState>>,
+    ) -> Result<Option<PendingRequestCapture>> {
+        if capture.replay_snapshot.is_some() {
+            // The full capture overlaps dispatch, so a storage failure on its
+            // own could surface only after the request was sent. Commit a small
+            // typed pre-send marker first, durable before the transport is
+            // touched: if even that cannot commit, the error returns here and
+            // nothing is sent. The full capture still follows concurrently and
+            // its failure stays fatal.
+            let pre_send_marker_guard =
+                turn_timing.map(|timing| timing.begin_local_phase(TurnLocalPhase::Persistence));
+            let mut marker_request = capture.logical_request.clone();
+            marker_request.instructions = String::new();
+            self.retain_request_capture(RetainedRequestCapture {
+                identity: capture.identity.clone(),
+                turn_id: capture.turn_id.clone(),
+                transport: capture.transport,
+                selected_representation: capture.selected_representation,
+                has_sampling_boundary: capture.has_sampling_boundary,
+                logical_request: marker_request,
+                transport_request: None,
+                replay_snapshot: None,
+                dispatch_overlapped: true,
+                pre_send_marker: true,
+            }).await?;
+            drop(pre_send_marker_guard);
+            capture.dispatch_overlapped = true;
+            return Ok(self.spawn_request_capture(capture));
+        }
+        let retained_capture_guard =
+            turn_timing.map(|timing| timing.begin_local_phase(TurnLocalPhase::Persistence));
+        self.retain_request_capture(capture).await?;
+        drop(retained_capture_guard);
+        Ok(None)
+    }
+
     /// Attach shared transports immediately after construction, before cloning the client.
     pub fn with_shared_http_clients(
         mut self,
@@ -2806,6 +2866,7 @@ impl ModelClient {
             accepted_websocket_ancestry: false,
             websocket_ancestry_auth_mode: None,
             pending_websocket_preconnect: None,
+            pending_websocket_preconnect_opportunistic: false,
             preconnect_failure_setup: None,
             failed_websocket_setup: None,
             dispatched_account: None,
@@ -2836,6 +2897,7 @@ impl ModelClient {
             accepted_websocket_ancestry: false,
             websocket_ancestry_auth_mode: None,
             pending_websocket_preconnect: None,
+            pending_websocket_preconnect_opportunistic: false,
             preconnect_failure_setup: None,
             failed_websocket_setup: None,
             dispatched_account: None,
@@ -3150,16 +3212,28 @@ impl ModelClient {
             prompt.get_formatted_input_for_request(model_info.use_responses_lite)
         };
         // Saved updates remain durable, but must not reach an unsupported model/provider.
+        // A remote-v2 compaction request keeps the same effort update item as the sampling
+        // requests it summarizes; stripping it moved the first request divergence to the update
+        // item's position and left only the stable prefix before it cacheable.
+        let keep_update_for_compaction = matches!(
+            responses_metadata.request_kind,
+            Some(crate::responses_metadata::CodexResponsesRequestKind::Compaction(metadata))
+                if matches!(
+                    metadata.implementation(),
+                    codex_analytics::CompactionImplementation::ResponsesCompactionV2
+                )
+        );
         if (!self.state.provider.info().is_openai()
             || !model_info.use_responses_lite
             || !model_info.supports_reasoning_effort_updates
             || self.state.session_source.is_non_root_agent()
             || matches!(self.state.session_source, SessionSource::Internal(_))
             || matches!(effort.as_ref(), Some(ReasoningEffortConfig::Custom(_)))
-            || !matches!(
-                responses_metadata.request_kind,
-                Some(crate::responses_metadata::CodexResponsesRequestKind::Turn)
-            ))
+            || !(keep_update_for_compaction
+                || matches!(
+                    responses_metadata.request_kind,
+                    Some(crate::responses_metadata::CodexResponsesRequestKind::Turn)
+                )))
             && input
                 .iter()
                 .any(|item| matches!(item, ResponseItem::ConfigurationUpdate { .. }))
@@ -4137,6 +4211,34 @@ impl ModelClientSession {
         );
         self.pending_websocket_preconnect =
             Some(AbortOnDropHandle::new(tokio::spawn(dial.in_current_span())));
+        self.pending_websocket_preconnect_opportunistic = false;
+    }
+
+    /// Dials the replacement socket while the retry owner waits out the backoff that
+    /// follows a provider close, so the retried request does not pay connection setup
+    /// after the wait. Transport-only: no request is sent and the retry deadline, budget
+    /// and fallback policy are unchanged. Dispatch adopts the socket only if it is already
+    /// connected; a failed or unfinished dial is discarded and dispatch connects exactly
+    /// as it would without this prewarm.
+    pub async fn prewarm_websocket_during_backoff(
+        &mut self,
+        model_info: &ModelInfo,
+        service_tier: Option<String>,
+        session_telemetry: &SessionTelemetry,
+        responses_metadata: &CodexResponsesMetadata,
+    ) {
+        if !self.ready_for_websocket_preconnect().await {
+            return;
+        }
+        let dial = self.websocket_preconnect_dial(
+            model_info,
+            service_tier,
+            session_telemetry,
+            responses_metadata,
+        );
+        self.pending_websocket_preconnect =
+            Some(AbortOnDropHandle::new(tokio::spawn(dial.in_current_span())));
+        self.pending_websocket_preconnect_opportunistic = true;
     }
 
     async fn ready_for_websocket_preconnect(&mut self) -> bool {
@@ -4260,6 +4362,7 @@ impl ModelClientSession {
             responses_metadata,
         );
         let turn_timing = self.turn_timing.clone();
+        self.pending_websocket_preconnect_opportunistic = false;
         self.pending_websocket_preconnect = Some(AbortOnDropHandle::new(tokio::spawn(
             async move {
                 tokio::pin!(fresh_dial);
@@ -4319,6 +4422,7 @@ impl ModelClientSession {
     }
 
     async fn finish_websocket_preconnect(&mut self) -> Result<()> {
+        let opportunistic = std::mem::take(&mut self.pending_websocket_preconnect_opportunistic);
         let Some(task) = self.pending_websocket_preconnect.take() else {
             return Ok(());
         };
@@ -4328,9 +4432,22 @@ impl ModelClientSession {
             drop(task);
             return Ok(());
         }
+        if opportunistic && !task.is_finished() {
+            // A backoff prewarm had the whole wait to connect. Never hold dispatch on a
+            // stalled handshake; connect at dispatch exactly as without the prewarm.
+            drop(task);
+            self.preconnect_failure_setup.take();
+            return Ok(());
+        }
         match task.await {
             Ok(Ok(Some(transport))) if self.client.responses_websocket_enabled() => {
                 self.websocket_session = transport;
+            }
+            Ok(Err(error)) if opportunistic => {
+                // The prewarm is speculative: its failure must not become a pre-dispatch
+                // failure (which could switch transports). Dispatch dials as usual.
+                self.preconnect_failure_setup.take();
+                warn!(target: "codex_core::client", "backoff websocket prewarm failed; connecting at dispatch: {error:#}");
             }
             Ok(Err(error)) if self.client.responses_websocket_enabled() => {
                 // Count this connection attempt under the ordinary retry owner.
@@ -4778,19 +4895,21 @@ impl ModelClientSession {
                     };
                     attempt_clock.mark_queue_finished();
                     let _sampling_admission = sampling_admission?;
-                    let retained_capture_guard = self.turn_timing.as_ref()
-                        .map(|timing| timing.begin_local_phase(TurnLocalPhase::Persistence));
-                    self.client.retain_request_capture(RetainedRequestCapture {
-                        identity: attempt_identity.clone(),
-                        turn_id: responses_metadata.turn_id.clone(),
-                        transport: "responses_http",
-                        selected_representation: "http_selected",
-                        has_sampling_boundary: attempt_prepared.is_some(),
-                        logical_request: request.clone(),
-                        transport_request: None,
-                        replay_snapshot: prompt.replay_snapshot.clone(),
-                    }).await?;
-                    drop(retained_capture_guard);
+                    let mut pending_capture = self.client.retain_or_overlap_request_capture(
+                        RetainedRequestCapture {
+                            identity: attempt_identity.clone(),
+                            turn_id: responses_metadata.turn_id.clone(),
+                            transport: "responses_http",
+                            selected_representation: "http_selected",
+                            has_sampling_boundary: attempt_prepared.is_some(),
+                            logical_request: request.clone(),
+                            transport_request: None,
+                            replay_snapshot: prompt.replay_snapshot.clone(),
+                            dispatch_overlapped: false,
+                            pre_send_marker: false,
+                        },
+                        self.turn_timing.as_ref(),
+                    ).await?;
                     let mut api_provider = client_setup.api_provider;
                     if let Some(timeout) = prompt.stream_progress_timeout {
                         api_provider.stream_idle_timeout = timeout;
@@ -4968,7 +5087,7 @@ impl ModelClientSession {
 
                     match stream_result {
                         Ok(stream) => {
-                            let (stream, _) = map_response_stream(
+                            let (mut stream, _) = map_response_stream(
                                 stream,
                                 request_session_telemetry,
                                 Arc::clone(&self.client.state.provider),
@@ -4976,12 +5095,15 @@ impl ModelClientSession {
                                 /*websocket_success*/ None,
                                 cache_comparison,
                             );
+                            stream.pending_capture = pending_capture.take();
                             return Ok(stream);
                         }
                         Err(ApiError::Transport(unauthorized_transport))
                             if is_recoverable_authentication_failure(&unauthorized_transport) =>
                         {
+                            let captured = join_request_capture(pending_capture.take()).await;
                             finish_failed_model_attempt(&mut attempt, Vec::new());
+                            captured?;
                             // A refresh failure or next loop's setup error is not this HTTP rejection.
                             let source = self.stream_retry_source.take();
                             pending_retry = PendingUnauthorizedRetry::from_recovery(
@@ -5001,7 +5123,9 @@ impl ModelClientSession {
                         }
                         Err(err) => {
                             let err = self.client.state.provider.map_api_error(err);
+                            let captured = join_request_capture(pending_capture.take()).await;
                             finish_failed_model_attempt(&mut attempt, Vec::new());
+                            captured?;
                             return Err(err);
                         }
                     }
@@ -5425,20 +5549,23 @@ impl ModelClientSession {
                 clock.mark_queue_finished();
             }
             let _sampling_admission = sampling_admission?;
+            let mut pending_capture = None;
             if !warmup && let Some(identity) = attempt_identity.as_ref() {
-                let retained_capture_guard = self.turn_timing.as_ref()
-                    .map(|timing| timing.begin_local_phase(TurnLocalPhase::Persistence));
-                self.client.retain_request_capture(RetainedRequestCapture {
-                    identity: identity.clone(),
-                    turn_id: responses_metadata.turn_id.clone(),
-                    transport: "responses_websocket",
-                    selected_representation: selected_representation.as_str(),
-                    has_sampling_boundary: attempt_prepared.is_some(),
-                    logical_request: request.clone(),
-                    transport_request: Some(ws_request.clone()),
-                    replay_snapshot: prompt.replay_snapshot.clone(),
-                }).await?;
-                drop(retained_capture_guard);
+                pending_capture = self.client.retain_or_overlap_request_capture(
+                    RetainedRequestCapture {
+                        identity: identity.clone(),
+                        turn_id: responses_metadata.turn_id.clone(),
+                        transport: "responses_websocket",
+                        selected_representation: selected_representation.as_str(),
+                        has_sampling_boundary: attempt_prepared.is_some(),
+                        logical_request: request.clone(),
+                        transport_request: Some(ws_request.clone()),
+                        replay_snapshot: prompt.replay_snapshot.clone(),
+                        dispatch_overlapped: false,
+                        pre_send_marker: false,
+                    },
+                    self.turn_timing.as_ref(),
+                ).await?;
             }
             let turn_timing = self.turn_timing.clone();
             let serialization_timing_guard = self
@@ -5706,7 +5833,9 @@ impl ModelClientSession {
                 Ok(stream) => stream,
                 Err(err) => {
                     let err = self.client.state.provider.map_api_error(err);
+                    let captured = join_request_capture(pending_capture.take()).await;
                     finish_failed_model_attempt(&mut attempt, Vec::new());
+                    captured?;
                     return Err(err);
                 }
             };
@@ -5723,7 +5852,7 @@ impl ModelClientSession {
             self.effective_consumption_input = Some(selected_representation.source_input(prompt));
             self.websocket_session.last_request = Some(request);
             self.websocket_session.last_response_from_untraced_warmup = warmup;
-            let (stream, last_request_rx) = map_response_stream(
+            let (mut stream, last_request_rx) = map_response_stream(
                 stream_result,
                 request_session_telemetry,
                 Arc::clone(&self.client.state.provider),
@@ -5731,6 +5860,7 @@ impl ModelClientSession {
                 (!warmup).then(|| (self.client.clone(), websocket_epoch)),
                 cache_comparison,
             );
+            stream.pending_capture = pending_capture.take();
             self.websocket_session.last_response_rx = Some(last_request_rx);
             self.websocket_session.last_response = None;
             return Ok(WebsocketStreamOutcome::Stream(stream));
@@ -6636,9 +6766,23 @@ where
             attempt_identity,
             consumer_dropped: consumer_dropped_for_stream,
             text_delivery,
+            pending_capture: None,
         },
         rx_last_response,
     )
+}
+
+type PendingRequestCapture = AbortOnDropHandle<Result<()>>;
+
+/// Join an overlapped capture on paths that deliver no stream. A capture
+/// failure wins: on the sequential path it would have prevented dispatch.
+async fn join_request_capture(capture: Option<PendingRequestCapture>) -> Result<()> {
+    match capture {
+        Some(capture) => capture.await.map_err(|error| {
+            CodexErr::Fatal(format!("context replay capture task failed: {error}"))
+        })?,
+        None => Ok(()),
+    }
 }
 
 /// Handles a 401 response by optionally refreshing ChatGPT tokens once.

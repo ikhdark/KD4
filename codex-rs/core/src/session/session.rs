@@ -1138,7 +1138,9 @@ async fn warm_plugins_and_skills_for_session_init(
     turn_environments: &TurnEnvironmentSnapshot,
     repository_sandbox: Option<codex_file_system::FileSystemSandboxContext>,
 ) -> Vec<SkillError> {
-    let fs = turn_environments.primary_filesystem();
+    let fs = turn_environments.primary_host_path_filesystem();
+    // The repository authority only applies to a filesystem that is discovered.
+    let repository_sandbox = fs.as_ref().and(repository_sandbox);
     let plugins_input = config.plugins_config_input();
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
     let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
@@ -1454,8 +1456,15 @@ impl Session {
             .unwrap_or_else(|| {
                 std::env::current_dir().unwrap_or_else(|_| config.codex_home.to_path_buf())
             });
+        // Spawned agents cannot call MCP tools (DynamicExternal), so they start
+        // optional local stdio servers on first use when an identical server's
+        // catalog is already known in this process.
         let mcp_runtime_context =
-            McpRuntimeContext::new(Arc::clone(&environment_manager), mcp_runtime_cwd);
+            McpRuntimeContext::new(Arc::clone(&environment_manager), mcp_runtime_cwd)
+                .with_deferred_optional_stdio_startup(matches!(
+                    session_configuration.session_source,
+                    codex_protocol::protocol::SessionSource::SubAgent(_)
+                ));
         let mcp_runtime_context_for_auth = mcp_runtime_context.clone();
         let auth_and_mcp_fut = async move {
             let auth = auth_manager_clone.auth().await;

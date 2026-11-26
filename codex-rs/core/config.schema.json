@@ -3980,7 +3980,7 @@
       "type": "object"
     },
     "mcp_oauth_callback_port": {
-      "description": "Optional fixed port for the local HTTP callback server used during MCP OAuth login. When unset, Codex will bind to an ephemeral port chosen by the OS.",
+      "description": "Optional fixed port for the local HTTP callback server used during MCP OAuth login. When unset, Codex will bind to an ephemeral port chosen by the OS. Plugin-install OAuth logins that share a fixed port run one at a time.",
       "format": "uint16",
       "minimum": 0.0,
       "type": "integer"

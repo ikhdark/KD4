@@ -24,6 +24,26 @@ pub fn internal_error(message: impl Into<String>) -> JSONRPCErrorError {
     error(INTERNAL_ERROR_CODE, message)
 }
 
+/// Admission refusal for a bounded live registry (fuzzy search sessions,
+/// `process/spawn`): the `fs/watch` capacity code with the registry `reason`
+/// and the limiting `scope` (`"server"` or `"connection"`). Releasing an
+/// existing entry restores capacity, so the refusal is not blindly retryable.
+pub fn capacity_error(
+    reason: &'static str,
+    scope: &'static str,
+    message: impl Into<String>,
+) -> JSONRPCErrorError {
+    JSONRPCErrorError {
+        code: FS_WATCH_CAPACITY_ERROR_CODE,
+        message: message.into(),
+        data: Some(serde_json::json!({
+            "reason": reason,
+            "scope": scope,
+            "retryable": false,
+        })),
+    }
+}
+
 fn error(code: i64, message: impl Into<String>) -> JSONRPCErrorError {
     JSONRPCErrorError {
         code,

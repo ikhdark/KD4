@@ -145,16 +145,21 @@ impl SkillProvider for ExecutorSkillProvider {
                     request.resource.as_str()
                 )));
             };
-            let contents = environment
-                .get_filesystem()
-                .read_file_text(resource_path, Some(sandbox))
-                .await
-                .map_err(|err| {
-                    SkillProviderError::new(format!(
-                        "failed to read executor skill resource {}: {err}",
-                        request.resource.as_str()
-                    ))
-                })?;
+            let file_system = environment.get_filesystem();
+            let contents = match request.max_text_bytes {
+                Some(max_bytes) => {
+                    file_system
+                        .read_file_text_prefix(resource_path, max_bytes, Some(sandbox))
+                        .await
+                }
+                None => file_system.read_file_text(resource_path, Some(sandbox)).await,
+            }
+            .map_err(|err| {
+                SkillProviderError::new(format!(
+                    "failed to read executor skill resource {}: {err}",
+                    request.resource.as_str()
+                ))
+            })?;
 
             Ok(SkillReadResult {
                 resource: request.resource,

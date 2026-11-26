@@ -19,3 +19,15 @@ The separate `disable_execution_speed_throttling()` helper opts Windows processe
 out of automatic execution-speed throttling while preserving other power settings.
 It returns an I/O error if the native operation fails, does not raise scheduling
 priority or change timer resolution, and is a no-op on other platforms.
+
+`prefer_largest_last_level_cache()` runs from `codex-arg0` at startup, before
+runtime threads exist. On a single-processor-group Windows machine whose
+last-level caches differ in size (for example a Ryzen X3D part with one
+stacked-cache CCD), it sets this process's default CPU Sets to the logical
+processors sharing the uniquely largest cache. CPU Sets are not inherited, so
+commands, builds and other child processes keep the whole machine and their
+normal affinity. Nothing changes when the caches are single or uniform, when
+the process already has a narrower affinity mask or CPU Sets, or on other
+platforms. Set `CODEX_CPU_SET_PREFERENCE=off` to keep default placement.
+On a Ryzen 9 9950X3D app-server soak this cut app-server CPU cycles 13.8% and
+median turn time 35%; placing the same work on the smaller-cache CCD gave no gain.

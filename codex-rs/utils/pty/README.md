@@ -27,8 +27,18 @@ background descendants.
   - `request_terminate()` cancels the Windows Job or Unix initial process group and leaves readers draining.
     Windows success requires job accounting to reach zero active processes; a native error or
     five-second confirmation deadline retains the terminator for retry, even after root exit.
+    The wait blocks the calling thread, so async callers run `request_terminate()`/`terminate()`
+    on the blocking pool; dropping a live handle on a multi-thread runtime worker uses `block_in_place`.
   - `finish()` releases an exited child without signalling it; `terminate()` does both
   - `release_pty_after_exit()` closes stdin and releases the pseudoconsole
+  - `deferred_priority_class()` → the Windows priority class a lowered root must restore (below)
+- `pipe::spawn_process_no_stdin_lowered_until_handoff(program, args, cwd, env, arg0)` →
+  `(SpawnedProcess, pid, ObservedProcess)`: a NUL-stdin root that Windows creates like any other,
+  then lowered to below normal while still suspended. It records the class Windows assigned
+  (parent, Job and image-execution policy included) in `deferred_priority_class()` for the child to
+  restore before it runs caller code. The pid and start observation let the launcher verify its
+  hand-off client and attribute the root to the consuming call
+  (`ObservedProcess::adopt_into_current_scope`). Used by core's speculative PowerShell launch.
 - `conpty_supported()` → `bool` (Windows build check; always true elsewhere)
 - `ManagedRootProcess` and `install_managed_root_admission_reclaimer` bound the number of live
   managed process trees.

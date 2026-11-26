@@ -44,9 +44,18 @@ impl ThreadRequestProcessor {
                             .thread_delete_response(params, &mut deleted_thread_ids)
                             .await
                     };
+                    // Let log entries buffered for the deleted threads settle before the
+                    // response is published, but only for a bounded time: the flush is
+                    // queued behind every pending insert batch and each batch can wait out
+                    // the SQLite busy timeout, so a locked logs database must not hold the
+                    // response (or the thread/deleted notifications) back indefinitely.
+                    // Deletion is already committed, and the durable deletion fence drops
+                    // late entries for deleted threads, so proceeding is safe.
                     if !deleted_thread_ids.is_empty()
                         && let Some(log_db) = processor.log_db.as_ref()
-                        && let Err(err) = log_db.flush().await
+                        && let Err(err) = log_db
+                            .flush_within(codex_state::log_db::REQUEST_FLUSH_TIMEOUT)
+                            .await
                     {
                         tracing::warn!(%err, "failed to flush SQLite logs");
                     }

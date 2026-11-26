@@ -216,6 +216,10 @@ pub(crate) struct SessionState {
     granted_permissions_by_approval_scope_id: HashMap<String, UriAdditionalPermissionProfile>,
     next_turn_is_first: bool,
     pending_context_baseline: Option<ContextBaselineCandidate>,
+    /// CLAUDE-S02: generations counted for the session's current typed worker
+    /// attempt. A single slot, reset when the attempt changes, so nothing
+    /// outlives the session and no entry remains for a finished attempt.
+    periodic_partial_generations: Option<(codex_agent_task_store::AttemptId, u64)>,
 }
 
 impl SessionState {
@@ -249,7 +253,22 @@ impl SessionState {
             granted_permissions_by_approval_scope_id: HashMap::new(),
             next_turn_is_first: true,
             pending_context_baseline: None,
+            periodic_partial_generations: None,
         }
+    }
+
+    /// Count one completed model generation of `attempt` and return its count;
+    /// a different attempt restarts the count from one.
+    pub(crate) fn count_attempt_generation(
+        &mut self,
+        attempt: codex_agent_task_store::AttemptId,
+    ) -> u64 {
+        let count = match self.periodic_partial_generations {
+            Some((counted, count)) if counted == attempt => count.saturating_add(1),
+            _ => 1,
+        };
+        self.periodic_partial_generations = Some((attempt, count));
+        count
     }
 
     // History helpers

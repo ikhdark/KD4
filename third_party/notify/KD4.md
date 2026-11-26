@@ -16,6 +16,15 @@ for actions, so it must keep send-before-wake without racing handle closure.
 Native coverage reconciliation and requested-namespace ownership remain in
 codex-file-watcher, which stages replacement backends after coverage loss.
 
+Windows backend: each `ReadDirectoryChangesW` request uses a 64 KiB buffer
+(upstream 16 KiB; 64 KiB is the network-path maximum), and `FILE_ACTION_ADDED`
+reports `Create(CreateKind::Any)` without querying the new path's metadata on
+the notification thread. codex-file-watcher matches `Create(_)` only. In a KDR
+burst workload (4,096 creates into a watched directory) this removed overflow
+rescans (3 of 12 bursts before, 0 of 12 after) and shortened the creating
+process's burst (balanced blocks, pooled median about -27%); see the KDR case
+kd4-io-filesystem-latency-ab.
+
 Private FSEvents cleanup removes the unused collecting translator and imprecise
 translation mode. Unsupported runtime configuration uses the unchanged Watcher
 trait default instead of a no-op forwarding layer.

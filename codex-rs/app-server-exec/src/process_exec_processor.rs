@@ -38,10 +38,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command_exec::OutputByteCap;
 use crate::command_exec::StdinWriteRequest;
+use crate::command_exec::request_terminate_off_runtime;
 use crate::command_exec::spawn_stdin_writer;
 use crate::command_exec::terminal_size_from_protocol;
 use crate::command_exec::validate_command_argv;
 use codex_app_server_rpc::connection_rpc_gate::ConnectionRpcGate;
+use codex_app_server_rpc::error_code::capacity_error;
 use codex_app_server_rpc::error_code::internal_error;
 use codex_app_server_rpc::error_code::invalid_params;
 use codex_app_server_rpc::error_code::invalid_request;
@@ -54,6 +56,10 @@ use codex_app_server_rpc::outgoing_message::OutgoingMessageSender;
 const EXEC_TIMEOUT_EXIT_CODE: i32 = 124;
 const MAX_PENDING_STDIN_WRITES: usize = 32;
 const OUTPUT_CHUNK_SIZE_HINT: usize = 64 * 1024;
+// Every live process/spawn session owns a child process, stdin/control workers
+// and notification state, so admission is bounded like fs/watch.
+const PROCESS_SESSIONS_PER_CONNECTION: usize = 128;
+const PROCESS_SESSIONS_PER_SERVER: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProcessSpawnLogMetadata {
@@ -383,17 +389,34 @@ impl ProcessExecRequestProcessor {
         {
             let mut sessions = self.sessions.lock().await;
             rpc_gate
-                .try_commit(|| match sessions.entry(process_key.clone()) {
-                    Entry::Occupied(_) => Err(invalid_request(format!(
-                        "duplicate active process handle: {process_handle:?}",
-                    ))),
-                    Entry::Vacant(entry) => {
-                        entry.insert(ProcessSession {
-                            control_tx,
-                            write_tx,
-                            write_slots,
-                        });
-                        Ok(())
+                .try_commit(|| {
+                    // Live sessions (including ones whose process already exited
+                    // but whose terminal cleanup has not run) count against the
+                    // bounds; exit, kill and connection close release capacity.
+                    let limit = sessions.admission_limit(
+                        process_key.connection_id,
+                        PROCESS_SESSIONS_PER_CONNECTION,
+                        PROCESS_SESSIONS_PER_SERVER,
+                    );
+                    match sessions.entry(process_key.clone()) {
+                        Entry::Occupied(_) => Err(invalid_request(format!(
+                            "duplicate active process handle: {process_handle:?}",
+                        ))),
+                        Entry::Vacant(entry) => {
+                            if let Some(scope) = limit {
+                                return Err(capacity_error(
+                                    "processSpawnCapacity",
+                                    scope,
+                                    "process capacity reached; wait for a process to exit or kill one before retrying",
+                                ));
+                            }
+                            entry.insert(ProcessSession {
+                                control_tx,
+                                write_tx,
+                                write_slots,
+                            });
+                            Ok(())
+                        }
                     }
                 })
                 .ok_or_else(|| invalid_request("connection is closed"))??;
@@ -694,7 +717,7 @@ async fn run_process(params: RunProcessParams) {
                 if let Some(code) = session.exit_code() { break code; }
                 expiration_outcome = Some(outcome);
                 termination_retry = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-                if let Err(error) = session.request_terminate() {
+                if let Err(error) = request_terminate_off_runtime(&session).await {
                     tracing::warn!(%process_handle, %error, cleanup_pending = true,
                         "expired process termination failed; native exit remains unconfirmed");
                 }
@@ -704,7 +727,7 @@ async fn run_process(params: RunProcessParams) {
                     tokio::time::sleep_until(deadline).await;
                 } else { std::future::pending::<()>().await; }
             } => {
-                if let Err(error) = session.request_terminate() {
+                if let Err(error) = request_terminate_off_runtime(&session).await {
                     tracing::warn!(%process_handle, %error, cleanup_pending = true,
                         "automatic process termination failed; native exit remains unconfirmed and cleanup will retry");
                 }
@@ -721,7 +744,7 @@ async fn run_process(params: RunProcessParams) {
             _ = connection_cancellation.cancelled(), if !connection_cancelled => {
                 connection_cancelled = true;
                 termination_retry = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-                if let Err(error) = session.request_terminate() {
+                if let Err(error) = request_terminate_off_runtime(&session).await {
                     tracing::warn!(
                         process_handle = %process_handle,
                         %error,
@@ -736,8 +759,8 @@ async fn run_process(params: RunProcessParams) {
                             ProcessControl::Resize { size } => {
                                 handle_process_resize(&session, size)
                             }
-                            ProcessControl::Kill => session
-                                .request_terminate()
+                            ProcessControl::Kill => request_terminate_off_runtime(&session)
+                                .await
                                 .map_err(|error| internal_error(error.to_string())),
                         };
                         if let Some(response_tx) = response_tx
@@ -752,7 +775,7 @@ async fn run_process(params: RunProcessParams) {
                     None => {
                         control_open = false;
                         termination_retry = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-                        let _ = session.request_terminate();
+                        let _ = request_terminate_off_runtime(&session).await;
                     }
                 }
             }

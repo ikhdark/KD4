@@ -570,9 +570,8 @@ fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Valu
     if raw.get("source_sha256").is_none() {
         printed.shift_remove("canonical_sha256");
     }
-    if raw["historical_authenticity"] == "unverified" {
-        printed.shift_remove("historical_authenticity");
-    }
+    // historical_authenticity stays in both values: "unverified" is a verdict, not
+    // restated success, and an omitted field would read as success here.
     let whole_source = raw["file_complete"] == true
         && raw["results"].as_array().is_some_and(|rows| rows.len() == 1);
     let Some(rows) = printed.get_mut("results").and_then(Value::as_array_mut) else {

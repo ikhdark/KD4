@@ -59,17 +59,20 @@
   });
 
   Object.defineProperty(globalThis, "collect_read_wave", {
-    value: async function collect_read_wave({ rows, admitted, unresolved }, { timeout_ms } = {}) {
+    value: async function collect_read_wave({ rows, admitted, unresolved }, { timeout_ms, completion_mode } = {}) {
+      const mode = completion_mode ?? "all";
+      if (mode !== "all" && mode !== "any")
+        throw new TypeError('collect_read_wave completion_mode must be "all" or "any"');
       const reports = [], unavailable = [], indices = new Map();
-      let pending = [], reason = null;
+      let pending = [], reason = null, attempts = new Map();
       if (admitted.length) {
         const { completion } = await tool("wait_agent")({
-          targets: admitted.map(a => a.target), completion_mode: "all",
+          targets: admitted.map(a => a.target), completion_mode: mode,
           ...(timeout_ms === undefined ? {} : { timeout_ms }),
         });
         reason = completion.reason;
         pending = completion.pending;
-        const attempts = new Map(completion.outcomes.map(o => [o.assignment_id, o.attempt_id]));
+        attempts = new Map(completion.outcomes.map(o => [o.assignment_id, o.attempt_id]));
         const ready = admitted.filter(a => attempts.get(a.assignment_id));
         if (ready.length) {
           const lookup = tool("get_agent_task");
@@ -88,10 +91,17 @@
           }
         }
       }
-      return {
+      const collected = {
         results: rows.map(({ id, producer }) => ({ id, producer, report_index: indices.get(producer) ?? null })),
         reports, unresolved, unavailable, pending, reason,
       };
+      if (mode === "any") {
+        // Admitted producers with no returned outcome yet, as a wave for the next collection.
+        const left = admitted.filter(a => !attempts.get(a.assignment_id));
+        const names = new Set(left.map(a => a.producer));
+        collected.remaining = { rows: rows.filter(row => names.has(row.producer)), admitted: left, unresolved: [] };
+      }
+      return collected;
     },
   });
 })();

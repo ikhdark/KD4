@@ -3,8 +3,10 @@
 use std::time::Duration;
 
 use crate::client::ModelClientSession;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::retry::backoff_with_cap;
 use crate::session::session::Session;
+use crate::session::turn::service_tier_for_sampling;
 use crate::session::turn_context::TurnContext;
 use crate::turn_timing::retries::RetryAction;
 use crate::turn_timing::retries::RetryStreamFailure;
@@ -30,8 +32,10 @@ const INITIAL_CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(60);
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(15);
-/// Bounds automatic recovery after the first failure, including account waits.
-/// This is not a timeout on an accepted, potentially long-running generation.
+/// Bounds automatic recovery after the first failure, including account waits,
+/// for every session source (the name and error code predate non-interactive
+/// coverage). This is not a timeout on an accepted, potentially long-running
+/// generation.
 const INTERACTIVE_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(120);
 const INTERACTIVE_RETRY_BUDGET_ERROR_CODE: &str = "interactive_retry_budget_exhausted";
 /// Bounds the wait when the limit provably cannot reset inside the full bound,
@@ -54,13 +58,13 @@ pub(crate) enum ResponsesStreamRequest {
 pub(crate) struct ResponsesRecoveryWait(Option<tokio::time::Instant>);
 
 impl ResponsesRecoveryWait {
+    /// Every session source shares this bound. Non-interactive callers stop
+    /// at provider advice beyond it instead of waiting it out; account and
+    /// network waits remain interactive-only.
     fn interactive_deadline(
         &mut self,
-        session_source: &SessionSource,
+        _session_source: &SessionSource,
     ) -> Option<tokio::time::Instant> {
-        if !is_interactive_recovery(session_source) {
-            return None;
-        }
         Some(*self.0.get_or_insert_with(|| {
             tokio::time::Instant::now() + INTERACTIVE_RETRY_WAIT_BUDGET
         }))
@@ -120,14 +124,10 @@ impl<'a> ResponsesStreamRetryState<'a> {
             || serde_json::json!({"kind": "unknown"}),
             |limit| serde_json::json!({"kind": "finite", "value": limit}),
         );
-        let deadline = if !is_interactive_recovery(source) {
-            serde_json::json!({"kind": "unlimited", "remaining_ms": null})
-        } else {
-            serde_json::json!({"kind": "finite", "limit_ms": INTERACTIVE_RETRY_WAIT_BUDGET.as_millis(),
-                "state": if self.recovery_wait.0.is_some() { "running" } else { "not_started" },
-                "remaining_ms": self.recovery_wait.0.map(|deadline|
-                    deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis())})
-        };
+        let deadline = serde_json::json!({"kind": "finite", "limit_ms": INTERACTIVE_RETRY_WAIT_BUDGET.as_millis(),
+            "state": if self.recovery_wait.0.is_some() { "running" } else { "not_started" },
+            "remaining_ms": self.recovery_wait.0.map(|deadline|
+                deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis())});
         serde_json::json!({
             "version": 1, "owner": "responses_stream", "agent_attempts": "unknown",
             // Repairs/account recovery do not all spend the replay counter.
@@ -283,7 +283,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         retry_state.retries += 1;
         retry_state.reconnected_after_close = true;
         retry_state.emit_budget(turn_context, request);
-        let delay = response_stream_retry_delay(&err, retry_state.retries);
+        let delay = reconnect_after_close_delay(&err, retry_state.retries);
         let retry_at = retry_after
             .map(RetryAfter::deadline)
             .unwrap_or_else(|| tokio::time::Instant::now() + delay);
@@ -296,6 +296,25 @@ pub(crate) async fn handle_retryable_response_stream_error(
             "provider closed the stream and invited a reconnect; rebuilding the websocket"
         );
         client_session.replace_websocket_for_recovery();
+        if matches!(request, ResponsesStreamRequest::Sampling) {
+            // Overlap connection setup with the backoff instead of following it. The
+            // request is still dispatched only at the same retry deadline, and a failed
+            // or unfinished prewarm leaves dispatch to connect as it otherwise would.
+            let metadata = turn_context.turn_metadata_state.to_responses_metadata(
+                sess.installation_id.clone(),
+                sess.current_window_id().await,
+                CodexResponsesRequestKind::Turn,
+            );
+            let service_tier = service_tier_for_sampling(sess, turn_context).await;
+            client_session
+                .prewarm_websocket_during_backoff(
+                    &turn_context.model_info,
+                    service_tier,
+                    &turn_context.session_telemetry,
+                    &metadata,
+                )
+                .await;
+        }
         sess.notify_stream_error(
             turn_context,
             format!("Reconnecting... the server closed the stream (next retry in {delay:.1?}){}",
@@ -470,8 +489,9 @@ pub(crate) async fn handle_retryable_response_stream_error(
 ///
 /// Applies once per request, and only to a close whose code invites another
 /// connection. Recovery backs off so a restarting or overloaded backend has
-/// time to recover; a second close of the same request falls through to the
-/// ordinary fallback path. A close code that rejects the request (policy,
+/// time to recover, while a normal or going-away close redials on the shorter
+/// connection cadence ([`reconnect_after_close_delay`]); a second close of the
+/// same request falls through to the ordinary fallback path. A close code that rejects the request (policy,
 /// protocol, payload) is never reconnected, since a new socket would only repeat
 /// the rejection.
 fn should_reconnect_after_close(err: &CodexErr, state: &ResponsesStreamRetryState<'_>) -> bool {
@@ -882,6 +902,29 @@ fn response_stream_retry_delay(err: &CodexErr, retry_count: u64) -> Duration {
         );
     }
     backoff_with_cap(retry_count, MAX_RESPONSE_STREAM_RETRY_DELAY)
+}
+
+/// Delay before the single reconnect after a close that invites another
+/// connection. A normal (1000) or going-away (1001) close ends one socket,
+/// not the service, so the new socket is dialed on the jittered connection
+/// cadence instead of the capacity backoff. Restart and try-again-later closes
+/// (1012/1013) keep the capacity backoff, and server Retry-After advice still
+/// wins through [`response_stream_retry_delay`].
+fn reconnect_after_close_delay(err: &CodexErr, retry_count: u64) -> Duration {
+    if err.retry_after().is_none()
+        && matches!(
+            err,
+            CodexErr::ResponseStreamFailed(failed)
+                if failed.reconnectable_close && matches!(failed.close_code, Some(1000 | 1001))
+        )
+    {
+        return codex_client::capped_backoff(
+            INITIAL_CONNECTION_RETRY_DELAY,
+            1,
+            MAX_CONNECTION_RETRY_DELAY,
+        );
+    }
+    response_stream_retry_delay(err, retry_count)
 }
 
 fn log_retry(

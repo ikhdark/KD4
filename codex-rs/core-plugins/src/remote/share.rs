@@ -430,12 +430,12 @@ async fn fetch_created_workspace_plugins(
     let mut plugins = Vec::new();
     let mut page_token = None;
     let mut seen_page_tokens = HashSet::new();
-    loop {
+    for _ in 0..MAX_REMOTE_PLUGIN_LIST_PAGES {
         let response =
             get_created_workspace_plugins_page(client, config, auth, page_token.as_deref()).await?;
         plugins.extend(response.plugins);
         let Some(next_page_token) = response.pagination.next_page_token else {
-            break;
+            return Ok(plugins);
         };
         if !seen_page_tokens.insert(next_page_token.clone()) {
             return Err(RemotePluginCatalogError::UnexpectedResponse(
@@ -444,7 +444,9 @@ async fn fetch_created_workspace_plugins(
         }
         page_token = Some(next_page_token);
     }
-    Ok(plugins)
+    Err(RemotePluginCatalogError::UnexpectedResponse(format!(
+        "remote created workspace plugin listing exceeded {MAX_REMOTE_PLUGIN_LIST_PAGES} pages"
+    )))
 }
 
 async fn get_created_workspace_plugins_page(

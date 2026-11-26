@@ -15,8 +15,8 @@ pub(crate) fn manifest(
     let configuration = serde_json::json!({
         "operating_system": std::env::consts::OS,
         "architecture": std::env::consts::ARCH,
-        "cwd": std::env::current_dir().map_err(serde_json::Error::io)?,
-        "helper_executable": runtime_paths.codex_self_exe.as_path(),
+        "cwd": path_json(&std::env::current_dir().map_err(serde_json::Error::io)?),
+        "helper_executable": path_json(runtime_paths.codex_self_exe.as_path()),
     });
     let mut manifest = CapabilityManifest {
         schema_version: crate::protocol::CAPABILITY_MANIFEST_VERSION,
@@ -30,6 +30,17 @@ pub(crate) fn manifest(
     };
     manifest.revision = revision(&manifest)?;
     Ok(manifest)
+}
+
+/// `json!` serializes a `Path` through serde and unwraps the result, so a
+/// non-UTF-8 path panics instead of reaching the `Result` above. A UTF-8 path
+/// keeps its exact string form (existing revisions are unchanged); any other
+/// path becomes a distinct escaped-debug identity.
+fn path_json(path: &std::path::Path) -> serde_json::Value {
+    match path.to_str() {
+        Some(text) => serde_json::Value::String(text.to_owned()),
+        None => serde_json::json!({ "non_utf8_path": format!("{path:?}") }),
+    }
 }
 
 fn revision(value: &impl serde::Serialize) -> Result<String, serde_json::Error> {

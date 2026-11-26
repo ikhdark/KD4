@@ -42,32 +42,77 @@ pub fn lock_directory_chain(path: &Path) -> io::Result<Vec<File>> {
             }
             _ => current.push(component),
         }
-        let handle = OpenOptions::new()
-            .read(true)
-            // Attribute-only handles do not participate in Windows sharing
-            // checks. Traverse access pins the directory without requiring
-            // permission to enumerate every ancestor's contents.
-            .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&current)
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "cannot pin directory {} without following links: {error}",
-                        current.display()
-                    ),
-                )
-            })?;
-        let metadata = handle.metadata()?;
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "guarded directory traversal refuses a reparse point or non-directory",
-            ));
-        }
-        handles.push(handle);
+        handles.push(pin_directory(&current)?);
     }
     Ok(handles)
+}
+
+/// Re-check directories already pinned by [`lock_directory_chain`] through
+/// their retained handles: each must still be a directory, not a reparse point.
+/// The retained handles deny rename and delete, so their names still resolve to
+/// the same objects; this replaces reopening every component from the root.
+pub fn validate_pinned_directories(handles: &[File]) -> io::Result<()> {
+    handles.iter().try_for_each(check_pinned_directory)
+}
+
+/// Pin only the components of `path` below `base`, whose own chain the caller
+/// already holds (from [`lock_directory_chain`]). Each component gets the same
+/// no-follow open and checks as [`lock_directory_chain`].
+pub fn lock_directory_components_below(base: &Path, path: &Path) -> io::Result<Vec<File>> {
+    let rest = path.strip_prefix(base).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guarded path is outside its pinned base",
+        )
+    })?;
+    let mut current = base.to_path_buf();
+    let mut handles = Vec::new();
+    for component in rest.components() {
+        match component {
+            Component::Normal(_) => current.push(component),
+            Component::CurDir => continue,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "parent traversal is not allowed in a guarded path",
+                ));
+            }
+        }
+        handles.push(pin_directory(&current)?);
+    }
+    Ok(handles)
+}
+
+fn pin_directory(current: &Path) -> io::Result<File> {
+    let handle = OpenOptions::new()
+        .read(true)
+        // Attribute-only handles do not participate in Windows sharing
+        // checks. Traverse access pins the directory without requiring
+        // permission to enumerate every ancestor's contents.
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(current)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot pin directory {} without following links: {error}",
+                    current.display()
+                ),
+            )
+        })?;
+    check_pinned_directory(&handle)?;
+    Ok(handle)
+}
+
+fn check_pinned_directory(handle: &File) -> io::Result<()> {
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guarded directory traversal refuses a reparse point or non-directory",
+        ));
+    }
+    Ok(())
 }

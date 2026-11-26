@@ -36,7 +36,8 @@ pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 /// Reconciliation cadence once coverage is settled.
 const BACKFILL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Pause before a process's first pass, so it never competes with the first model
-/// request, and before resuming a pass that had more work left.
+/// request, and before resuming a pass that had more work left. Also the first
+/// retry after an unresolved pass while coverage is uncertified.
 const BACKFILL_RESUME_DELAY: Duration = Duration::from_secs(1);
 /// One pass, after which it hands the claim back and resumes from its checkpoint.
 const BACKFILL_PASS_BOUND: Duration = Duration::from_secs(20);
@@ -136,6 +137,7 @@ fn spawn_backfill_refresh(
     let weak = std::sync::Arc::downgrade(runtime);
     tokio::spawn(async move {
         let mut delay = initial_delay;
+        let mut uncertified_retry = BACKFILL_RESUME_DELAY;
         loop {
             tokio::time::sleep(delay).await;
             let Some(runtime) = weak.upgrade() else {
@@ -148,7 +150,23 @@ fn spawn_backfill_refresh(
                 &mut backfill_memo,
             )
             .await;
-            delay = match backfill_memo.last_pass_remainder() {
+            let remainder = backfill_memo.last_pass_remainder();
+            // Archive and delete wait on certification (`await_thread_index`), and a
+            // rollout that a live writer changed mid-extraction leaves the pass
+            // unresolved. Retry an uncertified index soon, backing off to the refresh
+            // interval so a persistent gap keeps the normal cadence. A pass with an
+            // unresolved failure still never certifies coverage.
+            let retry_uncertified = remainder == Some(metadata::PassRemainder::Unresolved)
+                && !runtime.thread_index_certified().await;
+            if retry_uncertified {
+                delay = uncertified_retry;
+                uncertified_retry = uncertified_retry
+                    .saturating_mul(2)
+                    .min(BACKFILL_REFRESH_INTERVAL);
+                continue;
+            }
+            uncertified_retry = BACKFILL_RESUME_DELAY;
+            delay = match remainder {
                 // A fairness slice is not a failed traversal; it released its lease already.
                 Some(metadata::PassRemainder::DiscoveryPending) => Duration::ZERO,
                 Some(metadata::PassRemainder::Stopped) => BACKFILL_RESUME_DELAY,

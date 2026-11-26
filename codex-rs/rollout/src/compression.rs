@@ -215,17 +215,33 @@ pub async fn move_rollout_to_directory_with_owner(
             &compressed_source
         };
         let mut duplicate = None;
+        // The pathname checks only select files. Equality is established on
+        // descriptors that stay open, so the removal below can be bound to the
+        // very objects that were compared.
+        let mut source_handle: Option<File> = None;
+        let mut duplicate_handles: Vec<(PathBuf, File)> = Vec::new();
         for destination in [
             &plain_destination,
             &path::compressed_rollout_path(&plain_destination),
         ] {
             if destination.try_exists()? {
-                if !rollouts_have_identical_bytes(current_source, destination)? {
+                let source_file = match source_handle.take() {
+                    Some(file) => file,
+                    None => open_rollout_duplicate(current_source)?,
+                };
+                std::io::Seek::rewind(&mut &source_file)?;
+                let destination_file = open_rollout_duplicate(destination)?;
+                if !rollouts_have_identical_bytes(
+                    (current_source, &source_file),
+                    (destination, &destination_file),
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         format!("conflicting rollout destination: {}", destination.display()),
                     ));
                 }
+                source_handle = Some(source_file);
+                duplicate_handles.push((destination.clone(), destination_file));
                 duplicate = Some(destination.clone());
             }
         }
@@ -244,7 +260,26 @@ pub async fn move_rollout_to_directory_with_owner(
             compressed_path
         };
         if let Some(destination) = duplicate {
-            std::fs::remove_file(source)?;
+            let source_handle = source_handle.ok_or_else(|| {
+                io::Error::other("rollout duplicate comparison retained no source descriptor")
+            })?;
+            // Never discard the only other copy: each destination must still
+            // name the object it was compared against.
+            for (compared_path, compared) in &duplicate_handles {
+                if !rollout_handles_same_identity(&open_rollout_duplicate(compared_path)?, compared)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "rollout duplicate destination was replaced; source retained: {}",
+                            compared_path.display()
+                        ),
+                    ));
+                }
+            }
+            // Remove only the file that was compared, not a name substituted since.
+            remove_owned_rollout_file(&source, &source_handle)?;
+            drop(source_handle);
+            drop(duplicate_handles);
             return Ok(destination);
         }
         let file_name = source.file_name().ok_or_else(|| {
@@ -293,16 +328,31 @@ fn move_rollout_no_replace(source: &Path, destination: &Path) -> io::Result<()> 
     std::fs::remove_file(source)
 }
 
-fn rollouts_have_identical_bytes(first: &Path, second: &Path) -> io::Result<bool> {
-    use std::io::BufRead;
-    fn reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
-        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
-            return Err(io::Error::new(
+/// Open a rollout copy for a duplicate comparison without following a
+/// substituted name: the descriptor is validated as an ordinary file, so it is
+/// the object that gets read and the object a later removal is bound to.
+fn open_rollout_duplicate(path: &Path) -> io::Result<File> {
+    open_regular_identity_file(path).map_err(|error| {
+        // The identity helper reports non-ordinary files without an OS error code.
+        if error.raw_os_error().is_none() && error.kind() == io::ErrorKind::Other {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "rollout duplicate is not an ordinary file; preserving both copies",
-            ));
+            )
+        } else {
+            error
         }
-        let file = File::open(path)?;
+    })
+}
+
+/// Compare the decoded bytes of two opened rollout copies from their current
+/// offsets; the paths only select the plain or zstd decoding.
+fn rollouts_have_identical_bytes(
+    first: (&Path, &File),
+    second: (&Path, &File),
+) -> io::Result<bool> {
+    use std::io::BufRead;
+    fn reader<'a>((path, file): (&Path, &'a File)) -> io::Result<Box<dyn BufRead + 'a>> {
         if path.extension().is_some_and(|extension| extension == "zst") {
             Ok(Box::new(std::io::BufReader::new(
                 zstd::stream::read::Decoder::new(file)?,
@@ -849,6 +899,39 @@ impl RolloutLineReader {
             // Return the small reference for the operational decoder to account
             // for its record slot without opening or retaining the diagnostic blob.
             return Ok(Some(HydratedRecord::Text(line)));
+        }
+        if self.enroll_payloads && crate::payload_artifact::is_context_replay_reference(&line) {
+            // Append preflight never consumes a diagnostic replay body either: the
+            // resumed history and append visitors discard it. Confirm the body is
+            // present at its recorded size and enroll it for the durable barrier
+            // without reading, hashing or parsing it. A missing or wrong-size body
+            // stays an unresolved payload; full diagnostic readers still verify it.
+            let path = self.path.clone();
+            let payload_sync_owner = crate::payload_artifact::PayloadSyncOwner::new(&path);
+            let measure = timing.is_some();
+            let (line, result, elapsed) = tokio::task::spawn_blocking(move || {
+                let started = measure.then(std::time::Instant::now);
+                let result = crate::payload_artifact::enroll_replay_reference(&path, &line);
+                drop(payload_sync_owner);
+                (line, result, started.map(|started| started.elapsed()))
+            })
+            .await
+            .map_err(io::Error::other)?;
+            if let Some(timing) = timing {
+                timing.candidates += 1;
+                timing.replay_size_checked += 1;
+                if let Some(elapsed) = elapsed {
+                    timing.enroll += elapsed;
+                }
+            }
+            return match result {
+                Ok(()) => Ok(Some(HydratedRecord::Text(line))),
+                Err(error) => {
+                    self.unresolved_payloads = self.unresolved_payloads.saturating_add(1);
+                    tracing::warn!(path = %self.path.display(), %error, "skipping unreadable rollout payload");
+                    Ok(Some(HydratedRecord::Text("invalid rollout payload record".to_owned())))
+                }
+            };
         }
         let path = self.path.clone();
         let enroll = self.enroll_payloads;

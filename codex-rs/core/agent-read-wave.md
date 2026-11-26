@@ -30,6 +30,13 @@ and their native failures separately. You can collect again on the same
 wave once pending work settles; do not reassign or follow up on its producers
 as part of collection.
 
+When early reports have useful independent work (for example, inspecting cited
+evidence) and other workers may run much longer, pass `{completion_mode:"any"}`.
+The helper then returns at the first terminal worker with a `remaining` wave;
+store `remaining` and collect it in a later cell. Its rows map only the
+producers that were still uncollected. The default (`"all"`) still returns once
+every admitted worker settles.
+
 Make the source version, scope, and evidence requirements explicit in the
 message when they differ. For independent verification or separate owners,
 use distinct `producer` names or direct assignments, even when the messages

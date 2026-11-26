@@ -426,12 +426,17 @@ impl ToolRouter {
             apply_visible_namespace_description_budget(&mut visible);
             Arc::new(ToolSchemaArtifact::new(visible))
         };
-        if !activated.is_empty()
-            && let Some(warning) = tool_schema_size_warning(&schemas)
-        {
+        let warning = if activated.is_empty() {
+            None
+        } else {
+            tool_schema_size_warning(&schemas)
+        };
+        *cache = Some((activated.clone(), Arc::clone(&schemas)));
+        // Emit the advisory after releasing the cache guard.
+        drop(cache);
+        if let Some(warning) = warning {
             tracing::warn!("{warning}");
         }
-        *cache = Some((activated.clone(), Arc::clone(&schemas)));
         schemas
     }
 

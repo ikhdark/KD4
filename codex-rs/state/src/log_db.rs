@@ -52,6 +52,11 @@ use crate::runtime::LogRetentionScope;
 const LOG_QUEUE_CAPACITY: usize = 512;
 const LOG_BATCH_SIZE: usize = 128;
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+/// Longest a request handler waits in [`LogDbLayer::flush_within`] for queued log inserts to settle
+/// before proceeding without confirmation. A healthy flush completes in milliseconds; the bound only
+/// matters when the log database is locked and each queued insert batch waits out the SQLite busy
+/// timeout.
+pub const REQUEST_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const SQLX_LOG_TARGETS: [&str; 3] = ["sqlx", "sqlx_core", "sqlx_sqlite"];
 // Span records are diagnostic history, not an unbounded event log. Retain the
 // newest UTF-8 suffix; thread identity is stored separately in SpanLogContext.
@@ -166,6 +171,19 @@ impl LogDbLayer {
             .map_err(|_| anyhow::anyhow!("log inserter stopped before acknowledging flush"))?
     }
 
+    /// Like [`Self::flush`], but gives up after `timeout` (including time spent waiting for queue
+    /// admission). The Flush command is serialized behind every queued insert batch, and each batch
+    /// can wait the SQLite busy timeout when the log database is locked, so an unbounded flush lets a
+    /// stalled log database stall callers that only need the buffered entries to settle on a
+    /// best-effort basis. Giving up abandons only the wait: the command stays queued, its reply is
+    /// dropped without effect, and a later flush still reports any pending insertion failure.
+    pub async fn flush_within(&self, timeout: Duration) -> anyhow::Result<()> {
+        tokio::time::timeout(timeout, self.flush())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("timed out after {timeout:?} waiting for queued log inserts")
+            })?
+    }
 }
 
 impl<S> Layer<S> for LogDbLayer

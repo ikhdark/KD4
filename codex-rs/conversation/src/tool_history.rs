@@ -415,8 +415,7 @@ impl ToolHistoryCandidate {
 
     /// A checkpoint describes what survived, not whether the task no longer
     /// needs it. Keep producer assertions separate from runtime eligibility.
-    fn checkpoint_preservation(&self) -> serde_json::Value {
-        let pin = self.checkpoint_pin();
+    fn checkpoint_preservation(&self, pin: Option<(String, usize)>) -> serde_json::Value {
         let pin_sha256 = pin.as_ref().map(|(text, _)| sha256(text.as_bytes()));
         let pin = pin.and_then(|(text, _)| serde_json::from_str::<serde_json::Value>(&text).ok());
         let output = serde_json::from_str::<serde_json::Value>(&self.bounded_model_output).ok();
@@ -1251,6 +1250,8 @@ pub fn phase_checkpoint_ids(item: &ResponseItem) -> Option<Vec<String>> {
 /// retire evidence exactly like explicit checkpoints, whose projection keys on
 /// the receipt IDs alone, but carry no assistant conclusions.
 const PRESSURE_RETIREMENT_SOURCE: &str = "context_pressure";
+/// S16/AT03: only arguments larger than this are evicted with their retired output.
+const ARGUMENT_STUB_MIN_BYTES: usize = 1024;
 
 /// Why the runtime retired consumed tool results. Recorded in the checkpoint
 /// so a rollout distinguishes the two triggers without inferring them from
@@ -1962,7 +1963,7 @@ impl ToolHistoryState {
                         resolution_call_id.is_none()
                     } { "unresolved_failure" }
                     else if sha256(output.as_bytes()) != candidate.derived.bounded_model_output_sha256 { "representation_changed" }
-                    else if let Some((_, tokens)) = candidate.checkpoint_pin() {
+                    else if let Some((_, tokens)) = self.checkpoint_pin_for(candidate) {
                         pin_tokens = Some(tokens);
                         if exclude == Some(call_id) {
                             "before_candidate_cut"
@@ -2009,7 +2010,7 @@ impl ToolHistoryState {
                             "minimum_relative_savings_percent":MINIMUM_RELATIVE_SAVINGS_PERCENT,
                             "artifact_sha256":candidate.artifact_sha256,
                             "artifact_bytes":candidate.artifact_bytes,
-                            "preserved":candidate.checkpoint_preservation(),
+                            "preserved":candidate.checkpoint_preservation(self.checkpoint_pin_for(candidate)),
                             "semantic_necessity":"unknown; not an eligibility input",
                         })),
                     }));
@@ -2387,6 +2388,7 @@ impl ToolHistoryState {
         }
         let reused = crate::tool_occurrence::reused_call_ids(items);
         let mut checkpointed = ProjectedResponseItems::Shared(Arc::clone(items));
+        let mut pinned_call_ids = BTreeSet::<String>::new();
         let resolutions = FailureResolutionIndex::default();
         for (index, item) in items.iter().enumerate() {
             let Some((call_id, output)) = canonical_textual_output_identity(item) else {
@@ -2407,12 +2409,49 @@ impl ToolHistoryState {
             {
                 continue;
             }
-            let Some((pin, _)) = candidate.checkpoint_pin() else {
+            let Some((pin, _)) = self.checkpoint_pin_for(candidate) else {
                 continue;
             };
             if let Some((_, body)) = textual_output_body_mut(&mut checkpointed.make_owned()[index])
             {
                 replace_model_visible_output_text(body, pin);
+                pinned_call_ids.insert(call_id.to_string());
+            }
+        }
+        // S16/AT03: the call's own bulky arguments leave the request
+        // only for calls whose output was just retired; the durable rollout keeps
+        // the exact bytes and `context:resume-state` resume_filter.call_id restores them.
+        if !pinned_call_ids.is_empty() {
+            for index in 0..items.len() {
+                let stub = match &items[index] {
+                    ResponseItem::FunctionCall { call_id, arguments, .. }
+                        if arguments.len() > ARGUMENT_STUB_MIN_BYTES
+                            && pinned_call_ids.contains(call_id.as_str()) =>
+                    {
+                        Some(serde_json::json!({"evicted_arguments": {
+                            "call_id": call_id, "bytes": arguments.len(),
+                            "sha256": sha256(arguments.as_bytes()),
+                            "restore": "read_file path=context:resume-state with resume_filter.call_id",
+                        }}).to_string())
+                    }
+                    ResponseItem::CustomToolCall { call_id, input, .. }
+                        if input.len() > ARGUMENT_STUB_MIN_BYTES
+                            && pinned_call_ids.contains(call_id.as_str()) =>
+                    {
+                        Some(format!(
+                            "/* evicted_arguments call_id={call_id} bytes={} sha256={} restore: read_file path=context:resume-state with resume_filter.call_id */",
+                            input.len(), sha256(input.as_bytes())
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some(stub) = stub {
+                    match &mut checkpointed.make_owned()[index] {
+                        ResponseItem::FunctionCall { arguments, .. } => *arguments = stub,
+                        ResponseItem::CustomToolCall { input, .. } => *input = stub,
+                        _ => {}
+                    }
+                }
             }
         }
         // Recovery pins carry the needed addresses. Runtime retirement records
@@ -3090,6 +3129,51 @@ impl ToolHistoryState {
             pin["sources"] = sources;
         }
         pin
+    }
+
+    /// A code-mode carrier's in-place pin names no source although the ledger
+    /// holds each nested read's exact `source_sha256`. Surface up to four of
+    /// them (`nested_reads`) so a conditional re-read (`if_source_hash`) can
+    /// credit an unchanged source after retirement. Eligibility stays with
+    /// `checkpoint_pin`; direct pins are returned as is.
+    fn checkpoint_pin_for(&self, candidate: &ToolHistoryCandidate) -> Option<(String, usize)> {
+        let pin = candidate.checkpoint_pin()?;
+        let Some(nested) = self.code_mode_nested_evidence.get(&candidate.call_id) else {
+            return Some(pin);
+        };
+        let reads = nested
+            .values()
+            .filter_map(|result| {
+                let output = serde_json::from_str::<serde_json::Value>(&result.output).ok()?;
+                let path = output.get("path")?.as_str()?;
+                let sha = output.get("source_sha256")?.as_str()?;
+                (sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| {
+                    let mut read = serde_json::Map::new();
+                    read.insert("path".into(), path.into());
+                    read.insert("source_sha256".into(), sha.into());
+                    if let Some(bytes) = output.get("canonical_bytes") {
+                        read.insert("canonical_bytes".into(), bytes.clone());
+                    }
+                    serde_json::Value::Object(read)
+                })
+            })
+            .collect::<Vec<_>>();
+        if reads.is_empty() {
+            return Some(pin);
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&pin.0) else {
+            return Some(pin);
+        };
+        let omitted = reads.len().saturating_sub(4);
+        value["nested_reads"] = serde_json::Value::Array(reads.into_iter().take(4).collect());
+        if omitted > 0 {
+            value["nested_reads_omitted"] = omitted.into();
+        }
+        let Ok(rendered) = serde_json::to_string(&value) else {
+            return Some(pin);
+        };
+        let tokens = approx_token_count(&rendered);
+        Some((rendered, tokens))
     }
 
     /// Paths observed through a call whose own receipt names no source: a

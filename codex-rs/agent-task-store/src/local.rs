@@ -744,7 +744,15 @@ impl LocalAgentTaskStore {
         // wait for storage ownership while holding the home-wide SQL writer.
         let lease_deadline = tokio::time::Instant::now() + DATABASE_BUSY_TIMEOUT;
         let capsule_lease = loop {
-            if let Some(lease) = try_capsule_lease(capsule_path.with_extension("lock")).await? { break lease; }
+            if let Some(lease) = try_capsule_lease(capsule_path.with_extension("lock")).await? {
+                // The acquisition itself can finish after the caller's bound (for
+                // example while it waited for a blocking worker). Honor the bound
+                // instead of publishing late; dropping the lease releases it.
+                if tokio::time::Instant::now() >= lease_deadline {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "task capsule publication is busy").into());
+                }
+                break lease;
+            }
             if tokio::time::Instant::now() >= lease_deadline {
                 return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "task capsule publication is busy").into());
             }
@@ -2820,6 +2828,9 @@ LIMIT 1
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
+            if reap_abandoned_capsule_temporary(&capsule_dir, &path, name).await {
+                continue;
+            }
             let is_stage = name.starts_with('.') && name.ends_with(".staged.json");
             if !is_stage && (name.starts_with('.') || !name.ends_with(".json")) {
                 continue;
@@ -3203,6 +3214,29 @@ impl LocalAgentTaskStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Agent path of an attempt whose newest retained terminal outcome is not yet
+    /// acknowledged: its completion forwarder committed durable completion but has
+    /// not confirmed result-mail delivery to the parent.
+    pub async fn undelivered_terminal_outcome_agent_path(
+        &self,
+        attempt: AttemptId,
+    ) -> StoreResult<Option<String>> {
+        let row = sqlx::query(
+            "SELECT binding_json, acknowledged FROM pending_terminal_outcomes WHERE attempt_id = ? ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(attempt.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if row.get::<i64, _>("acknowledged") != 0 {
+            return Ok(None);
+        }
+        decode::<AgentTaskBinding>(&row.get::<String, _>("binding_json"))
+            .map(|binding| Some(binding.agent_path))
     }
 
     /// Agent path of an attempt whose terminal outcome mail reached its parent.
@@ -4549,6 +4583,10 @@ async fn restore_missing_capsule(path: PathBuf, payload: String) -> StoreResult<
         let temporary = path.with_extension(format!("{}.repair", AttemptId::new()));
         let result = (|| -> StoreResult<()> {
             let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            // Best-effort liveness marker for startup reaping: a crashed writer's
+            // lock dies with it, a live writer's does not. Released by the drop
+            // below, before the link.
+            let _ = file.try_lock();
             file.write_all(payload.as_bytes())?;
             file.sync_all()?;
             drop(file);
@@ -5656,6 +5694,72 @@ async fn try_capsule_lease(path: PathBuf) -> StoreResult<Option<std::fs::File>> 
     }).await.map_err(std::io::Error::other)?.map_err(StoreError::from)
 }
 
+/// Read-repair temporaries are written without the assignment lease, so their
+/// age is part of the proof that the writer is gone.
+const CAPSULE_REPAIR_TEMP_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Startup reaping of publication temporaries a crash left behind: the attach
+/// temporary `.{assignment}.staged.{attempt}.writing` and the read-repair
+/// temporary `{assignment}.{attempt}.repair`. Returns true when `name` is such
+/// a temporary (reaped or deliberately retained) so it is not treated as a
+/// capsule. Removal needs proof that no live writer can own it: the assignment
+/// lease, which attach holds from before it creates its temporary until after
+/// it removes or renames it, and, for a repair temporary that no lease
+/// protects, an age past the grace plus the temporary's own lock, which its
+/// writer holds and the OS drops with the process. Any doubt retains the file.
+async fn reap_abandoned_capsule_temporary(capsule_dir: &Path, path: &Path, name: &str) -> bool {
+    let (assignment, attempt, repair) =
+        if let Some(rest) = name.strip_prefix('.').and_then(|rest| rest.strip_suffix(".writing")) {
+            let Some((assignment, attempt)) = rest.split_once(".staged.") else { return false; };
+            (assignment, attempt, false)
+        } else if let Some(rest) = name.strip_suffix(".repair") {
+            let Some((assignment, attempt)) = rest.split_once('.') else { return false; };
+            (assignment, attempt, true)
+        } else {
+            return false;
+        };
+    match (AssignmentId::parse(assignment), AttemptId::parse(attempt)) {
+        (Ok(id), Ok(_)) if id.to_string() == assignment => {}
+        _ => return false,
+    }
+    let lease_path = capsule_dir.join(format!("{assignment}.lock"));
+    let _lease = match try_capsule_lease(lease_path.clone()).await {
+        Ok(Some(lease)) => lease,
+        // A live publisher owns its temporary.
+        Ok(None) => return true,
+        Err(error) => {
+            tracing::warn!(path = %lease_path.display(), temporary = %path.display(), %error, "task capsule lease unavailable; temporary retained");
+            return true;
+        }
+    };
+    let temporary = path.to_path_buf();
+    let reaped = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        if repair {
+            let file = std::fs::OpenOptions::new().read(true).write(true).open(&temporary)?;
+            let aged = file.metadata()?.modified().ok()
+                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age >= CAPSULE_REPAIR_TEMP_GRACE);
+            // Unsupported or contended locking fails closed.
+            if !aged || file.try_lock().is_err() {
+                return Ok(false);
+            }
+            drop(file);
+        }
+        std::fs::remove_file(&temporary)?;
+        Ok(true)
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|result| result);
+    match reaped {
+        Ok(true) => tracing::info!(temporary = %path.display(), "reaped abandoned task capsule temporary"),
+        Ok(false) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(temporary = %path.display(), %error, "task capsule temporary could not be reaped; retained"),
+    }
+    true
+}
+
 fn task_capsule_staging_path(coordination_root: &Path, assignment_id: AssignmentId) -> PathBuf {
     coordination_root
         .join("task_capsules")
@@ -5732,8 +5836,41 @@ fn is_canonical_persisted_task_capsule(
     payload: &str,
 ) -> StoreResult<bool> {
     let canonical = serde_json::to_string(capsule)?;
-    if canonical == payload {
+    if matches_canonical_or_planless(capsule, &canonical, payload) {
         return Ok(true);
+    }
+
+    // Capsules committed before workspace_strategy was removed (5cabc244e6)
+    // are immutable too. That serializer wrote the field, when set, directly
+    // before relation, architecture_contract_ref or integration_plan. Accept
+    // exactly one such top-level field at that position with an otherwise
+    // canonical remainder: an unescaped `,"` cannot occur inside a JSON
+    // string, and no nested capsule type carried this key.
+    const LEGACY_STRATEGY_FIELD: &str = ",\"workspace_strategy\":\"";
+    let Some((before, rest)) = payload.split_once(LEGACY_STRATEGY_FIELD) else {
+        return Ok(false);
+    };
+    if rest.contains(LEGACY_STRATEGY_FIELD) {
+        return Ok(false);
+    }
+    let Some(after) = ["auto\"", "shared\"", "isolated\""]
+        .into_iter()
+        .find_map(|value| rest.strip_prefix(value))
+    else {
+        return Ok(false);
+    };
+    if ![",\"relation\":", ",\"architecture_contract_ref\":", ",\"integration_plan\":"]
+        .into_iter()
+        .any(|key| after.starts_with(key))
+    {
+        return Ok(false);
+    }
+    Ok(matches_canonical_or_planless(capsule, &canonical, &format!("{before}{after}")))
+}
+
+fn matches_canonical_or_planless(capsule: &TaskCapsuleV1, canonical: &str, payload: &str) -> bool {
+    if canonical == payload {
+        return true;
     }
 
     // Capsules written before integration_plan was added are immutable. Their
@@ -5742,10 +5879,10 @@ fn is_canonical_persisted_task_capsule(
     if capsule.integration_plan == IntegrationPlan::SingleWriter {
         const DEFAULT_PLAN_FIELD: &str = ",\"integration_plan\":\"single_writer\"";
         if let Some((before, after)) = canonical.split_once(DEFAULT_PLAN_FIELD) {
-            return Ok(payload == format!("{before}{after}"));
+            return payload == format!("{before}{after}");
         }
     }
-    Ok(false)
+    false
 }
 
 async fn durable_wake_watermark(connection: &mut sqlx::SqliteConnection) -> StoreResult<i64> {

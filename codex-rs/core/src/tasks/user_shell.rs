@@ -42,6 +42,8 @@ use codex_protocol::protocol::ExecOutputStream;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
+use codex_shell_command::powershell::extract_powershell_command;
+use codex_shell_command::powershell::preserve_powershell_native_exit_code;
 
 use super::SessionTask;
 use super::SessionTaskResult;
@@ -475,13 +477,14 @@ async fn execute_remote_user_shell_command(
         CODEX_THREAD_ID_ENV_VAR.to_string(),
         session.thread_id.to_string(),
     );
-    let display_command = maybe_wrap_shell_lc_with_snapshot_file(
+    let wrapped_command = maybe_wrap_shell_lc_with_snapshot_file(
         &display_command,
         environment_shell,
         shell_snapshot.as_deref(),
         &policy.r#set,
         &mut env,
     );
+    let display_command = preserve_user_shell_native_exit_code(&display_command, wrapped_command);
     let process_id = call_id.into();
     let exec_backend = turn_environment.exec_backend();
     let params = ExecParams {
@@ -738,7 +741,7 @@ fn prepare_user_shell_exec_command(
     exec_env_map: &mut HashMap<String, String>,
 ) -> Vec<String> {
     {
-        maybe_wrap_shell_lc_with_snapshot_file(
+        let command = maybe_wrap_shell_lc_with_snapshot_file(
             display_command,
             shell,
             shell_snapshot,
@@ -747,8 +750,21 @@ fn prepare_user_shell_exec_command(
             // On Windows, arg0 has already prepended the package path to the
             // process PATH before create_env() builds exec_env_map. Shell
             // snapshot replay does not need additional runtime path entries.
-        )
+        );
+        preserve_user_shell_native_exit_code(display_command, command)
     }
+}
+
+/// Keeps a plain PowerShell command line's own native exit code, as the
+/// model-launched shell tools do. The recorded and displayed command stay the
+/// user's original script; only the spawned argv changes.
+fn preserve_user_shell_native_exit_code(
+    display_command: &[String],
+    command: Vec<String>,
+) -> Vec<String> {
+    extract_powershell_command(display_command)
+        .and_then(|(_, script)| preserve_powershell_native_exit_code(&command, script))
+        .unwrap_or(command)
 }
 
 async fn persist_user_shell_output(

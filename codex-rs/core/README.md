@@ -19,6 +19,11 @@ process boundaries, start with the [workspace map](../README.md).
    [session/turn.rs](src/session/turn.rs) coordinates model sampling and results.
    [turn_execution.rs](src/session/turn_execution.rs) owns execution control and
    completion reconciliation. Its batching notice counts tool calls, not the operations inside each call.
+   The ordinary final gate can offer one owner-settlement opportunity for a
+   previously launched validation check, before invoking Stop. It does not
+   launch or replay checks, or treat capture loss as a pending operation.
+   An already published answer, or one without generation capacity left,
+   completes normally with the pending check in its assessment.
    [turn_context.rs](src/session/turn_context.rs) and
    [step_context.rs](src/session/step_context.rs) carry turn/step configuration.
 4. [tools/router.rs](src/tools/router.rs) and
@@ -30,6 +35,15 @@ process boundaries, start with the [workspace map](../README.md).
 ## Avoid unnecessary continuations
 
 - Send `exec_command.yield_time_ms` as an integer. The [command decoder](src/tools/handlers/unified_exec.rs) also repairs a canonical decimal string in that one observation field and reports the conversion before applying the usual bounds. It does not infer other arguments, repair shell syntax, or retry a command.
+- A yielded noninteractive command that exits before the generation's last
+  tool result is delivered reaches the next request without a model poll: the
+  [turn drain](src/session/turn.rs) appends one `background_completion`
+  contextual receipt carrying the result the ordinary empty poll returned
+  (bounded output, exit code, artifact reference). The
+  [process owner](src/unified_exec/process_manager.rs) produces it through that
+  poll path, so a later poll of a drained session returns only its completion
+  status and output reference. Running, interactive, mid-launch, shutting-down
+  and currently polled processes are left for the model's own poll.
 
 - Resolve known completion blockers before drafting a final. Use the
   [current plan and its native receipts](../tools/src/builtin_specs/plan_progress.md);
@@ -138,8 +152,12 @@ not establish that an external effect did not happen.
 | Tool-output retirement under context pressure | [Context-limit continuation](src/session/turn.rs) may prefer a shorter rewritten request tail in the soft, post-response lane when the reviewed candidate has sufficient calibrated reclaim. Hard and projected pressure preserve the existing oldest-first decision and compaction fallback. [History and exact pin custody](../conversation/src/context_manager/history.rs), [eligible older outputs](../conversation/src/tool_history.rs). |
 | Bounded completion attribution | [Existing-test outline attribution](src/session/turn.rs) retains one shared analysis deadline and reports paths by gap (budget, parser recovery, or unavailable outline/worker). Parser recovery is not a compiler result; incomplete analysis does not prove an edit or that tests were unchanged. |
 | Live recovery evidence | [session/resume_inventory.rs](src/session/resume_inventory.rs), [unified_exec/process_inventory.rs](src/unified_exec/process_inventory.rs) |
+| Speculative PowerShell launch (Windows) | [unified_exec/speculative_shell.rs](src/unified_exec/speculative_shell.rs) pre-starts pwsh 7 hosts for local, non-interactive `-Command` launches after an eligible launch or an announced `exec`/`exec_command` call (process-wide pool of two, up to two per key; `CODEX_THREAD_ID` is bound at handoff). Hosts run below normal priority until handoff and then restore the class Windows assigned at creation, so commands keep the priority an ordinary launch gets. The [bootstrap](src/unified_exec/speculative_shell_bootstrap.ps1) receives the exact launch script and runs it with `-Command` exit semantics, or declines before running anything (parse error, `param`/`begin`/`process` blocks, top-level `return`, `break`/`continue` outside a loop/switch/trap, or a non-empty profile for a login launch, after which no login hosts are prepared in that process). The script is written only to a pipe client whose process id is the host's, and an accepted host is recorded as the consuming call's requested root (creation and hand-off times). A key mismatch, decline, dead host or timeout falls back to the ordinary launch; unused hosts expire after 45 s. Disabled by default: ordinary cold launch avoids the measured termination overhead. Opt in with `KD4_SPECULATIVE_SHELL=1`; set `0` or leave it unset to use cold launch. |
+| Responses retry, reconnect and fallback | [responses_retry.rs](src/responses_retry.rs) owns the decisions. After a close that invites a reconnect, a sampling request dials its replacement WebSocket during the unchanged backoff ([`prewarm_websocket_during_backoff`](../model-client/src/client.rs)); dispatch adopts it only if already connected, otherwise connects as before. Deadlines, retry budgets and fallback are unchanged. |
 | Approval and full-access execution | [tools/orchestrator.rs](src/tools/orchestrator.rs), [tools/sandboxing.rs](src/tools/sandboxing.rs) (legacy compatibility names), [exec_policy.rs](src/exec_policy.rs) |
-| MCP session integration | [mcp.rs](src/mcp.rs), [mcp_tool_call.rs](src/mcp_tool_call.rs), [session/mcp.rs](src/session/mcp.rs) (start, refresh, publication), [session/mcp_runtime.rs](src/session/mcp_runtime.rs) (snapshots and lifecycle) |
+| MCP session integration | [mcp.rs](src/mcp.rs), [mcp_tool_call.rs](src/mcp_tool_call.rs), [session/mcp.rs](src/session/mcp.rs) (start, refresh, publication), [session/mcp_runtime.rs](src/session/mcp_runtime.rs) (snapshots and lifecycle). Spawned agents cannot call MCP tools (`DynamicExternal`), so their sessions [defer](../codex-mcp/src/connection_manager.rs) optional local stdio servers whose identical catalog is already known in this process: the catalog and resource capability are advertised at once and the server starts on its first operation, such as a resource read. Root sessions and required servers start eagerly as before. |
+| MCP hung-server probe | After any request to an MCP server times out, [`RmcpClient`](../rmcp-client/src/rmcp_client.rs) gates that server's next tool call on a `ping` answered within min(tool timeout / 4, 10 s). No answer refuses the call before it is sent (safe to retry); any answer, including a JSON-RPC error, clears the gate. A server still busy past the probe is refused too. |
+| Automatic retry wait budget | [responses_retry.rs](src/responses_retry.rs) bounds automatic recovery after a model request's first failure at 120 s for every session source, including `codex exec`. Provider `Retry-After` beyond the remaining budget stops the request with `interactive_retry_budget_exhausted` instead of waiting; account-switch and network-loss waits remain interactive-only. |
 
 ## Focused modules behind the orchestration
 
@@ -164,6 +182,21 @@ one request when the just-completed generation reports that at least half of its
 input was cached. Unknown usage, new user input and insufficient physical headroom
 do not qualify. Prepared-prompt admission rechecks the waiver; continued pressure
 and provider overflow still take the existing compaction paths.
+
+Remote-v2 compaction requests send the sampling requests' request-level effort
+baseline and keep the turn's positional reasoning-effort updates
+([request builder](../model-client/src/client.rs), [remote compaction](src/compact_remote_v2.rs)),
+so the compaction prompt is the preceding turn prompt plus its trigger and can reuse
+the provider's cached prefix. Unsupported providers or models, workers, internal
+sessions and custom efforts drop positional updates for both request kinds.
+[Local compaction](src/compact.rs) still drops the updates and sends the selected
+effort: its prompt already differs from the turn prompt before the first update.
+When remote compaction runs before sampling has recorded the selected effort
+(pre-sampling or manual compaction, or a resumed session whose effort changed), the
+[compaction effort helpers](src/session/turn_context.rs) append that effort's update
+before the trigger in [every remote input](src/compact_remote_v2_attempt.rs), in the
+compaction prompt only. History and the session pin are unchanged. A custom selected
+effort is sent as the request-level effort alone.
 
 The [compaction history commit](src/session/mod.rs) records one pending
 `SessionStart(compact)` occurrence after each successful replacement. The

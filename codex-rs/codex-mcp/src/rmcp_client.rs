@@ -195,7 +195,7 @@ impl ManagedClient {
         Ok((catalog.generation, schema))
     }
 
-    fn listed_tools(&self) -> Vec<ToolInfo> {
+    pub(crate) fn listed_tools(&self) -> Vec<ToolInfo> {
         let Some(catalog) = self.current_catalog() else {
             return Vec::new();
         };
@@ -620,9 +620,27 @@ pub(crate) struct AsyncManagedClient {
     pub(crate) cancel_token: CancellationToken,
     pub(crate) manager_owners: Arc<AtomicUsize>,
     pub(crate) manager_lease: Arc<std::sync::Mutex<Option<bool>>>,
+    /// Catalog of an identical server already started in this process. A
+    /// deferred client advertises it and starts only for an actual operation.
+    pub(crate) deferred_catalog: Option<Arc<crate::connection_manager::DeferredCatalog>>,
 }
 
 impl AsyncManagedClient {
+    pub(crate) fn with_deferred_catalog(
+        mut self,
+        catalog: Arc<crate::connection_manager::DeferredCatalog>,
+    ) -> Self {
+        self.deferred_catalog = Some(catalog);
+        self
+    }
+
+    /// Deferred and not yet started: the cached catalog stands in for discovery.
+    pub(crate) fn is_deferred_unstarted(&self) -> bool {
+        self.deferred_catalog.is_some()
+            && !self.startup_complete.load(Ordering::Acquire)
+            && self.client.peek().is_none()
+    }
+
     pub(crate) fn next_approval_incarnation() -> u64 {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -740,6 +758,7 @@ impl AsyncManagedClient {
             cancel_token,
             manager_owners: Arc::new(AtomicUsize::new(1)),
             manager_lease: Arc::new(std::sync::Mutex::new(None)),
+            deferred_catalog: None,
         }
     }
 
@@ -883,12 +902,14 @@ impl AsyncManagedClient {
         self.codex_apps_tools_cache_context
             .as_ref()
             .is_some_and(CodexAppsToolsCacheContext::has_current_tools)
+            || self.deferred_catalog.is_some()
     }
 
     fn cached_tools(&self) -> Option<Vec<ToolInfo>> {
         self.codex_apps_tools_cache_context
             .as_ref()
             .and_then(CodexAppsToolsCacheContext::current_tools)
+            .or_else(|| self.deferred_catalog.as_ref().map(|catalog| catalog.tools.clone()))
             .map(|tools| filter_tools(tools, &self.tool_filter))
     }
 
@@ -948,8 +969,18 @@ impl AsyncManagedClient {
                 .iter()
                 .find(|tool| tool.tool.name == tool_name)
                 .cloned()
+        } else if let Some(catalog) = catalog {
+            catalog
+                .tools
+                .iter()
+                .find(|tool| tool.tool.name == tool_name)
+                .cloned()
         } else {
-            catalog?
+            // A deferred server that has not started describes its call from the
+            // identical server's catalog; the call itself starts the server.
+            self.deferred_catalog
+                .as_ref()
+                .filter(|_| !self.startup_complete.load(Ordering::Acquire))?
                 .tools
                 .iter()
                 .find(|tool| tool.tool.name == tool_name)
@@ -1154,7 +1185,9 @@ where
         Vec::new()
     };
     Ok(match (cache_context, ticket) {
-        (Some(context), Some(ticket)) => context.publish_if_newest_accepted(ticket, server_info, tools).await,
+        (Some(context), Some(ticket)) => context
+            .publish_if_newest_accepted(ticket, server_info, tools, || true)
+            .await,
         (None, None) => tools,
         _ => unreachable!("fetch ticket requires cache context"),
     })
@@ -1396,9 +1429,15 @@ fn spawn_tool_catalog_refresh_worker(
                 if client.session_generation() != generation || !client.managed_auth_scope_is_current() {
                     return Err(anyhow!("MCP session changed during tool discovery"));
                 }
+                // The check above precedes the publication queue. Re-check inside it
+                // so a session replaced while waiting cannot publish its tools.
+                let publication_client = Arc::clone(&client);
                 let refreshed = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
                     (Some(cache), Some(ticket)) => cache
-                        .publish_if_newest_accepted(ticket, &next.server_info, refreshed).await,
+                        .publish_if_newest_accepted(ticket, &next.server_info, refreshed, move || {
+                            publication_client.session_generation() == generation
+                                && publication_client.managed_auth_scope_is_current()
+                        }).await,
                     (None, None) => refreshed,
                     _ => unreachable!("Codex Apps fetch ticket requires cache context"),
                 };

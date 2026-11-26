@@ -277,11 +277,14 @@ impl Drop for RolloutLeaseCustody {
                 "rollout writer stopped before terminal settlement",
             ));
         }
-        self.0
+        // Close the file after the guard, still before signalling release.
+        let writer_lease = self
+            .0
             .writer_lease
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        drop(writer_lease);
         self.0.lease_custody_released.send_replace(true);
     }
 }
@@ -1498,8 +1501,11 @@ impl RolloutRecorder {
             if matches!(&record, HydratedRecord::Text(line) if line.trim().is_empty()) {
                 continue;
             }
-            if exclude_context_replay && matches!(&record, HydratedRecord::Text(line)
-                if crate::payload_artifact::is_context_replay_reference(line))
+            // Excluded (operational load) and size-checked (append preflight) replay
+            // references keep their record slot without decoding a diagnostic body.
+            if (exclude_context_replay || enroll_dependencies)
+                && matches!(&record, HydratedRecord::Text(line)
+                    if crate::payload_artifact::is_context_replay_reference(line))
             {
                 decoder.note_undecoded_record();
                 continue;
@@ -1584,7 +1590,9 @@ impl RolloutRecorder {
         let mut reader = compression::open_rollout_line_reader(path).await?;
         reader.enroll_payload_dependencies();
         while let Some(line) = reader.next_line().await? {
-            if line.trim().is_empty() {
+            // Enrolled replay references arrive size-checked but undecoded; they
+            // carry neither session metadata nor tool manifests.
+            if line.trim().is_empty() || crate::payload_artifact::is_context_replay_reference(&line) {
                 continue;
             }
             let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(line.trim()) else {
@@ -2720,6 +2728,7 @@ where
                 "payload_sha256_ns": timing.payload.sha256.as_nanos(),
                 "payload_parse_ns": timing.payload.parse.as_nanos(),
                 "plain_replay_projected": timing.payload.plain_replay_projected,
+                "replay_size_checked": timing.payload.replay_size_checked,
                 "payload_enroll_ns": timing.payload.enroll.as_nanos(),
                 "payload_envelope_ns": timing.payload.envelope.as_nanos(),
                 "canonical_decode_ns": timing.decode.as_nanos(),

@@ -12,6 +12,9 @@ use crate::operations::run_git_for_stdout;
 ///
 /// The function mirrors `git merge-base HEAD <branch>` but returns `Ok(None)` when
 /// the repository has no `HEAD` yet or when the branch cannot be resolved.
+/// A missing or unusable upstream falls back to the local branch. Any other
+/// Git failure, including a failed local/upstream comparison, is returned
+/// rather than reported as absence.
 pub fn merge_base_with_head(
     repo_path: &Path,
     branch: &str,
@@ -62,11 +65,14 @@ pub fn resolve_commit(repo_root: &Path, revision: &str) -> Result<String, GitToo
 }
 
 fn resolve_branch_ref(repo_root: &Path, branch: &str) -> Result<Option<String>, GitToolingError> {
+    // `--quiet` makes a name that does not resolve exit with status 1, leaving
+    // 128 for fatal failures that must not be reported as an absent branch.
     let rev = run_git_for_stdout(
         repo_root,
         vec![
             OsString::from("rev-parse"),
             OsString::from("--verify"),
+            OsString::from("--quiet"),
             OsString::from(branch),
         ],
         /*env*/ None,
@@ -74,7 +80,7 @@ fn resolve_branch_ref(repo_root: &Path, branch: &str) -> Result<Option<String>, 
 
     match rev {
         Ok(rev) => Ok(Some(rev)),
-        Err(GitToolingError::GitCommand { .. }) => Ok(None),
+        Err(GitToolingError::GitCommand { status, .. }) if status.code() == Some(1) => Ok(None),
         Err(other) => Err(other),
     }
 }
@@ -115,7 +121,8 @@ fn resolve_upstream_if_remote_ahead(
         /*env*/ None,
     ) {
         Ok(counts) => counts,
-        Err(GitToolingError::GitCommand { .. }) => return Ok(None),
+        // Both operands resolved above, so a failed comparison is a Git failure
+        // and not evidence that the upstream is absent or not ahead.
         Err(other) => return Err(other),
     };
 

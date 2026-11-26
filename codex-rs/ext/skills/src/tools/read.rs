@@ -110,6 +110,7 @@ impl ToolExecutor<ToolCall> for ReadTool {
                         executor_file_system_sandboxes: Vec::new(),
                         host_snapshot: None,
                         mcp_resources: self.context.mcp_resources.clone(),
+                        max_text_bytes: None,
                     },
                 )
                 .await

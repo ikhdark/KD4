@@ -15,7 +15,10 @@ process-clock `activityTimeline`. It does not change scheduling or admission.
   busy/subscription snapshot; this is historical attribution, not current ownership.
 - Hook-free passive process polls can join the native read cohort. Same-handle
   interaction remains ordered by the process manager; input, EOF and termination
-  are not passive polls.
+  are not passive polls. Outside a repository, hook-free commands with the same
+  shell-aware read-only proof that grants shared repository admission also join
+  the cohort instead of taking the global exclusive gate one at a time; writers
+  and unproven commands still exclude them.
 - Dependency-wait observers cover ordered tool-result collection and interrupt
   resolution. Explicit edges also link model-issued (direct) tool executions to
   their emitting generation and a resumed generation to model-visible tool
@@ -35,6 +38,10 @@ is not CPU time; model/tool envelopes include internal waits. Category unions
 overlap and must not be added. Uninstrumented dependencies, remote descendants
 and unattributed holder identities remain unknown; these records alone do not
 prove a full causal critical path or achievable scheduling savings.
+
+The terminal [wall-clock profile](../turn-timing/WALL_CLOCK_PROFILE.md) derives
+critical-path duration, utilization and work-span ratio from the complete native
+graph below; an incomplete graph leaves them unavailable.
 
 ## Native graph and recovery inventories
 

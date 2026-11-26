@@ -51,7 +51,7 @@ pub(crate) async fn capture(
             parameters,
             backend,
             configuration_revision: digest(serde_json::json!({
-                "contract": contract_revision, "cwd": turn.cwd(),
+                "contract": contract_revision, "cwd": path_json(turn.cwd().as_path()),
                 "permissions": turn.permission_profile(),
                 "approval": turn.approval_policy.get(),
                 "windows_sandbox": turn.windows_sandbox_level,
@@ -64,6 +64,17 @@ pub(crate) async fn capture(
             })),
         })
     }
+
+/// `json!` serializes a `Path` through serde and unwraps the result, so a
+/// non-UTF-8 cwd would panic every tool call. A UTF-8 path keeps its exact
+/// string form (existing configuration digests are unchanged); any other path
+/// becomes a distinct escaped-debug identity.
+fn path_json(path: &std::path::Path) -> serde_json::Value {
+    match path.to_str() {
+        Some(text) => serde_json::Value::String(text.to_owned()),
+        None => serde_json::json!({ "non_utf8_path": format!("{path:?}") }),
+    }
+}
 
 pub(crate) fn settle(attempt: &mut OperationAttempt, result: &Result<AnyToolResult, FunctionCallError>) {
     match result {

@@ -2459,7 +2459,25 @@ impl UnifiedExecProcessManager {
             .command
             .split_first()
             .ok_or(UnifiedExecError::MissingCommandLine)?;
-        let spawn_result = if tty {
+        // Speculative shell prototype: only a local, noninteractive launch with
+        // null stdin and no inherited handles can use a matching prepared host.
+        let speculative = if !tty && !pipe_stdin && inherited_fds.is_empty() {
+            crate::unified_exec::speculative_shell::SpeculativeShellKey::for_launch(
+                &request.command,
+                native_cwd.as_path(),
+                &request.env,
+                &request.arg0,
+            )
+        } else {
+            None
+        };
+        let handed_off = match speculative.as_ref() {
+            Some(launch) => self.speculative_shell.take_and_hand_off(launch).await,
+            None => None,
+        };
+        let spawn_result = if let Some(spawned) = handed_off {
+            Ok(spawned)
+        } else if tty {
             codex_utils_pty::pty::spawn_process_with_inherited_fds(
                 program,
                 args,
@@ -2517,6 +2535,9 @@ impl UnifiedExecProcessManager {
             }
             UnifiedExecError::create_process(error.to_string())
         })?;
+        if let Some(launch) = speculative {
+            self.speculative_shell.replenish(launch.key);
+        }
         spawn_lifecycle.after_spawn();
         mark_exec_process_spawned();
         drop(spawn_timing);
@@ -3305,6 +3326,71 @@ impl UnifiedExecProcessManager {
         }
 
         Ok(removed_entries.len())
+    }
+
+    /// Terminal results of yielded background commands that exited before the
+    /// next model-visible boundary (event-driven completion delivery).
+    ///
+    /// Only noninteractive processes whose launching call already returned a
+    /// live handle, whose output is closed and whose terminal completion is
+    /// ready qualify. Each result comes from the ordinary empty-input poll, so
+    /// the process retires exactly as if the model had polled it and a later
+    /// poll receives the same retained finished result. Running, interactive,
+    /// mid-launch, shutting-down and currently interacting processes are left
+    /// untouched for the model's own poll.
+    pub(crate) async fn collect_exited_background_results(
+        &self,
+        truncation_policy: codex_utils_output_truncation::TruncationPolicy,
+        max_output_tokens: usize,
+        limit: usize,
+    ) -> Vec<(u32, ExecCommandToolOutput)> {
+        let candidates = {
+            let store = self.process_store.lock().await;
+            let mut candidates = store
+                .processes
+                .values()
+                .filter(|entry| {
+                    !entry.tty
+                        && !entry.initial_exec_command_active.load(Ordering::Acquire)
+                        && entry.process.has_exited()
+                        && !entry.process.shutdown_is_pending()
+                        && entry.process.output_is_closed()
+                        && entry.process.terminal_completion_is_ready()
+                        && entry.process.interaction_lock().try_lock().is_ok()
+                })
+                .map(|entry| (entry.last_used, entry.process_id))
+                .collect::<Vec<_>>();
+            candidates.sort_unstable();
+            candidates.truncate(limit);
+            candidates
+        };
+        let mut results = Vec::with_capacity(candidates.len());
+        for (_, process_id) in candidates {
+            let request = WriteStdinRequest {
+                process_id,
+                input: "",
+                close_stdin: false,
+                yield_time_ms: MIN_YIELD_TIME_MS,
+                max_output_tokens: Some(max_output_tokens),
+                truncation_policy,
+                nested_deadline: None,
+            };
+            // Any chunk this poll consumed must reach the model, including a
+            // partial drain that still names its session for the remainder.
+            match self.write_stdin(request).await {
+                Ok(output) => results.push((process_id, output)),
+                Err(UnifiedExecError::ProcessFailedWithOutput { output, .. }) => {
+                    results.push((process_id, *output));
+                }
+                Err(UnifiedExecError::ToolHistoryPersistence { output: Some(output), .. }) => {
+                    results.push((process_id, *output));
+                }
+                Err(error) => {
+                    tracing::debug!(process_id, %error, "background completion receipt unavailable");
+                }
+            }
+        }
+        results
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {

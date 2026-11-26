@@ -5255,6 +5255,7 @@ impl Session {
                     },
                 },
                 None,
+                false,
             )
             .await?;
         }
@@ -6540,11 +6541,42 @@ impl Session {
         capture: codex_model_client::client::RetainedRequestCapture,
     ) -> CodexResult<()> {
         // Respect deliberately non-persistent sessions. Persistent sessions
-        // cannot dispatch past a failed capture/flush, just like sampling prefixes.
+        // cannot consume a response past a failed capture/flush. A capture of
+        // an immutable prepared snapshot overlaps dispatch; the model client
+        // joins it before the attempt's first response event and turns its
+        // failure into this non-retryable error. A live-history capture still
+        // completes before dispatch so its snapshot basis cannot move.
         if self.live_thread().is_none() {
             return Ok(());
         }
+        if capture.pre_send_marker {
+            // Small typed record, durable before the transport is touched; its
+            // failure means no send. The full capture follows concurrently.
+            let marker = RolloutItem::ContextReplay {
+                version: 1,
+                turn_id: capture.turn_id,
+                sampling_request_id: capture.identity.sampling_request_id,
+                physical_attempt_id: capture.identity.physical_attempt_id,
+                capture: serde_json::json!({
+                    "schema_version":1,
+                    "thread_id":self.thread_id.to_string(),
+                    "transport":capture.transport,
+                    "selected_representation":capture.selected_representation,
+                    "has_sampling_boundary":capture.has_sampling_boundary,
+                    "marker":"pre_send_marker_v1",
+                    "model":capture.logical_request.model,
+                    "stage":"pre_send_marker_v1; durable before transport; the full capture follows concurrently and its failure stays fatal"
+                }).into(),
+            };
+            return self.persist_rollout_items_then_sync(&[marker]).await
+                .map_err(|error| CodexErr::Fatal(format!("context replay pre-send marker failed: {error}")));
+        }
         let prepared = capture.replay_snapshot.is_some();
+        let stage = if capture.dispatch_overlapped {
+            "retained_concurrently_with_transport; joined before the attempt's first response event; dispatch/acceptance require attempt timing"
+        } else {
+            "retained_before_transport; dispatch/acceptance require attempt timing"
+        };
         let snapshot = match capture.replay_snapshot.clone() {
             Some(snapshot) => snapshot,
             None => self.clone_history().await.sampling_replay_snapshot(),
@@ -6578,7 +6610,7 @@ impl Session {
                     "transport_request_sha256":digest(transport.as_deref().unwrap_or(&logical)),
                     "logical_request_json":logical,
                     "transport_request_json":transport,
-                    "stage":"retained_before_transport; dispatch/acceptance require attempt timing"
+                    "stage":stage
                 }).into(),
             })
         }).await.map_err(|error| CodexErr::Fatal(format!("context replay capture task failed: {error}")))?
@@ -7702,9 +7734,25 @@ impl Session {
         step_context: &StepContext,
     ) -> std::io::Result<Arc<WorldState>> {
         let prepared = self.prepare_context_update(step_context).await;
-        self.commit_prepared_context_update(prepared, None)
+        self.commit_prepared_context_update(prepared, None, false)
             .await?
             .ok_or_else(|| std::io::Error::other("unconditional context commit was stale"))
+    }
+
+    /// History-only injection establishes initial context only while no turn
+    /// owns it. Under the state lock, an accepted reference skips the update,
+    /// and a staged candidate is kept: a running turn may have bound it to a
+    /// provider attempt, and replacing it would make that attempt's acceptance
+    /// fail.
+    pub(crate) async fn record_initial_context_unless_owned(
+        self: &Arc<Self>,
+        step_context: &StepContext,
+    ) -> std::io::Result<()> {
+        let prepared = self.prepare_context_update(step_context).await;
+        self.commit_prepared_context_update(prepared, None, true)
+            .await?
+            .ok_or_else(|| std::io::Error::other("unconditional context commit was stale"))
+            .map(|_| ())
     }
 
     /// Compares a pending plan's generation and begins its persistence while
@@ -7715,7 +7763,7 @@ impl Session {
         prepared: PreparedContextUpdate,
         expected_planning_generation: u64,
     ) -> std::io::Result<Option<Arc<WorldState>>> {
-        self.commit_prepared_context_update(prepared, Some(expected_planning_generation))
+        self.commit_prepared_context_update(prepared, Some(expected_planning_generation), false)
             .await
     }
 
@@ -7741,6 +7789,7 @@ impl Session {
         self: &Arc<Self>,
         prepared: PreparedContextUpdate,
         expected_planning_generation: Option<u64>,
+        initial_unless_owned: bool,
     ) -> std::io::Result<Option<Arc<WorldState>>> {
         let session = Arc::clone(self);
         let in_flight = self.retain_tool_dispatch_commit();
@@ -7773,6 +7822,11 @@ impl Session {
             {
                 return Ok(None);
             }
+            if initial_unless_owned && state.has_reference_context_item() {
+                return Ok(Some(world_state));
+            }
+            let keep_staged_baseline =
+                initial_unless_owned && state.pending_context_baseline_ref().is_some();
             // One changed fragment selects the full startup context. Append only
             // sections whose latest value in history differs, as turn injections do.
             let context_items = crate::stable_context::filter_unchanged_stable_context_items(
@@ -7794,7 +7848,9 @@ impl Session {
                 context_items.iter(),
                 turn_context.model_info.truncation_policy.into(),
             );
-            state.stage_context_baseline(baseline);
+            if !keep_staged_baseline {
+                state.stage_context_baseline(baseline);
+            }
             drop(state);
             drop(_permit);
             drop(persistence_timing_guard);
@@ -8079,6 +8135,84 @@ impl Session {
                     %error,
                     "typed actor heartbeat failed after model progress"
                 ),
+            }
+            // CLAUDE-S02: publish a PROVISIONAL partial result every
+            // `PERIODIC_PARTIAL_GENERATIONS`-th generation of a bound worker attempt, so a worker cut
+            // off by a provider error leaves the parent retrievable progress. Its sources are
+            // host-observed recorded tool outputs (call id + SHA-256 of the recorded output text), not
+            // worker claims. It never accepts, seals or completes work.
+            if let Some(store) = coordinator.store() {
+                const PERIODIC_PARTIAL_GENERATIONS: u64 = 25;
+                const HOST_PERIODIC_PARTIAL_PREFIX: &str = "Host periodic partial";
+                let period = PERIODIC_PARTIAL_GENERATIONS;
+                // The count lives in the session state (one slot for the current attempt), not in
+                // a process-wide map, so nothing outlives the session.
+                let count = self
+                    .state
+                    .lock()
+                    .await
+                    .count_attempt_generation(binding.attempt_id);
+                if count % period == 0 {
+                    use sha2::Digest as _;
+                    let history = self.clone_history().await;
+                    let mut sources = Vec::new();
+                    let mut evidence = String::new();
+                    for item in history.raw_items().iter().rev() {
+                        let (call_id, output) = match item {
+                            codex_protocol::models::ResponseItem::FunctionCallOutput {
+                                call_id,
+                                output,
+                                ..
+                            }
+                            | codex_protocol::models::ResponseItem::CustomToolCallOutput {
+                                call_id,
+                                output,
+                                ..
+                            } => (call_id, output),
+                            _ => continue,
+                        };
+                        let Some(text) = output.body.to_text() else {
+                            continue;
+                        };
+                        sources.push(codex_agent_task_store::PartialResultSource {
+                            identity: format!("tool_output:{call_id}"),
+                            sha256: hex::encode(sha2::Sha256::digest(text.as_bytes())),
+                        });
+                        evidence.push_str(&format!(
+                            "tool_output:{call_id}: {}\n",
+                            codex_utils_string::truncate_middle_chars(&text, 400)
+                        ));
+                        if sources.len() == 8 {
+                            break;
+                        }
+                    }
+                    if !sources.is_empty() {
+                        let draft = codex_agent_task_store::PartialResultDraft {
+                            summary: format!(
+                                "{HOST_PERIODIC_PARTIAL_PREFIX} at generation {count} (period {period})"
+                            ),
+                            evidence,
+                            sources,
+                            limitations: vec![
+                                "Host-synthesized from the newest recorded tool outputs; not worker analysis, not accepted evidence, not a receipt.".to_string(),
+                            ],
+                            findings: Vec::new(),
+                        };
+                        // Host rows are numbered apart from a worker's own versions and are written
+                        // only while the worker has published none (`Ok(None)` = it has, nothing
+                        // written), so a worker keeps the `expected_version` it holds.
+                        let published = store
+                            .publish_host_partial_result(
+                                binding.root_session_id.clone(),
+                                binding.attempt_id,
+                                draft,
+                            )
+                            .await;
+                        if let Err(error) = published {
+                            warn!(attempt_id = %binding.attempt_id, %error, "periodic partial publication failed");
+                        }
+                    }
+                }
             }
         }
         Ok(())

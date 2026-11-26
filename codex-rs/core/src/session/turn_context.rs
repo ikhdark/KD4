@@ -1167,6 +1167,48 @@ impl Session {
         turn.request_reasoning_effort()
     }
 
+    /// Compaction's request-level effort: the sampling baseline, except that a
+    /// custom selected effort is sent alone (the request builder then drops
+    /// positional updates), as sampling does after clearing the pin.
+    pub(crate) async fn compaction_request_reasoning_effort(
+        &self,
+        turn: &TurnContext,
+    ) -> Option<ReasoningEffortConfig> {
+        match turn.request_reasoning_effort() {
+            custom @ Some(ReasoningEffortConfig::Custom(_)) => custom,
+            _ => self.request_reasoning_effort(turn).await,
+        }
+    }
+
+    /// Compaction can run before sampling records the selected effort
+    /// (pre-sampling or manual compaction, or a resumed session whose effort
+    /// changed). Return the update sampling would append, so the compaction
+    /// samples at the selected effort without rewriting the cached prefix.
+    pub(crate) fn compaction_reasoning_effort_update(
+        turn: &TurnContext,
+        input: &[ResponseItem],
+        request_effort: Option<&ReasoningEffortConfig>,
+    ) -> Option<ResponseItem> {
+        let selected = turn.request_reasoning_effort().filter(|effort| {
+            Self::supports_effort_updates(turn)
+                && !matches!(effort, ReasoningEffortConfig::Custom(_))
+        })?;
+        let effective = input
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                ResponseItem::ConfigurationUpdate { reasoning } => Some(&reasoning.effort),
+                _ => None,
+            })
+            .or(request_effort);
+        if effective == Some(&selected) {
+            return None;
+        }
+        Some(ResponseItem::ConfigurationUpdate {
+            reasoning: codex_protocol::models::ConfigurationReasoning { effort: selected },
+        })
+    }
+
     /// Don't expand the number of mutated arguments on config. We are in the process of getting rid of it.
     pub(crate) fn build_per_turn_config(
         session_configuration: &SessionConfiguration,
@@ -1506,18 +1548,23 @@ impl Session {
                     .with_plugin_skill_snapshots(plugin_skill_snapshots);
                 // Repository skills come from the primary environment; discover and read
                 // them under the authority this turn's TurnContext will enforce there.
-                let repository_sandbox = primary_turn_environment.as_ref().map(|environment| {
-                    TurnContext::file_system_sandbox_context_for_profile(
-                        &session_configuration.permission_profile(),
-                        /*additional_permissions*/ None,
-                        environment.cwd(),
-                        &per_turn_config.effective_workspace_roots(),
-                        session_configuration.windows_sandbox_level,
-                        per_turn_config.permissions.windows_sandbox_private_desktop,
-                    )
-                });
-                let fs = primary_turn_environment
-                    .map(|environment| environment.environment.get_filesystem());
+                // The walk starts at the host-native `cwd` above, so a foreign primary
+                // (whose cwd fell back to the session cwd) contributes no repository
+                // filesystem rather than being paired with an unrelated host path.
+                let fs = turn_environments.primary_host_path_filesystem();
+                let repository_sandbox = fs
+                    .as_ref()
+                    .and(primary_turn_environment.as_ref())
+                    .map(|environment| {
+                        TurnContext::file_system_sandbox_context_for_profile(
+                            &session_configuration.permission_profile(),
+                            /*additional_permissions*/ None,
+                            environment.cwd(),
+                            &per_turn_config.effective_workspace_roots(),
+                            session_configuration.windows_sandbox_level,
+                            per_turn_config.permissions.windows_sandbox_private_desktop,
+                        )
+                    });
                 self.services
                     .skills_service
                     .snapshot_for_config(&skills_input, fs, repository_sandbox.as_ref())

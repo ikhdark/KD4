@@ -437,8 +437,9 @@ pub struct ResponseStreamFailed {
     /// so one such close cannot degrade the rest of the session.
     pub reconnectable_close: bool,
     /// RFC 6455 connection close code when the provider sent a close frame
-    /// (1005 when that frame carried no code). Diagnostics only: retry routing
-    /// keeps using `reconnectable_close`.
+    /// (1005 when that frame carried no code). Retry routing keeps using
+    /// `reconnectable_close`; only the reconnect delay distinguishes a normal
+    /// or going-away close (1000/1001) from a restart or overload close.
     pub close_code: Option<u16>,
 }
 

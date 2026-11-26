@@ -21,6 +21,8 @@ const TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 // (the stack is only reserved), not committed memory.
 #[cfg(windows)]
 const TOKIO_MAX_BLOCKING_THREADS: usize = 4096;
+/// Set to `off` to keep the scheduler's default CPU placement for this process.
+const CPU_SET_PREFERENCE_ENV: &str = "CODEX_CPU_SET_PREFERENCE";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Arg0DispatchPaths {
@@ -151,6 +153,12 @@ where
 
     if let Err(error) = codex_process_hardening::disable_execution_speed_throttling() {
         eprintln!("WARNING: could not disable automatic background CPU throttling: {error}");
+    }
+    // Before any runtime thread starts; child processes are not affected.
+    if std::env::var_os(CPU_SET_PREFERENCE_ENV).is_none_or(|value| value != "off")
+        && let Err(error) = codex_process_hardening::prefer_largest_last_level_cache()
+    {
+        eprintln!("WARNING: could not prefer the largest last-level cache: {error}");
     }
 
     // Regular invocation. Run the async entry point on a thread with the same

@@ -45,9 +45,13 @@ the compiled bundle. Ordinary checkout builds without freezing stay in place;
 `--source-mirror never` remains an explicit opt-out. Relocation/configuration
 checks and in-place source-change rejection remain unchanged.
 
-Busy reusable lanes wait for an owner to finish by default. `--warm-wait-seconds`
-is the delay before explicitly enabled `--allow-cold-overflow`, not a total
-wait timeout; `--max-active-lanes` bounds that family's concurrent builds.
+In-place Python builds wait for busy reusable lanes by default. Eligible
+mirrored builds allow cold siblings immediately when capacity remains.
+`--warm-wait-seconds` delays overflow; `--no-cold-overflow` waits for a
+reusable lane rather than creating a cold sibling behind it. Mirrored and
+overflow-enabled families default to eight active lanes; `--max-active-lanes`
+can override the Python limit. PowerShell preserves its bounded busy exit
+and applies the same environment cap when `-AllowColdOverflow` is selected.
 Eligible source-mirror builds enable bounded overflow automatically. The short
 `--lock-timeout-seconds` covers coordination-lock acquisition, not build time.
 
@@ -60,15 +64,15 @@ bundle hits need no resource lease. Direct unmanaged Cargo commands do not join
 this pool; their memory use still reduces the observed admission headroom.
 
 Cargo jobs are chosen at launch: at 32 logical processors, an otherwise idle pool
-starts with 32, then 16, then 10, then 8 jobs as builds join. Explicit smaller
+starts with 32, then 16, 10, 8, 6 and 5 jobs as builds join. Explicit smaller
 job counts remain smaller. Running Cargo job counts cannot be changed safely;
 Windows owning jobs instead rebalance **whole-process-tree hard CPU caps** as
-builds join/finish. Four builds have at most one quarter of the configured CPU
+builds join/finish. Six builds have at most one sixth of the configured CPU
 ceiling each. Opaque wrappers receive `CARGO_BUILD_JOBS`; wrapper-supplied `-j`
 may override it, but not the owning tree's CPU cap. Nested managed wrappers reuse
 a verified parent lease.
 
-Defaults are experimental: at most four managed builds (including cold builds),
+Defaults are experimental: at most six managed builds (including cold builds),
 100% aggregate host CPU, 512 MiB projected commit per Cargo job, plus 4 GiB for
 a cold build or 2 GiB for a warm build. Admission leaves at least 2 GiB each of
 available physical memory and commit headroom, subtracting other admitted builds'
@@ -79,13 +83,26 @@ memory. Set `MAX_COLD` below `MAX_ACTIVE` for an explicitly measured cold-build
 concurrency experiment; it defaults to the active-build ceiling rather than
 silently serializing otherwise admissible cold work.
 
+Refused requests are admitted in arrival order: each keeps a ticket under
+`.builds/resources/waiters/`, refreshed on every admission pass, and a later
+request that fits waits (`earlier_waiter`) while an older waiter would also fit;
+the older request's projected reservation is kept for it. An older request still
+refused by a cap or headroom never holds back a later one that fits, and a ticket
+not refreshed for 1 s (dead, cancelled or lane-blocked owner) stops counting.
+A busy PowerShell exit withdraws its ticket. Runner copies without this change
+join the pool unordered. `CODEX_CARGO_BUILD_FIFO=off` restores unordered admission.
+
 Use process-scoped environment overrides, not machine-wide settings:
 
 ```powershell
-$env:CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE = "3" # mirror overflow / warm retention only
-$env:CODEX_CARGO_BUILD_MAX_ACTIVE = "4"       # shared admission ceiling
+$env:CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE = "3" # cap a mirror or overflow-enabled family
+$env:CODEX_CARGO_BUILD_MAX_ACTIVE = "6"       # shared admission ceiling
 $env:CODEX_CARGO_BUILD_CPU_PERCENT = "100"    # aggregate CPU cap, 1..100
 ```
+
+Explicit cleanup defaults to one idle compiled lane per family; empty reservations
+do not use that quota. KD4's existing automatic maintenance retains two by default
+and still honors an explicit `CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE` setting.
 
 Other positive-integer `CODEX_CARGO_BUILD_` settings are `MAX_COLD`,
 `MEMORY_PER_JOB_MIB`, `COLD_BASE_MIB`, `WARM_BASE_MIB`,

@@ -60,6 +60,8 @@ const JSON_MIME_TYPE: &str = "application/json";
 const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const NON_JSON_RESPONSE_BODY_PREVIEW_BYTES: usize = 8_192;
 const MAX_JSON_RPC_ERROR_BODY_BYTES: usize = 1024 * 1024;
+/// Matches the stdio transport's per-message limit (`MCP_STDOUT_MAX_MESSAGE_BYTES`).
+const MAX_JSON_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 const ERROR_BODY_PREVIEW_TIMEOUT: Duration = Duration::from_millis(25);
 const JSON_RPC_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -70,6 +72,149 @@ pub(crate) struct StreamableHttpClientAdapter {
     auth_provider: Option<SharedAuthProvider>,
     oauth_authority: Option<OAuthRequestAuthority>,
     initialize_deadline: Arc<Mutex<Option<Instant>>>,
+    initialize_session: Arc<InitializeSessionCleanup>,
+}
+
+const ORPHANED_SESSION_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tracks the session issued by one handshake attempt's `initialize` POST until
+/// RMCP takes ownership of its cleanup.
+///
+/// RMCP's legacy startup records its session cleanup only for a handshake that
+/// reaches the message loop; a timeout, dropped handshake or failed
+/// `notifications/initialized` POST leaves a server-issued session that is never
+/// deleted. This adapter sees both POSTs and every DELETE, so it deletes such an
+/// orphan itself instead of changing the dependency.
+#[derive(Default)]
+pub(crate) struct InitializeSessionCleanup {
+    state: Mutex<InitializeSessionState>,
+}
+
+#[derive(Default)]
+struct InitializeSessionState {
+    issued: Option<IssuedSession>,
+    abandoned: bool,
+}
+
+struct IssuedSession {
+    // Carries no `initialize_session` link back to this state.
+    adapter: StreamableHttpClientAdapter,
+    uri: Arc<str>,
+    session: Arc<str>,
+    auth_token: Option<String>,
+    custom_headers: HashMap<HeaderName, HeaderValue>,
+}
+
+/// What an `initialize` POST needs to remember in order to delete its session.
+struct InitializeCleanupRequest {
+    uri: Arc<str>,
+    auth_token: Option<String>,
+    custom_headers: HashMap<HeaderName, HeaderValue>,
+}
+
+impl InitializeSessionCleanup {
+    fn lock(&self) -> std::sync::MutexGuard<'_, InitializeSessionState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn issued(&self, session: IssuedSession) {
+        let mut state = self.lock();
+        let orphan = if state.abandoned {
+            Some(session)
+        } else {
+            state.issued.replace(session)
+        };
+        drop(state);
+        if let Some(orphan) = orphan {
+            spawn_orphaned_session_delete(orphan);
+        }
+    }
+
+    /// RMCP owns the session once the `initialized` notification is accepted or
+    /// it issues its own DELETE.
+    fn released(&self, session: &str) {
+        let mut state = self.lock();
+        if state
+            .issued
+            .as_ref()
+            .is_some_and(|issued| issued.session.as_ref() == session)
+        {
+            state.issued = None;
+        }
+    }
+
+    /// The attempt ended without a running service: delete its unreleased
+    /// session now, or as soon as a still-running `initialize` POST returns one.
+    pub(crate) fn abandon(&self) {
+        let mut state = self.lock();
+        state.abandoned = true;
+        let orphan = state.issued.take();
+        drop(state);
+        if let Some(orphan) = orphan {
+            spawn_orphaned_session_delete(orphan);
+        }
+    }
+
+    /// The handshake succeeded, so RMCP's message loop owns the session.
+    pub(crate) fn complete(&self) {
+        self.lock().issued = None;
+    }
+}
+
+fn spawn_orphaned_session_delete(orphan: IssuedSession) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("no async runtime to delete an abandoned streamable HTTP MCP session");
+        return;
+    };
+    runtime.spawn(async move {
+        let IssuedSession {
+            adapter,
+            uri,
+            session,
+            auth_token,
+            custom_headers,
+        } = orphan;
+        match tokio::time::timeout(
+            ORPHANED_SESSION_DELETE_TIMEOUT,
+            adapter.delete_session(uri, session, auth_token, custom_headers),
+        )
+        .await
+        {
+            Ok(Ok(())) => tracing::debug!("deleted abandoned streamable HTTP MCP session"),
+            Ok(Err(error)) => {
+                tracing::warn!("failed to delete abandoned streamable HTTP MCP session: {error}");
+            }
+            Err(_elapsed) => tracing::warn!(
+                "deleting an abandoned streamable HTTP MCP session timed out after {ORPHANED_SESSION_DELETE_TIMEOUT:?}"
+            ),
+        }
+    });
+}
+
+/// Abandons the attempt's unreleased session when dropped, including when the
+/// caller cancels the handshake, unless the handshake completed first.
+pub(crate) struct InitializeSessionGuard(Option<Arc<InitializeSessionCleanup>>);
+
+impl InitializeSessionGuard {
+    pub(crate) fn new(cleanup: Arc<InitializeSessionCleanup>) -> Self {
+        Self(Some(cleanup))
+    }
+
+    pub(crate) fn complete(&mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup.complete();
+        }
+    }
+}
+
+impl Drop for InitializeSessionGuard {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup.abandon();
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +251,7 @@ impl StreamableHttpClientAdapter {
             auth_provider,
             oauth_authority: None,
             initialize_deadline,
+            initialize_session: Arc::default(),
         }
     }
 
@@ -120,6 +266,48 @@ impl StreamableHttpClientAdapter {
     ) -> Self {
         self.initialize_deadline = initialize_deadline;
         self
+    }
+
+    /// Starts a new handshake attempt's session record, so a reused client never
+    /// shares one with an earlier attempt.
+    pub(crate) fn with_fresh_initialize_session(mut self) -> Self {
+        self.initialize_session = Arc::default();
+        self
+    }
+
+    pub(crate) fn initialize_session(&self) -> Arc<InitializeSessionCleanup> {
+        Arc::clone(&self.initialize_session)
+    }
+
+    fn observe_post_session(
+        &self,
+        mcp_method: Option<&str>,
+        request_session: Option<&str>,
+        response_session: Option<&str>,
+        cleanup_request: Option<InitializeCleanupRequest>,
+    ) {
+        match mcp_method {
+            Some("initialize") => {
+                let (Some(session), Some(request)) = (response_session, cleanup_request) else {
+                    return;
+                };
+                let mut adapter = self.clone();
+                adapter.initialize_session = Arc::default();
+                self.initialize_session.issued(IssuedSession {
+                    adapter,
+                    uri: request.uri,
+                    session: session.into(),
+                    auth_token: request.auth_token,
+                    custom_headers: request.custom_headers,
+                });
+            }
+            Some("notifications/initialized") => {
+                if let Some(session) = request_session {
+                    self.initialize_session.released(session);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -136,6 +324,13 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
     ) -> std::result::Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         let (mcp_method, mcp_request_id) = client_jsonrpc_message_fields(&message);
         let has_session_id = session_id.is_some();
+        let request_session = session_id.clone();
+        let cleanup_request =
+            (mcp_method.as_deref() == Some("initialize")).then(|| InitializeCleanupRequest {
+                uri: Arc::clone(&uri),
+                auth_token: auth_token.clone(),
+                custom_headers: custom_headers.clone(),
+            });
         let redirect_policy = self.redirect_policy(
             &custom_headers,
             auth_token.is_some() || has_session_id,
@@ -246,6 +441,12 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             StatusCode::from_u16(response.status).ok(),
             Some(StatusCode::ACCEPTED | StatusCode::NO_CONTENT)
         ) {
+            self.observe_post_session(
+                mcp_method.as_deref(),
+                request_session.as_deref(),
+                /*response_session*/ None,
+                /*cleanup_request*/ None,
+            );
             return Ok(StreamableHttpPostResponse::Accepted);
         }
 
@@ -305,6 +506,12 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 && !truncated
                 && let Some(message) = parse_json_rpc_error(&body)
             {
+                self.observe_post_session(
+                    mcp_method.as_deref(),
+                    request_session.as_deref(),
+                    session_id.as_deref(),
+                    cleanup_request,
+                );
                 return Ok(StreamableHttpPostResponse::Json(message, session_id));
             }
             let mut preview = body_preview(String::from_utf8_lossy(
@@ -326,12 +533,32 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         match content_type.as_deref() {
             Some(content_type) if has_media_type(content_type, EVENT_STREAM_MIME_TYPE) => {
                 let event_stream = sse_stream_from_body(body_stream);
+                // RMCP rejects an SSE reply to `initialized`, so it never releases the session.
+                self.observe_post_session(
+                    mcp_method.as_deref(),
+                    /*request_session*/ None,
+                    session_id.as_deref(),
+                    cleanup_request,
+                );
                 Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
             }
             Some(content_type) if has_media_type(content_type, JSON_MIME_TYPE) => {
-                let body = collect_body(&mut body_stream).await?;
+                // A malformed initialize body can still carry a server-issued session.
+                self.observe_post_session(
+                    mcp_method.as_deref(),
+                    /*request_session*/ None,
+                    session_id.as_deref(),
+                    cleanup_request,
+                );
+                let body = collect_body(&mut body_stream, MAX_JSON_RESPONSE_BODY_BYTES).await?;
                 let message: ServerJsonRpcMessage =
                     serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)?;
+                self.observe_post_session(
+                    mcp_method.as_deref(),
+                    request_session.as_deref(),
+                    /*response_session*/ None,
+                    /*cleanup_request*/ None,
+                );
                 Ok(StreamableHttpPostResponse::Json(message, session_id))
             }
             _ => {
@@ -369,6 +596,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> std::result::Result<(), StreamableHttpError<Self::Error>> {
+        self.initialize_session.released(&session);
         let redirect_policy = self.redirect_policy(&custom_headers, true);
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
@@ -791,15 +1019,13 @@ async fn collect_body_prefix(
 
 async fn collect_body(
     body_stream: &mut HttpResponseBodyStream,
+    limit: usize,
 ) -> std::result::Result<Vec<u8>, StreamableHttpError<StreamableHttpClientAdapterError>> {
-    let mut body = Vec::new();
-    while let Some(chunk) = body_stream
-        .recv()
-        .await
-        .map_err(StreamableHttpClientAdapterError::from)
-        .map_err(StreamableHttpError::Client)?
-    {
-        body.extend_from_slice(&chunk);
+    let (body, truncated) = collect_body_prefix(body_stream, limit).await?;
+    if truncated {
+        return Err(StreamableHttpError::UnexpectedServerResponse(
+            format!("MCP JSON response body exceeded the {limit}-byte limit").into(),
+        ));
     }
     Ok(body)
 }

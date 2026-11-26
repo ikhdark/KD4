@@ -972,6 +972,9 @@ pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> Threa
 
 /// An unload attempt is irreversible once shutdown is admitted. Keep its exact
 /// runtime and closing marker until actual accepted owners and persistence drain.
+/// The one exception is a session loop that already ended abnormally: its
+/// completion is immutable, so a retry reports the same failure forever and the
+/// marker, registry entry and eviction capacity would never be released.
 async fn wait_for_owned_thread_retirement(thread_id: ThreadId, thread: &Arc<CodexThread>) {
     let mut retry_delay = Duration::from_secs(1);
     loop {
@@ -980,7 +983,16 @@ async fn wait_for_owned_thread_retirement(thread_id: ThreadId, thread: &Arc<Code
             thread.wait_until_drained().await
         }.await {
             Ok(()) => return,
-            Err(error) => warn!(%thread_id, %error, "thread retirement failed; retaining owner for retry"),
+            Err(error) => {
+                if let Some(failure) = thread.session_loop_failure() {
+                    tracing::error!(
+                        %thread_id, %error, failure,
+                        "session loop ended abnormally and its completion is final; releasing unload authority without a confirmed drain"
+                    );
+                    return;
+                }
+                warn!(%thread_id, %error, "thread retirement failed; retaining owner for retry");
+            }
         }
         tokio::time::sleep(retry_delay).await;
         retry_delay = (retry_delay * 2).min(Duration::from_secs(30));

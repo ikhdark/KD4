@@ -120,6 +120,35 @@ async fn current_dynamic_tool_exposure_identity(
         shell_approval_surface: crate::tools::spec_plan::shell_approval_surface(
             step_context.turn.as_ref(),
         ),
+        worker_patch_exposed: worker_patch_exposed(sess, step_context).await,
+    }
+}
+
+/// Whether apply_patch is advertised to this turn. A subagent that authorization
+/// would always refuse for apply_patch (unbound, or a bound assignment with an
+/// empty write scope) does not advertise it. Authority is unchanged: the runtime
+/// stays registered, so a stale call still reaches the same typed refusal. A store
+/// error fails open to the historical surface.
+async fn worker_patch_exposed(sess: &Session, step_context: &StepContext) -> bool {
+    let turn = step_context.turn.as_ref();
+    if !matches!(
+        turn.session_source,
+        codex_protocol::protocol::SessionSource::SubAgent(_)
+    ) {
+        return true;
+    }
+    let coordinator = sess.services.agent_control.task_coordinator();
+    // Uncached lookup: this advertisement probe must not populate the turn's binding
+    // cache that call-time authorization reads.
+    let Some(binding) = coordinator.binding_for_source(&turn.session_source) else {
+        return false;
+    };
+    match coordinator
+        .get_agent_task_authorization(binding.assignment_id)
+        .await
+    {
+        Ok(authorization) => !authorization.assignment.write_scope.is_empty(),
+        Err(_) => true,
     }
 }
 
@@ -307,6 +336,7 @@ pub(crate) async fn built_tools(
     for diagnostic in &selected_skill_mcp_exposure.diagnostics {
         warn!("{diagnostic}");
     }
+    let patch_exposed = worker_patch_exposed(sess, step_context).await;
     let exposure_identity = derive_tool_exposure_identity(
         sess,
         step_context,
@@ -315,6 +345,7 @@ pub(crate) async fn built_tools(
         mcp_tool_snapshot.resources_available,
         &extension_tool_executors,
         extension_snapshot.revision,
+        patch_exposed,
     );
     let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
 
@@ -392,6 +423,7 @@ fn derive_tool_exposure_identity(
         dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>,
     >],
     extension_tool_surface_revision: u64,
+    worker_patch_exposed: bool,
 ) -> ToolExposureIdentity {
     let turn_context = step_context.turn.as_ref();
     let agent_surface_stage = agent_surface_stage(sess, turn_context);
@@ -421,6 +453,7 @@ fn derive_tool_exposure_identity(
             step_context,
         ),
         shell_approval_surface: crate::tools::spec_plan::shell_approval_surface(turn_context),
+        worker_patch_exposed,
     }
 }
 

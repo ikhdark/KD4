@@ -70,13 +70,54 @@ pub enum FileMutationRetention {
     DiscardDeleted(RetainedFile),
 }
 
+thread_local! {
+    /// Canonical parent spellings reused inside one [`with_guard_memo`] scope.
+    static CANONICAL_PARENT_MEMO: std::cell::RefCell<Option<std::collections::HashMap<PathBuf, PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run one blocking batch of guarded probes (for example an executable lookup's
+/// PATH x PATHEXT candidates) while reusing each parent directory's canonical
+/// spelling for the patch-capture admission guard, instead of canonicalizing
+/// the same parent once per candidate. The memo lives only for this call on this
+/// thread; nested scopes share it. Probed paths themselves are not cached.
+pub fn with_guard_memo<T>(operation: impl FnOnce() -> T) -> T {
+    if CANONICAL_PARENT_MEMO.with(|memo| memo.borrow().is_some()) {
+        return operation();
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CANONICAL_PARENT_MEMO.with(|memo| *memo.borrow_mut() = None);
+        }
+    }
+    CANONICAL_PARENT_MEMO.with(|memo| *memo.borrow_mut() = Some(Default::default()));
+    let _reset = Reset;
+    operation()
+}
+
+fn canonical_parent(parent: &Path) -> io::Result<PathBuf> {
+    if let Some(found) = CANONICAL_PARENT_MEMO
+        .with(|memo| memo.borrow().as_ref().and_then(|memo| memo.get(parent).cloned()))
+    {
+        return Ok(found);
+    }
+    let canonical = std::fs::canonicalize(parent)?;
+    CANONICAL_PARENT_MEMO.with(|memo| {
+        if let Some(memo) = memo.borrow_mut().as_mut() {
+            memo.insert(parent.to_path_buf(), canonical.clone());
+        }
+    });
+    Ok(canonical)
+}
+
 // Native readers must not mistake the deliberate capture/publication interval
 // for stable absence. Keep this advisory namespace outside the workspace and
 // never unlink a lock file while another process can still own its inode.
 fn patch_capture_lock_path(path: &Path) -> io::Result<PathBuf> {
     use std::hash::Hash;
     use std::hash::Hasher;
-    let parent = std::fs::canonicalize(
+    let parent = canonical_parent(
         path.parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?,
     )?;

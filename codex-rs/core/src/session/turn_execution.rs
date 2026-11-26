@@ -3337,6 +3337,10 @@ impl TurnExecutionControl {
         })
     }
 
+    pub(crate) fn has_pending_validation_for_stop(&self) -> bool {
+        !self.pending_validation_processes.is_empty()
+    }
+
     pub(crate) fn decide_obligation_stop(
         &mut self,
         turn: &crate::session::turn_context::TurnContext,

@@ -75,6 +75,86 @@ pub fn apply_user_plugin_config_edits_blocking(
     write_atomically(&write_paths.write_path, &doc.to_string())
 }
 
+/// The prior user config state of one plugin's `enabled` setting, returned by
+/// [`set_user_plugin_enabled_blocking_with_restore`] when that write changed it.
+#[derive(Debug)]
+pub struct PluginEnabledRestore {
+    plugin_key: String,
+    enabled: bool,
+    previous: Option<TomlItem>,
+    created_entry: bool,
+}
+
+/// Set a plugin's `enabled` value from a blocking context and return what is
+/// needed to undo it if the caller's larger transaction later fails. Returns
+/// `None` when the config already had that value.
+pub fn set_user_plugin_enabled_blocking_with_restore(
+    codex_home: &Path,
+    plugin_key: String,
+    enabled: bool,
+) -> std::io::Result<Option<PluginEnabledRestore>> {
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let (write_paths, _lock) = acquire_resolved_atomic_write_lock(&config_path)?;
+    let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
+    let existing_entry = doc
+        .get("plugins")
+        .and_then(TomlItem::as_table_like)
+        .and_then(|plugins| plugins.get(&plugin_key));
+    let created_entry = existing_entry.is_none();
+    let previous = existing_entry
+        .and_then(TomlItem::as_table_like)
+        .and_then(|plugin| plugin.get("enabled"))
+        .cloned();
+    if !set_plugin_enabled(&mut doc, &plugin_key, enabled)? {
+        return Ok(None);
+    }
+    write_atomically(&write_paths.write_path, &doc.to_string())?;
+    Ok(Some(PluginEnabledRestore {
+        plugin_key,
+        enabled,
+        previous,
+        created_entry,
+    }))
+}
+
+/// Undo a write made by [`set_user_plugin_enabled_blocking_with_restore`].
+/// A value changed by someone else since that write is left untouched.
+pub fn restore_user_plugin_enabled_blocking(
+    codex_home: &Path,
+    restore: PluginEnabledRestore,
+) -> std::io::Result<()> {
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let (write_paths, _lock) = acquire_resolved_atomic_write_lock(&config_path)?;
+    let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
+    let Some(plugins) = doc
+        .get_mut("plugins")
+        .and_then(TomlItem::as_table_like_mut)
+    else {
+        return Ok(());
+    };
+    let Some(plugin) = plugins
+        .get_mut(&restore.plugin_key)
+        .and_then(TomlItem::as_table_like_mut)
+    else {
+        return Ok(());
+    };
+    if plugin.get("enabled").and_then(TomlItem::as_bool) != Some(restore.enabled) {
+        return Ok(());
+    }
+    match restore.previous {
+        Some(previous) => {
+            plugin.insert("enabled", previous);
+        }
+        None if restore.created_entry && plugin.len() == 1 => {
+            plugins.remove(&restore.plugin_key);
+        }
+        None => {
+            plugin.remove("enabled");
+        }
+    }
+    write_atomically(&write_paths.write_path, &doc.to_string())
+}
+
 fn set_plugin_enabled(
     doc: &mut DocumentMut,
     plugin_key: &str,

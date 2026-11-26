@@ -864,7 +864,18 @@ impl UnifiedExecProcess {
         self.termination_requested.store(true, Ordering::Release);
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => {
-                if let Err(error) = process_handle.terminate() {
+                // Reached from Drop, possibly on a runtime worker: Windows job
+                // termination waits for the tree to empty, so hand the worker's
+                // other tasks off first (block_in_place panics on current-thread).
+                let on_multi_thread_worker = tokio::runtime::Handle::try_current().is_ok_and(
+                    |runtime| runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+                );
+                let result = if on_multi_thread_worker {
+                    tokio::task::block_in_place(|| process_handle.terminate())
+                } else {
+                    process_handle.terminate()
+                };
+                if let Err(error) = result {
                     tracing::warn!(%error, "failed to terminate local unified-exec process");
                 } else {
                     self.finish_termination();
@@ -956,8 +967,9 @@ impl UnifiedExecProcess {
         Ok(())
     }
 
+    /// An interrupt is not a termination request: the process may handle it and
+    /// keep running, so stall notices and observations stay live.
     pub(super) async fn interrupt(&self) -> Result<(), UnifiedExecError> {
-        self.termination_requested.store(true, Ordering::Release);
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => {
                 let process_handle = Arc::clone(process_handle);
@@ -1296,8 +1308,12 @@ impl UnifiedExecProcess {
         let process = started.process;
         let mut events = process.subscribe_events();
         tokio::spawn(async move {
-            let mut artifact_task =
-                RawOutputArtifactTask::spawn_with_target(raw_output_artifact, artifact_ready, raw_output_target);
+            let mut artifact_task = RawOutputArtifactTask::spawn_with_target_off_executor(
+                raw_output_artifact,
+                artifact_ready,
+                raw_output_target,
+            )
+            .await;
             let mut last_seq: u64 = 0;
             let mut exit_known = false;
             let mut replay = std::collections::VecDeque::new();
@@ -1436,9 +1452,8 @@ impl UnifiedExecProcess {
                             _ => (ExecOutputStream::Stdout, &stdout_buffer),
                         };
                         let bytes = chunk.chunk.into_inner();
-                        if let Some(task) = artifact_task.as_mut() {
-                            task.write_chunk(&bytes);
-                        }
+                        RawOutputArtifactTask::write_chunk_off_executor(&mut artifact_task, &bytes)
+                            .await;
                         append_output_chunk(
                             &output_buffer,
                             &completion_output_buffer,
@@ -1535,8 +1550,12 @@ impl UnifiedExecProcess {
             cancellation_token: _,
         } = output_handles;
         tokio::spawn(async move {
-            let mut artifact_task =
-                RawOutputArtifactTask::spawn_with_target(raw_output_artifact, artifact_ready, raw_output_target);
+            let mut artifact_task = RawOutputArtifactTask::spawn_with_target_off_executor(
+                raw_output_artifact,
+                artifact_ready,
+                raw_output_target,
+            )
+            .await;
             let mut stdout_open = true;
             let mut stderr_open = true;
             let mut decoder = AggregateOutputDecoder::default();
@@ -1565,9 +1584,11 @@ impl UnifiedExecProcess {
                     else => break,
                 };
                 if let Some(output) = output {
-                    if let Some(task) = artifact_task.as_mut() {
-                        task.write_chunk(&output.bytes);
-                    }
+                    RawOutputArtifactTask::write_chunk_off_executor(
+                        &mut artifact_task,
+                        &output.bytes,
+                    )
+                    .await;
                     let stream_buffer = match &output.stream {
                         ExecOutputStream::Stdout => &stdout_buffer,
                         ExecOutputStream::Stderr => &stderr_buffer,

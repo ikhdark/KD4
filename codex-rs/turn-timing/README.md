@@ -25,6 +25,10 @@ clock. These are observations, not task acceptance or achievable savings.
   lifetime. Concurrent turns in the process are included; children and Desktop
   renderers are excluded. API failures or invalid counters produce no sample,
   not zeros. Sampling creates no timer, thread or background task.
+- `performanceObservations.wallClockProfile`: terminal-only derived profile
+  (critical path, inclusive/exclusive latency, wait ratios, concurrency,
+  scheduling, queueing, idle gaps, material progress, recovery and delegation).
+  It reads only this record's evidence; see the [metric contract](WALL_CLOCK_PROFILE.md).
 - `measurementEvidence.operations`: native command-launch/read-call census,
   with owner execution/call IDs and lifecycle endpoints. Immutable snapshot
   reads retain exact delivered byte ranges and content/resource identities.
@@ -84,7 +88,10 @@ has neither. Proven-unsent connection recovery jitters the cancellable wait arou
 nominal 500 ms-to-15 s exponential schedule. The nominal state, total deadline,
 provider-directed `Retry-After`, and separate WebSocket fallback cooldown are
 unchanged. Cancellation during backoff can leave an unexecuted terminal
-row without erasing the plan's source facts.
+row without erasing the plan's source facts. The single reconnect after a
+normal (1000) or going-away (1001) close waits on that jittered 500 ms
+connection cadence; restart and try-again-later closes (1012/1013) and busy
+responses keep the 5 s capacity backoff, and `Retry-After` still wins.
 
 ## Controlled capture labels
 

@@ -308,6 +308,17 @@ pub(crate) struct ModelProviderCacheIdentity {
     normalized_base_urls: BTreeMap<String, String>,
 }
 
+/// `json!` serializes a `Path` through serde and unwraps the result, so a
+/// non-UTF-8 command-auth cwd would panic. A UTF-8 path keeps its exact string
+/// form (the V2 digest contract is unchanged); any other path becomes a
+/// distinct escaped-debug identity.
+fn cache_path_json(path: &std::path::Path) -> serde_json::Value {
+    match path.to_str() {
+        Some(text) => serde_json::Value::String(text.to_owned()),
+        None => serde_json::json!({ "non_utf8_path": format!("{path:?}") }),
+    }
+}
+
 impl fmt::Debug for ModelProviderCacheIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ModelProviderCacheIdentity { .. }")
@@ -336,7 +347,7 @@ impl ModelProviderCacheIdentity {
             serde_json::json!({
                 "command": &auth.command,
                 "args": &auth.args,
-                "cwd": &auth.cwd,
+                "cwd": cache_path_json(auth.cwd.as_path()),
             })
         });
         // Keep the exact existing object keys/order and V2 digest contract.

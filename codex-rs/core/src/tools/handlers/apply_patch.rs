@@ -557,6 +557,15 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
             let thread = invocation.session.thread_id.to_string();
             let id = operation_id.clone();
             let terminal_tasks = invocation.session.terminal_tasks.clone();
+            // CLAUDE-AT14/AT15: only a typed bound writer can publish a settled-change advisory, so any
+            // other apply_patch keeps the unchanged path (no receipt copy, no extra work).
+            let settled_push = invocation
+                .session
+                .services
+                .agent_control
+                .task_coordinator()
+                .binding_for_turn(&invocation.step_context.turn)
+                .map(|_| (invocation.session.clone(), invocation.step_context.turn.clone()));
             let handler = Self::new(self.multi_environment);
             // The tracked owner holds the reservation from admission through
             // filesystem finalization and the durable receipt write.
@@ -621,9 +630,13 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
                     }
                     Err(_) => None,
                 };
+                let settled_receipt = settled_push.as_ref().and_then(|_| receipt.clone());
                 if let Some(receipt) = receipt {
                     tokio::task::spawn_blocking(move || operation.finish(&receipt)).await
                         .map_err(|e| FunctionCallError::Fatal(format!("Patch receipt owner failed: {e}")))??;
+                }
+                if let (Some((session, turn)), Some(settled)) = (settled_push, settled_receipt) {
+                    publish_settled_change(&session, &turn, &settled).await;
                 }
                 result.map(boxed_tool_output)
             }).await.map_err(|e| FunctionCallError::Fatal(format!("Patch operation owner failed: {e}")))?
@@ -1180,6 +1193,93 @@ impl From<PatchWorkspaceWaitError> for FunctionCallError {
             PatchWorkspaceWaitError::Cancelled => PATCH_WORKSPACE_CANCELLED.to_string(),
             PatchWorkspaceWaitError::Admission(error) => error,
         })
+    }
+}
+
+/// CLAUDE-AT14/AT15: after a typed bound writer's apply_patch
+/// receipt is durably settled as exactly committed, queue one advisory message (no turn is started) to each other
+/// active typed task in the same repository and workspace whose read scope covers a committed path inside the writer's
+/// write scope. Unknown, unchanged, failed, inexact, unbound, out-of-scope and other-workspace writes publish nothing.
+/// The message carries the exact path and written sha256; the reader still re-reads explicitly. Best effort: any
+/// lookup or delivery failure is a no-op.
+async fn publish_settled_change(session: &Session, turn: &TurnContext, receipt: &serde_json::Value) {
+    use crate::agent_communication::{AgentCommunicationContext, AgentCommunicationKind};
+    if receipt["success"].as_bool() != Some(true)
+        || receipt["outcome"].as_str() != Some("committed")
+        || receipt["changes_exact"].as_bool() != Some(true)
+    {
+        return;
+    }
+    let Some(changes) = receipt["changes"].as_array() else { return };
+    let control = &session.services.agent_control;
+    let coordinator = control.task_coordinator();
+    let Some(writer) = coordinator.binding_for_turn(turn) else { return };
+    let (Some(store), Some(root)) = (coordinator.store(), coordinator.root_session_id()) else { return };
+    let Ok(writer_task) = coordinator.get_agent_task(writer.assignment_id, Some(0)).await else { return };
+    let Ok(bindings) = store.list_agent_task_bindings(root, None).await else { return };
+    let author = turn.session_source.get_agent_path().unwrap_or_else(codex_protocol::AgentPath::root);
+    let Ok(cwd) = std::fs::canonicalize(turn.cwd().as_path()) else { return };
+    let mut notified = BTreeSet::new();
+    for change in changes {
+        let (Some(path), Some(sha)) = (change["path"].as_str(), change["write_receipt"]["sha256"].as_str()) else {
+            continue;
+        };
+        let Ok(canonical) = std::fs::canonicalize(path) else { continue };
+        let Ok(relative) = canonical.strip_prefix(&cwd) else { continue };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if !writer_task.assignment.write_scope.iter().any(|scope| scope.covers_path(&relative)) {
+            continue;
+        }
+        for binding in &bindings {
+            let Some(thread) = binding.thread_id.as_deref() else { continue };
+            if binding.attempt_id == writer.attempt_id || notified.contains(&(thread.to_string(), relative.clone())) {
+                continue;
+            }
+            let Ok(task) = coordinator.get_agent_task(binding.assignment_id, Some(0)).await else { continue };
+            if task.current_attempt.attempt_id != binding.attempt_id
+                || task.current_attempt.state.is_terminal()
+                || task.assignment.repository_id != writer_task.assignment.repository_id
+                || task.assignment.workspace_id != writer_task.assignment.workspace_id
+                || !task.assignment.read_scope.iter().any(|scope| scope.covers_path(&relative))
+            {
+                continue;
+            }
+            let delivered = async {
+                let thread_id = codex_protocol::ThreadId::from_string(thread).map_err(|e| e.to_string())?;
+                let recipient = binding.agent_path.parse::<codex_protocol::AgentPath>().map_err(|e| e.to_string())?;
+                control.ensure_agent_in_tree(thread_id).await.map_err(|e| e.to_string())?;
+                let text = serde_json::json!({
+                    "kind": "kdr_at14_settled_source_change",
+                    "source_path": relative,
+                    "new_sha256": sha,
+                    "operation_id": receipt["operation_id"],
+                    "writer_assignment": writer.assignment_id,
+                    "writer_attempt": writer.attempt_id,
+                    "workspace": writer_task.assignment.workspace_id,
+                    "advisory": "A sibling's apply_patch settled this exact change; a copy you already read is stale. Re-read before relying on it. Not a lock, instruction or scope grant.",
+                })
+                .to_string();
+                let mut communication = codex_protocol::protocol::InterAgentCommunication::new(
+                    author.clone(), recipient, Vec::new(), text, /*trigger_turn*/ false,
+                );
+                communication.trigger_turn = false;
+                control
+                    .send_inter_agent_communication(
+                        thread_id,
+                        communication,
+                        AgentCommunicationContext::new(AgentCommunicationKind::Message, session.thread_id),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match delivered {
+                Ok(_) => {
+                    notified.insert((thread.to_string(), relative.clone()));
+                }
+                Err(error) => tracing::warn!("settled-change push to {thread} was not queued: {error}"),
+            }
+        }
     }
 }
 

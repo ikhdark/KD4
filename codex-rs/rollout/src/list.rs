@@ -118,6 +118,9 @@ pub(crate) struct HeadTailSummary {
 // filesystem recovery streams history on a source-version cache miss.
 const HEAD_RECORD_LIMIT: usize = 10;
 const USER_EVENT_SCAN_LIMIT: usize = 200;
+// Hydrated summaries a full-summary listing may hold before it keeps only the
+// `page_size + 1` best ones. Every candidate is still hydrated and considered.
+const RECENCY_COMPACTION_FLOOR: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadListLayout {
@@ -615,6 +618,19 @@ async fn get_threads_in_root_by_summary(
             continue;
         }
         keyed_items.push((key, ordinal, item));
+        // The page and its "more" probe need only the first `page_size + 1`
+        // items in final order, and `(key, ordinal)` is a strict total order
+        // (`ordinal` is unique per candidate). Periodically keep just that
+        // prefix instead of every hydrated summary; an evicted item always has
+        // at least `retain` better items still retained, so the result is exact.
+        let retain = page_size.saturating_add(1);
+        if keyed_items.len() >= retain.saturating_mul(2).max(RECENCY_COMPACTION_FLOOR) {
+            keyed_items.sort_by_key(|(key, ordinal, _)| (*key, *ordinal));
+            if !ascending {
+                keyed_items.reverse();
+            }
+            keyed_items.truncate(retain);
+        }
     }
     // Preserve the original stable tie order despite reordered hydration.
     keyed_items.sort_by_key(|(key, ordinal, _)| (*key, *ordinal));

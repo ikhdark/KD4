@@ -160,6 +160,37 @@ enum PipeStdinMode {
     Null,
 }
 
+/// Windows priority handling for a pipe root. A speculative host keeps the class
+/// Windows assigns at creation (parent, job and image-execution policy included),
+/// but runs below normal until it is handed real work, so its startup yields to
+/// demand work; the assigned class is recorded on its handle for restoration.
+#[derive(Clone, Copy)]
+enum SpawnPriority {
+    Normal,
+    LoweredUntilHandoff,
+}
+
+/// Lowers a suspended root to below normal and returns the class Windows had
+/// assigned it, or `None` (unchanged) when either query fails.
+#[cfg(windows)]
+fn lower_until_handoff(child: &tokio::process::Child) -> Option<u32> {
+    use winapi::um::processthreadsapi::GetPriorityClass;
+    use winapi::um::processthreadsapi::SetPriorityClass;
+    use winapi::um::winbase::BELOW_NORMAL_PRIORITY_CLASS;
+    let handle = child.raw_handle()?;
+    // SAFETY: the child's process handle stays open for both calls, which only
+    // read or set its priority class and report failure through their results.
+    let assigned = unsafe { GetPriorityClass(handle as _) };
+    if assigned == 0 {
+        return None;
+    }
+    // SAFETY: as above.
+    if unsafe { SetPriorityClass(handle as _, BELOW_NORMAL_PRIORITY_CLASS) } == 0 {
+        return None;
+    }
+    Some(assigned)
+}
+
 /// The Windows pipe owner's actual OS process-creation call failed.
 #[cfg(windows)]
 #[derive(Debug)]
@@ -189,6 +220,40 @@ async fn spawn_process_with_stdin_mode(
     arg0: &Option<String>,
     stdin_mode: PipeStdinMode,
     inherited_fds: &[i32],
+    priority: SpawnPriority,
+) -> Result<SpawnedProcess> {
+    spawn_process_with_stdin_mode_reporting_pid(
+        program,
+        args,
+        cwd,
+        env,
+        arg0,
+        stdin_mode,
+        inherited_fds,
+        /*launch_slot*/ None,
+        priority,
+    )
+    .await
+}
+
+/// The created root's OS process id (0 when unavailable) and its start
+/// observation, published for a launcher that hands the root to a later scope.
+pub(crate) type LaunchObservationSlot =
+    Arc<StdMutex<Option<(u32, crate::process_observation::ObservedProcess)>>>;
+
+/// Same root launch, additionally publishing the root's id and start
+/// observation in `launch_slot` before the root is resumed.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_process_with_stdin_mode_reporting_pid(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    arg0: &Option<String>,
+    stdin_mode: PipeStdinMode,
+    inherited_fds: &[i32],
+    launch_slot: Option<LaunchObservationSlot>,
+    priority: SpawnPriority,
 ) -> Result<SpawnedProcess> {
     if program.is_empty() {
         anyhow::bail!("missing program for pipe spawn");
@@ -285,7 +350,7 @@ async fn spawn_process_with_stdin_mode(
             // Keep OS spawn refusal separate from waiter timeout and from
             // failures attaching or configuring a process that did spawn.
             Ok(command.spawn().map(|child| {
-                runtime.block_on(finish_pipe_process_setup(child, managed))
+                runtime.block_on(finish_pipe_process_setup(child, managed, launch_slot, priority))
             }))
         })
         .await?
@@ -294,13 +359,15 @@ async fn spawn_process_with_stdin_mode(
     #[cfg(not(windows))]
     {
         let child = command.spawn()?;
-        finish_pipe_process_setup(child, managed).await
+        finish_pipe_process_setup(child, managed, launch_slot, priority).await
     }
 }
 
 async fn finish_pipe_process_setup(
     mut child: tokio::process::Child,
     managed: ManagedRootProcess,
+    launch_slot: Option<LaunchObservationSlot>,
+    priority: SpawnPriority,
 ) -> Result<SpawnedProcess> {
     let observation = crate::process_observation::observe_process_start(
         "unified_pipe",
@@ -308,6 +375,23 @@ async fn finish_pipe_process_setup(
         child.id(),
         None,
     );
+    if let Some(slot) = launch_slot.as_ref()
+        && let Ok(mut slot) = slot.lock()
+    {
+        *slot = Some((child.id().unwrap_or(0), observation.clone()));
+    }
+    // The root is still suspended here, so a lowered host never runs above
+    // below-normal before it is handed work.
+    #[cfg(windows)]
+    let deferred_priority_class = match priority {
+        SpawnPriority::Normal => None,
+        SpawnPriority::LoweredUntilHandoff => lower_until_handoff(&child),
+    };
+    #[cfg(not(windows))]
+    let deferred_priority_class = {
+        let _ = priority;
+        None
+    };
     #[cfg(windows)]
     let windows_terminator = {
         let pid = child
@@ -483,7 +567,8 @@ async fn finish_pipe_process_setup(
     )
     .with_output_capture(capture)
     .with_stdin_close_request(stdin_close_tx)
-    .with_stdin_close_receipt(stdin_receipt_rx);
+    .with_stdin_close_receipt(stdin_receipt_rx)
+    .with_deferred_priority_class(deferred_priority_class);
 
     Ok(SpawnedProcess {
         session: handle,
@@ -513,7 +598,17 @@ pub async fn spawn_process_with_inherited_fds(
     arg0: &Option<String>,
     inherited_fds: &[i32],
 ) -> Result<SpawnedProcess> {
-    spawn_process_with_stdin_mode(program, args, cwd, env, arg0, PipeStdinMode::Piped, inherited_fds).await
+    spawn_process_with_stdin_mode(
+        program,
+        args,
+        cwd,
+        env,
+        arg0,
+        PipeStdinMode::Piped,
+        inherited_fds,
+        SpawnPriority::Normal,
+    )
+    .await
 }
 
 /// Spawn a process using regular pipes, but close stdin immediately.
@@ -545,7 +640,47 @@ pub async fn spawn_process_no_stdin_with_inherited_fds(
         arg0,
         PipeStdinMode::Null,
         inherited_fds,
+        SpawnPriority::Normal,
     )
     .await
+}
+
+/// Like [`spawn_process_no_stdin`], but a Windows root runs below normal until it is
+/// handed work: the class Windows assigned at creation is available from
+/// [`ProcessHandle::deferred_priority_class`] and must be restored by the child
+/// before it runs caller code. Also returns the root's OS process id (0 when
+/// unavailable) and its start observation, so the launcher can check who connects
+/// to its hand-off channel and attribute the root to the call it is handed to
+/// ([`crate::process_observation::ObservedProcess::adopt_into_current_scope`]).
+pub async fn spawn_process_no_stdin_lowered_until_handoff(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    arg0: &Option<String>,
+) -> Result<(
+    SpawnedProcess,
+    u32,
+    crate::process_observation::ObservedProcess,
+)> {
+    let launch_slot: LaunchObservationSlot = Arc::new(StdMutex::new(None));
+    let spawned = spawn_process_with_stdin_mode_reporting_pid(
+        program,
+        args,
+        cwd,
+        env,
+        arg0,
+        PipeStdinMode::Null,
+        &[],
+        Some(Arc::clone(&launch_slot)),
+        SpawnPriority::LoweredUntilHandoff,
+    )
+    .await?;
+    let (pid, observation) = launch_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_default();
+    Ok((spawned, pid, observation))
 }
 

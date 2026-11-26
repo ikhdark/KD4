@@ -269,6 +269,17 @@ impl CodexThread {
         let _ = self.codex.session_loop_termination.clone().await;
     }
 
+    /// The settled failure of the session loop, if it ended abnormally. The
+    /// completion is immutable: `wait_until_drained` reports this same failure
+    /// on every later call, so retrying a drain that failed on it can never
+    /// confirm retirement.
+    pub fn session_loop_failure(&self) -> Option<&'static str> {
+        self.codex
+            .session_loop_termination
+            .peek()
+            .and_then(|termination| termination.as_ref().err().copied())
+    }
+
     /// Wait for actual accepted owners, not just the bounded loop observer.
     /// Callers retiring a runtime must retain its identity/capacity until this
     /// completes. Cancelling this observer does not cancel any of the owners.
@@ -883,7 +894,7 @@ impl CodexThread {
                 .await?;
             self.codex
                 .session
-                .record_context_updates_and_set_reference_context_item(step_context.as_ref())
+                .record_initial_context_unless_owned(step_context.as_ref())
                 .await?;
         }
         self.codex

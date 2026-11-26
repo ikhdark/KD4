@@ -127,6 +127,13 @@ fn completed_process_output(
 }
 
 
+/// Unreadable durable terminal evidence is a different fact from an absent
+/// receipt; failures that fall back to "unknown/stale" carry this note so the
+/// caller can tell them apart.
+fn durable_evidence_note(cause: &str) -> String {
+    format!("durable terminal evidence could not be read: {cause}")
+}
+
 /// An argument combination refused before any process is polled, written or
 /// signalled: nothing ran, so the failure says so instead of unknown effects.
 fn argument_refusal(message: &str) -> FunctionCallError {
@@ -190,8 +197,8 @@ impl WriteStdinHandler {
                 .process_status(args.session_id, incarnation)
                 .await;
             let observed = if observed.as_ref().map_or(true, |value| value["status"] == "unavailable") {
-                if let Some(receipt) = session.retained_process_result(args.session_id, incarnation).await {
-                    Ok(serde_json::json!({
+                match session.retained_process_result(args.session_id, incarnation).await {
+                    Ok(Some(receipt)) => Ok(serde_json::json!({
                         "status_only": true, "session_id": args.session_id, "incarnation": incarnation,
                         "status": if receipt["process_exited"] == true { "exited" } else { "uncertain" },
                         "exit_code": receipt["exit_code"],
@@ -199,8 +206,18 @@ impl WriteStdinHandler {
                         "completion_provenance": receipt["completion_provenance"],
                         "output_drained": receipt["output_drained"],
                         "output_reference": receipt["output_reference"],
-                    }))
-                } else { observed }
+                    })),
+                    Ok(None) => observed,
+                    // Unreadable evidence is not an absent receipt: keep the
+                    // owner's observation and say why history was not consulted.
+                    Err(cause) => match observed {
+                        Ok(mut value) => {
+                            value["durable_evidence_error"] = cause.into();
+                            Ok(value)
+                        }
+                        Err(message) => Err(format!("{message}; {}", durable_evidence_note(&cause))),
+                    },
+                }
             } else { observed };
             let result = observed
                 .map_err(|message| FunctionCallError::structured(ToolFailure::no_effects(
@@ -221,12 +238,17 @@ impl WriteStdinHandler {
                 ToolFailureCode::StaleInput,
                 "event_filter requires the originating process incarnation",
             )))?;
-            if session.services.unified_exec_manager.process_incarnation(args.session_id).await.is_none()
-                && let Some(receipt) = session.retained_process_result(args.session_id, incarnation).await
-            {
-                let result = filter.retained_observation(args.session_id, incarnation, &receipt)
-                    .map_err(FunctionCallError::RespondToModel)?;
-                return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(result, Some(true))));
+            let mut durable_error = None;
+            if session.services.unified_exec_manager.process_incarnation(args.session_id).await.is_none() {
+                match session.retained_process_result(args.session_id, incarnation).await {
+                    Ok(Some(receipt)) => {
+                        let result = filter.retained_observation(args.session_id, incarnation, &receipt)
+                            .map_err(FunctionCallError::RespondToModel)?;
+                        return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(result, Some(true))));
+                    }
+                    Ok(None) => {}
+                    Err(cause) => durable_error = Some(cause),
+                }
             }
             let result = session.services.unified_exec_manager
                 .filtered_process_events(
@@ -247,7 +269,10 @@ impl WriteStdinHandler {
                     args.session_id, incarnation,
                 ).await),
             }
-                .map_err(FunctionCallError::RespondToModel)?;
+                .map_err(|message| FunctionCallError::RespondToModel(match &durable_error {
+                    Some(cause) => format!("{message}; {}", durable_evidence_note(cause)),
+                    None => message,
+                }))?;
             return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(result, Some(true))));
         }
         let live_incarnation = session
@@ -255,24 +280,35 @@ impl WriteStdinHandler {
             .unified_exec_manager
             .process_incarnation(args.session_id)
             .await;
+        let mut durable_error = None;
         if live_incarnation.is_none()
             && args.chars.is_empty()
             && !args.terminate
             && !args.close_stdin
             && let Some(incarnation) = args.incarnation
-            && let Some(result) = session.retained_process_result(args.session_id, incarnation).await
         {
-            return Ok(completed_process_output(result));
+            match session.retained_process_result(args.session_id, incarnation).await {
+                Ok(Some(result)) => return Ok(completed_process_output(result)),
+                Ok(None) => {}
+                Err(cause) => durable_error = Some(cause),
+            }
         }
         // Legacy numeric-only handles are readable history, not live authority.
         // IDs are not reused inside a manager; the creation token additionally
         // prevents persisted values from controlling another runtime's process.
         let incarnation = match args.incarnation {
             Some(incarnation) if live_incarnation == Some(incarnation) => incarnation,
-            _ => return Err(FunctionCallError::structured(ToolFailure::no_effects(
-                ToolFailureCode::StaleInput,
-                "process handle is stale or lacks its creation identity; supply incarnation from the originating session_capabilities. No process was polled, written, or terminated.",
-            ))),
+            _ => {
+                let mut message = "process handle is stale or lacks its creation identity; supply incarnation from the originating session_capabilities. No process was polled, written, or terminated.".to_string();
+                if let Some(cause) = &durable_error {
+                    message.push(' ');
+                    message.push_str(&durable_evidence_note(cause));
+                }
+                return Err(FunctionCallError::structured(ToolFailure::no_effects(
+                    ToolFailureCode::StaleInput,
+                    message,
+                )));
+            }
         };
         let wait_for_output = args.waits_for_output();
         if args.terminate && !args.chars.is_empty() {
@@ -375,13 +411,15 @@ impl WriteStdinHandler {
                 )
                 .await;
         }
+        let mut unreadable_history = None;
         let response = match response {
             Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
                 if args.chars.is_empty() && !args.terminate && !args.close_stdin =>
             {
-                if let Some(result) = session.retained_process_result(process_id, incarnation).await
-                {
-                    return Ok(completed_process_output(result));
+                match session.retained_process_result(process_id, incarnation).await {
+                    Ok(Some(result)) => return Ok(completed_process_output(result)),
+                    Ok(None) => {}
+                    Err(cause) => unreadable_history = Some(cause),
                 }
                 Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
             }
@@ -421,10 +459,15 @@ impl WriteStdinHandler {
                 ).await);
             }
             Err(err) => {
+                let mut message = format!("write_stdin failed: {err}");
+                if let Some(cause) = &unreadable_history {
+                    message.push_str("; ");
+                    message.push_str(&durable_evidence_note(cause));
+                }
                 return Err(stdin_failure(
                     &session,
                     ToolFailureCode::UncertainEffects,
-                    format!("write_stdin failed: {err}"),
+                    message,
                     args.session_id, incarnation,
                 ).await);
             }

@@ -469,6 +469,11 @@ async fn run_remote_compaction_request_v2(
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retry_state = ResponsesStreamRetryState::new(max_retries, recovery_wait);
     turn_context.turn_timing_state.begin_compaction_generation();
+    // Send the sampling requests' request-level effort baseline. The retained
+    // positional updates, plus any appended before the trigger, select the
+    // effective effort, so the compaction prompt is the turn prompt plus its
+    // suffix and keeps the cached prefix.
+    let request_effort = sess.compaction_request_reasoning_effort(turn_context).await;
     loop {
         retry_state.check_retry_budget(cancellation_token)?;
         retry_state.begin_attempt(turn_context, ResponsesStreamRequest::RemoteCompactionV2);
@@ -482,7 +487,7 @@ async fn run_remote_compaction_request_v2(
                 prompt,
                 &turn_context.model_info,
                 &turn_context.session_telemetry,
-                turn_context.request_reasoning_effort(),
+                request_effort.clone(),
                 codex_protocol::config_types::ReasoningSummary::None,
                 service_tier,
                 responses_metadata,

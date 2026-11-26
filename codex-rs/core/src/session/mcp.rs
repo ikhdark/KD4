@@ -197,6 +197,7 @@ impl Session {
             local_cwd,
         )
         .with_selected_environments(captured)
+        .with_deferred_optional_stdio_startup(current_context.defers_optional_stdio_startup())
     }
 
     async fn mcp_runtime_for_binding(
@@ -544,6 +545,9 @@ impl Session {
         let mcp_runtime_context = bound_context.unwrap_or_else(|| {
             McpRuntimeContext::new(environment_manager, cwd)
                 .with_selected_environments(environments.captured_environments())
+                .with_deferred_optional_stdio_startup(
+                    expected_runtime.runtime_context().defers_optional_stdio_startup(),
+                )
         });
         let auth_statuses = codex_mcp::compute_cached_auth_statuses(
             mcp_servers.iter(),

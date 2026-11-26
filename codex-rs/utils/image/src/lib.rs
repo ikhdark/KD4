@@ -45,24 +45,31 @@ pub use crate::error::ImageProcessingError;
 /// Bounded local acquisition for synchronous protocol/clipboard callers. Core
 /// sessions use ExecutorFileSystem's cancellable stable-snapshot reader instead.
 pub fn read_image_source(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-    let inspect = |metadata: &std::fs::Metadata| {
-        if !metadata.is_file() || metadata.len() > MAX_PROMPT_IMAGE_SOURCE_BYTES as u64 {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "image source must be a regular file no larger than 64 MiB",
-            ))
-        } else {
-            Ok(())
-        }
-    };
     let metadata = std::fs::metadata(path)?;
-    inspect(&metadata)?;
+    inspect_image_source(&metadata)?;
     let mut file = std::fs::File::open(path)?;
+    read_opened_image_source(&mut file)
+}
+
+fn inspect_image_source(metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    if !metadata.is_file() || metadata.len() > MAX_PROMPT_IMAGE_SOURCE_BYTES as u64 {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image source must be a regular file no larger than 64 MiB",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate and read an already opened source from its current offset, so the
+/// bytes read belong to the object that was validated.
+fn read_opened_image_source(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
     let before = file.metadata()?;
-    inspect(&before)?;
+    inspect_image_source(&before)?;
     let mut bytes = Vec::new();
-    (&mut file)
+    file.by_ref()
         .take(MAX_PROMPT_IMAGE_SOURCE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     let after = file.metadata()?;
@@ -445,18 +452,18 @@ pub fn prompt_image_dimensions(bytes: &[u8]) -> image::ImageResult<(u32, u32)> {
 
 pub fn prompt_image_dimensions_from_path(path: &Path) -> image::ImageResult<(u32, u32)> {
     let metadata = std::fs::metadata(path)?;
-    if !metadata.is_file() || metadata.len() > MAX_PROMPT_IMAGE_SOURCE_BYTES as u64 {
-        return Err(image::ImageError::IoError(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "image source must be a regular file no larger than 64 MiB",
-        )));
-    }
-    let file = std::fs::File::open(path)?;
-    let mut reader = ImageReader::new(std::io::BufReader::new(file)).with_guessed_format()?;
+    inspect_image_source(&metadata)?;
+    let mut file = std::fs::File::open(path)?;
+    // The pathname gate above only selects the file: validate the opened object
+    // itself, then sniff, bound and decode that same descriptor.
+    inspect_image_source(&file.metadata()?)?;
+    let mut reader = ImageReader::new(std::io::BufReader::new(&mut file)).with_guessed_format()?;
     if reader.format() == Some(ImageFormat::Png) {
+        drop(reader);
+        std::io::Seek::rewind(&mut file)?;
         // Inspect the bounded source, not just its header: png intentionally
         // suppresses ICC decompression-limit errors as optional metadata damage.
-        return prompt_image_dimensions(&read_image_source(path)?);
+        return prompt_image_dimensions(&read_opened_image_source(&mut file)?);
     }
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_IMAGE_METADATA_BYTES);

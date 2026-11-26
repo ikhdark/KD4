@@ -347,6 +347,9 @@ pub struct ProcessHandle {
     // Optional resize hook for driver-backed sessions that proxy PTY control to
     // another backend instead of owning local PTY handles.
     resizer: StdMutex<Option<ResizeFn>>,
+    // Windows priority class assigned at creation, recorded when the root was
+    // started below normal until it is handed real work.
+    deferred_priority_class: Option<u32>,
 }
 
 impl fmt::Debug for ProcessHandle {
@@ -389,7 +392,19 @@ impl ProcessHandle {
             pty_handles: pty_handles.unwrap_or_default(),
             has_pty,
             resizer: StdMutex::new(resizer),
+            deferred_priority_class: None,
         }
+    }
+
+    pub(crate) fn with_deferred_priority_class(mut self, class: Option<u32>) -> Self {
+        self.deferred_priority_class = class;
+        self
+    }
+
+    /// The priority class Windows assigned at creation when the root was lowered
+    /// to below normal before it first ran; `None` for ordinary launches.
+    pub fn deferred_priority_class(&self) -> Option<u32> {
+        self.deferred_priority_class
     }
 
     pub(crate) fn with_output_capture(mut self, capture: OutputCapture) -> Self {
@@ -704,7 +719,18 @@ impl Drop for ProcessHandle {
         if self.killer.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() {
             return;
         }
-        if let Err(error) = self.terminate() {
+        // Windows job termination waits (up to seconds) for the tree to empty.
+        // A handle dropped on a multi-thread runtime worker hands that worker's
+        // other tasks off first; ordering and custody stay identical. Current-
+        // thread runtimes (where block_in_place panics) keep the inline path.
+        let on_multi_thread_worker = tokio::runtime::Handle::try_current()
+            .is_ok_and(|runtime| runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        let result = if on_multi_thread_worker {
+            tokio::task::block_in_place(|| self.terminate())
+        } else {
+            self.terminate()
+        };
+        if let Err(error) = result {
             log::warn!("failed to terminate process while dropping its handle: {error}");
             // The native waiter owns root reaping, but cannot certify tree
             // cleanup. Transfer the failed terminator rather than closing its

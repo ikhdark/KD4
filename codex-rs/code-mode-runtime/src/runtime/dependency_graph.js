@@ -2,6 +2,7 @@
 // resource admission remain owned by the normal nested-tool runtime.
 (() => {
 const observeGraph = globalThis.__codex_graph_observation;
+const monotonicNow = globalThis.__codex_monotonic_now;
 const originalResolveTool = globalThis.resolve_tool;
 delete globalThis.__codex_graph_observation;
 Object.defineProperty(globalThis, "run_graph", {
@@ -236,8 +237,9 @@ Object.defineProperty(globalThis, "run_graph", {
       error.omitted_capabilities = missingCount - missingCapabilities.length;
       throw error;
     }
-    // Longest remaining dependency path first; zero estimates retain the
-    // original input-order policy. Estimates affect admission, never results.
+    // Longest remaining estimated path first. Equal estimates, including the
+    // default zero, start the longer remaining dependency chain (node count)
+    // first, then keep input order. Ranks affect admission, never results.
     const ranks = new Map();
     for (const id of [...visited].reverse()) {
       if (!selected.has(id)) continue;
@@ -247,11 +249,20 @@ Object.defineProperty(globalThis, "run_graph", {
       for (const dep of node.deps)
         ranks.set(dep, Math.max(ranks.get(dep) ?? 0, rank));
     }
+    const depths = new Map();
+    for (const id of [...visited].reverse()) {
+      if (!selected.has(id)) continue;
+      const depth = (depths.get(id) ?? 0) + 1;
+      depths.set(id, depth);
+      for (const dep of graph.get(id).deps)
+        depths.set(dep, Math.max(depths.get(dep) ?? 0, depth));
+    }
     const admissionOrder = [...graph.keys()]
       .filter((id) => selected.has(id))
       .sort(
         (a, b) =>
           ranks.get(b) - ranks.get(a) ||
+          depths.get(b) - depths.get(a) ||
           graph.get(a).ordinal - graph.get(b).ordinal,
       );
     const results = Object.create(null);
@@ -268,9 +279,55 @@ Object.defineProperty(globalThis, "run_graph", {
       admissionOrder.filter((id) => remainingDeps.get(id) === 0),
     );
     const running = new Set();
+    // Bounded online experiment: preserve declared admission for resource
+    // claims and track only positive-cost root service within this graph.
+    const rootCosts = concurrency > 1 && typeof monotonicNow === "function" &&
+      admissionOrder.every((id) => {
+        const { read, write } = graph.get(id).claims;
+        return !read.length && !write.length;
+      })
+      ? new Map(admissionOrder.flatMap((id) => {
+        const { deps, estimated_ms } = graph.get(id);
+        return !deps.length && estimated_ms > 0 ? [[id, estimated_ms]] : [];
+      }))
+      : null;
+    const startedRoots = rootCosts?.size ? new Map() : null;
+    const completedService = startedRoots ? new Map() : null;
+    function readyInPriorityOrder() {
+      const ready = [...pending].sort((a, b) => priority.get(a) - priority.get(b));
+      if (!startedRoots?.size || running.size !== concurrency - 1 || ready.length < 2)
+        return ready;
+      const first = ready[0], cost = rootCosts.get(first);
+      if (cost === undefined || consumers.get(first).length) return ready;
+      const now = monotonicNow();
+      const next = ready.findIndex((id, index) => {
+        const { deps } = graph.get(id);
+        if (!index || deps.length !== 1 || rootCosts.get(deps[0]) !== cost)
+          return false;
+        const sample = completedService.get(deps[0]);
+        const rank = ranks.get(id);
+        if (sample === undefined || rank <= 0 || rank >= Math.min(cost, sample))
+          return false;
+        // The still-running same-class root supplies a censored lower bound,
+        // not a completed cost estimate. A 10% allowance covers launch skew
+        // between the roots; it must still exceed the declared root cost.
+        return [...startedRoots].some(([peer, startedAt]) =>
+          rootCosts.get(peer) === cost &&
+          now - startedAt > cost && now - startedAt >= sample * 0.9,
+        );
+      });
+      if (next > 0) ready.unshift(ready.splice(next, 1)[0]);
+      return ready;
+    }
     let remaining = selected.size,
       wake;
     function settled(id) {
+      const startedAt = startedRoots?.get(id);
+      if (startedAt !== undefined) {
+        startedRoots.delete(id);
+        if (results[id]?.status === "fulfilled")
+          completedService.set(id, monotonicNow() - startedAt);
+      }
       --remaining;
       for (const consumer of consumers.get(id)) {
         const count = remainingDeps.get(consumer) - 1;
@@ -326,6 +383,7 @@ Object.defineProperty(globalThis, "run_graph", {
       try {
         const dependencies = Object.create(null);
         for (const dep of node.deps) dependencies[dep] = results[dep].value;
+        if (startedRoots && rootCosts.has(id)) startedRoots.set(id, monotonicNow());
         value = await node.run(Object.freeze(dependencies));
         produced = true;
         // Promise resolution is not tool success. `accept` establishes the
@@ -358,9 +416,7 @@ Object.defineProperty(globalThis, "run_graph", {
       // These are scheduling reservations, never acquired or cross-cell leases.
       const waitingReads = new Map(),
         waitingWrites = new Map();
-      for (const id of [...pending].sort(
-        (a, b) => priority.get(a) - priority.get(b),
-      )) {
+      for (const id of readyInPriorityOrder()) {
         const node = graph.get(id);
         if (node.deps.some((dep) => results[dep].status !== "fulfilled")) {
           results[id] = {

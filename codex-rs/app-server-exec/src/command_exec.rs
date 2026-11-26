@@ -82,13 +82,28 @@ impl OutputByteCap {
     }
 }
 
+/// Requests process-tree termination on the blocking pool.
+///
+/// On Windows `request_terminate` waits (up to seconds) for the job to empty
+/// while holding the terminator lock; supervision loops must not stall a
+/// runtime worker shared with unrelated requests. The caller still awaits the
+/// outcome, so termination ordering and reported errors are unchanged.
+pub(crate) async fn request_terminate_off_runtime(session: &Arc<ProcessHandle>) -> std::io::Result<()> {
+    let session = Arc::clone(session);
+    tokio::task::spawn_blocking(move || session.request_terminate())
+        .await
+        .unwrap_or_else(|error| {
+            Err(std::io::Error::other(format!("process termination worker failed: {error}")))
+        })
+}
+
 pub(crate) async fn observe_process_exit(session: Arc<ProcessHandle>, exit_rx: oneshot::Receiver<i32>) -> i32 {
     if let Some(code) = session.exit_code() { return code; }
     if let Ok(code) = exit_rx.await { return code; }
     tracing::error!(cleanup_pending = true, "native exit observer failed; retaining process ownership until confirmed exit");
     loop {
         if let Some(code) = session.exit_code() { return code; }
-        if let Err(error) = session.request_terminate() {
+        if let Err(error) = request_terminate_off_runtime(&session).await {
             tracing::warn!(%error, "native exit recovery termination failed");
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -138,6 +153,26 @@ impl<K: ConnectionSessionKey, V> ConnectionSessionMap<K, V> {
         let removed = entries.remove(key);
         if entries.is_empty() { self.connections.remove(&connection_id); }
         removed
+    }
+    /// Names the bound a new entry owned by `connection_id` would exceed, so an
+    /// admitting caller can refuse it before registering. Server scope wins.
+    pub(crate) fn admission_limit(
+        &self,
+        connection_id: ConnectionId,
+        per_connection: usize,
+        per_server: usize,
+    ) -> Option<&'static str> {
+        if self.connections.values().map(HashMap::len).sum::<usize>() >= per_server {
+            Some("server")
+        } else if self
+            .connections
+            .get(&connection_id)
+            .is_some_and(|entries| entries.len() >= per_connection)
+        {
+            Some("connection")
+        } else {
+            None
+        }
     }
     pub(crate) fn remove_connection(&mut self, connection_id: ConnectionId) -> Vec<V> {
         self.connections.remove(&connection_id).unwrap_or_default().into_values().collect()
@@ -700,7 +735,7 @@ async fn run_command(params: RunCommandParams) {
             outcome = &mut expiration, if expiration_outcome.is_none() => {
                 if let Some(code) = session.exit_code() { break code; }
                 expiration_outcome = Some(outcome);
-                termination_error = session.request_terminate().err().map(|error| error.to_string());
+                termination_error = request_terminate_off_runtime(&session).await.err().map(|error| error.to_string());
                 termination_deadline = Some(tokio::time::Instant::now() + codex_app_server_rpc::outgoing_message::RESOURCE_DELIVERY_TIMEOUT);
             }
             _ = async {
@@ -713,7 +748,7 @@ async fn run_command(params: RunCommandParams) {
                 // A failed kill remains retryable in ProcessHandle. Report an
                 // honest unknown outcome, but keep this run, process ID, native
                 // waiter and admission owned until exit is actually observed.
-                let retry_error = session.request_terminate().err().map(|error| error.to_string());
+                let retry_error = request_terminate_off_runtime(&session).await.err().map(|error| error.to_string());
                 termination_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
                 if termination_reported { continue; }
                 let mut error = internal_error("command expiration requested termination, but process exit is not confirmed; cleanup remains pending; do not repeat the command");
@@ -731,8 +766,8 @@ async fn run_command(params: RunCommandParams) {
                             CommandControl::Resize { size } => {
                                 handle_process_resize(&session, size)
                             }
-                            CommandControl::Terminate => session
-                                .request_terminate()
+                            CommandControl::Terminate => request_terminate_off_runtime(&session)
+                                .await
                                 .map_err(|error| internal_error(error.to_string())),
                         };
                         if let Some(response_tx) = response_tx {
@@ -741,7 +776,7 @@ async fn run_command(params: RunCommandParams) {
                     },
                     None => {
                         control_open = false;
-                        let _ = session.request_terminate();
+                        let _ = request_terminate_off_runtime(&session).await;
                     }
                 }
             }

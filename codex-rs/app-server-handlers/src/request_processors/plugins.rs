@@ -114,6 +114,8 @@ use codex_rmcp_client::perform_oauth_login_silent_with_http_client;
 use futures::StreamExt;
 
 const PLUGIN_OAUTH_DISCOVERY_CONCURRENCY: usize = 8;
+/// Serializes plugin MCP OAuth logins that share the configured callback port.
+static PLUGIN_OAUTH_FIXED_PORT_LOGIN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn join_plugin_listing_reads<L, R, E>(
     local: impl std::future::Future<Output = Result<L, E>>,
@@ -2230,6 +2232,13 @@ impl PluginRequestProcessor {
             let notification_name = name.clone();
 
             tokio::spawn(async move {
+                // A configured callback port can be bound by one login at a time.
+                // Queue those logins instead of letting the later ones fail with
+                // an address-in-use error; ephemeral-port logins stay concurrent.
+                let fixed_port_login = match callback_port {
+                    Some(_) => Some(PLUGIN_OAUTH_FIXED_PORT_LOGIN.lock().await),
+                    None => None,
+                };
                 let oauth_client_id = server.oauth_client_id();
                 let first_attempt = perform_oauth_login_silent_with_http_client(
                     &codex_home,
@@ -2269,6 +2278,7 @@ impl PluginRequestProcessor {
                     }
                     result => result,
                 };
+                drop(fixed_port_login);
 
                 let (success, error) = match final_result {
                     Ok(()) => (true, None),

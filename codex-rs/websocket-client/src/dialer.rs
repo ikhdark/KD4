@@ -1,9 +1,14 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
+
+use tokio::io::AsyncRead;
 
 use codex_http_client::OutboundProxyRoute;
 use futures::StreamExt;
@@ -29,6 +34,154 @@ use crate::ConnectionInner;
 use crate::TcpNodelay;
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+
+/// Pre-established transport streams (TCP, any proxy CONNECT and destination TLS) that await a
+/// WebSocket upgrade. No HTTP byte has been written to them: every upgrade still sends its own
+/// request, so thread identity and attestation headers stay per connection and only transport
+/// setup is shared. A stream is used at most once, kept briefly and checked for a peer close.
+const WARM_STREAM_MAX_AGE: Duration = Duration::from_secs(10);
+const WARM_STREAMS_PER_KEY: usize = 1;
+/// `0` disables the pool; any other value or no value keeps it enabled.
+const WARM_STREAM_POOL_ENV: &str = "CODEX_WEBSOCKET_TRANSPORT_POOL";
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct WarmStreamKey {
+    route: OutboundProxyRoute,
+    target: String,
+    tls_config: usize,
+    tcp_nodelay: bool,
+}
+
+struct WarmStream {
+    stream: Box<dyn AsyncIo>,
+    ready_at: Instant,
+    // Pins the configuration whose address is part of the key.
+    _tls_config: Arc<ClientConfig>,
+}
+
+#[derive(Default)]
+struct WarmSlot {
+    streams: Vec<WarmStream>,
+    refilling: bool,
+}
+
+static WARM_STREAMS: LazyLock<StdMutex<HashMap<WarmStreamKey, WarmSlot>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn warm_streams() -> std::sync::MutexGuard<'static, HashMap<WarmStreamKey, WarmSlot>> {
+    WARM_STREAMS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn warm_stream_key(
+    request: &Request,
+    tls_config: &Arc<ClientConfig>,
+    route: &OutboundProxyRoute,
+    tcp_nodelay: TcpNodelay,
+) -> Option<WarmStreamKey> {
+    if std::env::var_os(WARM_STREAM_POOL_ENV).is_some_and(|value| value == "0") {
+        return None;
+    }
+    if !matches!(route, OutboundProxyRoute::Direct | OutboundProxyRoute::Proxy { .. }) {
+        return None;
+    }
+    let uri = request.uri();
+    Some(WarmStreamKey {
+        route: route.clone(),
+        target: format!("{}://{}:{}", uri.scheme_str()?, uri.host()?, websocket_port(request).ok()?),
+        tls_config: Arc::as_ptr(tls_config) as usize,
+        tcp_nodelay: tcp_nodelay == TcpNodelay::Enabled,
+    })
+}
+
+fn take_warm_stream(key: &WarmStreamKey) -> Option<Box<dyn AsyncIo>> {
+    let mut discarded = Vec::new();
+    let taken = {
+        let mut pool = warm_streams();
+        let slot = pool.get_mut(key)?;
+        let mut taken = None;
+        while let Some(mut warm) = slot.streams.pop() {
+            if warm.ready_at.elapsed() <= WARM_STREAM_MAX_AGE && warm_stream_is_quiet(&mut warm.stream) {
+                taken = Some(warm.stream);
+                break;
+            }
+            discarded.push(warm);
+        }
+        taken
+    };
+    drop(discarded);
+    taken
+}
+
+/// A usable stream has nothing to read yet. End of stream, data or an error means the peer
+/// closed it or wrote unsolicited bytes, so it is dropped rather than upgraded.
+fn warm_stream_is_quiet(stream: &mut Box<dyn AsyncIo>) -> bool {
+    let mut byte = [0_u8; 1];
+    let mut buffer = tokio::io::ReadBuf::new(&mut byte);
+    let waker = futures::task::noop_waker();
+    let mut context = std::task::Context::from_waker(&waker);
+    matches!(
+        std::pin::Pin::new(stream).poll_read(&mut context, &mut buffer),
+        std::task::Poll::Pending
+    )
+}
+
+/// Replaces a used stream for the next dial of the same destination. Only the destination
+/// URI is copied; no request header reaches a warm stream.
+fn schedule_warm_refill(
+    key: WarmStreamKey,
+    request: &Request,
+    tls_config: &Arc<ClientConfig>,
+    route: OutboundProxyRoute,
+    tcp_nodelay: TcpNodelay,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Ok(target) = Request::builder().uri(request.uri().clone()).body(()) else {
+        return;
+    };
+    {
+        let mut pool = warm_streams();
+        let slot = pool.entry(key.clone()).or_default();
+        if slot.refilling || slot.streams.len() >= WARM_STREAMS_PER_KEY {
+            return;
+        }
+        slot.refilling = true;
+    }
+    let tls_config = Arc::clone(tls_config);
+    runtime.spawn(async move {
+        let stream = connect_routed_stream(&target, &tls_config, route, tcp_nodelay).await.ok();
+        {
+            let mut pool = warm_streams();
+            let slot = pool.entry(key.clone()).or_default();
+            slot.refilling = false;
+            match stream {
+                Some(stream) if slot.streams.len() < WARM_STREAMS_PER_KEY => {
+                    slot.streams.push(WarmStream {
+                        stream,
+                        ready_at: Instant::now(),
+                        _tls_config: tls_config,
+                    });
+                }
+                _ => return,
+            }
+        }
+        // Do not hold an unused socket past its age limit.
+        tokio::time::sleep(WARM_STREAM_MAX_AGE).await;
+        let expired = {
+            let mut pool = warm_streams();
+            let Some(slot) = pool.get_mut(&key) else {
+                return;
+            };
+            let (kept, expired): (Vec<_>, Vec<_>) = std::mem::take(&mut slot.streams)
+                .into_iter()
+                .partition(|warm| warm.ready_at.elapsed() < WARM_STREAM_MAX_AGE);
+            slot.streams = kept;
+            expired
+        };
+        drop(expired);
+    });
+}
 
 pub(crate) async fn connect(
     request: Request,
@@ -84,8 +237,21 @@ async fn connect_route(
                 )));
             }
         }
-        match connect_routed_stream(&request, &tls_config, route, tcp_nodelay).await {
-            Ok(stream) => break stream,
+        let warm_key = warm_stream_key(&request, &tls_config, &route, tcp_nodelay);
+        if let Some(stream) = warm_key.as_ref().and_then(take_warm_stream) {
+            // Transport setup only; the upgrade below still carries this request's headers.
+            if let Some(key) = warm_key {
+                schedule_warm_refill(key, &request, &tls_config, route, tcp_nodelay);
+            }
+            break stream;
+        }
+        match connect_routed_stream(&request, &tls_config, route.clone(), tcp_nodelay).await {
+            Ok(stream) => {
+                if let Some(key) = warm_key {
+                    schedule_warm_refill(key, &request, &tls_config, route, tcp_nodelay);
+                }
+                break stream;
+            }
             Err(error) if routes.peek().is_some()
                 && !codex_http_client::is_permanent_connection_error(&error) => continue,
             Err(error) => return Err(error),

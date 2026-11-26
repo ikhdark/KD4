@@ -59,6 +59,8 @@ use codex_analytics::PluginInstallSource;
 use codex_config::ConfigLayerStack;
 use codex_config::PluginConfigEdit;
 use codex_config::apply_user_plugin_config_edits_blocking;
+use codex_config::restore_user_plugin_enabled_blocking;
+use codex_config::set_user_plugin_enabled_blocking_with_restore;
 use codex_config::types::PluginConfig;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::ToolSuggestDiscoverableType;
@@ -2093,15 +2095,22 @@ impl PluginsManager {
             // its owned transaction. Release source leases before config locking.
             drop(snapshot);
             drop(marketplace_snapshot);
-            apply_user_plugin_config_edits_blocking(
+            let enabled_restore = set_user_plugin_enabled_blocking_with_restore(
                 codex_home.as_path(),
-                vec![PluginConfigEdit::SetEnabled {
-                    plugin_key: pending_install.result().plugin_id.as_key(),
-                    enabled: true,
-                }],
+                pending_install.result().plugin_id.as_key(),
+                true,
             )
             .map_err(anyhow::Error::from)?;
-            Ok(pending_install.commit()?)
+            // A failed commit rolls the files back, so undo the enable first
+            // rather than leave config enabling a plugin that was withdrawn.
+            Ok(pending_install.commit_or_restore(|| {
+                if let Some(restore) = enabled_restore
+                    && let Err(err) =
+                        restore_user_plugin_enabled_blocking(codex_home.as_path(), restore)
+                {
+                    warn!("failed to restore plugin config after failed install commit: {err}");
+                }
+            })?)
         })
         .await
         .map_err(PluginInstallError::join)??;

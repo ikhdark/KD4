@@ -5,6 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -41,6 +42,7 @@ use rmcp::model::ListResourcesResult;
 use rmcp::model::ListToolsRequest;
 use rmcp::model::ListToolsResult;
 use rmcp::model::PaginatedRequestParams;
+use rmcp::model::PingRequest;
 use rmcp::model::ProgressNotificationParam;
 use rmcp::model::ReadResourceRequest;
 use rmcp::model::ReadResourceRequestParams;
@@ -72,6 +74,8 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::elicitation_client_service::ElicitationClientService;
+use crate::http_client_adapter::InitializeSessionCleanup;
+use crate::http_client_adapter::InitializeSessionGuard;
 use crate::http_client_adapter::StreamableHttpClientAdapter;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
 use crate::oauth::OAuthPersistor;
@@ -100,11 +104,13 @@ enum PendingTransport {
     StreamableHttp {
         transport: StreamableHttpClientTransport<StreamableHttpClientAdapter>,
         initialize_deadline: Arc<StdMutex<Option<Instant>>>,
+        initialize_session: Arc<InitializeSessionCleanup>,
     },
     StreamableHttpWithOAuth {
         transport: StreamableHttpClientTransport<AuthClient<StreamableHttpClientAdapter>>,
         oauth_persistor: OAuthPersistor,
         initialize_deadline: Arc<StdMutex<Option<Instant>>>,
+        initialize_session: Arc<InitializeSessionCleanup>,
     },
 }
 
@@ -363,7 +369,14 @@ enum ClientOperationError {
         ""
     })]
     Timeout { label: String, duration: Duration },
+    #[error(
+        "MCP server did not answer a liveness ping within {probe:.0?} after an earlier request to it timed out; this tools/call was not sent"
+    )]
+    Unresponsive { probe: Duration },
 }
+
+/// Upper bound for the liveness ping that gates a call after a timeout.
+const LIVENESS_PROBE_MAX: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 #[error("timed out handshaking with MCP server after {duration:?}")]
@@ -651,6 +664,7 @@ pub struct RmcpClient {
     session_recovery: StdMutex<Option<RecoveryObservation>>,
     session_generation: AtomicU64,
     elicitation_pause_state: ElicitationPauseRegistry,
+    liveness_suspect: AtomicBool,
 }
 
 impl RmcpClient {
@@ -685,6 +699,7 @@ impl RmcpClient {
             session_recovery: StdMutex::new(None),
             session_generation: AtomicU64::new(0),
             elicitation_pause_state: ElicitationPauseRegistry::default(),
+            liveness_suspect: AtomicBool::new(false),
         })
     }
 
@@ -727,6 +742,7 @@ impl RmcpClient {
             session_recovery: StdMutex::new(None),
             session_generation: AtomicU64::new(0),
             elicitation_pause_state: ElicitationPauseRegistry::default(),
+            liveness_suspect: AtomicBool::new(false),
         })
     }
 
@@ -1080,6 +1096,7 @@ impl RmcpClient {
             }
             None => None,
         };
+        self.confirm_liveness_after_timeout(timeout).await?;
         let mut rmcp_params = CallToolRequestParams::new(name);
         rmcp_params.arguments = arguments;
         let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1127,6 +1144,47 @@ impl RmcpClient {
                 source
             }
         })
+    }
+
+    /// After an earlier request timed out, require a bounded ping answer
+    /// before sending another call that would otherwise wait a full timeout
+    /// on a hung peer. Any answer, including a JSON-RPC error, proves the peer
+    /// reads requests; only a probe timeout refuses the call, before it is
+    /// sent. A server still busy past the probe is refused too; the caller
+    /// may retry once it answers.
+    async fn confirm_liveness_after_timeout(&self, call_timeout: Option<Duration>) -> Result<()> {
+        if !self.liveness_suspect.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let probe = call_timeout.map_or(LIVENESS_PROBE_MAX, |timeout| {
+            (timeout / 4).min(LIVENESS_PROBE_MAX)
+        });
+        let result = self
+            .run_service_operation("ping", Some(probe), |service, tracker| {
+                async move {
+                    send_tracked_request(
+                        service,
+                        tracker,
+                        ClientRequest::PingRequest(PingRequest {
+                            method: Default::default(),
+                            extensions: Default::default(),
+                        }),
+                        rmcp::service::PeerRequestOptions::no_options(),
+                    )
+                    .await
+                }
+                .boxed()
+            })
+            .await;
+        match result {
+            Err(error) if is_timeout_error(&error) => {
+                Err(ClientOperationError::Unresponsive { probe }.into())
+            }
+            _ => {
+                self.liveness_suspect.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
     }
 
     pub async fn send_custom_notification(
@@ -1400,7 +1458,9 @@ impl RmcpClient {
                     let mut auth_client = auth_client.clone();
                     auth_client.http_client = auth_client
                         .http_client
-                        .with_initialize_deadline(Arc::clone(&initialize_deadline));
+                        .with_initialize_deadline(Arc::clone(&initialize_deadline))
+                        .with_fresh_initialize_session();
+                    let initialize_session = auth_client.http_client.initialize_session();
                     return Ok(PendingTransport::StreamableHttpWithOAuth {
                         transport: StreamableHttpClientTransport::with_client(
                             auth_client,
@@ -1408,6 +1468,7 @@ impl RmcpClient {
                         ),
                         oauth_persistor: oauth_persistor.clone(),
                         initialize_deadline,
+                        initialize_session,
                     });
                 }
                 let initial_oauth_tokens = if bearer_token.is_none()
@@ -1455,11 +1516,13 @@ impl RmcpClient {
                     .await
                     {
                         Ok((transport, oauth_persistor, auth_client)) => {
+                            let initialize_session = auth_client.http_client.initialize_session();
                             *cached_oauth = Some((auth_client, oauth_persistor.clone()));
                             Ok(PendingTransport::StreamableHttpWithOAuth {
                                 transport,
                                 oauth_persistor,
                                 initialize_deadline,
+                                initialize_session,
                             })
                         }
                         Err(err)
@@ -1479,18 +1542,19 @@ impl RmcpClient {
                             let http_config =
                                 StreamableHttpClientTransportConfig::with_uri(url.clone())
                                     .auth_header(access_token);
-                            let transport = StreamableHttpClientTransport::with_client(
-                                StreamableHttpClientAdapter::new(
-                                    Arc::clone(http_client),
-                                    default_headers,
-                                    /*auth_provider*/ None,
-                                    Arc::clone(&initialize_deadline),
-                                ).with_oauth_authority(request_authority),
-                                http_config,
-                            );
+                            let adapter = StreamableHttpClientAdapter::new(
+                                Arc::clone(http_client),
+                                default_headers,
+                                /*auth_provider*/ None,
+                                Arc::clone(&initialize_deadline),
+                            ).with_oauth_authority(request_authority);
+                            let initialize_session = adapter.initialize_session();
+                            let transport =
+                                StreamableHttpClientTransport::with_client(adapter, http_config);
                             Ok(PendingTransport::StreamableHttp {
                                 transport,
                                 initialize_deadline,
+                                initialize_session,
                             })
                         }
                         Err(err) => Err(err),
@@ -1502,18 +1566,19 @@ impl RmcpClient {
                         http_config = http_config.auth_header(bearer_token);
                     }
 
-                    let transport = StreamableHttpClientTransport::with_client(
-                        StreamableHttpClientAdapter::new(
-                            Arc::clone(http_client),
-                            default_headers,
-                            auth_provider,
-                            Arc::clone(&initialize_deadline),
-                        ).with_oauth_authority(request_authority),
-                        http_config,
-                    );
+                    let adapter = StreamableHttpClientAdapter::new(
+                        Arc::clone(http_client),
+                        default_headers,
+                        auth_provider,
+                        Arc::clone(&initialize_deadline),
+                    ).with_oauth_authority(request_authority);
+                    let initialize_session = adapter.initialize_session();
+                    let transport =
+                        StreamableHttpClientTransport::with_client(adapter, http_config);
                     Ok(PendingTransport::StreamableHttp {
                         transport,
                         initialize_deadline,
+                        initialize_session,
                     })
                 }
             }
@@ -1530,30 +1595,40 @@ impl RmcpClient {
     )> {
         let deadline = timeout.map(|duration| Instant::now() + duration);
         let client_service = client_service.with_fresh_progress_routes();
-        let (transport, oauth_persistor, initialize_deadline) = match pending_transport {
-            PendingTransport::Stdio { transport } => (
-                service::serve_client(client_service, transport).boxed(),
-                None,
-                None,
-            ),
-            PendingTransport::StreamableHttp {
-                transport,
-                initialize_deadline,
-            } => (
-                service::serve_client(client_service, transport).boxed(),
-                None,
-                Some(initialize_deadline),
-            ),
-            PendingTransport::StreamableHttpWithOAuth {
-                transport,
-                oauth_persistor,
-                initialize_deadline,
-            } => (
-                service::serve_client(client_service, transport).boxed(),
-                Some(oauth_persistor),
-                Some(initialize_deadline),
-            ),
-        };
+        let (transport, oauth_persistor, initialize_deadline, initialize_session) =
+            match pending_transport {
+                PendingTransport::Stdio { transport } => (
+                    service::serve_client(client_service, transport).boxed(),
+                    None,
+                    None,
+                    None,
+                ),
+                PendingTransport::StreamableHttp {
+                    transport,
+                    initialize_deadline,
+                    initialize_session,
+                } => (
+                    service::serve_client(client_service, transport).boxed(),
+                    None,
+                    Some(initialize_deadline),
+                    Some(initialize_session),
+                ),
+                PendingTransport::StreamableHttpWithOAuth {
+                    transport,
+                    oauth_persistor,
+                    initialize_deadline,
+                    initialize_session,
+                } => (
+                    service::serve_client(client_service, transport).boxed(),
+                    Some(oauth_persistor),
+                    Some(initialize_deadline),
+                    Some(initialize_session),
+                ),
+            };
+        // RMCP deletes a session only after a completed handshake. Failure,
+        // timeout or caller cancellation drops this guard first, which deletes
+        // the session the attempt's `initialize` POST was issued.
+        let mut initialize_session_guard = initialize_session.map(InitializeSessionGuard::new);
         if let Some(initialize_deadline) = &initialize_deadline {
             *initialize_deadline
                 .lock()
@@ -1594,6 +1669,10 @@ impl RmcpClient {
                 return Err(error);
             }
         };
+
+        if let Some(guard) = &mut initialize_session_guard {
+            guard.complete();
+        }
 
         // Clear only after this worker's handshake succeeds. On failure or
         // caller cancellation, a delayed OAuth retry/bootstrap POST must retain
@@ -1659,6 +1738,7 @@ impl RmcpClient {
             {
                 Ok(result) => result,
                 Err(()) => {
+                    self.liveness_suspect.store(true, Ordering::Release);
                     let tracker = tracker.clone();
                     tokio::spawn(async move {
                         tracker.cancel_current("request timeout").await;

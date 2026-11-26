@@ -46,6 +46,11 @@ pub struct SkillReadRequest {
     pub executor_file_system_sandboxes: Vec<EnvironmentFileSystemSandbox>,
     pub host_snapshot: Option<Arc<HostSkillsSnapshot>>,
     pub mcp_resources: Option<Arc<McpResourceClient>>,
+    /// Only the leading bytes the caller can use. Host and executor providers
+    /// then read at most that prefix instead of materializing the whole file;
+    /// a longer resource yields its longest valid UTF-8 prefix. `None` reads in
+    /// full. The orchestrator enforces its own resource limit and ignores this.
+    pub max_text_bytes: Option<usize>,
 }
 
 pub type SkillProviderFuture<'a, T> =

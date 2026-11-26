@@ -122,7 +122,12 @@ Experimental RPC capability is per logical connection. Remote-control
 temporary failures use error `-32002` with `data.reason`, `retryable: true`
 and an optional RFC 3339 `retryAt`. An authoritative managed denial is not a
 temporary service cooldown. `fs/watch` capacity failures use `-32003` with the
-limiting scope; unwatch releases capacity. File reads still require an absolute
+limiting scope; unwatch releases capacity. Live fuzzy-search sessions (32 per
+connection, 256 per server) and `process/spawn` sessions (128 per connection,
+1024 per server) are bounded the same way: `-32003` with `data.reason`
+`fuzzyFileSearchSessionCapacity` or `processSpawnCapacity`, `data.scope`
+`connection` or `server`, and `retryable: false`; stopping a session, process
+exit or kill, or closing the connection releases capacity. File reads still require an absolute
 path in the selected host environment, not a phone-side display label. A
 filtered `thread/list` page may be empty with a continuation: keep reading
 until `nextCursor` is null.

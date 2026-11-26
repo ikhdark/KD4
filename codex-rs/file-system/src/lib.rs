@@ -25,7 +25,10 @@ pub use confined_file::open_regular_file_no_follow;
 pub use confined_file::open_confined_file_with_metadata;
 pub use confined_file::resolved_file_path;
 pub use copy_failure::CopyFailure;
+pub use conditional_mutation::with_guard_memo;
 pub use directory_guard::lock_directory_chain;
+pub use directory_guard::lock_directory_components_below;
+pub use directory_guard::validate_pinned_directories;
 pub use find_up::FindUpErrorPolicy;
 pub use find_up::find_nearest_ancestor_with_markers;
 pub use find_up::find_nearest_native_ancestor_with_markers;
@@ -147,6 +150,7 @@ const MAX_WALK_ENTRIES: usize = 50_000;
 pub const MAX_WALK_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const WALK_RESPONSE_ITEM_OVERHEAD_BYTES: usize = 64;
 const MAX_CONCURRENT_WALK_METADATA: usize = 8;
+const MAX_WALK_READ_AHEAD: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreateDirectoryOptions {
@@ -988,6 +992,46 @@ pub trait ExecutorFileSystem: Send + Sync {
         })
     }
 
+    /// Reads at most the first `max_bytes` bytes of a file as UTF-8 text, without
+    /// collecting the remainder. A file that fits is decoded exactly as by
+    /// [`Self::read_file_text`]. For a longer file, a character split by the
+    /// cut is dropped, so the text is the longest valid prefix of those bytes
+    /// (at least `max_bytes - 3` bytes); invalid UTF-8 inside the prefix is
+    /// still an error, but bytes beyond it are never examined. The stream is
+    /// dropped early, so backends read at most one extra chunk
+    /// ([`FILE_READ_CHUNK_SIZE`]) and release their handle.
+    fn read_file_text_prefix<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, String> {
+        Box::pin(async move {
+            let mut stream = self.read_file_stream(path, sandbox).await?;
+            let mut bytes = Vec::new();
+            let mut truncated = false;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                let room = max_bytes - bytes.len();
+                if chunk.len() > room {
+                    bytes.extend_from_slice(&chunk[..room]);
+                    truncated = true;
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            drop(stream);
+            let valid_len = match std::str::from_utf8(&bytes) {
+                Ok(_) => bytes.len(),
+                // Only a character cut by the limit may be incomplete.
+                Err(error) if truncated && error.error_len().is_none() => error.valid_up_to(),
+                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            };
+            bytes.truncate(valid_len);
+            String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+        })
+    }
+
     fn write_file<'a>(
         &'a self,
         path: &'a PathUri,
@@ -1129,6 +1173,14 @@ pub trait ExecutorFileSystem: Send + Sync {
         self.walk_via_directory_reads(path, options, sandbox)
     }
 
+    /// No-follow directory reads that [`Self::walk_via_directory_reads`] may
+    /// keep in flight for the front of its breadth-first queue. Results are
+    /// still consumed in queue order with the exact sequential entry budget.
+    /// The default (1) issues one read at a time.
+    fn walk_read_ahead(&self) -> usize {
+        1
+    }
+
     /// Performs a bounded walk using the primitive filesystem operations.
     ///
     /// Requires producer-bounded directory reads; unsupported backends fail explicitly.
@@ -1157,6 +1209,20 @@ pub trait ExecutorFileSystem: Send + Sync {
         copy_options: CopyOptions,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, ()>;
+}
+
+/// One owned no-follow directory read for the walk's read-ahead window.
+async fn read_walk_directory_no_follow<F: ExecutorFileSystem + ?Sized>(
+    file_system: &F,
+    directory: PathUri,
+    limit: usize,
+    include_metadata: bool,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> (PathUri, usize, FileSystemResult<ReadDirectoryOutcome<WalkDirectoryEntry>>) {
+    let result = file_system
+        .read_directory_bounded_no_follow_for_walk(&directory, limit, include_metadata, sandbox)
+        .await;
+    (directory, limit, result)
 }
 
 async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
@@ -1232,6 +1298,17 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
     let filters = PreparedWalkFilters::new(&options.filters);
     let mut name_chars = Vec::new();
     let mut path_chars = Vec::new();
+    // Backends that opt in keep up to `read_ahead` no-follow reads in flight for
+    // the queue front. The queue itself is unchanged (stops still report every
+    // queued directory), results are consumed in queue order, and a read issued
+    // with a larger remaining budget is cut back to the exact sequential result.
+    let read_ahead = if options.follow_directory_symlinks {
+        1
+    } else {
+        file_system.walk_read_ahead().clamp(1, MAX_WALK_READ_AHEAD)
+    };
+    let read_metadata = options.include_metadata || options.summary_only;
+    let mut in_flight = futures::stream::FuturesOrdered::new();
 
     while let Some((directory, depth, relative_directory)) = queue.pop_front() {
         if entry_count == examination_limit {
@@ -1245,22 +1322,63 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 examination_limit,
             ));
         }
-        let read = if options.follow_directory_symlinks {
-            file_system.read_directory_bounded_for_walk(
-                &directory,
-                examination_limit - entry_count,
-                options.include_metadata || options.summary_only,
-                sandbox,
-            )
+        let remaining = examination_limit - entry_count;
+        let read = if read_ahead > 1 {
+            // `in_flight` holds the popped directory followed by the next
+            // queued directories, in queue order.
+            if in_flight.is_empty() {
+                in_flight.push_back(read_walk_directory_no_follow(
+                    file_system, directory.clone(), remaining, read_metadata, sandbox,
+                ));
+            }
+            let issued = in_flight.len() - 1;
+            for (queued, _, _) in queue.iter().skip(issued).take(read_ahead - in_flight.len()) {
+                in_flight.push_back(read_walk_directory_no_follow(
+                    file_system, queued.clone(), remaining, read_metadata, sandbox,
+                ));
+            }
+            match in_flight.next().await {
+                Some((read_directory, issued_limit, result)) if read_directory == directory => {
+                    match result {
+                        // A sequential read with `remaining` stops after that many
+                        // examined entries and reports the limit, even when the
+                        // directory held exactly that many.
+                        Ok(mut batch)
+                            if issued_limit > remaining
+                                && batch.entries_examined >= remaining
+                                && batch.entries.len() == batch.entries_examined =>
+                        {
+                            batch.entries.truncate(remaining);
+                            batch.entries_examined = remaining;
+                            batch.limit_reached = true;
+                            Ok(batch)
+                        }
+                        // Anything a smaller budget might not have reached (such as a
+                        // later entry error) is read again with the exact budget.
+                        Ok(batch) if issued_limit > remaining && batch.entries_examined >= remaining => {
+                            read_walk_directory_no_follow(file_system, directory.clone(), remaining, read_metadata, sandbox).await.2
+                        }
+                        Err(_) if issued_limit > remaining => {
+                            read_walk_directory_no_follow(file_system, directory.clone(), remaining, read_metadata, sandbox).await.2
+                        }
+                        result => result,
+                    }
+                }
+                _ => {
+                    in_flight = futures::stream::FuturesOrdered::new();
+                    read_walk_directory_no_follow(file_system, directory.clone(), remaining, read_metadata, sandbox).await.2
+                }
+            }
+        } else if options.follow_directory_symlinks {
+            file_system
+                .read_directory_bounded_for_walk(&directory, remaining, read_metadata, sandbox)
+                .await
         } else {
-            file_system.read_directory_bounded_no_follow_for_walk(
-                &directory,
-                examination_limit - entry_count,
-                options.include_metadata || options.summary_only,
-                sandbox,
-            )
+            file_system
+                .read_directory_bounded_no_follow_for_walk(&directory, remaining, read_metadata, sandbox)
+                .await
         };
-        let batch = match read.await {
+        let batch = match read {
             Ok(batch) => batch,
             Err(error) if &directory == root => return Err(error),
             Err(error) if error.kind() == io::ErrorKind::Unsupported => return Err(error),

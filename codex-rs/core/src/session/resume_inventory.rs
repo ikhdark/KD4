@@ -135,6 +135,28 @@ fn command_records(items: &[RolloutItem]) -> BTreeMap<String, Value> {
     records
 }
 
+/// Exact recorded arguments of one call ID (function or custom tool). Read-only; no control grant.
+fn recorded_call_arguments(items: &[RolloutItem], call_id: &str) -> Vec<Value> {
+    use sha2::Digest;
+    let mut found = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let RolloutItem::ResponseItem(item) = item else { continue };
+        let (kind, name, text) = match item {
+            ResponseItem::FunctionCall { call_id: id, name, arguments, .. } if id == call_id =>
+                ("function_call", name, arguments),
+            ResponseItem::CustomToolCall { call_id: id, name, input, .. } if id == call_id =>
+                ("custom_tool_call", name, input),
+            _ => continue,
+        };
+        found.push(json!({
+            "kind": kind, "rollout_item_index": index, "call_id": call_id, "name": name,
+            "bytes": text.len(), "sha256": hex::encode(sha2::Sha256::digest(text.as_bytes())),
+            "arguments": text,
+        }));
+    }
+    found
+}
+
 fn reconcile(record: &mut Value, owners: &[Value]) {
     let owner = record["session_id"].as_u64().and_then(|id| {
         owners
@@ -175,29 +197,55 @@ fn reconcile(record: &mut Value, owners: &[Value]) {
 
 impl Session {
     /// Historical facts only; this never reconstructs control rights.
+    /// `Ok(None)` means the evidence was readable and holds no receipt for this
+    /// handle; `Err` means the durable evidence itself could not be read, which
+    /// is not the same fact and must not be reported as an absent receipt.
     pub(crate) async fn retained_process_result(
         &self,
         process_id: u32,
         incarnation: uuid::Uuid,
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>, String> {
         if let Some(result) = self.services.command_execution
             .completed_process_result(process_id, incarnation).await
         {
-            return Some(result);
+            return Ok(Some(result));
         }
-        let records = self.durable_process_records().await?;
-        Self::durable_process_result(&records, process_id, incarnation)
+        let Some(records) = self.durable_process_records().await? else {
+            return Ok(None);
+        };
+        Ok(Self::durable_process_result(&records, process_id, incarnation))
     }
 
     /// A grouped wait shares this single read/parse instead of reloading the
-    /// same durable rollout once for every retired handle.
-    pub(crate) async fn durable_process_records(&self) -> Option<std::sync::Arc<Vec<Value>>> {
-        let path = self.current_rollout_path().await.ok()??;
-        let (items, _, _) = codex_rollout::RolloutRecorder::load_rollout_items(&path).await.ok()?;
+    /// same durable rollout once for every retired handle. `Ok(None)` means
+    /// there is no durable rollout (or none materialized yet); `Err` names the
+    /// path, reader or worker failure so callers do not mistake unreadable
+    /// evidence for a missing receipt.
+    pub(crate) async fn durable_process_records(
+        &self,
+    ) -> Result<Option<std::sync::Arc<Vec<Value>>>, String> {
+        let Some(path) = self.current_rollout_path().await
+            .map_err(|error| format!("durable rollout path unavailable: {error}"))?
+        else {
+            return Ok(None);
+        };
+        let items = match codex_rollout::RolloutRecorder::load_rollout_items(&path).await {
+            Ok((items, _, _)) => items,
+            // A rollout path can be reserved before its file is materialized.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "durable rollout {} could not be read: {error}",
+                    path.display()
+                ));
+            }
+        };
         tokio::task::spawn_blocking(move || std::sync::Arc::new(
             command_records(&items).into_values()
                 .filter(|record| record["terminal_receipt"].is_object()).collect()
-        )).await.ok()
+        )).await
+            .map(Some)
+            .map_err(|error| format!("durable receipt reader task failed: {error}"))
     }
 
     pub(crate) fn durable_process_result(
@@ -270,6 +318,9 @@ impl Session {
             .await
             .map_err(|error| error.to_string())?;
         let active_turn = active_turn.to_string();
+        // S16/AT03: exact original arguments of the named call, from the durable rollout.
+        let call_arguments = filter.and_then(|filter| filter.call_id.as_deref())
+            .map(|call_id| recorded_call_arguments(&items, call_id)).unwrap_or_default();
         let (mut records, mut unresolved_invocations) = tokio::task::spawn_blocking(move || {
             let records = command_records(&items);
             // In-flight calls in this turn still have their original owner.
@@ -440,6 +491,15 @@ impl Session {
             "current_process_owner": owners, "limit_per_group": 32,
             "recovery": "Use read_tool_output on this read's retained artifact with the exact JSON pointers above. For remaining rows use structured selectors over /operations, /unresolved_invocations, /current_process_owner or /retained_evidence; do not reconstruct the inventory to page it. Counts include omitted rows. No new control authority is granted.",
         });
+        if !call_arguments.is_empty() {
+            inventory["outstanding"]["call_arguments"] = json!(call_arguments.iter().enumerate().take(8)
+                .map(|(index, record)| json!({
+                    "pointer": format!("/call_arguments/{index}/arguments"),
+                    "call_id": record["call_id"], "name": record["name"],
+                    "bytes": record["bytes"], "sha256": record["sha256"],
+                })).collect::<Vec<_>>());
+            inventory["call_arguments"] = Value::Array(call_arguments);
+        }
         serde_json::to_string_pretty(&inventory).map_err(|error| error.to_string())
     }
 }

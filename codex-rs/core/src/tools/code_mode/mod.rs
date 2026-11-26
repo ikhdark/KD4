@@ -135,6 +135,15 @@ struct CodeModePacketAdmission {
 }
 
 impl CodeModePacketAdmission {
+    /// Move a sealed cell's packet back into `cells`. Callers that then read
+    /// `cells` must do so under the same guard; otherwise a concurrent seal can
+    /// move the packet back to `terminal_cells` in between.
+    fn restore_terminal(&mut self, cell_id: &str) {
+        if let Some(packet) = self.terminal_cells.remove(cell_id) {
+            self.cells.insert(cell_id.to_string(), packet);
+        }
+    }
+
     fn metrics_mut(&mut self, cell_id: &str) -> Option<&mut CodeModePacketMetrics> {
         if self.cells.contains_key(cell_id) {
             self.cells.get_mut(cell_id)
@@ -626,23 +635,19 @@ impl CodeModeService {
     // This transfers observation custody only. The broker/runtime remain closed
     // and cannot dispatch new actions on behalf of a terminal receipt.
     fn restore_terminal_packet(&self, cell_id: &str) {
+        self.packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restore_terminal(cell_id);
+    }
+
+    pub(crate) fn record_output_budget(&self, cell_id: &CellId, budget: Option<usize>, explicit: bool) {
         let mut admission = self
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(packet) = admission.terminal_cells.remove(cell_id) {
-            admission.cells.insert(cell_id.to_string(), packet);
-        }
-    }
-
-    pub(crate) fn record_output_budget(&self, cell_id: &CellId, budget: Option<usize>, explicit: bool) {
-        self.restore_terminal_packet(cell_id.as_str());
-        if let Some(metrics) = self
-            .packet_admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cells
-            .get_mut(cell_id.as_str())
+        admission.restore_terminal(cell_id.as_str());
+        if let Some(metrics) = admission.cells.get_mut(cell_id.as_str())
             && budget.is_some()
         {
             metrics.output_budget = budget;
@@ -839,11 +844,11 @@ impl CodeModeService {
         response: &RuntimeResponse,
         command_states: &[JsonValue],
     ) -> Result<Option<String>, JsonValue> {
-        self.restore_terminal_packet(cell_id.as_str());
         let mut admission = self
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.restore_terminal(cell_id.as_str());
         let CodeModePacketAdmission {
             cells,
             closed_recovery,
@@ -1038,6 +1043,24 @@ impl CodeModeService {
         signal: Option<&JsonValue>,
         value: &JsonValue,
     ) -> Option<JsonValue> {
+        // Parse and hash before taking the admission guard: a result can be
+        // several MiB, and every packet transition in the session waits on it.
+        let exact = match (artifact_required, artifact.as_ref()) {
+            (true, Some((_, sha256, _))) => {
+                let text = value.as_str().or_else(|| value["output"].as_str());
+                text.is_some_and(|text| hex::encode(Sha256::digest(text.as_bytes())) == *sha256)
+                    || {
+                        let parsed =
+                            text.and_then(|text| serde_json::from_str::<JsonValue>(text).ok());
+                        codex_tools::CanonicalToolResult::json(
+                            parsed.as_ref().unwrap_or(value).clone(),
+                        )
+                        .sha256
+                            == *sha256
+                    }
+            }
+            _ => false,
+        };
         let mut admission = self
             .packet_admission
             .lock()
@@ -1046,14 +1069,6 @@ impl CodeModeService {
         let mut recovery = None;
         if artifact_required {
             if let Some((id, sha256, bytes)) = artifact {
-                let text = value.as_str().or_else(|| value["output"].as_str());
-                let parsed = text.and_then(|text| serde_json::from_str::<JsonValue>(text).ok());
-                let exact = text
-                    .is_some_and(|text| hex::encode(Sha256::digest(text.as_bytes())) == sha256)
-                    || codex_tools::CanonicalToolResult::json(
-                        parsed.as_ref().unwrap_or(value).clone(),
-                    )
-                    .sha256 == sha256;
                 let coverage = metrics
                     .delivery_recovery
                     .entry(id.clone())
@@ -1486,11 +1501,11 @@ impl CodeModeService {
 
 
     fn finish_packet(&self, cell_id: &str, retain_terminal: bool) -> CodeModePacketReceipt {
-        self.restore_terminal_packet(cell_id);
         let mut admission = self
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.restore_terminal(cell_id);
         // Piggyback meaningful transitions on an already-requested packet.
         // No polling task, notification, model wakeup, or guessed queue rank.
         let mut unsettled_nested_calls = Vec::new();
@@ -3332,6 +3347,12 @@ async fn call_nested_tool(
             );
         return Err(FunctionCallError::RespondToModel(message));
     }
+    // The first poll runs under the user-intent fence (invoke_with_user_intent)
+    // so packet admission is ordered against steering. Payload construction,
+    // patch scanning and clones are proportional to the input (up to the 8 MiB
+    // runtime cap) and have no effects; run them after the fence is released.
+    // Handler entry re-checks the fence before any effect.
+    tokio::task::yield_now().await;
 
     let payload = match build_nested_tool_payload(tool_kind, &tool_name, input) {
         Ok(payload) => payload,

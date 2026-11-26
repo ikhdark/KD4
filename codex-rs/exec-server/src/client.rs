@@ -36,6 +36,7 @@ use crate::client_api::RemoteExecServerConnectArgs;
 use crate::client_api::StdioExecServerConnectArgs;
 use crate::client_transport::ExecServerReconnectStrategy;
 use crate::connection::JsonRpcConnection;
+use crate::connection::MAX_FILE_PAYLOAD_BYTES;
 use crate::process::ExecProcessEvent;
 use crate::process::ExecProcessEventLog;
 use crate::process::ExecProcessEventReceiver;
@@ -128,6 +129,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const ENVIRONMENT_INFO_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_READ_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+// Transfer allowance for the unary reads whose single reply frame can be as large
+// as a file payload. It uses the transport's own whole-message floor (64 KiB/s,
+// see `WEBSOCKET_MESSAGE_TIMEOUT`), so a read the transport still delivers is not
+// failed here; the allowance is added to `FILE_READ_RPC_TIMEOUT`.
+const FILE_PAYLOAD_READ_MIN_BYTES_PER_SECOND: usize = 64 * 1024;
 pub(crate) const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -885,19 +891,24 @@ impl ExecServerClient {
         &self,
         params: FsReadFileBoundedParams,
     ) -> Result<FsReadFileBoundedResponse, ExecServerError> {
-        self.call_optional_fs(FS_READ_FILE_BOUNDED_METHOD, &params).await
+        let deadline = file_payload_read_rpc_timeout(params.max_bytes);
+        self.call_optional_fs(FS_READ_FILE_BOUNDED_METHOD, &params, Some(deadline))
+            .await
     }
 
     pub async fn fs_read_file_range(
         &self, params: crate::protocol::FsReadFileRangeParams,
     ) -> Result<crate::protocol::FsReadFileRangeResponse, ExecServerError> {
-        self.call_optional_fs(crate::protocol::FS_READ_FILE_RANGE_METHOD, &params).await
+        let deadline = file_payload_read_rpc_timeout(params.len);
+        self.call_optional_fs(crate::protocol::FS_READ_FILE_RANGE_METHOD, &params, Some(deadline))
+            .await
     }
 
     async fn call_optional_fs<P, T>(
         &self,
         method: &'static str,
         params: &P,
+        deadline: Option<Duration>,
     ) -> Result<T, ExecServerError>
     where
         P: serde::Serialize,
@@ -923,7 +934,9 @@ impl ExecServerClient {
                 });
             }
         }
-        let result = self.call_rpc(&rpc_client, method, params).await;
+        let result = self
+            .call_rpc_with_read_deadline(&rpc_client, method, params, deadline)
+            .await;
         if let Err(ExecServerError::Server { code, message, .. }) = &result
             && *code == METHOD_NOT_FOUND
         {
@@ -1022,7 +1035,8 @@ impl ExecServerClient {
     }
 
     pub async fn fs_walk(&self, params: FsWalkParams) -> Result<FsWalkResponse, ExecServerError> {
-        self.call_optional_fs(FS_WALK_METHOD, &params).await
+        self.call_optional_fs(FS_WALK_METHOD, &params, file_read_rpc_deadline(FS_WALK_METHOD))
+            .await
     }
 
     pub async fn fs_remove(
@@ -1290,16 +1304,33 @@ impl ExecServerClient {
         P: serde::Serialize,
         T: serde::de::DeserializeOwned,
     {
-        // Handle reads are bounded operations, not caller-selected exec long polls
-        // or HTTP streams. A live socket/Pong does not prove their handler replied.
+        self.call_rpc_with_read_deadline(rpc_client, method, params, file_read_rpc_deadline(method))
+            .await
+    }
+
+    async fn call_rpc_with_read_deadline<P, T>(
+        &self,
+        rpc_client: &Arc<RpcClient>,
+        method: &str,
+        params: &P,
+        deadline: Option<Duration>,
+    ) -> Result<T, ExecServerError>
+    where
+        P: serde::Serialize,
+        T: serde::de::DeserializeOwned,
+    {
+        // Bounded file reads are not caller-selected exec long polls or HTTP
+        // streams. A live socket/Pong does not prove their handler replied.
         // Reuse the RPC deadline, including queue admission, without retrying an
-        // exchange or extending this policy to intentionally long-lived methods.
-        let result = if matches!(method, FS_OPEN_METHOD | FS_READ_BLOCK_METHOD) {
-            rpc_client
-                .call_with_timeout(method, params, FILE_READ_RPC_TIMEOUT)
-                .await
-        } else {
-            rpc_client.call(method, params).await
+        // exchange or extending this policy to intentionally long-lived methods
+        // or to mutators (see `file_read_rpc_deadline`).
+        let result = match deadline {
+            Some(deadline) => {
+                rpc_client
+                    .call_with_timeout(method, params, deadline)
+                    .await
+            }
+            None => rpc_client.call(method, params).await,
         };
         map_rpc_call_result(result)
     }
@@ -1365,6 +1396,48 @@ impl ExecServerClient {
         }
         map_rpc_call_result(result)
     }
+}
+
+/// Deadline for the bounded, read-only fs/* requests; `None` for every other method.
+///
+/// Included: `fs/open` and `fs/readBlock` (streamed reads), `fs/getMetadata`,
+/// `fs/canonicalize` and `fs/readDirectory` (small replies, the directory reply is
+/// capped by the server) get `FILE_READ_RPC_TIMEOUT`. `fs/readFile`,
+/// `fs/readFileBounded` and `fs/readFileRange` return one frame of up to
+/// `MAX_FILE_PAYLOAD_BYTES`, so they also get a transfer allowance
+/// (`file_payload_read_rpc_timeout`); callers that know their cap pass a tighter one.
+///
+/// Excluded on purpose: mutators (`fs/writeFile`, `fs/createDirectory`, `fs/remove`,
+/// `fs/copy`, `fs/mutateFileIfMatches*`) because a deadline cannot tell whether the
+/// server later applies the change; `fs/close` (own cleanup deadline);
+/// `fs/walk`, `fs/lookupBatch` and `fs/checksumFile` (work proportional to a
+/// caller-chosen tree, batch or file; checksum has its own cancel method); and
+/// `process/*`, `http/*`, `environment/*` (long polls and streams).
+fn file_read_rpc_deadline(method: &str) -> Option<Duration> {
+    match method {
+        FS_OPEN_METHOD
+        | FS_READ_BLOCK_METHOD
+        | FS_GET_METADATA_METHOD
+        | FS_CANONICALIZE_METHOD
+        | FS_READ_DIRECTORY_METHOD => Some(FILE_READ_RPC_TIMEOUT),
+        FS_READ_FILE_METHOD
+        | FS_READ_FILE_BOUNDED_METHOD
+        | crate::protocol::FS_READ_FILE_RANGE_METHOD => {
+            Some(file_payload_read_rpc_timeout(MAX_FILE_PAYLOAD_BYTES))
+        }
+        _ => None,
+    }
+}
+
+/// `FILE_READ_RPC_TIMEOUT` plus the time the transport's 64 KiB/s floor allows for
+/// the base64 reply of a read capped at `max_payload_bytes` raw bytes.
+fn file_payload_read_rpc_timeout(max_payload_bytes: usize) -> Duration {
+    let reply_bytes = max_payload_bytes
+        .min(MAX_FILE_PAYLOAD_BYTES)
+        .div_ceil(3)
+        .saturating_mul(4);
+    FILE_READ_RPC_TIMEOUT
+        + Duration::from_secs((reply_bytes / FILE_PAYLOAD_READ_MIN_BYTES_PER_SECOND) as u64)
 }
 
 fn map_rpc_call_result<T>(result: Result<T, RpcCallError>) -> Result<T, ExecServerError> {

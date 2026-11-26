@@ -55,6 +55,7 @@ mod process;
 pub(crate) mod process_inventory;
 mod process_manager;
 mod process_state;
+pub(crate) mod speculative_shell;
 
 
 pub(crate) use errors::UnifiedExecError;
@@ -368,6 +369,7 @@ pub(crate) struct UnifiedExecProcessManager {
     pending_cleanup_owners: Arc<process_manager::PendingProcessCleanupOwners>,
     max_write_stdin_yield_time_ms: u64,
     executor_ready_environments: StdMutex<HashSet<String>>,
+    speculative_shell: Arc<speculative_shell::SpeculativeShellSlot>,
 }
 
 impl UnifiedExecProcessManager {
@@ -378,7 +380,13 @@ impl UnifiedExecProcessManager {
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
             executor_ready_environments: StdMutex::new(HashSet::new()),
+            speculative_shell: Arc::default(),
         }
+    }
+
+    /// Lookahead for an announced shell-capable call (speculative shell prototype).
+    pub(crate) fn prime_speculative_shell(&self) {
+        self.speculative_shell.prime();
     }
 
     /// Effective ceiling for an empty `write_stdin` poll. A nested tool call

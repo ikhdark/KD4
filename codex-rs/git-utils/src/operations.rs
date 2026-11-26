@@ -36,18 +36,25 @@ pub(crate) fn ensure_git_repository(path: &Path) -> Result<(), GitToolingError> 
     }
 }
 
+/// Resolves `HEAD`, returning `Ok(None)` only when it does not resolve yet
+/// (an unborn branch).
+///
+/// `rev-parse --verify --quiet` exits with status 1 when the name does not
+/// resolve and with 128 for every fatal failure, so a corrupt or unreadable
+/// repository is reported as an error rather than as "no HEAD yet".
 pub(crate) fn resolve_head(path: &Path) -> Result<Option<String>, GitToolingError> {
     match run_git_for_stdout(
         path,
         vec![
             OsString::from("rev-parse"),
             OsString::from("--verify"),
+            OsString::from("--quiet"),
             OsString::from("HEAD"),
         ],
         /*env*/ None,
     ) {
         Ok(sha) => Ok(Some(sha)),
-        Err(GitToolingError::GitCommand { status, .. }) if status.code() == Some(128) => Ok(None),
+        Err(GitToolingError::GitCommand { status, .. }) if status.code() == Some(1) => Ok(None),
         Err(other) => Err(other),
     }
 }

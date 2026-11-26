@@ -352,9 +352,9 @@ pub(crate) fn run_turn<'a>(
             let err = CodexErr::Fatal(format!(
                 "Failed to prepare the agent's follow-up task: {error}"
             ));
+            sess.track_turn_codex_error(turn_context.as_ref(), &err);
             sess.emit_turn_error_lifecycle(turn_context.as_ref(), err.to_codex_protocol_error())
                 .await;
-            sess.track_turn_codex_error(turn_context.as_ref(), &err);
             sess.send_event(
                 turn_context.as_ref(),
                 EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
@@ -373,6 +373,7 @@ pub(crate) fn run_turn<'a>(
         });
         let mut finalized_mutation_revision = None;
         let mut seen_stop_repairs = Vec::new();
+        let mut validation_stop_recovery_attempted = false;
         let mut stop_hook_bookkeeping_revisions = 0_u64;
         let mut completion_evidence = None;
         let mut provider_overflow_recovery_attempted = false;
@@ -820,8 +821,14 @@ pub(crate) fn run_turn<'a>(
                 && !stop_hook_active
                 && finalized_mutation_revision.is_none()
                 && !authored_receipt_sealed();
-            if (allows_ordinary_final_reconciliation() || gate_budget_final)
-                && turn_execution.unresolved_plan().is_some()
+            let ordinary_root = !matches!(&turn_context.session_source, SessionSource::SubAgent(_));
+            let hold_pending_validation_answer = ordinary_root
+                && allows_ordinary_final_reconciliation()
+                && !validation_stop_recovery_attempted
+                && turn_execution.has_pending_validation_for_stop();
+            if ((allows_ordinary_final_reconciliation() || gate_budget_final)
+                && turn_execution.unresolved_plan().is_some())
+                || hold_pending_validation_answer
             {
                 let _ = turn_context.extension_data.get_or_init(
                     crate::stream_events_utils::DeferredFinalOutput::default,
@@ -1371,14 +1378,14 @@ pub(crate) fn run_turn<'a>(
                                     return Err(err);
                                 }
                                 let error = err.to_codex_protocol_error();
+                                // `run_auto_compact` reports no failure itself; this
+                                // boundary owns the turn's single terminal error.
+                                sess.track_turn_codex_error(turn_context.as_ref(), &err);
                                 sess.emit_turn_error_lifecycle(
                                     turn_context.as_ref(),
                                     error.clone(),
                                 )
                                 .await;
-                                // `run_auto_compact` reports no failure itself; this
-                                // boundary owns the turn's single terminal error.
-                                sess.track_turn_codex_error(turn_context.as_ref(), &err);
                                 sess.send_event(
                                     &turn_context,
                                     EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
@@ -1495,6 +1502,48 @@ pub(crate) fn run_turn<'a>(
                                 pending_continuation_cause = Some(ContinuationCause::StopHook);
                                 continue 'sampling_loop;
                             }
+                        }
+                        // One bounded opportunity to collect an already launched validation
+                        // through its owner. Capture loss and terminal failures do not earn a
+                        // new check, and the hook has not run yet. Only a still-unpublished
+                        // (deferred) answer is held; without generation capacity the authored
+                        // answer publishes as before and the assessment keeps the pending check.
+                        if ordinary_root
+                            && allows_ordinary_final_reconciliation()
+                            && !validation_stop_recovery_attempted
+                            && turn_execution.has_pending_validation_for_stop()
+                            && turn_context.extension_data
+                                .get::<crate::stream_events_utils::DeferredFinalOutput>()
+                                .is_some()
+                            && !generation_budget_error_reported
+                            && logical_generation_budget.can_admit(/*terminal_requested*/ false)
+                        {
+                            validation_stop_recovery_attempted = true;
+                            sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
+                                id: None,
+                                role: "developer".to_string(),
+                                content: vec![ContentItem::InputText {
+                                    text: "Final answer deferred: a validation check already launched in this turn has no terminal result. Collect the exact existing operation through its owner using the retained launch receipt. Do not launch or replay the check. If the owner cannot deliver a terminal result, report the pending validation honestly.".to_string(),
+                                }],
+                                phase: None,
+                                internal_chat_message_metadata_passthrough: None,
+                            }]).await?;
+                            output_state.invalidate_for_repair();
+                            let _ = turn_context.extension_data
+                                .remove::<crate::stream_events_utils::DeferredFinalOutput>();
+                            last_agent_message = None;
+                            pending_generation_request = Some(GenerationRequestDisposition {
+                                purpose: Some(TurnTimingGenerationPurpose::Repair),
+                                relevant_state_fingerprint: turn_execution
+                                    .baselines_with_tool_exposure_revision(
+                                        settled_state.mutation_revision,
+                                        settled_state.tool_exposure_revision,
+                                    ).relevant_state_fingerprint(),
+                                failure_fingerprint: None,
+                                terminal_completion_only: false,
+                            });
+                            pending_continuation_cause = Some(ContinuationCause::StopHook);
+                            continue 'sampling_loop;
                         }
                         // A delivery candidate has no publication authority until this
                         // completion attempt survives hooks and pending-input admission.
@@ -2025,12 +2074,12 @@ pub(crate) fn run_turn<'a>(
                             if matches!(err, CodexErr::TurnAborted) {
                                 return Err(err);
                             }
+                            sess.track_turn_codex_error(turn_context.as_ref(), &err);
                             sess.emit_turn_error_lifecycle(
                                 turn_context.as_ref(),
                                 err.to_codex_protocol_error(),
                             )
                             .await;
-                            sess.track_turn_codex_error(turn_context.as_ref(), &err);
                             sess.send_event(
                                 &turn_context,
                                 EventMsg::Error(err.to_error_event(None)),
@@ -2189,9 +2238,9 @@ async fn finish_pending_turn_planning_failure(
     }
 
     let error = err.to_codex_protocol_error();
+    sess.track_turn_codex_error(turn_context.as_ref(), &err);
     sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
         .await;
-    sess.track_turn_codex_error(turn_context.as_ref(), &err);
     sess.send_event(
         turn_context.as_ref(),
         EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
@@ -5972,6 +6021,56 @@ impl UnsettledSamplingRequestResult {
 }
 
 
+/// Total model-visible output budget shared by one completion receipt. The
+/// untrusted contextual envelope caps its body at 4,000 bytes, so receipts
+/// stay below it; omitted bytes remain recoverable from each artifact.
+const BACKGROUND_COMPLETION_OUTPUT_TOKENS: usize = 700;
+const BACKGROUND_COMPLETION_LIMIT: usize = 4;
+
+/// Render exited background commands as one contextual receipt. Each entry is
+/// the result the ordinary empty poll returned; `session_id` stays the handle
+/// the model already holds, and `output_drained: false` means that handle
+/// still has output to collect.
+fn background_completion_receipt(
+    receipts: &[(u32, crate::tools::context::ExecCommandToolOutput)],
+) -> Option<ResponseItem> {
+    if receipts.is_empty() {
+        return None;
+    }
+    let per_receipt_tokens = (BACKGROUND_COMPLETION_OUTPUT_TOKENS / receipts.len()).max(120);
+    let entries = receipts
+        .iter()
+        .map(|(session_id, output)| {
+            let artifact_id = output
+                .raw_output_artifact
+                .as_ref()
+                .and_then(|artifact| artifact.model_projection().0.map(|id| id.to_string()));
+            serde_json::json!({
+                "session_id": session_id,
+                "command": output.hook_command.as_deref().map(|command| {
+                    command.chars().take(160).collect::<String>()
+                }),
+                "exit_code": output.exit_code,
+                "process_exited": output.process_exited,
+                "output_drained": output.process_id.is_none(),
+                "error": output.error,
+                "output": output.truncated_output(per_receipt_tokens),
+                "raw_output_artifact_id": artifact_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = serde_json::json!({
+        "background_completion": entries,
+        "note": "Commands started earlier with a short yield exited before this result was returned. Each entry is the terminal result an empty poll returned, so no poll is needed to learn it; a later poll of a drained session returns only its completion status and output reference. When output_drained is false, poll that session_id only for the remainder. Recover omitted output with read_tool_output and raw_output_artifact_id; do not rerun the command.",
+    });
+    Some(crate::context::ContextualUserFragment::into(
+        crate::context::AdditionalContextUserFragment::new(
+            "background_completion".to_string(),
+            value.to_string(),
+        ),
+    ))
+}
+
 #[instrument(level = "trace", skip_all)]
 async fn drain_in_flight_with_buffer(
     completed: &mut VecDeque<InFlightToolResult>,
@@ -6055,6 +6154,25 @@ async fn drain_in_flight_with_buffer(
             };
         let mut response_items = vec![response_input.into()];
         response_items.extend(failure_detail);
+        // Event-driven completion delivery: after the generation's final result,
+        // attach terminal results of yielded commands that already exited so
+        // the next request carries them without a model-issued poll.
+        if completed.is_empty()
+            && in_flight.is_empty()
+            && completion_error.is_none()
+            && required_terminal.is_none()
+        {
+            let receipts = sess
+                .services
+                .unified_exec_manager
+                .collect_exited_background_results(
+                    turn_context.model_info.truncation_policy.into(),
+                    BACKGROUND_COMPLETION_OUTPUT_TOKENS,
+                    BACKGROUND_COMPLETION_LIMIT,
+                )
+                .await;
+            response_items.extend(background_completion_receipt(&receipts));
+        }
         let commit = sess.record_tool_completion_ordered(
             &turn_context, &completion.call_id, &response_items, pending_continuation_ack,
         );
@@ -7536,6 +7654,9 @@ fn try_run_sampling_request<'a>(
                 }
                 ResponseEvent::OutputItemAdded(mut item) => {
                     assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
+                    if crate::unified_exec::speculative_shell::announces_shell_work(&item) {
+                        sess.services.unified_exec_manager.prime_speculative_shell();
+                    }
                     if let Some((call_id, tool_name)) = tool_argument_diff_target(&item) {
                         active_tool_argument_diff_consumer = tool_runtime
                             .create_diff_consumer(&tool_name)

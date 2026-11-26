@@ -234,6 +234,11 @@ impl CodexAppsToolsCacheContext {
         }
     }
 
+    /// `session_is_current` is evaluated inside the publication critical
+    /// section, after any wait for earlier publications and immediately before
+    /// acceptance. A fetch whose MCP session was replaced while it waited
+    /// publishes nothing and receives the current tools instead, so the replaced
+    /// session's tools cannot reach the shared cache or its disk copy.
     #[expect(
         clippy::expect_used,
         reason = "A panicked publication worker may have partially committed a generation; do not return fabricated success"
@@ -243,13 +248,19 @@ impl CodexAppsToolsCacheContext {
         ticket: CodexAppsToolsFetchTicket,
         server_info: &McpServerInfo,
         tools: Vec<ToolInfo>,
+        session_is_current: impl FnOnce() -> bool + Send + 'static,
     ) -> Vec<ToolInfo> {
         let context = self.clone();
         let server_info = server_info.clone();
         // Keep acceptance, live publication, and disk ordering in one owned job.
         // Dropping the request cannot detach persistence from its generation.
         tokio::task::spawn_blocking(move || {
-            context.publish_if_newest_accepted_blocking(ticket, &server_info, tools)
+            context.publish_if_newest_accepted_blocking(
+                ticket,
+                &server_info,
+                tools,
+                session_is_current,
+            )
         })
         .await
         .expect("Codex Apps cache publication worker failed")
@@ -260,6 +271,7 @@ impl CodexAppsToolsCacheContext {
         ticket: CodexAppsToolsFetchTicket,
         server_info: &McpServerInfo,
         mut tools: Vec<ToolInfo>,
+        session_is_current: impl FnOnce() -> bool,
     ) -> Vec<ToolInfo> {
         let publish_start = Instant::now();
         let mut last_accepted_generation = lock_unpoisoned(&self.entry.last_accepted_generation);
@@ -268,6 +280,17 @@ impl CodexAppsToolsCacheContext {
                 MCP_TOOLS_CACHE_PUBLISH_DURATION_METRIC,
                 publish_start.elapsed(),
                 &[("source", ticket.source.as_str()), ("result", "stale")],
+            );
+            return self.current_tools().unwrap_or(tools);
+        }
+        if !session_is_current() {
+            emit_duration(
+                MCP_TOOLS_CACHE_PUBLISH_DURATION_METRIC,
+                publish_start.elapsed(),
+                &[
+                    ("source", ticket.source.as_str()),
+                    ("result", "session_changed"),
+                ],
             );
             return self.current_tools().unwrap_or(tools);
         }

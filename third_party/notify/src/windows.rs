@@ -40,7 +40,9 @@ use windows_sys::Win32::System::Threading::{
     CreateSemaphoreW, INFINITE, ReleaseSemaphore, WaitForSingleObjectEx,
 };
 
-const BUF_SIZE: u32 = 16384;
+// KD4: 64 KiB (the network-path maximum) instead of upstream's 16 KiB, so a
+// burst of creates overflows into a rescan far less often (see KD4.md).
+const BUF_SIZE: u32 = 65536;
 
 #[derive(Clone, Copy)]
 enum SeparatorStyle {
@@ -671,7 +673,6 @@ unsafe extern "system" fn handle_event(
             // prepend root to get a full path
             let relative_path =
                 PathBuf::from(OsString::from_wide(trim_leading_separators(encoded_path)));
-            let absolute_path = request.data.dir.join(&relative_path);
             let path = normalize_path_separators(
                 request.data.reported_dir.join(relative_path),
                 request.data.separator_style,
@@ -722,20 +723,10 @@ unsafe extern "system" fn handle_event(
                             event_handler(Ok(ev));
                         }
                         FILE_ACTION_ADDED => {
-                            let kind = std::fs::metadata(&absolute_path).map_or(
-                                CreateKind::Any,
-                                |metadata| {
-                                    if metadata.is_dir() {
-                                        CreateKind::Folder
-                                    } else if metadata.is_file() {
-                                        CreateKind::File
-                                    } else {
-                                        CreateKind::Any
-                                    }
-                                },
-                            );
-                            let kind = EventKind::Create(kind);
-                            let ev = newe.set_kind(kind);
+                            // KD4: no per-create metadata query on the notification
+                            // thread (it raced the creating process for every new
+                            // file); KD4's only consumer matches Create(_).
+                            let ev = newe.set_kind(EventKind::Create(CreateKind::Any));
                             event_handler(Ok(ev));
                         }
                         FILE_ACTION_REMOVED => {

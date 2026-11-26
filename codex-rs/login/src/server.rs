@@ -901,7 +901,41 @@ fn sanitize_url_for_logging(url: &str) -> String {
 /// non-JSON error text is preserved there. Structured logging stays narrower: it logs reviewed
 /// fields from parsed token responses and redacted transport errors, but does not log the final
 /// callback-layer `%err` string.
+///
+/// Like the device user-code request, the exchange is bounded: a token endpoint
+/// that accepts the connection but never finishes its response must not hold the
+/// browser callback or the device login forever.
 pub(crate) async fn exchange_code_for_tokens(
+    issuer: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    pkce: &PkceCodes,
+    code: &str,
+    auth_route_config: &AuthRouteConfig,
+) -> io::Result<ExchangedTokens> {
+    const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+    tokio::time::timeout(
+        TOKEN_EXCHANGE_TIMEOUT,
+        exchange_code_for_tokens_unbounded(
+            issuer,
+            client_id,
+            redirect_uri,
+            pkce,
+            code,
+            auth_route_config,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        warn!("oauth token exchange timed out");
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "token exchange timed out after 30 seconds",
+        )
+    })?
+}
+
+async fn exchange_code_for_tokens_unbounded(
     issuer: &str,
     client_id: &str,
     redirect_uri: &str,

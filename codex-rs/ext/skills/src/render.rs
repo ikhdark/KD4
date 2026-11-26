@@ -7,6 +7,11 @@ use crate::fragments::AvailableSkillsInstructions;
 
 const MAX_AVAILABLE_SKILLS_BYTES: usize = 8_000;
 pub(crate) const MAX_SELECTED_PROMPT_BYTES: usize = 32_000;
+/// Source bytes a host or executor selected prompt may contribute. No budget
+/// exceeds `MAX_SELECTED_PROMPT_BYTES`, so rendering never uses more. The extra
+/// four bytes cover a UTF-8 sequence cut by the limit: a longer source still
+/// decodes to more than the cap and is truncated exactly as the full text was.
+pub(crate) const MAX_SELECTED_PROMPT_READ_BYTES: usize = MAX_SELECTED_PROMPT_BYTES + 4;
 const MAX_CATALOG_SKILL_DESCRIPTION_CHARS: usize = 1_024;
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
 
