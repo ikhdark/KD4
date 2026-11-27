@@ -764,6 +764,9 @@ fn queueing_attribution(ops: &Operations<'_>, timing: &TurnTiming, duration: u64
             None => row.positioned = false,
         }
     };
+    // Keep the legacy row key for consumers but distinguish its enclosing
+    // timer from actual workspace resource suspensions recorded above.
+    const ADMISSION_ENVELOPE: &str = "tool:parallel_gate";
     for call in &timing.tool_calls {
         tool_row(
             "tool:first_poll",
@@ -772,8 +775,8 @@ fn queueing_attribution(ops: &Operations<'_>, timing: &TurnTiming, duration: u64
             span(ns(call.accepted_at_ms), ns(call.first_poll_at_ms)),
         );
         tool_row(
-            "tool:parallel_gate",
-            "admission_policy",
+            ADMISSION_ENVELOPE,
+            "first_poll_to_admission_envelope",
             ns(call.parallel_gate_wait_ms),
             span(ns(call.first_poll_at_ms), ns(call.parallel_gate_admitted_at_ms)),
         );
@@ -813,9 +816,13 @@ fn queueing_attribution(ops: &Operations<'_>, timing: &TurnTiming, duration: u64
         .collect::<Vec<_>>();
     rows.sort_by(|a, b| b.1.sum.cmp(&a.1.sum).then(a.0.cmp(&b.0)));
     let omitted = rows.len().saturating_sub(MAX_QUEUE_ROWS);
-    // Rank by elapsed coverage; unpositioned sums can overlap other work.
+    // The enclosing admission phase overlaps measured queue sources and
+    // can include active preparation. It does not compete with those sources.
+    // Pick a positioned source from the retained rows so it is inspectable.
     let dominant = rows
         .iter()
+        .take(MAX_QUEUE_ROWS)
+        .filter(|(source, _, _)| source != ADMISSION_ENVELOPE)
         .filter_map(|(source, _, union)| Some((union.filter(|union| *union > 0)?, source)))
         .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(a.1)))
         .map(|(_, source)| source.clone());
@@ -987,13 +994,32 @@ fn material_progress(timing: &TurnTiming, duration: u64) -> (Value, Value, Value
             events.push((at, "accepted_final_full_content"));
         }
     }
+    let complete = tool_inventory_complete(timing);
     let (Some(first), Some(last)) = (
         events.iter().min_by_key(|event| event.0),
         events.iter().max_by_key(|event| event.0),
     ) else {
-        let missing = unavailable("no_material_progress_observed");
+        let missing = unavailable(if complete {
+            "no_material_progress_observed"
+        } else {
+            "incomplete_tool_inventory"
+        });
         return (missing.clone(), missing.clone(), missing);
     };
+    // Without the omitted tool endpoints these extrema are directional bounds,
+    // not an exact account of when useful work stopped.
+    if !complete {
+        return (
+            json!({"status": "partial", "valueNs": first.0, "event": first.1,
+                "upperBound": true, "gaps": ["incomplete_tool_inventory"]}),
+            json!({"status": "partial", "valueNs": last.0, "event": last.1,
+                "shareOfTurn": ratio(last.0.min(duration), duration),
+                "lowerBound": true, "gaps": ["incomplete_tool_inventory"]}),
+            json!({"status": "partial", "valueNs": duration.saturating_sub(last.0),
+                "finalizationNs": timing.exclusive.finalization_ns,
+                "upperBound": true, "gaps": ["incomplete_tool_inventory"]}),
+        );
+    }
     (
         json!({"status": "available", "valueNs": first.0, "event": first.1}),
         json!({"status": "available", "valueNs": last.0, "event": last.1,

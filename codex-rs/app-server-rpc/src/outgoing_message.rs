@@ -288,6 +288,13 @@ pub struct ThreadScopedOutgoingMessageSender {
     thread_id: ThreadId,
 }
 
+struct ResponseEnqueueCutoff {
+    deadline: tokio::time::Instant,
+    context: Option<RequestContext>,
+}
+
+struct ResponseEnqueueDeadlineExpired;
+
 #[derive(Default)]
 struct ComponentNotificationCache {
     token_usage: HashMap<(ConnectionId, String), ThreadTokenUsageUpdatedNotification>,
@@ -699,11 +706,24 @@ impl ThreadScopedOutgoingMessageSender {
             serde_json::json!({"connection_id":request_id.connection_id.0,
                 "request_id":request_id.request_id, "boundary":"server_response_attempt_not_client_receipt"}));
         let mut context = None;
-        if tokio::time::timeout_at(deadline, async {
+        let result = tokio::time::timeout_at(deadline, async {
             context = self.outgoing.request_context(&request_id).await;
-            self.outgoing.send_response(request_id.clone(), response).await;
-        }).await.is_err()
-        {
+            self.outgoing
+                .send_response_as_inner(
+                    request_id.clone(),
+                    response.into(),
+                    /*thread_originator*/ None,
+                    /*receipt*/ None,
+                    Some(ResponseEnqueueCutoff {
+                        deadline,
+                        context: context.clone(),
+                    }),
+                )
+                .await
+        })
+        .await;
+        if !matches!(result, Ok(Ok(_))) {
+            // Cleanup for either deadline path must run outside the timeout.
             self.outgoing.fail_connection_delivery(request_id.connection_id).await;
             self.outgoing.finish_request_context(context.as_ref()).await;
             observation.finish("deadline_expired", serde_json::Value::Null);
@@ -1758,7 +1778,14 @@ impl OutgoingMessageSender {
     where
         T: Into<ClientResponsePayload>,
     {
-        self.send_response_as_inner(request_id, response.into(), /*thread_originator*/ None, None)
+        let _ = self
+            .send_response_as_inner(
+                request_id,
+                response.into(),
+                /*thread_originator*/ None,
+                /*receipt*/ None,
+                /*cutoff*/ None,
+            )
             .await;
     }
 
@@ -1773,9 +1800,16 @@ impl OutgoingMessageSender {
         T: Into<ClientResponsePayload>,
     {
         let (receipt, fence) = self.publication_fence(/*allow_filtering*/ false);
-        self.send_response_as_inner(request_id, response.into(), /*thread_originator*/ None, receipt)
-            .await
-            .then_some(fence)
+        let result = self
+            .send_response_as_inner(
+                request_id,
+                response.into(),
+                /*thread_originator*/ None,
+                receipt,
+                /*cutoff*/ None,
+            )
+            .await;
+        matches!(result, Ok(true)).then_some(fence)
     }
 
     pub async fn send_response_with_thread_originator<T>(
@@ -1786,7 +1820,14 @@ impl OutgoingMessageSender {
     ) where
         T: Into<ClientResponsePayload>,
     {
-        self.send_response_as_inner(request_id, response.into(), Some(thread_originator), None)
+        let _ = self
+            .send_response_as_inner(
+                request_id,
+                response.into(),
+                Some(thread_originator),
+                /*receipt*/ None,
+                /*cutoff*/ None,
+            )
             .await;
     }
 
@@ -1795,7 +1836,14 @@ impl OutgoingMessageSender {
         request_id: ConnectionRequestId,
         response: ClientResponsePayload,
     ) {
-        self.send_response_as_inner(request_id, response, /*thread_originator*/ None, None)
+        let _ = self
+            .send_response_as_inner(
+                request_id,
+                response,
+                /*thread_originator*/ None,
+                /*receipt*/ None,
+                /*cutoff*/ None,
+            )
             .await;
     }
 
@@ -1966,7 +2014,8 @@ impl OutgoingMessageSender {
         response: ClientResponsePayload,
         thread_originator: Option<String>,
         receipt: Option<OutgoingWriteReceipt>,
-    ) -> bool {
+        cutoff: Option<ResponseEnqueueCutoff>,
+    ) -> std::result::Result<bool, ResponseEnqueueDeadlineExpired> {
         let connection_id = request_id.connection_id;
         let request_id_for_analytics = request_id.request_id.clone();
         let retryable_history_page = matches!(&response, ClientResponsePayload::ThreadTurnsList(_));
@@ -1997,7 +2046,10 @@ impl OutgoingMessageSender {
                 }
                 (id, result)
             });
-        let request_context = self.request_context(&request_id).await;
+        let (request_context, enqueue_deadline) = match cutoff {
+            Some(cutoff) => (cutoff.context, Some(cutoff.deadline)),
+            None => (self.request_context(&request_id).await, None),
+        };
         Self::record_resume_serialization(request_context.as_ref(), serialization_timing);
         let response_observation = resume_response
             .then(|| Self::observe_local_resume_response(request_context.as_ref()))
@@ -2016,23 +2068,25 @@ impl OutgoingMessageSender {
                     outgoing_message,
                     "response",
                     receipt,
+                    enqueue_deadline,
                 )
-                .await
+                .await?
             }
             Err(err) => {
                 self.send_error_inner(
                     request_context,
                     request_id,
                     internal_error(format!("failed to serialize response: {err}")),
+                    enqueue_deadline,
                 )
-                .await;
+                .await?;
                 false
             }
         };
         if let Some(observation) = response_observation {
             observation.finish("owner_returned_not_peer_receipt", serde_json::Value::Null);
         }
-        enqueued
+        Ok(enqueued)
     }
 
     pub async fn send_server_notification(&self, notification: ServerNotification) {
@@ -2457,7 +2511,8 @@ impl OutgoingMessageSender {
         error: impl Into<JSONRPCErrorError>,
     ) {
         let request_context = self.request_context(&request_id).await;
-        self.send_error_inner(request_context, request_id, error.into())
+        let _ = self
+            .send_error_inner(request_context, request_id, error.into(), None)
             .await;
     }
 
@@ -2492,7 +2547,7 @@ impl OutgoingMessageSender {
                     tokio::select! {
                         biased;
                         _ = route_closed.cancelled() => {}
-                        _ = outgoing.send_error_inner(context.clone(), request_id, error) => {}
+                        _ = outgoing.send_error_inner(context.clone(), request_id, error, None) => {}
                     }
                     outgoing.finish_request_context(context.as_ref()).await;
                 });
@@ -2540,7 +2595,8 @@ impl OutgoingMessageSender {
         request_context: Option<RequestContext>,
         request_id: ConnectionRequestId,
         error: JSONRPCErrorError,
-    ) {
+        enqueue_deadline: Option<tokio::time::Instant>,
+    ) -> std::result::Result<bool, ResponseEnqueueDeadlineExpired> {
         let outgoing_message = OutgoingMessage::Error(OutgoingError {
             id: request_id.request_id,
             error,
@@ -2551,8 +2607,9 @@ impl OutgoingMessageSender {
             outgoing_message,
             "error",
             None,
+            enqueue_deadline,
         )
-        .await;
+        .await
     }
 
     async fn send_outgoing_message_to_connection(
@@ -2562,14 +2619,15 @@ impl OutgoingMessageSender {
         message: OutgoingMessage,
         message_kind: &'static str,
         receipt: Option<OutgoingWriteReceipt>,
-    ) -> bool {
+        enqueue_deadline: Option<tokio::time::Instant>,
+    ) -> std::result::Result<bool, ResponseEnqueueDeadlineExpired> {
         let route = self.active_connections.lock().await
             .get(&connection_id)
             .map(|connection| (connection.delivery_failure.clone(), connection.remote_control));
         let Some((route_failed, remote_control)) = route.filter(|(token, _)| !token.is_cancelled())
         else {
             self.finish_request_context(request_context.as_ref()).await;
-            return false;
+            return Ok(false);
         };
         let message = match message {
             OutgoingMessage::Response(mut response) if remote_control => {
@@ -2595,24 +2653,44 @@ impl OutgoingMessageSender {
                 _ => {}
             }
         }
-        let send_fut = self.sender.send(OutgoingEnvelope::ToConnection {
+        let envelope = OutgoingEnvelope::ToConnection {
             connection_id,
             message,
             write_complete_tx: receipt,
-        });
+        };
+        let send_fut = async {
+            let Some(deadline) = enqueue_deadline else {
+                return Ok(self.sender.send(envelope).await);
+            };
+            match self.sender.reserve().await {
+                Ok(permit) => {
+                    // A timeout can poll its inner future first. Capacity becoming
+                    // available on that poll must not publish an expired response.
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ResponseEnqueueDeadlineExpired);
+                    }
+                    permit.send(envelope);
+                    Ok(Ok(()))
+                }
+                Err(_) => Ok(Err(mpsc::error::SendError(envelope))),
+            }
+        };
         let send_fut = async {
             tokio::select! {
                 biased;
-                _ = route_failed.cancelled() => None,
-                _ = self.delivery_shutdown.cancelled() => None,
-                result = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT, send_fut) => Some(result),
+                _ = route_failed.cancelled() => Ok(None),
+                _ = self.delivery_shutdown.cancelled() => Ok(None),
+                result = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT, send_fut) => match result {
+                    Ok(result) => result.map(|result| Some(Ok(result))),
+                    Err(error) => Ok(Some(Err(error))),
+                },
             }
         };
         let send_result = if let Some(request_context) = request_context.as_ref() {
             send_fut.instrument(request_context.span()).await
         } else {
             send_fut.await
-        };
+        }?;
 
         if let Some(span) = request_span.as_ref() {
             span.record(
@@ -2643,7 +2721,7 @@ impl OutgoingMessageSender {
             ),
             None => {}
         }
-        enqueued
+        Ok(enqueued)
     }
 }
 

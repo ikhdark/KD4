@@ -290,7 +290,10 @@ fn declaration(tools: &[ToolInfo]) -> Result<String> {
     Ok(definitions[0].description.to_string())
 }
 
-async fn await_version(manager: &McpConnectionManager, expected: u64) -> Result<f64> {
+async fn await_version(
+    manager: &McpConnectionManager,
+    expected: u64,
+) -> Result<(f64, Arc<Vec<ToolInfo>>)> {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(5);
     loop {
@@ -302,7 +305,7 @@ async fn await_version(manager: &McpConnectionManager, expected: u64) -> Result<
         let observed_at = Instant::now();
         ensure!(observed_at < deadline, "catalog {expected} did not refresh");
         if matched {
-            return Ok((observed_at - start).as_secs_f64() * 1000.0);
+            return Ok(((observed_at - start).as_secs_f64() * 1000.0, snapshot));
         }
         tokio::time::sleep_until((observed_at + Duration::from_millis(5)).min(deadline)).await;
     }
@@ -378,8 +381,7 @@ async fn observe() -> Result<Value> {
         && manager.tool_catalog_revision() == before
         && peer.state.lists.load(Ordering::Acquire) == initial_lists;
     manager.invalidate_caches();
-    let invalidation_ms = await_version(&manager, 2).await?;
-    let invalidated = manager.list_all_tools_snapshot().await;
+    let (invalidation_ms, invalidated) = await_version(&manager, 2).await?;
     let after = manager.tool_catalog_revision();
     let inflight_preserved = !held.is_finished();
     peer.release();
@@ -393,14 +395,12 @@ async fn observe() -> Result<Value> {
     manager
         .call_tool("catalog", "lookup", Some(json!({"notify": true})), None)
         .await?;
-    let notification_ms = await_version(&manager, 3).await?;
-    let notified = manager.list_all_tools_snapshot().await;
+    let (notification_ms, notified) = await_version(&manager, 3).await?;
     let notification_revision = manager.tool_catalog_revision();
     peer.state.version.store(4, Ordering::Release);
     peer.state.epoch.store(2, Ordering::Release);
     manager.list_resources("catalog", None).await?;
-    let reconnect_ms = await_version(&manager, 4).await?;
-    let final_tools = manager.list_all_tools_snapshot().await;
+    let (reconnect_ms, final_tools) = await_version(&manager, 4).await?;
     let row = json!({"baseline_stale": baseline_stale,
         "invalidation_refreshed": after > before,
         "notification_refreshed": notification_revision > after,

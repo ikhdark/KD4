@@ -19,6 +19,7 @@ use std::time::Instant;
 
 mod collection;
 mod plain_replay;
+mod replay_chunks;
 pub use collection::{collect_home_payloads, home_retention_enabled};
 
 const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
@@ -60,6 +61,12 @@ pub(crate) fn is_context_replay_reference(line: &str) -> bool {
         bytes: u64,
         item_type: &'a str,
     }
+    if line.contains(replay_chunks::KEY)
+        && !serde_json::from_str::<serde_json::Value>(line)
+            .is_ok_and(|r| replay_chunks::manifest(&r["payload"]).is_ok())
+    {
+        return false;
+    }
     let Ok(reference) = serde_json::from_str::<Reference<'_>>(line) else {
         return false;
     };
@@ -75,6 +82,7 @@ pub(crate) fn is_context_replay_reference(line: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadDependencyVersion {
     pub(crate) path: PathBuf,
+    absent_selector: bool,
     stamp: Option<(
         u64,
         Option<std::time::SystemTime>,
@@ -101,20 +109,69 @@ fn dependency_stamp(
         })
 }
 
-/// Observe a named artifact before the canonical reader attempts hydration.
-pub(crate) fn named_payload_version(path: &Path, line: &str) -> Option<PayloadDependencyVersion> {
-    let record: serde_json::Value = serde_json::from_str(line).ok()?;
-    if record["type"] != KIND {
-        return None;
+fn objects(directory: &Path, p: &serde_json::Value) -> io::Result<Vec<(PathBuf, u64)>> {
+    let hash = p["sha256"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("missing payload hash"))?;
+    let size = p["bytes"]
+        .as_u64()
+        .ok_or_else(|| io::Error::other("missing payload length"))?;
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) || size > MAX_PAYLOAD_BYTES
+    {
+        return Err(io::Error::other("invalid rollout payload reference"));
     }
-    let hash = record["payload"]["sha256"].as_str().filter(|hash| {
-        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })?;
-    let path = root(path).join(format!("{hash}.json"));
-    Some(PayloadDependencyVersion {
-        stamp: dependency_stamp(&path),
-        path,
-    })
+    let plain = directory.join(format!("{hash}.json"));
+    if let Some(blocks) = replay_chunks::manifest(p)?
+        && matches!(std::fs::symlink_metadata(&plain),Err(e) if e.kind()==io::ErrorKind::NotFound)
+    {
+        return Ok(blocks
+            .into_iter()
+            .map(|(h, n, _)| {
+                (
+                    directory.join(format!("{h}.{}", replay_chunks::SUFFIX)),
+                    n as u64,
+                )
+            })
+            .collect());
+    }
+    Ok(vec![(plain, size)])
+}
+
+fn versions(directory: &Path, p: &serde_json::Value) -> io::Result<Vec<PayloadDependencyVersion>> {
+    let selected = objects(directory, p)?;
+    let mut out = Vec::new();
+    if selected[0]
+        .0
+        .extension()
+        .is_some_and(|e| e == replay_chunks::SUFFIX)
+    {
+        let h = p["sha256"].as_str().expect("validated hash");
+        out.push(PayloadDependencyVersion {
+            path: directory.join(format!("{h}.json")),
+            stamp: None,
+            absent_selector: true,
+        });
+    }
+    out.extend(
+        selected
+            .into_iter()
+            .map(|(path, _)| PayloadDependencyVersion {
+                stamp: dependency_stamp(&path),
+                path,
+                absent_selector: false,
+            }),
+    );
+    Ok(out)
+}
+
+pub(crate) fn named_payload_version(path: &Path, line: &str) -> Vec<PayloadDependencyVersion> {
+    let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else {
+        return vec![];
+    };
+    if r["type"] != KIND {
+        return vec![];
+    }
+    versions(&root(path), &r["payload"]).unwrap_or_default()
 }
 
 /// Cold-cache reference discovery only; verification remains in the canonical
@@ -130,7 +187,7 @@ pub async fn payload_dependency_versions(path: &Path) -> io::Result<Vec<PayloadD
             Box::new(file)
         };
         let mut reader = std::io::BufReader::new(input);
-        let mut paths = std::collections::BTreeSet::new();
+        let mut paths = BTreeMap::new();
         let mut line = String::new();
         loop {
             line.clear();
@@ -145,21 +202,11 @@ pub async fn payload_dependency_versions(path: &Path) -> io::Result<Vec<PayloadD
             if record["type"] != KIND {
                 continue;
             }
-            let hash = record["payload"]["sha256"]
-                .as_str()
-                .filter(|hash| {
-                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-                .ok_or_else(|| io::Error::other("invalid rollout payload digest"))?;
-            paths.insert(root(&path).join(format!("{hash}.json")));
+            for version in versions(&root(&path), &record["payload"])? {
+                paths.entry(version.path.clone()).or_insert(version);
+            }
         }
-        Ok(paths
-            .into_iter()
-            .map(|path| PayloadDependencyVersion {
-                stamp: dependency_stamp(&path),
-                path,
-            })
-            .collect())
+        Ok(paths.into_values().collect())
     })
     .await
     .map_err(io::Error::other)?
@@ -169,7 +216,7 @@ pub async fn payload_dependencies_unchanged(versions: &[PayloadDependencyVersion
     let versions = versions.to_vec();
     tokio::task::spawn_blocking(move || {
         versions.iter().all(|version| {
-            version.stamp.is_some() && dependency_stamp(&version.path) == version.stamp
+            (version.stamp.is_some() || version.absent_selector) && version_matches(version)
         })
     })
     .await
@@ -190,7 +237,7 @@ pub async fn named_payload_versions(path: &Path) -> io::Result<Vec<PayloadDepend
             Box::new(file)
         };
         let mut reader = std::io::BufReader::new(input);
-        let mut paths = std::collections::BTreeSet::new();
+        let mut paths = BTreeMap::new();
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -209,19 +256,11 @@ pub async fn named_payload_versions(path: &Path) -> io::Result<Vec<PayloadDepend
             if record["type"] != KIND {
                 continue;
             }
-            if let Some(hash) = record["payload"]["sha256"].as_str().filter(|hash| {
-                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-            }) {
-                paths.insert(root(&path).join(format!("{hash}.json")));
+            for version in versions(&root(&path), &record["payload"]).unwrap_or_default() {
+                paths.entry(version.path.clone()).or_insert(version);
             }
         }
-        Ok(paths
-            .into_iter()
-            .map(|path| PayloadDependencyVersion {
-                stamp: dependency_stamp(&path),
-                path,
-            })
-            .collect())
+        Ok(paths.into_values().collect())
     })
     .await
     .map_err(io::Error::other)?
@@ -232,13 +271,16 @@ pub async fn named_payload_versions(path: &Path) -> io::Result<Vec<PayloadDepend
 /// payload appears, is replaced, or is repaired.
 pub async fn payload_versions_match(versions: &[PayloadDependencyVersion]) -> bool {
     let versions = versions.to_vec();
-    tokio::task::spawn_blocking(move || {
-        versions
-            .iter()
-            .all(|version| dependency_stamp(&version.path) == version.stamp)
-    })
-    .await
-    .unwrap_or(false)
+    tokio::task::spawn_blocking(move || versions.iter().all(version_matches))
+        .await
+        .unwrap_or(false)
+}
+
+fn version_matches(version: &PayloadDependencyVersion) -> bool {
+    if version.absent_selector {
+        return matches!(std::fs::symlink_metadata(&version.path), Err(e) if e.kind()==io::ErrorKind::NotFound);
+    }
+    dependency_stamp(&version.path) == version.stamp
 }
 
 // Path ordering deduplicates payloads within one rollout; each fresh Arc is
@@ -563,6 +605,14 @@ pub(crate) fn store_value(
         .ok_or_else(|| io::Error::other("invalid rollout object"))?;
     let timestamp = fields.remove("timestamp");
     let format_version = fields.remove("format_version");
+    if item["type"] == "context_replay" {
+        return replay_chunks::store(
+            path,
+            &item,
+            timestamp.unwrap_or_default(),
+            format_version.unwrap_or_default(),
+        );
+    }
     let bytes = serde_json::to_vec(&item)?;
     if bytes.len() as u64 > MAX_PAYLOAD_BYTES {
         return Ok(None);
@@ -614,9 +664,18 @@ pub(crate) fn store_replay(
     format_version: u32,
 ) -> io::Result<Vec<u8>> {
     let item_type = match item {
-        RolloutItem::ContextReplay { .. } => "context_replay",
+        RolloutItem::ContextReplay { .. } => {
+            return replay_chunks::store(path, item, timestamp.into(), format_version.into())?
+                .ok_or_else(|| {
+                    io::Error::other("spooled record exceeds rollout payload size limit")
+                });
+        }
         RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) => "event_msg",
-        _ => return Err(io::Error::other("expected context replay or terminal event payload")),
+        _ => {
+            return Err(io::Error::other(
+                "expected context replay or terminal event payload",
+            ));
+        }
     };
     store_serialized(
         path,
@@ -633,31 +692,16 @@ pub(crate) fn store_replay(
 /// It is not read, hashed or parsed; append visitors never consume replay bodies,
 /// and full diagnostic readers still hydrate and verify them.
 pub(crate) fn enroll_replay_reference(path: &Path, line: &str) -> io::Result<()> {
-    #[derive(serde::Deserialize)]
-    struct Reference<'a> {
-        #[serde(borrow)]
-        payload: Payload<'a>,
+    let record: serde_json::Value = serde_json::from_str(line)?;
+    for (object, bytes) in objects(&root(path), &record["payload"])? {
+        let meta = std::fs::symlink_metadata(&object)?;
+        if !meta.file_type().is_file() || meta.len() != bytes {
+            return Err(io::Error::other(
+                "rollout payload is missing, replaced, or incomplete",
+            ));
+        }
+        enroll_payload_path_for_sync(path, object);
     }
-    #[derive(serde::Deserialize)]
-    struct Payload<'a> {
-        sha256: &'a str,
-        bytes: u64,
-    }
-    let reference: Reference<'_> = serde_json::from_str(line).map_err(io::Error::other)?;
-    let Payload { sha256, bytes } = reference.payload;
-    if sha256.len() != 64
-        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || bytes > MAX_PAYLOAD_BYTES
-    {
-        return Err(io::Error::other("invalid rollout payload reference"));
-    }
-    let metadata = std::fs::symlink_metadata(root(path).join(format!("{sha256}.json")))?;
-    if !metadata.file_type().is_file() || metadata.len() != bytes {
-        return Err(io::Error::other(
-            "rollout payload is missing, replaced, or incomplete",
-        ));
-    }
-    enroll_payload_for_sync(path, sha256);
     Ok(())
 }
 
@@ -736,9 +780,25 @@ fn publish_payload(
     bytes: u64,
     stage: impl FnOnce() -> io::Result<tempfile::NamedTempFile>,
 ) -> io::Result<()> {
+    publish_object(path, sha256, bytes, "json", stage)
+}
+
+fn publish_object(
+    path: &Path,
+    sha256: &str,
+    bytes: u64,
+    suffix: &str,
+    stage: impl FnOnce() -> io::Result<tempfile::NamedTempFile>,
+) -> io::Result<()> {
     let directory = root(path);
     std::fs::create_dir_all(&directory)?;
-    let destination = directory.join(format!("{sha256}.json"));
+    let destination = directory.join(format!("{sha256}.{suffix}"));
+    let verify = || -> io::Result<()> {
+        if digest(&read_object(&destination, bytes)?) != sha256 {
+            return Err(io::Error::other("rollout payload checksum mismatch"));
+        }
+        Ok(())
+    };
     // The caller writes the referencing rollout line as soon as this returns,
     // and the OS may persist that line before the next durable barrier. Sync
     // the staged body before its atomic rename so a content address never
@@ -750,15 +810,17 @@ fn publish_payload(
         Ok::<_, io::Error>(staged)
     };
     if destination.exists() {
-        if read_payload(&directory, sha256, bytes, None).is_err() {
-            stage()?.persist(&destination).map_err(|error| error.error)?;
+        if verify().is_err() {
+            stage()?
+                .persist(&destination)
+                .map_err(|error| error.error)?;
         }
     } else {
         match stage()?.persist_noclobber(&destination) {
             // The destination is exactly the complete temporary file we wrote.
             Ok(_) => {}
             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                if read_payload(&directory, sha256, bytes, None).is_err() {
+                if verify().is_err() {
                     error
                         .file
                         .persist(&destination)
@@ -860,7 +922,11 @@ fn read_payload(
 
 fn read_payload_bytes(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8>> {
     let path = directory.join(format!("{sha256}.json"));
-    let metadata = std::fs::symlink_metadata(&path)?;
+    read_object(&path, bytes)
+}
+
+fn read_object(path: &Path, bytes: u64) -> io::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.len() != bytes {
         return Err(io::Error::other(
             "rollout payload is missing, replaced, or incomplete",
@@ -950,7 +1016,31 @@ fn hydrate_record_with_limit(
     // Keep large nested bodies as borrowed JSON. Materializing a diagnostic
     // snapshot here only to serialize it for the canonical decoder duplicates
     // its entire object tree on every history read and cold resume.
-    let payload = read_payload(&root(path), sha256, bytes, timing.as_deref_mut())?;
+    let directory = root(path);
+    let objects = objects(&directory, &reference["payload"])?;
+    let payload = if objects[0]
+        .0
+        .extension()
+        .is_some_and(|e| e == replay_chunks::SUFFIX)
+    {
+        let blocks =
+            replay_chunks::manifest(&reference["payload"])?.expect("selected chunk representation");
+        let data = time_append_stage(timing.as_deref_mut().map(|t| &mut t.read), || {
+            replay_chunks::read(&directory, &blocks, bytes)
+        })?;
+        if let Some(t) = timing.as_deref_mut() {
+            t.bytes_read += data.len() as u64;
+        }
+        if time_append_stage(timing.as_deref_mut().map(|t| &mut t.sha256), || {
+            digest(&data)
+        }) != sha256
+        {
+            return Err(io::Error::other("rollout payload checksum mismatch"));
+        }
+        data
+    } else {
+        read_payload(&directory, sha256, bytes, timing.as_deref_mut())?
+    };
     let mut projected_plain_replay = false;
     let append_value = decode_value.then(|| {
         time_append_stage(timing.as_mut().map(|t| &mut t.parse), || {
@@ -976,7 +1066,9 @@ fn hydrate_record_with_limit(
         check_payload_type(item_type, &reference["payload"]["item_type"])?;
         if enroll {
             time_append_stage(timing.as_mut().map(|t| &mut t.enroll), || {
-                enroll_payload_for_sync(path, sha256);
+                for (object, _) in &objects {
+                    enroll_payload_path_for_sync(path, object.clone());
+                }
             });
         }
         // Same precedence as text hydration: record metadata belongs to
@@ -1003,7 +1095,9 @@ fn hydrate_record_with_limit(
     check_payload_type(&item_type, &reference["payload"]["item_type"])?;
     if enroll {
         time_append_stage(timing.as_mut().map(|t| &mut t.enroll), || {
-            enroll_payload_for_sync(path, sha256);
+            for (object, _) in &objects {
+                enroll_payload_path_for_sync(path, object.clone());
+            }
         });
     }
     time_append_stage(timing.map(|t| &mut t.envelope), move || {
@@ -1028,10 +1122,6 @@ fn check_payload_type(
     Ok(())
 }
 
-fn enroll_payload_for_sync(path: &Path, sha256: &str) {
-    enroll_payload_path_for_sync(path, root(path).join(format!("{sha256}.json")));
-}
-
 fn enroll_payload_path_for_sync(path: &Path, destination: PathBuf) {
     // A cold reader can observe the compressed representation. All custody
     // and durable barriers use the same materialized plain rollout key.
@@ -1053,4 +1143,3 @@ fn enroll_payload_path_for_sync(path: &Path, destination: PathBuf) {
         .replace(destination);
     drop(replaced);
 }
-

@@ -340,10 +340,21 @@ impl ThreadEnvironments {
                 continue;
             };
             let lifecycle = Arc::new(TurnEnvironmentLifecycle::new());
-            self.owned_lifecycles
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(Arc::downgrade(&lifecycle));
+            {
+                let mut lifecycles = self
+                    .owned_lifecycles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let capacity = lifecycles.capacity();
+                if lifecycles.len() == capacity {
+                    lifecycles.retain(|lifecycle| lifecycle.strong_count() != 0);
+                    // Make enough room between scans even when most owners remain live.
+                    if lifecycles.len() > capacity / 2 {
+                        lifecycles.reserve(capacity);
+                    }
+                }
+                lifecycles.push(Arc::downgrade(&lifecycle));
+            }
             // Read before the first poll below, which may join a startup attempt.
             let incarnation_at_start = runtime_incarnation(&environment);
             let resolution = Self::resolve_environment(

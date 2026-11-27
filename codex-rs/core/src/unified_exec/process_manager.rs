@@ -3542,17 +3542,13 @@ impl UnifiedExecProcessManager {
                         u64::try_from(close_wait_remaining.as_millis()).unwrap_or(u64::MAX);
                     let lifecycle_deadline_at_ms = tool_dispatch_timing
                         .as_ref()
-                        .and_then(|timing| timing.deadline_after_ms(requested_timeout_ms));
-                    if let Some(turn_timing) = tool_dispatch_timing
-                        .as_ref()
                         .and_then(|timing| timing.turn_timing_state())
-                    {
-                        turn_timing
-                            .record_tool_sample_block_reason_async(
+                        .and_then(|timing| {
+                            timing.observe_process_wait_before(
+                                close_wait_deadline.into_std(),
                                 NextSampleBlockReason::WaitingForProcessCleanup,
                             )
-                            .await;
-                    }
+                        });
                     let wake_reason = tokio::select! {
                         _ = Self::wait_for_interaction(handoff) => break ToolLifecycleWakeReason::Retry,
                         _ = &mut output_notified => ToolLifecycleWakeReason::Completed,
@@ -3587,15 +3583,13 @@ impl UnifiedExecProcessManager {
                 let requested_timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
                 let lifecycle_deadline_at_ms = tool_dispatch_timing
                     .as_ref()
-                    .and_then(|timing| timing.deadline_after_ms(requested_timeout_ms));
-                if let Some(turn_timing) = tool_dispatch_timing
-                    .as_ref()
                     .and_then(|timing| timing.turn_timing_state())
-                {
-                    turn_timing
-                        .record_tool_sample_block_reason_async(NextSampleBlockReason::WaitingForTool)
-                        .await;
-                }
+                    .and_then(|timing| {
+                        timing.observe_process_wait_before(
+                            effective_deadline.into_std(),
+                            NextSampleBlockReason::WaitingForTool,
+                        )
+                    });
                 let wake_reason = tokio::select! {
                         _ = Self::wait_for_interaction(handoff) => break ToolLifecycleWakeReason::Retry,
                     _ = &mut output_notified => ToolLifecycleWakeReason::Completed,

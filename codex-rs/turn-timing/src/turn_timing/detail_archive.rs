@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
-use super::{TurnTimingState, TurnTimingStateInner};
+use super::{PROCESS_WAIT_ATTRIBUTION_SEALED, TurnTimingState, TurnTimingStateInner};
 
 const MAX_PENDING_RECORDS: usize = 1024;
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
@@ -307,6 +307,12 @@ impl TurnTimingState {
         timing: &mut codex_protocol::protocol::TurnTiming,
         ephemeral: bool,
     ) {
+        let skipped = self.missed_process_wait_attributions.load(Ordering::Acquire)
+            & !PROCESS_WAIT_ATTRIBUTION_SEALED;
+        if skipped > 0 {
+            let evidence = timing.measurement_evidence.get_or_insert_with(|| json!({}));
+            evidence["processWaitAttribution"] = json!({"complete": false, "collectorContention": skipped});
+        }
         let ((finished, ingress_missing), expected) = {
             let state = self.state();
             if state.archive_sequence == 0 {

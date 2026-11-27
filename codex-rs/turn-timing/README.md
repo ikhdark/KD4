@@ -171,14 +171,27 @@ Terminal diagnostics use the same opt-in journal and process clock:
 `terminal_state_complete` brackets only the terminal snapshot's inner
 state completion, with a flag for cached results. The snapshot admits this row
 to the prepared bounded runtime-async lane; only a retained row is append
-evidence. The start/end pairs for
+evidence. Core's `cancel_request` span also uses the prepared lane. A retained
+pair observes scheduling only, not settlement, app-server acknowledgment, or
+a complete capture. The start/end pairs for
 `terminal_rollout_append` and `terminal_rollout_barrier` distinguish ordered
 append acknowledgment from stable-storage acknowledgment; an abandoned span
 does not establish cancellation of a queued write. These pairs are absent on
 paths without terminal storage. The listener's `terminal_queue_pause` span
-brackets its pause call; owner return is not proof a queue changed. Join an
+and the embedded `runtime_shutdown` span use the prepared runtime-async lane.
+The former brackets the pause call, not proof of a queue change. The latter
+observes the retained owner's result, not delivery of a shutdown response.
+Pair only retained endpoints; queue admission is not an append receipt. Join an
 interrupt's `cancel_ack_ready` to `bounded_response` using the connection and
 request IDs on the same clock; those rows are not a client receipt.
+
+For the ordinary process-output and post-exit drain timers, optional block
+reason attribution does not wait for the timing collector lock. Their wake
+records still carry the original deadline projected on the turn clock when
+known. `measurementEvidence.processWaitAttribution` reports collector
+contention losses observed at terminal capture. A missing marker does not
+prove every prior observer ran; archive byte and inventory completeness
+remain separate from reason attribution.
 
 Connectors can emit `codex_http_client::TransportIntervalObservation` through
 `observe_transport_interval`, or retain `current_transport_interval_observer()`

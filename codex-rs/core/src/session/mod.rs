@@ -3278,25 +3278,8 @@ impl Session {
             _ => false,
         };
         let post_dispatch = PreparedEventDispatch::new(&msg, self.show_raw_agent_reasoning());
-        if turn_context.multi_agent_version == MultiAgentVersion::V2
-            && (post_dispatch.terminal_source.is_some()
-                || matches!(&msg, EventMsg::Error(error) if error.affects_turn_status()))
-            && let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref)
-        {
-            // Status becomes observable during live delivery, before the
-            // post-dispatch owner can write the pending terminal row.
-            self.services.agent_control.task_coordinator()
-                .begin_terminal_dispatch(binding, &turn_context.sub_id);
-        }
-        if let EventMsg::Error(error) = &msg
-            && error.affects_turn_status()
-        {
-            turn_context
-                .terminal_error
-                .lock()
-                .await
-                .replace(error.clone());
-        }
+        self.stage_terminal_dispatch_status(turn_context, &msg, post_dispatch.terminal_source.is_some())
+            .await;
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
@@ -3313,6 +3296,33 @@ impl Session {
             self.send_event_raw_with_receipt(event, persist, publication_receipt).await;
         }
         post_dispatch
+    }
+
+    async fn stage_terminal_dispatch_status(
+        &self,
+        turn_context: &TurnContext,
+        msg: &EventMsg,
+        is_terminal: bool,
+    ) {
+        if turn_context.multi_agent_version == MultiAgentVersion::V2
+            && (is_terminal
+                || matches!(msg, EventMsg::Error(error) if error.affects_turn_status()))
+            && let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref)
+        {
+            // Status becomes observable during live delivery, before the
+            // post-dispatch owner can write the pending terminal row.
+            self.services.agent_control.task_coordinator()
+                .begin_terminal_dispatch(binding, &turn_context.sub_id);
+        }
+        if let EventMsg::Error(error) = msg
+            && error.affects_turn_status()
+        {
+            turn_context
+                .terminal_error
+                .lock()
+                .await
+                .replace(error.clone());
+        }
     }
 
     async fn finish_prepared_event_dispatch(
@@ -3734,6 +3744,55 @@ impl Session {
             }
             Err(e) => debug!("dropping event because channel is closed: {e}"),
         }
+    }
+
+    /// The finalizer already carries the same warning as a terminal gap.
+    /// Retain normal append-before-live ordering when the recorder is ready,
+    /// but do not wait indefinitely to report that a record was not saved.
+    pub(crate) async fn send_terminal_record_warning(&self, turn_id: &str, message: String) {
+        self.send_terminal_diagnostic(turn_id, EventMsg::Warning(WarningEvent { message }))
+            .await;
+    }
+
+    pub(crate) async fn send_terminal_worker_error(
+        &self,
+        turn_context: &TurnContext,
+        error: ErrorEvent,
+    ) -> bool {
+        let msg = EventMsg::Error(error);
+        self.stage_terminal_dispatch_status(turn_context, &msg, false).await;
+        self.send_terminal_diagnostic(&turn_context.sub_id, msg).await
+    }
+
+    /// Report whether ordered append was confirmed or not required, not durability.
+    async fn send_terminal_diagnostic(&self, turn_id: &str, msg: EventMsg) -> bool {
+        let mut append_confirmed = true;
+        if self
+            .live_thread()
+            .is_some_and(|thread| thread.should_persist_event(&msg))
+        {
+            let items = [RolloutItem::EventMsg(msg.clone())];
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.persist_rollout_items_ordered(&items),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    append_confirmed = false;
+                    warn!(%turn_id, %error, "failed to append terminal diagnostic");
+                }
+                Err(_) => {
+                    append_confirmed = false;
+                    warn!(%turn_id, "terminal diagnostic append was not confirmed");
+                }
+            }
+            // A timed-out observation does not revoke an admitted append. There
+            // is no retry or late live delivery from the recorder path.
+        }
+        self.deliver_event_raw(Event { id: turn_id.to_owned(), msg }).await;
+        append_confirmed
     }
 
     /// Offers a live-only event without waiting for a consumer or persisting it.
@@ -6768,7 +6827,7 @@ impl Session {
 
     async fn retain_context_replay_capture(
         &self,
-        capture: codex_model_client::client::RetainedRequestCapture,
+        evidence: codex_model_client::client::RetainedRequestEvidence,
     ) -> CodexResult<()> {
         // Respect deliberately non-persistent sessions. Persistent sessions
         // cannot consume a response past a failed capture/flush. A capture of
@@ -6779,28 +6838,31 @@ impl Session {
         if self.live_thread().is_none() {
             return Ok(());
         }
-        if capture.pre_send_marker {
-            // Small typed record, durable before the transport is touched; its
-            // failure means no send. The full capture follows concurrently.
-            let marker = RolloutItem::ContextReplay {
-                version: 1,
-                turn_id: capture.turn_id,
-                sampling_request_id: capture.identity.sampling_request_id,
-                physical_attempt_id: capture.identity.physical_attempt_id,
-                capture: serde_json::json!({
-                    "schema_version":1,
-                    "thread_id":self.thread_id.to_string(),
-                    "transport":capture.transport,
-                    "selected_representation":capture.selected_representation,
-                    "has_sampling_boundary":capture.has_sampling_boundary,
-                    "marker":"pre_send_marker_v1",
-                    "model":capture.logical_request.model,
-                    "stage":"pre_send_marker_v1; durable before transport; the full capture follows concurrently and its failure stays fatal"
-                }).into(),
-            };
-            return self.persist_rollout_items_then_sync(&[marker]).await
-                .map_err(|error| CodexErr::Fatal(format!("context replay pre-send marker failed: {error}")));
-        }
+        use codex_model_client::client::RetainedRequestEvidence;
+        let capture = match evidence {
+            RetainedRequestEvidence::PreSendMarker { identity, model } => {
+                // This record must commit before transport; the body follows concurrently.
+                let marker = RolloutItem::ContextReplay {
+                    version: 1,
+                    turn_id: identity.turn_id,
+                    sampling_request_id: identity.attempt.sampling_request_id,
+                    physical_attempt_id: identity.attempt.physical_attempt_id,
+                    capture: serde_json::json!({
+                        "schema_version":1,
+                        "thread_id":self.thread_id.to_string(),
+                        "transport":identity.transport,
+                        "selected_representation":identity.selected_representation,
+                        "has_sampling_boundary":identity.has_sampling_boundary,
+                        "marker":"pre_send_marker_v1",
+                        "model":model,
+                        "stage":"pre_send_marker_v1; durable before transport; the full capture follows concurrently and its failure stays fatal"
+                    }).into(),
+                };
+                return self.persist_rollout_items_then_sync(&[marker]).await
+                    .map_err(|error| CodexErr::Fatal(format!("context replay pre-send marker failed: {error}")));
+            }
+            RetainedRequestEvidence::Full(capture) => *capture,
+        };
         let prepared = capture.replay_snapshot.is_some();
         let stage = if capture.dispatch_overlapped {
             "retained_concurrently_with_transport; joined before the attempt's first response event; dispatch/acceptance require attempt timing"
@@ -6824,15 +6886,15 @@ impl Session {
             }).collect::<serde_json::Map<_, _>>();
             Ok(RolloutItem::ContextReplay {
                 version: 1,
-                turn_id: capture.turn_id,
-                sampling_request_id: capture.identity.sampling_request_id,
-                physical_attempt_id: capture.identity.physical_attempt_id,
+                turn_id: capture.identity.turn_id,
+                sampling_request_id: capture.identity.attempt.sampling_request_id,
+                physical_attempt_id: capture.identity.attempt.physical_attempt_id,
                 capture: serde_json::json!({
                     "schema_version":1,
                     "thread_id":thread_id,
-                    "transport":capture.transport,
-                    "selected_representation":capture.selected_representation,
-                    "has_sampling_boundary":capture.has_sampling_boundary,
+                    "transport":capture.identity.transport,
+                    "selected_representation":capture.identity.selected_representation,
+                    "has_sampling_boundary":capture.identity.has_sampling_boundary,
                     "snapshot_basis":if prepared { "immutable_prompt_preparation" } else { "live_session_at_auxiliary_dispatch" },
                     "native_snapshot":snapshot,
                     "retirement_decisions":decisions,

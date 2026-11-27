@@ -504,7 +504,7 @@ impl ToolEmitter {
         self.emit(ctx, ToolEventStage::Begin).await
     }
 
-    pub(crate) fn unified_exec_startup_item(&self, mut ctx: ToolEventCtx<'_>) -> TurnItem {
+    pub(crate) fn unified_exec_startup_item<'a>(&'a self, mut ctx: ToolEventCtx<'a>) -> TurnItem {
         let Self::UnifiedExec {
             captured_environment,
             command,

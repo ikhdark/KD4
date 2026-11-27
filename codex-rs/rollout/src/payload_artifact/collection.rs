@@ -70,7 +70,11 @@ pub async fn collect_home_payloads(home: &Path) -> io::Result<usize> {
             let entry = entry?;
             budget.visit_entry()?;
             let name = entry.file_name();
-            let Some(hash) = name.to_str().and_then(|s| s.strip_suffix(".json")) else {
+            let Some((hash, chunk)) = name.to_str().and_then(|s| {
+                s.strip_suffix(".json")
+                    .map(|h| (h, false))
+                    .or_else(|| s.strip_suffix(".replay-zst").map(|h| (h, true)))
+            }) else {
                 continue;
             };
             let Ok(hash) = <&PayloadHash>::try_from(hash.as_bytes()) else {
@@ -79,7 +83,7 @@ pub async fn collect_home_payloads(home: &Path) -> io::Result<usize> {
             if hash
                 .iter()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-                && !retained.contains(hash)
+                && !retained.contains(&(*hash, chunk))
                 && entry.file_type()?.is_file()
             {
                 direct(&entry.path())?;
@@ -116,7 +120,7 @@ fn mark_home(
     home: &Path,
     payload_directory: &Path,
     budget: &mut InventoryBudget,
-) -> io::Result<HashSet<PayloadHash>> {
+) -> io::Result<HashSet<(PayloadHash, bool)>> {
     let mut retained = HashSet::new();
     let sessions = home.join(crate::SESSIONS_SUBDIR);
     let archives = home.join(crate::ARCHIVED_SESSIONS_SUBDIR);
@@ -158,7 +162,7 @@ fn mark_tree(
     parent: &Path,
     tree: MarkTree<'_>,
     depth: usize,
-    retained: &mut HashSet<PayloadHash>,
+    retained: &mut HashSet<(PayloadHash, bool)>,
     budget: &mut InventoryBudget,
 ) -> io::Result<()> {
     if depth >= MAX_MARK_DEPTH {
@@ -288,7 +292,7 @@ fn is_zstd(path: &Path) -> bool {
 
 fn mark_file(
     path: &Path,
-    retained: &mut HashSet<PayloadHash>,
+    retained: &mut HashSet<(PayloadHash, bool)>,
     history: bool,
     budget: &InventoryBudget,
 ) -> io::Result<()> {
@@ -354,10 +358,22 @@ fn mark_file(
                 .filter(|hash| hash.iter().all(u8::is_ascii_hexdigit))
                 .ok_or_else(|| io::Error::other("invalid payload reference; sweep skipped"))?;
             hash.make_ascii_lowercase();
-            if retained.len() >= MAX_RETAINED_HASHES && !retained.contains(&hash) {
+            if retained.len() >= MAX_RETAINED_HASHES && !retained.contains(&(hash, false)) {
                 return Err(incomplete_inventory("retained hash limit"));
             }
-            retained.insert(hash);
+            retained.insert((hash, false));
+            if let Some(blocks) = super::replay_chunks::manifest(&record["payload"])? {
+                for (digest, _, _) in blocks {
+                    let key = (
+                        PayloadHash::try_from(digest.as_bytes()).map_err(io::Error::other)?,
+                        true,
+                    );
+                    if retained.len() >= MAX_RETAINED_HASHES && !retained.contains(&key) {
+                        return Err(incomplete_inventory("retained hash limit"));
+                    }
+                    retained.insert(key);
+                }
+            }
         }
     }
     Ok(())

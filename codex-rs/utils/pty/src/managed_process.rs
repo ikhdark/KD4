@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::time::Instant;
 
 const MANAGED_ROOT_WARNING_THRESHOLD: usize = 384;
 const MANAGED_ROOT_LIMIT: usize = 1024;
@@ -131,6 +132,16 @@ impl AdmissionObservation {
     }
 }
 
+fn check_reservation_deadline(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "managed root reservation deadline expired",
+        ));
+    }
+    Ok(())
+}
+
 /// A charge starts before native containment setup, and unwinds with the same
 /// identity on both setup failure and normal/cancelled cleanup.
 struct AdmissionReservation {
@@ -138,13 +149,16 @@ struct AdmissionReservation {
 }
 
 impl AdmissionReservation {
-    fn acquire(reclaim_id: Option<u64>) -> io::Result<Self> {
+    fn acquire(reclaim_id: Option<u64>, deadline: Option<Instant>) -> io::Result<Self> {
         // When observing, serialize the count mutation and census bookkeeping
         // together. The unobserved hot path keeps the existing atomic gate.
         let mut observer = admission_observer()
             .map(|observer| observer.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
         let mut current = MANAGED_ROOT_COUNT.load(Ordering::Acquire);
         loop {
+            // Check after taking the observer lock and again on each failed CAS.
+            // Dropping the async waiter does not cancel a queued Windows worker.
+            check_reservation_deadline(deadline)?;
             if current >= MANAGED_ROOT_LIMIT {
                 let observation = observer.as_mut().map(|observer| {
                     let census = observer.rejections < ADMISSION_CENSUS_LIMIT;
@@ -335,13 +349,16 @@ impl ManagedRootProcess {
 
     /// Reserve one of the process-wide managed-root slots before spawning.
     pub fn reserve() -> io::Result<Self> {
-        Self::reserve_inner(None)
+        Self::reserve_inner(None, None)
     }
 
-    fn reserve_inner(reclaim_id: Option<u64>) -> io::Result<Self> {
-        let admission = AdmissionReservation::acquire(reclaim_id)?;
+    fn reserve_inner(reclaim_id: Option<u64>, deadline: Option<Instant>) -> io::Result<Self> {
+        let admission = AdmissionReservation::acquire(reclaim_id, deadline)?;
         #[cfg(windows)]
         let job = {
+            // Admission observation can take time. Do not begin native setup if the
+            // cutoff passed after the charge; the owned reservation unwinds it.
+            check_reservation_deadline(deadline)?;
             let job = crate::win::JobObject::create()?;
             // Every managed launch promises cancellation of the contained
             // workload, including pipes and the direct core execution path.
@@ -360,28 +377,43 @@ impl ManagedRootProcess {
     /// Reserve a root, attempting one deadline-bounded serialized cross-layer
     /// reclaim pass before rejecting a launch at the hard limit.
     pub async fn reserve_with_reclaim() -> io::Result<Self> {
-        Self::reserve_with_reclaim_timeout(MANAGED_ROOT_RECLAIM_TIMEOUT).await
+        Self::reserve_with_reclaim_timeout(MANAGED_ROOT_RECLAIM_TIMEOUT, None).await
     }
 
-    async fn reserve_on_worker(reclaim_id: Option<u64>) -> io::Result<Self> {
+    /// Apply the caller's absolute cutoff to every capacity attempt and to
+    /// starting Job creation. The caller still bounds its own wait; native
+    /// operations already started cannot be interrupted by this cutoff.
+    #[cfg(windows)]
+    pub async fn reserve_with_reclaim_before(deadline: Instant) -> io::Result<Self> {
+        Self::reserve_with_reclaim_timeout(MANAGED_ROOT_RECLAIM_TIMEOUT, Some(deadline)).await
+    }
+
+    async fn reserve_on_worker(
+        reclaim_id: Option<u64>,
+        deadline: Option<Instant>,
+    ) -> io::Result<Self> {
         #[cfg(windows)]
         {
             run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
-                Self::reserve_inner(reclaim_id)
+                Self::reserve_inner(reclaim_id, deadline)
             })
             .await
         }
         #[cfg(not(windows))]
         {
-            Self::reserve_inner(reclaim_id)
+            Self::reserve_inner(reclaim_id, deadline)
         }
     }
 
-    async fn reserve_with_reclaim_timeout(reclaim_timeout: Duration) -> io::Result<Self> {
+    async fn reserve_with_reclaim_timeout(
+        reclaim_timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> io::Result<Self> {
         static NEXT_RECLAIM_REQUEST: AtomicU64 = AtomicU64::new(1);
         let reclaim_id = admission_observer()
             .map(|_| NEXT_RECLAIM_REQUEST.fetch_add(1, Ordering::Relaxed));
-        if let Some(root) = reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)? {
+        let reserve = || Self::reserve_on_worker(reclaim_id, deadline);
+        if let Some(root) = reclaimable_reservation(reserve().await)? {
             return Ok(root);
         }
 
@@ -394,6 +426,7 @@ impl ManagedRootProcess {
                 observation.emit();
             }
         };
+        check_reservation_deadline(deadline)?;
         observe_reclaim("reclaim_started");
         let reclaim = async {
             let _reclaim = ADMISSION_RECLAIM_PERMIT
@@ -403,7 +436,7 @@ impl ManagedRootProcess {
                 .map_err(|error| {
                     io::Error::other(format!("admission reclaimer closed: {error}"))
                 })?;
-            if let Some(root) = reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)? {
+            if let Some(root) = reclaimable_reservation(reserve().await)? {
                 return Ok(root);
             }
 
@@ -419,12 +452,14 @@ impl ManagedRootProcess {
                 .map(|(_, reclaimer)| reclaimer.clone())
                 .collect::<Vec<_>>();
             for reclaimer in &reclaimers {
+                check_reservation_deadline(deadline)?;
                 (reclaimer.retire_zero_lease_mcp_generations)().await;
             }
-            if let Some(root) = reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)? {
+            if let Some(root) = reclaimable_reservation(reserve().await)? {
                 return Ok(root);
             }
             for reclaimer in reclaimers {
+                check_reservation_deadline(deadline)?;
                 let eviction = (reclaimer.evict_one_eligible_task)();
                 tokio::pin!(eviction);
                 loop {
@@ -435,9 +470,7 @@ impl ManagedRootProcess {
                         () = wait_for_managed_root_capacity() => false,
                         () = &mut eviction => true,
                     };
-                    if let Some(root) =
-                        reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)?
-                    {
+                    if let Some(root) = reclaimable_reservation(reserve().await)? {
                         return Ok(root);
                     }
                     if eviction_finished {
@@ -447,7 +480,7 @@ impl ManagedRootProcess {
                 }
             }
 
-            Self::reserve_on_worker(reclaim_id).await
+            reserve().await
         };
 
         let result = tokio::time::timeout(reclaim_timeout, reclaim)

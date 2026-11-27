@@ -150,21 +150,18 @@ pub async fn observe_working_tree(
         .ok_or("working-tree subscription unavailable")?;
     loop {
         let event = match tokio::time::timeout_at(deadline, subscription.recv()).await {
-            Ok(event) => event.map_err(|error| error.to_string())?,
-            Err(_) => {
-                // Recheck even on expiry: a delayed backend must not certify
-                // unchanged state from an old baseline.
-                observed = capture(root.clone(), paths.clone(), max_files).await?;
-                observed.change_detected = observed.state_sha256 != baseline;
-                observed.rescan_required = observed.watch_routes != routes;
-                observed.timed_out = !observed.change_detected && !observed.rescan_required;
-                return Ok(observed);
-            }
+            Ok(event) => Some(event.map_err(|error| error.to_string())?),
+            Err(_) => None,
         };
+        // A queued event can win at expiry. Fold it into the one final fresh
+        // capture (including a rescan hint), rather than restarting the watch.
+        let final_capture = event.is_none() || Instant::now() >= deadline;
         observed = capture(root.clone(), paths.clone(), max_files).await?;
         observed.change_detected = observed.state_sha256 != baseline;
-        observed.rescan_required = event.rescan_required || observed.watch_routes != routes;
-        if observed.change_detected || observed.rescan_required {
+        observed.rescan_required = event.is_some_and(|event| event.rescan_required)
+            || observed.watch_routes != routes;
+        if observed.change_detected || observed.rescan_required || final_capture {
+            observed.timed_out = final_capture && !observed.change_detected && !observed.rescan_required;
             return Ok(observed);
         }
     }

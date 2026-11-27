@@ -310,12 +310,14 @@ fn scan_rollout_metadata(
         }
         let text = compression::decode_rollout_line(std::mem::take(&mut raw));
         let line = if crate::payload_artifact::may_be_reference(&text) {
-            if cache_key.is_some()
-                && let Some(version) = crate::payload_artifact::named_payload_version(&physical, &text)
-            {
-                // Repeated references share one dependency; keep the earliest
-                // observation so a repair during the scan cannot certify it.
-                payload_versions.entry(version.path.clone()).or_insert(version);
+            if cache_key.is_some() {
+                for version in crate::payload_artifact::named_payload_version(&physical, &text) {
+                    // Repeated references share one dependency; keep the earliest
+                    // observation so a repair during the scan cannot certify it.
+                    payload_versions
+                        .entry(version.path.clone())
+                        .or_insert(version);
+                }
             }
             match crate::payload_artifact::hydrate_line(&physical, text) {
                 Ok(line) => line,

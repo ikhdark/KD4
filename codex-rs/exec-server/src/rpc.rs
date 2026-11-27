@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio::time::timeout;
 
 use crate::connection::JsonRpcConnection;
@@ -67,9 +68,20 @@ type RequestRoute<S> = Box<
 type NotificationRoute<S> =
     Box<dyn Fn(Arc<S>, JSONRPCNotification) -> BoxFuture<Result<(), String>> + Send + Sync>;
 
+#[derive(Clone, Copy)]
 enum RpcCallTimeout {
     None,
     After(Duration),
+    // The outer cleanup caller owns the full deadline. Keep its cutoff here
+    // too, to prevent a late poll from publishing a new request.
+    Cleanup { deadline: Instant, budget: Duration },
+}
+
+fn rpc_timeout(method: &str, timeout: Duration) -> RpcCallError {
+    RpcCallError::TimedOut {
+        method: method.to_string(),
+        timeout,
+    }
 }
 
 #[derive(Debug)]
@@ -490,16 +502,6 @@ impl RpcClient {
             .await
     }
 
-    #[tracing::instrument(
-        name = "codex.exec_server.request",
-        level = "info",
-        skip_all,
-        fields(
-            otel.kind = "client",
-            otel.name = method,
-            method,
-        )
-    )]
     pub(crate) async fn call_for_cleanup<P, T>(
         &self,
         method: &str,
@@ -510,21 +512,67 @@ impl RpcClient {
         P: Serialize,
         T: DeserializeOwned,
     {
-        let _call_slot = match self.shared_call_slots.try_acquire() {
-            Ok(call_slot) => call_slot,
-            Err(_) => match self.cleanup_call_slots.try_acquire() {
-                Ok(call_slot) => call_slot,
-                Err(_) => {
-                    // Preserve the caller's cleanup deadline even when the child
-                    // supervisor is slow. Its retained owner finishes termination.
-                    self.request_transport_close();
-                    drain_pending(&self.pending).await;
-                    return Err(RpcCallError::Closed);
-                }
-            },
-        };
-        self.call_inner(method, params, RpcCallTimeout::After(call_timeout), None)
+        self.call_for_cleanup_before(method, params, Instant::now() + call_timeout)
             .await
+    }
+
+    #[tracing::instrument(
+        name = "codex.exec_server.request",
+        level = "info",
+        skip_all,
+        fields(
+            otel.kind = "client",
+            otel.name = method,
+            method,
+        )
+    )]
+    pub(crate) async fn call_for_cleanup_before<P, T>(
+        &self,
+        method: &str,
+        params: &P,
+        deadline: Instant,
+    ) -> Result<T, RpcCallError>
+    where
+        P: Serialize,
+        T: DeserializeOwned,
+    {
+        let budget = deadline.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            return Err(rpc_timeout(method, budget));
+        }
+        let call = async {
+            let _call_slot = match self.shared_call_slots.try_acquire() {
+                Ok(call_slot) => call_slot,
+                Err(_) => match self.cleanup_call_slots.try_acquire() {
+                    Ok(call_slot) => call_slot,
+                    Err(_) => {
+                        // Request closure before waiting on the pending map. The
+                        // reader also drains on disconnect if this wait expires.
+                        self.request_transport_close();
+                        drain_pending(&self.pending).await;
+                        return Err(RpcCallError::Closed);
+                    }
+                },
+            };
+            self.call_inner(
+                method,
+                params,
+                RpcCallTimeout::Cleanup { deadline, budget },
+                None,
+            )
+            .await
+        };
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => Err(rpc_timeout(method, budget)),
+            result = call => {
+                if Instant::now() >= deadline {
+                    Err(rpc_timeout(method, budget))
+                } else {
+                    result
+                }
+            }
+        }
     }
 
     async fn call_inner<P, T>(
@@ -547,6 +595,11 @@ impl RpcClient {
         let (response_tx, response_rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
+            if let RpcCallTimeout::Cleanup { deadline, budget } = call_timeout
+                && Instant::now() >= deadline
+            {
+                return Err(rpc_timeout(method, budget));
+            }
             // Registering the pending request and checking disconnect must be
             // atomic with the reader's drain_pending path. Otherwise a call
             // can sneak in after the drain and wait forever.
@@ -590,16 +643,32 @@ impl RpcClient {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
             };
-            self.write_tx
-                .send(JSONRPCMessage::Request(JSONRPCRequest {
-                    id: request_id.clone(),
-                    method: method.to_string(),
-                    params: Some(params),
-                    trace: codex_otel::current_span_w3c_trace_context(),
-                    capability_revision,
-                }))
-                .await
-                .map_err(|_| RpcCallError::Closed)?;
+            let message = JSONRPCMessage::Request(JSONRPCRequest {
+                id: request_id.clone(),
+                method: method.to_string(),
+                params: Some(params),
+                trace: codex_otel::current_span_w3c_trace_context(),
+                capability_revision,
+            });
+            if let RpcCallTimeout::Cleanup { deadline, budget } = call_timeout {
+                if Instant::now() >= deadline {
+                    return Err(rpc_timeout(method, budget));
+                }
+                let permit = self
+                    .write_tx
+                    .reserve()
+                    .await
+                    .map_err(|_| RpcCallError::Closed)?;
+                if Instant::now() >= deadline {
+                    return Err(rpc_timeout(method, budget));
+                }
+                permit.send(message);
+            } else {
+                self.write_tx
+                    .send(message)
+                    .await
+                    .map_err(|_| RpcCallError::Closed)?;
+            }
 
             if let Some(submitted) = submitted {
                 submitted.store(true, Ordering::Release);
@@ -619,7 +688,7 @@ impl RpcClient {
         // timer even starts. Dropping a pending send also keeps an expired request
         // from being queued later when the transport recovers.
         let response = match call_timeout {
-            RpcCallTimeout::None => exchange.await,
+            RpcCallTimeout::None | RpcCallTimeout::Cleanup { .. } => exchange.await,
             RpcCallTimeout::After(call_timeout) => match timeout(call_timeout, exchange).await {
                 Ok(response) => response,
                 Err(_) => Err(RpcCallError::TimedOut {

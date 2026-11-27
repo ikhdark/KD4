@@ -205,12 +205,21 @@ impl AgentTaskCoordinator {
         &self,
         scope: &(String, String),
     ) -> Arc<codex_command_analysis::command_preflight::FullSuiteBudget> {
-        let mut budgets = self.suite_budgets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Keep live root/child contexts, not every historical turn in a long session.
-        budgets.retain(|key, budget| key == scope || Arc::strong_count(budget) > 1);
-        Arc::clone(budgets.entry(scope.clone()).or_default())
+        let mut retired = Vec::new();
+        let budget = {
+            let mut budgets = self
+                .suite_budgets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Keep live root/child contexts, not every historical turn in a long session.
+            retired.extend(
+                budgets.extract_if(|key, budget| key != scope && Arc::strong_count(budget) == 1),
+            );
+            Arc::clone(budgets.entry(scope.clone()).or_default())
+        };
+        // Destroy retired budget state without holding the shared map lock.
+        drop(retired);
+        budget
     }
 
     pub(crate) fn record_unavailable_descendant(&self, thread: ThreadId, unavailable: bool) {

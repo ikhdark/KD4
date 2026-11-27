@@ -1392,8 +1392,7 @@ impl ExecServerClient {
         P: serde::Serialize,
         T: serde::de::DeserializeOwned,
     {
-        let call_timeout = deadline.saturating_duration_since(Instant::now());
-        if call_timeout.is_zero() {
+        if Instant::now() >= deadline {
             if method == FS_CLOSE_METHOD {
                 rpc_client.request_transport_close();
             }
@@ -1402,7 +1401,7 @@ impl ExecServerClient {
             )));
         }
         let result = rpc_client
-            .call_for_cleanup(method, params, call_timeout)
+            .call_for_cleanup_before(method, params, deadline)
             .await;
         if method == FS_CLOSE_METHOD && result.is_err() {
             // File handles are connection-local. If their close could not settle,

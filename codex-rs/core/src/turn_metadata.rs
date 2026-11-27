@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use serde_json::Value;
-use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::git_workspace::GitWorkspaceMetadata;
 use crate::git_workspace::GitWorkspaceMetadataSource;
@@ -50,7 +50,7 @@ pub(crate) struct TurnMetadataState {
     turn_started_at_unix_ms: Arc<RwLock<Option<i64>>>,
     responsesapi_client_metadata: Arc<RwLock<BTreeMap<String, String>>>,
     user_input_requested_during_turn: Arc<AtomicBool>,
-    enrichment_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    enrichment_task: Arc<Mutex<Option<AbortOnDropHandle<()>>>>,
 }
 
 impl TurnMetadataState {
@@ -227,9 +227,9 @@ impl TurnMetadataState {
     }
 
     pub(crate) fn spawn_git_enrichment_task(&self) {
-        if self.repo_root.is_none() {
+        let (Some(repo_root), Some(source)) = (&self.repo_root, &self.git_metadata_source) else {
             return;
-        }
+        };
 
         let mut task_guard = self
             .enrichment_task
@@ -239,24 +239,25 @@ impl TurnMetadataState {
             return;
         }
 
-        let state = self.clone();
-        *task_guard = Some(tokio::spawn(async move {
-            let workspace_git_metadata = state.fetch_workspace_git_metadata().await;
-            let Some(repo_root) = state.repo_root.clone() else {
-                return;
-            };
-
+        let repo_root = repo_root.clone();
+        let source = source.clone();
+        // The worker must not keep the turn or its abort-on-drop handle alive.
+        let enriched_workspaces = Arc::downgrade(&self.enriched_workspaces);
+        *task_guard = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            let workspace_git_metadata = source.metadata().await;
             if workspace_git_metadata.is_empty() {
                 return;
             }
+            let Some(enriched_workspaces) = enriched_workspaces.upgrade() else {
+                return;
+            };
 
             let mut workspaces = BTreeMap::new();
             workspaces.insert(repo_root, workspace_git_metadata);
-            *state
-                .enriched_workspaces
+            *enriched_workspaces
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(workspaces);
-        }));
+        })));
     }
 
     pub(crate) fn cancel_git_enrichment_task(&self) {
@@ -264,15 +265,7 @@ impl TurnMetadataState {
             .enrichment_task
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(task) = task_guard.take() {
-            task.abort();
-        }
-    }
-
-    async fn fetch_workspace_git_metadata(&self) -> GitWorkspaceMetadata {
-        match self.git_metadata_source.as_ref() {
-            Some(source) => source.metadata().await,
-            None => GitWorkspaceMetadata::default(),
-        }
+        // Dropping the handle aborts the task even if other contexts remain live.
+        drop(task_guard.take());
     }
 }

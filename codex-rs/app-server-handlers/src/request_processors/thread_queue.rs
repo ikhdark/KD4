@@ -1414,8 +1414,8 @@ impl ThreadQueueRequestProcessor {
     pub(super) async fn pause(&self, id: ThreadId, turn_id: &str) {
         use codex_protocol::timing::observations;
 
-        let observation = observations::enabled().then(|| {
-            observations::Span::start(
+        let observation = observations::runtime_async_enabled().then(|| {
+            observations::Span::start_queued(
                 "terminal_queue_pause",
                 &id.to_string(),
                 turn_id,

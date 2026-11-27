@@ -4917,6 +4917,8 @@ async fn retire_consumed_tool_outputs_before_limit(
         observation.outcome = "estimate_unavailable";
         return false;
     };
+    // The score no longer needs the snapshot; don't make the live append copy it.
+    drop(history);
     let rewritten = u64::try_from(history_tokens)
         .unwrap_or(0)
         .saturating_sub(saved);
@@ -5279,6 +5281,8 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
             }
         }
     }
+    // The chosen checkpoint is owned; release the original snapshot before appending it.
+    drop(candidate);
     if let Err(error) = sess
         .record_conversation_items(turn_context, &[checkpoint])
         .await

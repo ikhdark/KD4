@@ -1783,9 +1783,17 @@ pub(super) async fn handle_runtime_response(
     );
     let mut post_tool_use_feedback = packet.post_tool_use_feedback;
     if !packet.nested_call_transitions.is_empty() {
+        let notice = match &response {
+            RuntimeResponse::Yielded { .. } | RuntimeResponse::ExplicitYield { .. } => {
+                "Invocation state from the dispatch owner; terminal does not prove child-process exit or rollback. Resume this cell through its existing handle; do not relaunch its work."
+            }
+            RuntimeResponse::Result { .. } | RuntimeResponse::Terminated { .. } => {
+                "Invocation state from the dispatch owner; terminal does not prove child-process exit or rollback. The cell has ended. Inspect retained results and independently issued live handles; do not resume or replay the cell."
+            }
+        };
         post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
             text: serde_json::json!({"nested_call_transitions": packet.nested_call_transitions,
-                "notice": "Invocation state from the dispatch owner; terminal does not prove child-process exit or rollback. Resume this cell through its existing handle; do not relaunch its work."}).to_string(),
+                "notice": notice}).to_string(),
         });
     }
     let cancelled_nested_calls = matches!(&response, RuntimeResponse::Terminated { .. }).then(|| {
@@ -1863,17 +1871,17 @@ pub(super) async fn handle_runtime_response(
                 }) {
                     retain_bulk_failed_cell_result(exec, &mut entry).await;
                 }
-                // A truncated successful read preview can repeat the exact
-                // inline outcome below. Match identity AND bounded bytes;
-                // a locator, partial directory, or failed read is not a copy.
+                // Don't print a truncated success preview twice. The complete
+                // inline result must reproduce that exact preview for this
+                // call; neither an artifact locator nor a summary is enough.
                 if let Some(preview) = packet.nested_results.iter().find(|r| r.ordinal == ordinal)
                     && !preview.failed && preview.output_truncated
-                    && matches!(preview.tool_name.as_str(), "read_file" | "read_tool_output")
                     && entry["call_id"].as_str() == Some(preview.call_id.as_str())
                     && entry["tool_name"].as_str() == Some(preview.tool_name.as_str())
                     && entry["failed"] == false
                     && let Some(full) = entry.pointer("/outcome/result")
-                    && full["complete"] == true
+                    && (!matches!(preview.tool_name.as_str(), "read_file" | "read_tool_output")
+                        || full["complete"] == true)
                     && !nested_presentations.contains_key(&ordinal)
                     && bounded_serialized_json(full).0 == preview.output
                 {
@@ -2520,19 +2528,16 @@ fn compact_emitted_packet_recovery(mut entry: JsonValue, emitted: &str) -> JsonV
     entry
 }
 
-/// Move a bulky successful result out of an error packet, not out of custody.
+/// Move a bulky settled result out of an error packet, not out of custody.
 async fn retain_bulk_failed_cell_result(exec: &ExecContext, entry: &mut JsonValue) {
     use crate::tools::command_output_artifact::ToolOutputArtifactId;
     use crate::tools::command_output_artifact::create_canonical_output_artifact_with_id;
 
-    if entry["failed"] != false {
-        return;
-    }
     let Some(result) = entry.pointer("/outcome/result") else {
         return;
     };
-    let summary_keys: &[&str] = match entry["tool_name"].as_str() {
-        Some("exec_command" | "write_stdin")
+    let summary_keys: &[&str] = match (entry["failed"].as_bool(), entry["tool_name"].as_str()) {
+        (Some(false), Some("exec_command" | "write_stdin"))
             if result["execution_state"] == "exited"
                 && result["process_exited"] == true
                 && result["output_drained"] == true
@@ -2551,7 +2556,7 @@ async fn retain_bulk_failed_cell_result(exec: &ExecContext, entry: &mut JsonValu
                 "output_reference",
             ]
         }
-        Some("read_file")
+        (Some(false), Some("read_file"))
             if result["read_mode"] == "byte_ranges"
                 && result["complete"] == true
                 && matches!(result["encoding"].as_str(), Some("hex" | "base64")) =>
@@ -2566,16 +2571,38 @@ async fn retain_bulk_failed_cell_result(exec: &ExecContext, entry: &mut JsonValu
                 "readback_sha256",
             ]
         }
+        (Some(true), Some(tool))
+            if (matches!(tool, "read_file" | "read_tool_output" | "list_files")
+                && matches!(result["tool_failure"]["code"].as_str(), Some("invalid_input" | "failed"))
+                && matches!(result["tool_failure"]["execution_state"].as_str(), Some("not_started" | "completed"))
+                || result["payload_authority"] == "requested"
+                    && result["tool_failure"]["code"] == "invalid_input"
+                    && result["tool_failure"]["execution_state"] == "not_started")
+                && result["tool_failure"]["effects"] == "none"
+                && result["tool_failure"]["live_operations"].as_array().is_some_and(Vec::is_empty) =>
+        {
+            &["tool_failure", "payload_authority"]
+        }
         _ => return,
     };
     let canonical = codex_tools::CanonicalToolResult::json(result.clone());
     if canonical.exact_bytes <= 2048 {
         return;
     }
-    let summary: serde_json::Map<String, JsonValue> = summary_keys
+    let mut summary: serde_json::Map<String, JsonValue> = summary_keys
         .iter()
         .filter_map(|key| result.get(*key).map(|value| ((*key).to_string(), value.clone())))
         .collect();
+    // Keep the typed cause, correction, and any actionable retry history
+    // inline. Spill only if the normal failure projection pays for the locator.
+    if entry["failed"] == true
+        && (!codex_code_mode::omit_first_failure_history(&mut summary)
+            || serde_json::to_vec(&summary).map_or(true, |bytes| {
+                (bytes.len() as u64).saturating_add(1024) >= canonical.exact_bytes
+            }))
+    {
+        return;
+    }
     let artifact = create_canonical_output_artifact_with_id(
         &exec.turn.config.codex_home,
         &exec.session.thread_id.to_string(),

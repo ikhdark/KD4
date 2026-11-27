@@ -1118,11 +1118,23 @@ impl Handler {
             }
             // Mail stays queued for the next request; name who it is from.
             let mut mailbox_authors = Vec::new();
+            let mut receiver_enrichment_complete = true;
             if result.mailbox_wake {
-                for author in session.input_queue.pending_mailbox_authors().await {
-                    if !mailbox_authors.contains(&author) {
-                        mailbox_authors.push(author);
+                match observe_wait_receiver(
+                    deadline,
+                    &cancellation_token,
+                    session.input_queue.pending_mailbox_authors(),
+                )
+                .await
+                {
+                    Some(authors) => {
+                        for author in authors {
+                            if !mailbox_authors.contains(&author) {
+                                mailbox_authors.push(author);
+                            }
+                        }
                     }
+                    None => receiver_enrichment_complete = false,
                 }
             }
             if !mailbox_authors.is_empty() {
@@ -1134,11 +1146,20 @@ impl Handler {
                     .message
                     .replacen(MAILBOX_WAKE_MESSAGE, &mailbox_wake_message(&authors), 1);
             }
-            receivers = wait_receivers(&session, result, &mailbox_authors).await;
+            receivers = wait_receivers(
+                &session,
+                result,
+                &mailbox_authors,
+                deadline,
+                &cancellation_token,
+            )
+            .await;
+            receivers.enrichment_incomplete |= !receiver_enrichment_complete;
         }
 
         observation.finish(if result.is_ok() {"returned"} else {"failed"},
             json!({"receiver_thread_ids":receivers.thread_ids,
+                "receiver_enrichment_incomplete":receivers.enrichment_incomplete,
                 "join_scope":"observed_wait_result_not_all_descendants"}));
         session
             .emit_turn_item_completed(
@@ -1954,6 +1975,24 @@ struct WaitReceivers {
     thread_ids: Vec<codex_protocol::ThreadId>,
     agents: Vec<codex_protocol::protocol::CollabAgentRef>,
     states: HashMap<codex_protocol::ThreadId, AgentStatus>,
+    enrichment_incomplete: bool,
+}
+
+/// Bound optional receiver annotation, not the selected result or its paired
+/// terminal publication. A read that returns after the cutoff is not evidence.
+async fn observe_wait_receiver<T>(
+    deadline: Option<Instant>,
+    cancellation_token: &CancellationToken,
+    read: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => None,
+        _ = wait_until_deadline(deadline) => None,
+        value = read => {
+            (!cancellation_token.is_cancelled() && !deadline_elapsed(deadline)).then_some(value)
+        }
+    }
 }
 
 /// Agents whose durable deltas, selected completion outcomes/pending obligations,
@@ -1962,7 +2001,10 @@ async fn wait_receivers(
     session: &crate::session::session::Session,
     result: &WaitAgentResult,
     mailbox_authors: &[AgentPath],
+    deadline: Option<Instant>,
+    cancellation_token: &CancellationToken,
 ) -> WaitReceivers {
+    let mut receivers = WaitReceivers::default();
     let agent_control = &session.services.agent_control;
     let coordinator = agent_control.task_coordinator();
     let mut thread_ids = Vec::new();
@@ -1994,13 +2036,21 @@ async fn wait_receivers(
             if !seen_assignments.insert(assignment_id) {
                 continue;
             }
-            coordinator
-                .get_agent_task_binding(assignment_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|binding| binding.thread_id)
-                .and_then(|value| codex_protocol::ThreadId::from_string(&value).ok())
+            match observe_wait_receiver(
+                deadline,
+                cancellation_token,
+                coordinator.get_agent_task_binding(assignment_id),
+            )
+            .await
+            {
+                Some(Ok(binding)) => binding
+                    .and_then(|binding| binding.thread_id)
+                    .and_then(|value| codex_protocol::ThreadId::from_string(&value).ok()),
+                Some(Err(_)) | None => {
+                    receivers.enrichment_incomplete = true;
+                    None
+                }
+            }
         } else {
             None
         };
@@ -2010,26 +2060,47 @@ async fn wait_receivers(
             thread_ids.push(thread_id);
         }
     }
+    let enrichment_closed = || cancellation_token.is_cancelled() || deadline_elapsed(deadline);
     for author in mailbox_authors {
-        if let Some(thread_id) = agent_control.get_agent_id_for_path(author)
+        if enrichment_closed() {
+            receivers.enrichment_incomplete = true;
+            break;
+        }
+        let thread_id = agent_control.get_agent_id_for_path(author);
+        if enrichment_closed() {
+            receivers.enrichment_incomplete = true;
+            break;
+        }
+        if let Some(thread_id) = thread_id
             && seen_threads.insert(thread_id)
         {
             thread_ids.push(thread_id);
         }
     }
-    let mut receivers = WaitReceivers::default();
     for thread_id in thread_ids {
-        let metadata = agent_control
-            .get_agent_metadata(thread_id)
-            .unwrap_or_default();
+        let metadata = if enrichment_closed() {
+            None
+        } else {
+            let metadata = agent_control.get_agent_metadata(thread_id);
+            (!enrichment_closed()).then_some(metadata)
+        };
+        if metadata.is_none() {
+            receivers.enrichment_incomplete = true;
+        }
+        let metadata = metadata.flatten().unwrap_or_default();
         receivers.agents.push(codex_protocol::protocol::CollabAgentRef {
             thread_id,
             agent_nickname: metadata.agent_nickname,
             agent_role: metadata.agent_role,
         });
-        receivers
-            .states
-            .insert(thread_id, agent_control.get_status(thread_id).await);
+        match observe_wait_receiver(deadline, cancellation_token, agent_control.get_status(thread_id))
+            .await
+        {
+            Some(status) => {
+                receivers.states.insert(thread_id, status);
+            }
+            None => receivers.enrichment_incomplete = true,
+        }
         receivers.thread_ids.push(thread_id);
     }
     receivers

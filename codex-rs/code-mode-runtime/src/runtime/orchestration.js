@@ -142,14 +142,31 @@
     },
   });
 
+  // The same path goes to native read and into the patch's unquoted, trimmed
+  // header. Reject ambiguous and non-local spellings, but leave resolution
+  // and access checks to the native tools.
+  function isGuardedLinePath(path) {
+    if (typeof path !== "string" || !path || path !== path.trim() ||
+        /[\p{Cc}\p{Cs}\p{Zl}\p{Zp}<>"|?*]/u.test(path))
+      return false;
+    const local = /^[a-z]:[/\\]/i.test(path) ? path.slice(3) :
+      path.startsWith("/") ? path.slice(1) : path;
+    if (/^[/\\]|:/.test(local)) return false;
+    const parts = local.split(/[/\\]/);
+    const leaf = parts.at(-1);
+    if (!leaf || leaf === "." || leaf === "..") return false;
+    const device = /^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³]) *(?:\.|$)/i;
+    return parts.every(part => part === "." || part === ".." ||
+      (!/[. ]$/.test(part) && !device.test(part)));
+  }
+
   // Exact single-file line replacement: one complete native read as the source
   // guard, one hash-guarded patch, one readback. No retry and no fallback edit form.
   Object.defineProperty(globalThis, "guarded_line", {
     value: async function guarded_line(path, before, after, { expected_source_sha256 } = {}) {
       if (![before, after].every(s => typeof s === "string" && s && !/[\r\n\0]/.test(s)) ||
-          before === after || typeof path !== "string" || !/^[\w.-]+$/.test(path) ||
-          path === "." || path === "..")
-        throw new Error("expected one local filename and distinct exact lines");
+          before === after || !isGuardedLinePath(path))
+        throw new Error("expected one local file path and distinct exact lines");
       if (expected_source_sha256 !== undefined && (typeof expected_source_sha256 !== "string" ||
           !/^[0-9a-f]{64}$/.test(expected_source_sha256))) throw new TypeError("expected a full source SHA-256");
       const get = async () => {

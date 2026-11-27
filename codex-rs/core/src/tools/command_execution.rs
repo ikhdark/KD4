@@ -952,11 +952,6 @@ impl CommandExecutionLedger {
             })
     }
 
-    pub(crate) async fn finish_turn(&self, turn_id: &str) {
-        self.finish_turn_before_terminal(turn_id).await;
-        self.persist_cache_after_terminal().await;
-    }
-
     pub(crate) async fn finish_turn_before_terminal(&self, turn_id: &str) {
         self.forget_turn_repository_revision(turn_id).await;
     }

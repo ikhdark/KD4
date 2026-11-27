@@ -2091,30 +2091,39 @@ pub type AttemptPreparedCallback = Arc<
         + Sync,
 >;
 
-/// Local-only evidence from the selected, normalized request. The core sink
-/// owns persistence; no HTTP headers or authentication are captured. A capture
-/// of an immutable prepared snapshot is retained concurrently with transport
-/// I/O and joined before the attempt's first response event is delivered.
-#[derive(Debug)]
-pub struct RetainedRequestCapture {
-    pub identity: ResponseAttemptIdentity,
+/// Identity shared by the durable marker and full local replay capture.
+#[derive(Clone, Debug)]
+pub struct RetainedRequestIdentity {
+    pub attempt: ResponseAttemptIdentity,
     pub turn_id: Option<String>,
     pub transport: &'static str,
     pub selected_representation: &'static str,
     pub has_sampling_boundary: bool,
+}
+
+/// The marker deliberately cannot hold request or replay data. The full
+/// evidence remains local and excludes transport headers and authentication.
+#[derive(Debug)]
+pub enum RetainedRequestEvidence {
+    PreSendMarker {
+        identity: RetainedRequestIdentity,
+        model: String,
+    },
+    Full(Box<RetainedRequestCapture>),
+}
+
+#[derive(Debug)]
+pub struct RetainedRequestCapture {
+    pub identity: RetainedRequestIdentity,
     pub logical_request: ResponsesApiRequest,
     pub transport_request: Option<ResponsesWsRequest>,
     pub replay_snapshot: Option<codex_conversation::context_manager::SamplingReplaySnapshot>,
     /// Whether dispatch proceeded while this capture was being retained.
     pub dispatch_overlapped: bool,
-    /// Whether this is the small typed pre-send marker committed durably before
-    /// an overlapped dispatch (no snapshot, no transport request). The full
-    /// capture still follows.
-    pub pre_send_marker: bool,
 }
 
 pub type RetainedRequestCaptureCallback = Arc<
-    dyn Fn(RetainedRequestCapture) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync,
+    dyn Fn(RetainedRequestEvidence) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync,
 >;
 
 #[derive(Default)]
@@ -2717,13 +2726,13 @@ impl ModelClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner).0 = Some(callback);
     }
 
-    async fn retain_request_capture(&self, capture: RetainedRequestCapture) -> Result<()> {
+    async fn retain_request_capture(&self, evidence: RetainedRequestEvidence) -> Result<()> {
         let callback = self.state.retained_capture.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner).0.clone();
         // No client/session lock survives this await. Core uses a weak Session
         // reference, so retained captures cannot keep a session/task alive.
         if let Some(callback) = callback {
-            callback(capture).await?;
+            callback(evidence).await?;
         }
         Ok(())
     }
@@ -2733,7 +2742,9 @@ impl ModelClient {
     fn spawn_request_capture(&self, capture: RetainedRequestCapture) -> Option<PendingRequestCapture> {
         let callback = self.state.retained_capture.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner).0.clone()?;
-        Some(AbortOnDropHandle::new(tokio::spawn(callback(capture))))
+        Some(AbortOnDropHandle::new(tokio::spawn(callback(
+            RetainedRequestEvidence::Full(Box::new(capture)),
+        ))))
     }
 
     /// Retain an immutable prepared capture concurrently with dispatch; keep
@@ -2752,19 +2763,9 @@ impl ModelClient {
             // its failure stays fatal.
             let pre_send_marker_guard =
                 turn_timing.map(|timing| timing.begin_local_phase(TurnLocalPhase::Persistence));
-            let mut marker_request = capture.logical_request.clone();
-            marker_request.instructions = String::new();
-            self.retain_request_capture(RetainedRequestCapture {
+            self.retain_request_capture(RetainedRequestEvidence::PreSendMarker {
                 identity: capture.identity.clone(),
-                turn_id: capture.turn_id.clone(),
-                transport: capture.transport,
-                selected_representation: capture.selected_representation,
-                has_sampling_boundary: capture.has_sampling_boundary,
-                logical_request: marker_request,
-                transport_request: None,
-                replay_snapshot: None,
-                dispatch_overlapped: true,
-                pre_send_marker: true,
+                model: capture.logical_request.model.clone(),
             }).await?;
             drop(pre_send_marker_guard);
             capture.dispatch_overlapped = true;
@@ -2772,7 +2773,8 @@ impl ModelClient {
         }
         let retained_capture_guard =
             turn_timing.map(|timing| timing.begin_local_phase(TurnLocalPhase::Persistence));
-        self.retain_request_capture(capture).await?;
+        self.retain_request_capture(RetainedRequestEvidence::Full(Box::new(capture)))
+            .await?;
         drop(retained_capture_guard);
         Ok(None)
     }
@@ -4875,16 +4877,17 @@ impl ModelClientSession {
                     let _sampling_admission = sampling_admission?;
                     let mut pending_capture = self.client.retain_or_overlap_request_capture(
                         RetainedRequestCapture {
-                            identity: attempt_identity.clone(),
-                            turn_id: responses_metadata.turn_id.clone(),
-                            transport: "responses_http",
-                            selected_representation: "http_selected",
-                            has_sampling_boundary: attempt_prepared.is_some(),
+                            identity: RetainedRequestIdentity {
+                                attempt: attempt_identity.clone(),
+                                turn_id: responses_metadata.turn_id.clone(),
+                                transport: "responses_http",
+                                selected_representation: "http_selected",
+                                has_sampling_boundary: attempt_prepared.is_some(),
+                            },
                             logical_request: request.clone(),
                             transport_request: None,
                             replay_snapshot: prompt.replay_snapshot.clone(),
                             dispatch_overlapped: false,
-                            pre_send_marker: false,
                         },
                         self.turn_timing.as_ref(),
                     ).await?;
@@ -5486,6 +5489,13 @@ impl ModelClientSession {
                     .as_ref()
                     .zip(attempt_clock.as_ref())
                     .map(|(identity, clock)| {
+                        // Transport lineage is already known at dispatch. The
+                        // essential receipt must not depend on async diagnostics.
+                        let mut measurements = ModelRequestMeasurements::default();
+                        measurements.baseline_generation = baseline_generation;
+                        measurements.provider_baseline = provider_baseline;
+                        measurements.previous_response_id_present = previous_response_id_present;
+                        measurements.selected_representation = Some(selected_representation);
                         ModelAttemptGuard::new(
                             request_session_telemetry.clone(),
                             identity.clone(),
@@ -5494,7 +5504,7 @@ impl ModelClientSession {
                             request_kind,
                             ModelAttemptTransport::ResponsesWebsocket,
                             Some(connection_reused),
-                            ModelRequestMeasurements::default(),
+                            measurements,
                             clock.clone(),
                             responses_metadata.turn_id.clone(),
                             self.turn_timing
@@ -5531,16 +5541,17 @@ impl ModelClientSession {
             if !warmup && let Some(identity) = attempt_identity.as_ref() {
                 pending_capture = self.client.retain_or_overlap_request_capture(
                     RetainedRequestCapture {
-                        identity: identity.clone(),
-                        turn_id: responses_metadata.turn_id.clone(),
-                        transport: "responses_websocket",
-                        selected_representation: selected_representation.as_str(),
-                        has_sampling_boundary: attempt_prepared.is_some(),
+                        identity: RetainedRequestIdentity {
+                            attempt: identity.clone(),
+                            turn_id: responses_metadata.turn_id.clone(),
+                            transport: "responses_websocket",
+                            selected_representation: selected_representation.as_str(),
+                            has_sampling_boundary: attempt_prepared.is_some(),
+                        },
                         logical_request: request.clone(),
                         transport_request: Some(ws_request.clone()),
                         replay_snapshot: prompt.replay_snapshot.clone(),
                         dispatch_overlapped: false,
-                        pre_send_marker: false,
                     },
                     self.turn_timing.as_ref(),
                 ).await?;

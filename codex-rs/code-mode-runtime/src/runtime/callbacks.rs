@@ -652,7 +652,10 @@ pub(super) fn store_callback(
             .and_then(|available| available.checked_sub(key_bytes))
     });
     let Some(max_bytes) = admission else {
-        reject_storage_limit(scope);
+        let entry_limit = scope.get_slot::<RuntimeState>().is_some_and(|state| {
+            state.stored_values.len() >= MAX_SESSION_STORED_VALUES && !state.stored_values.contains_key(&key)
+        });
+        reject_store_admission(scope, entry_limit);
         return;
     };
     let value = args.get(1);
@@ -716,9 +719,22 @@ pub(super) fn store_callback(
 
         // Admission is transactional: rejection leaves the previous values and
         // staged writes intact. An uncaught exception still rejects the cell.
-        Some(stored_value_limit_message())
+        Some(previous_bytes.is_none() && state.stored_values.len() >= MAX_SESSION_STORED_VALUES)
     });
-    if limit_error.is_some() {
+    if let Some(entry_limit) = limit_error {
+        reject_store_admission(scope, entry_limit);
+    }
+}
+
+fn reject_store_admission(scope: &mut v8::PinScope<'_, '_>, entry_limit: bool) {
+    if entry_limit && !scope.is_execution_terminating()
+        && let Some(state) = scope.get_slot_mut::<RuntimeState>()
+    {
+        state.storage_limit_rejected = true;
+        throw_type_error(scope, &format!(
+            "Session storage has {MAX_SESSION_STORED_VALUES} entries; a new key cannot fit. Reuse an existing key or delete only an obsolete one. Preserve results; do not rerun producers."
+        ));
+    } else {
         reject_storage_limit(scope);
     }
 }

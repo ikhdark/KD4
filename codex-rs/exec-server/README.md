@@ -50,6 +50,11 @@ time of their maximum reply (the request's byte cap, at most the file payload
 limit). Mutators, `fs/close`, `fs/walk`, `fs/lookupBatch`, `fs/checksumFile`,
 process, HTTP and environment methods keep their own policies.
 
+Owned cleanup RPCs use one absolute cutoff for admission, outbound queueing,
+and response observation. A timeout does not establish that a previously
+queued cleanup did not execute. A remote file close that cannot be confirmed
+still requests transport shutdown to release connection-owned handles.
+
 ## Capability manifests
 
 `initialize` returns an optional `capabilityManifest`; initialized clients can

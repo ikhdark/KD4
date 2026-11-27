@@ -424,6 +424,7 @@ struct TerminalFinalization {
     abort_reason: Option<TurnAbortReason>,
     permit: Option<TurnTerminalPermit>,
     worker_failure_reported: bool,
+    worker_error_append_unconfirmed: bool,
     selected_terminal_event: Option<EventMsg>,
     paired_lifecycle_gap: Option<String>,
     published_terminal_event: Option<EventMsg>,
@@ -1214,7 +1215,7 @@ impl Session {
         turn_id: &str,
         reason: TurnAbortReason,
     ) -> CodexResult<bool> {
-        let observation = codex_protocol::timing::observations::Span::start(
+        let observation = codex_protocol::timing::observations::Span::start_queued(
             "cancel_request", &self.thread_id.to_string(), turn_id, turn_id,
             serde_json::json!({"reason":reason}));
         let schedule = self
@@ -1449,6 +1450,7 @@ impl Session {
                         abort_reason,
                         permit: Some(permit),
                         worker_failure_reported: false,
+                        worker_error_append_unconfirmed: false,
                         selected_terminal_event: None,
                         paired_lifecycle_gap: None,
                         published_terminal_event: None,
@@ -1622,16 +1624,18 @@ impl Session {
             WorkerJoinFailure::Cancelled => "cancelled",
             WorkerJoinFailure::Panicked => "panicked",
         };
-        self.send_event(
-            turn_context,
-            EventMsg::Error(ErrorEvent {
-                message: format!(
-                    "The turn worker {failure_kind} before terminal bookkeeping completed."
-                ),
-                codex_error_info: Some(CodexErrorInfo::InternalServerError),
-            }),
-        )
-        .await;
+        let append_confirmed = self
+            .send_terminal_worker_error(
+                turn_context,
+                ErrorEvent {
+                    message: format!(
+                        "The turn worker {failure_kind} before terminal bookkeeping completed."
+                    ),
+                    codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                },
+            )
+            .await;
+        finalization.worker_error_append_unconfirmed = !append_confirmed;
         finalization.worker_failure_reported = true;
     }
 
@@ -1652,12 +1656,17 @@ impl Session {
     }
 
     async fn publish_terminal_outcome(
-        &self,
+        self: &Arc<Self>,
         finalization: &mut TerminalFinalization,
         mut event: EventMsg,
+        restart_for_terminal_outcome: bool,
+        flush_and_observe_idle: bool,
     ) -> bool {
         let turn_context = Arc::clone(&finalization.task.turn_context);
-        if let Some(gap) = &finalization.paired_lifecycle_gap {
+        let worker_error_gap = finalization.worker_error_append_unconfirmed.then_some(
+            "Worker error notification was offered live, but its ordered append was not confirmed.",
+        );
+        for gap in finalization.paired_lifecycle_gap.as_deref().into_iter().chain(worker_error_gap) {
             let timing = match &mut event {
                 EventMsg::TurnComplete(event) => &mut event.timing,
                 EventMsg::TurnAborted(event) => &mut event.timing,
@@ -1668,7 +1677,7 @@ impl Session {
                 .completion_assessment
                 .get_or_insert_with(Default::default)
                 .verification_gaps
-                .push(gap.clone());
+                .push(gap.to_owned());
         }
         if finalization.terminal_dispatch_owner.is_none()
             && let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref)
@@ -1705,10 +1714,56 @@ impl Session {
         // Do not acquire task_start_gate here: a replacement holds it while
         // waiting for this coordinator. Optional post-dispatch work stays outside.
         let cleared_active_turn = self.detach_terminal_turn(finalization).await;
-        if !finalization.terminal_post_dispatch_completed {
-            finalization.terminal_post_dispatch_completed = self
-                .finish_terminal_event_dispatch(turn_context.as_ref(), &published_event)
-                .await;
+        let restart_allowed = cleared_active_turn
+            && finalization
+                .outcome
+                .allows_pending_input_restart(finalization.published_terminal_event.as_ref());
+        let restart_requested =
+            restart_for_terminal_outcome || finalization.restart_for_pending_input;
+        let wake = async {
+            // Mail received before detach may already have tried the terminal
+            // fence. Never wake for a refused terminal or a failed turn.
+            if restart_allowed
+                && (restart_requested || self.input_queue.has_trigger_turn_mailbox_items().await)
+            {
+                self.maybe_start_turn_for_pending_work().await;
+            }
+        };
+        let after_publication = async {
+            if !finalization.terminal_post_dispatch_completed {
+                // Commit the result before polling cleanup or wake, which
+                // can panic. Recovery must not replay a settled dispatch.
+                finalization.terminal_post_dispatch_completed = self
+                    .finish_terminal_event_dispatch(&turn_context, &published_event)
+                    .await;
+            }
+            if flush_and_observe_idle {
+                let _ = self.flush_rollout().await;
+                if cleared_active_turn {
+                    self.emit_thread_idle_lifecycle_if_idle().await;
+                }
+            }
+        };
+        if restart_allowed {
+            // Give the healthy path its existing order. The timer releases
+            // only the wake observer: the same dispatch and cleanup continue
+            // under the tracked terminal owner, even if wake panics.
+            tokio::pin!(after_publication);
+            tokio::select! {
+                biased;
+                () = &mut after_publication => wake.await,
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    let ((), wake_result) = tokio::join!(
+                        after_publication,
+                        AssertUnwindSafe(wake).catch_unwind(),
+                    );
+                    if let Err(payload) = wake_result {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            }
+        } else {
+            after_publication.await;
         }
         cleared_active_turn
     }
@@ -1858,14 +1913,9 @@ impl Session {
             unsaved_records.push(format!("interrupted-turn marker ({err})"));
         }
         if !unsaved_records.is_empty() {
-            self.send_event(
-                turn_context.as_ref(),
-                EventMsg::Warning(WarningEvent {
-                    message: unsaved_turn_record_warning(
-                        &turn_context.sub_id,
-                        &unsaved_records.join("; "),
-                    ),
-                }),
+            self.send_terminal_record_warning(
+                &turn_context.sub_id,
+                unsaved_turn_record_warning(&turn_context.sub_id, &unsaved_records.join("; ")),
             )
             .await;
         }
@@ -2116,21 +2166,17 @@ impl Session {
                 thread_id: self.thread_id.to_string(),
                 token_usage: turn_token_usage.clone(),
             });
-        let cleared_active_turn = self.publish_terminal_outcome(finalization, event).await;
-        // Mail accepted after input recovery may have hit the terminal fence on
-        // its own wake attempt. Recheck triggering mail after releasing that fence.
-        if cleared_active_turn
-            && finalization
-                .outcome
-                .allows_pending_input_restart(finalization.published_terminal_event.as_ref())
-            && (abort_reason == Some(TurnAbortReason::Interrupted)
-                || required_tool_terminal.is_some()
-                || defer_pending_input
-                || finalization.restart_for_pending_input
-                || self.input_queue.has_trigger_turn_mailbox_items().await)
-        {
-            self.maybe_start_turn_for_pending_work().await;
-        }
+        let restart_for_terminal_outcome = abort_reason == Some(TurnAbortReason::Interrupted)
+            || required_tool_terminal.is_some()
+            || defer_pending_input;
+        let cleared_active_turn = self
+            .publish_terminal_outcome(
+                finalization,
+                event,
+                restart_for_terminal_outcome,
+                /*flush_and_observe_idle*/ false,
+            )
+            .await;
         self.services
             .command_execution
             .persist_cache_after_terminal()
@@ -2511,7 +2557,7 @@ impl Session {
         self.settle_terminal_task_usage(&turn_context).await;
         self.services
             .command_execution
-            .finish_turn(&turn_context.sub_id)
+            .finish_turn_before_terminal(&turn_context.sub_id)
             .await;
         turn_context
             .turn_metadata_state
@@ -2570,12 +2616,6 @@ impl Session {
         self.input_queue
             .clear_pending_for_turn_state(finalization.turn_state.as_ref())
             .await;
-        let cleared_active_turn = self.publish_terminal_outcome(finalization, event).await;
-
-        let _ = self.flush_rollout().await;
-        if cleared_active_turn {
-            self.emit_thread_idle_lifecycle_if_idle().await;
-        }
         let restart_for_terminal_outcome = match &finalization.outcome {
             TurnTerminalOutcome::Aborted(TurnAbortReason::Interrupted) => true,
             TurnTerminalOutcome::Completed { result } => {
@@ -2583,16 +2623,15 @@ impl Session {
             }
             _ => false,
         };
-        if cleared_active_turn
-            && finalization
-                .outcome
-                .allows_pending_input_restart(finalization.published_terminal_event.as_ref())
-            && (finalization.restart_for_pending_input
-                || restart_for_terminal_outcome
-                || self.input_queue.has_trigger_turn_mailbox_items().await)
-        {
-            self.maybe_start_turn_for_pending_work().await;
-        }
+        self.publish_terminal_outcome(
+            finalization,
+            event,
+            restart_for_terminal_outcome,
+            /*flush_and_observe_idle*/ true,
+        )
+        .await;
+        // Preserve the tracked disk write without gating terminal publication.
+        self.services.command_execution.persist_cache_after_terminal().await;
     }
 
     pub(crate) async fn begin_shutdown(&self) {

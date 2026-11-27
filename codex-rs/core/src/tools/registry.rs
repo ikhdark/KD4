@@ -3231,6 +3231,18 @@ impl CodeModeArgumentPreflight {
                         })
                         .collect();
                     failure.details = Some(serde_json::json!({"selector_branches": details}));
+                } else if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "read_file"
+                    && misplaced_resume_filter(&value)
+                {
+                    let details = serde_json::json!({"message": failure.message, "field_errors": failure.field_errors,
+                        "details": failure.details});
+                    failure.message = "For context:resume-state, pass resume_filter beside path, not inside selectors. The native error retains the full schema diagnostic in tool_failure.details.selector_branches.".into();
+                    failure.field_errors = vec![ToolFieldError {
+                        path: "/selectors/0/resume_filter".into(),
+                        expected: "a top-level resume_filter on context:resume-state".into(),
+                        correction: "Move the filter to /resume_filter and omit the selector wrapper.".into(),
+                    }];
+                    failure.details = Some(serde_json::json!({"selector_branches": details}));
                 }
                 failure.message = format!("tool `{tool_name}` rejected before execution: {}", failure.message);
                 Err(failure)
@@ -3238,6 +3250,27 @@ impl CodeModeArgumentPreflight {
             None => Ok(()),
         }
     }
+}
+
+// A misplaced inventory filter is not a malformed data projection. Offer a
+// relocation only for this unambiguous envelope and a valid filter; keep the
+// general diagnostic for unrelated errors, siblings and invalid filters.
+fn misplaced_resume_filter(value: &Value) -> bool {
+    if value["path"] != crate::session::resume_inventory::LOCATOR
+        || value.as_object().is_none_or(|args| args.len() != 2)
+    {
+        return false;
+    }
+    let Some([selector]) = value["selectors"].as_array().map(Vec::as_slice) else {
+        return false;
+    };
+    selector["kind"] == "structured"
+        && selector.as_object().is_some_and(|fields| fields.len() == 2)
+        && selector.get("resume_filter").is_some_and(|filter| {
+            use serde::Deserialize;
+            crate::session::resume_inventory::ResumeInventoryFilter::deserialize(filter)
+                .is_ok_and(|filter| filter.validate().is_ok())
+        })
 }
 
 // Only summarize errors on tail selector items themselves. A root, array,

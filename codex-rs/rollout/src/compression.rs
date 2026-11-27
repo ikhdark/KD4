@@ -941,7 +941,7 @@ impl RolloutLineReader {
         let (version, result, contribution) = tokio::task::spawn_blocking(move || {
             let version = capture_versions
                 .then(|| crate::payload_artifact::named_payload_version(&path, &line))
-                .flatten();
+                .unwrap_or_default();
             let mut contribution = measure_payload.then(Default::default);
             let result = crate::payload_artifact::hydrate_record(
                 &path,
@@ -958,10 +958,12 @@ impl RolloutLineReader {
         if let (Some(timing), Some(contribution)) = (timing, contribution) {
             timing.add(contribution);
         }
-        if let (Some(versions), Some(version)) = (&mut self.payload_versions, version) {
-            // Retain the first pre-hydration observation for repeated references:
-            // replacement during replay must invalidate this projection.
-            versions.entry(version.path.clone()).or_insert(version);
+        if let Some(versions) = &mut self.payload_versions {
+            for version in version {
+                // Retain the first pre-hydration observation for repeated references:
+                // replacement during replay must invalidate this projection.
+                versions.entry(version.path.clone()).or_insert(version);
+            }
         }
         match result {
             Ok(line) => Ok(Some(line)),
@@ -1322,7 +1324,15 @@ mod worker {
                 if !file_type.is_file() {
                     continue;
                 }
+                // Metadata may have completed after the scheduling cutoff.
+                // Do not start housekeeping then; already owned jobs still drain.
+                if started_at.elapsed() >= WORKER_MAX_RUNTIME {
+                    break;
+                }
                 cleanup_stale_temp(&entry).await;
+                if started_at.elapsed() >= WORKER_MAX_RUNTIME {
+                    break;
+                }
                 #[cfg(windows)]
                 if path
                     .extension()

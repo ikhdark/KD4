@@ -443,7 +443,7 @@ impl InProcessClientHandle {
     }
 
     async fn shutdown_owned(mut self) -> IoResult<()> {
-        let observation = codex_protocol::timing::observations::Span::start(
+        let observation = codex_protocol::timing::observations::Span::start_queued(
             "runtime_shutdown", "", "", &self.observation_id.to_string(),
             serde_json::json!({"custody":"retained_runtime_owner"}));
         let observation_id = self.observation_id;
@@ -532,6 +532,8 @@ pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHand
 async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
     let channel_capacity = args.channel_capacity.max(1);
     let installation_id = resolve_installation_id(&args.config.codex_home).await?;
+    // Shutdown can run before the spawned message processor is ready.
+    let _ = codex_protocol::timing::observations::prepare_runtime_async_lane();
     let (client_tx, mut client_rx) = ControlReserveSender::<InProcessClientMessage>::channel(
         channel_capacity.saturating_add(CONTROL_REQUEST_CAPACITY),
     );

@@ -801,7 +801,7 @@ pub fn filter_unchanged_stable_context_items(
     history: &[ResponseItem],
     candidates: Vec<ResponseItem>,
 ) -> Vec<ResponseItem> {
-    filter_unchanged_sections(history, candidates, |slot| !slot.is_volatile())
+    filter_unchanged_sections(history, candidates, false, |slot| !slot.is_volatile())
 }
 
 /// A user-role replacement cannot revoke a source's earlier developer policy.
@@ -847,14 +847,75 @@ pub fn turn_contribution_authority_retractions(
 pub(crate) fn filter_unchanged_sampling_context_items(
     items: Vec<ResponseItem>,
 ) -> Vec<ResponseItem> {
-    filter_unchanged_sections(&[], items, |slot| {
+    filter_unchanged_sections(&[], items, true, |slot| {
         !slot.is_volatile() || slot.keeps_only_latest_value()
     })
+}
+
+const VERIFICATION_LEDGER_OPEN: &str = "<verification_ledger>";
+const VERIFICATION_LEDGER_CLOSE: &str = "</verification_ledger>";
+
+/// Ledger delivery receipts live in world state, not a latest-wins slot.
+/// Deduplicate trusted standalone parts in place without retiring old revisions.
+fn verification_ledger_updates(item: &ResponseItem) -> impl Iterator<Item = (usize, Option<&str>)> {
+    let content = match item {
+        ResponseItem::Message { role, content, .. }
+            if role == "developer" && is_trusted_stable_context_item(item) =>
+        {
+            content.as_slice()
+        }
+        _ => &[],
+    };
+    let mut following_payload = false;
+    content.iter().enumerate().filter_map(move |(index, part)| {
+        if std::mem::take(&mut following_payload) {
+            return None;
+        }
+        let ContentItem::InputText { text } = part else {
+            return None;
+        };
+        if matches!(
+            text.trim(),
+            DEVELOPER_INSTRUCTIONS_PRESENT_MARKER | MULTI_AGENT_USAGE_HINT_PRESENT_MARKER
+        ) {
+            // A quoted ledger in another producer's payload is not a notice.
+            following_payload = true;
+            return None;
+        }
+        if text.starts_with(VERIFICATION_LEDGER_OPEN) {
+            return Some((
+                index,
+                text.ends_with(VERIFICATION_LEDGER_CLOSE).then_some(text.as_str()),
+            ));
+        }
+        let removal = text
+            .strip_prefix("<world_state_removal>")?
+            .strip_suffix("</world_state_removal>")?
+            .trim_end();
+        let (_, receipt) = removal.rsplit_once('\n')?;
+        let receipt: serde_json::Value = serde_json::from_str(receipt).ok()?;
+        (receipt["section_id"] == "verification_ledger").then_some((index, None))
+    })
+}
+
+fn equivalent_verification_ledger_notices(previous: &str, candidate: &str) -> bool {
+    fn normalize(notice: &str) -> Option<(&str, serde_json::Value)> {
+        let (guidance, queue) = notice
+            .strip_suffix(VERIFICATION_LEDGER_CLOSE)?
+            .rsplit_once('\n')?;
+        let mut queue: serde_json::Value = serde_json::from_str(queue).ok()?;
+        for repository in queue.get_mut("repositories")?.as_array_mut()? {
+            repository.as_object_mut()?.remove("recorded_at_ns");
+        }
+        Some((guidance, queue))
+    }
+    normalize(previous).is_some_and(|previous| normalize(candidate) == Some(previous))
 }
 
 fn filter_unchanged_sections(
     history: &[ResponseItem],
     candidates: Vec<ResponseItem>,
+    sampling: bool,
     filterable: impl Fn(StableContextSlot) -> bool,
 ) -> Vec<ResponseItem> {
     // Only trusted candidates can be filtered. Avoid walking history for empty
@@ -863,7 +924,11 @@ fn filter_unchanged_sections(
         return candidates;
     }
     let mut latest = HashMap::<StableContextSlot, StableItemSignatureEntry>::new();
+    let mut latest_ledger = None;
     for item in history {
+        if let Some((_, notice)) = verification_ledger_updates(item).last() {
+            latest_ledger = notice;
+        }
         if let Some(signature) = stable_item_signature(item) {
             for section in signature {
                 latest.insert(section.entry.slot, section.entry);
@@ -874,19 +939,33 @@ fn filter_unchanged_sections(
     let removed_content = candidates
         .iter()
         .map(|item| {
-            let Some(signature) = stable_item_signature(item) else {
-                return Vec::new();
-            };
-            let removed = signature
-                .iter()
-                .filter(|section| {
-                    filterable(section.entry.slot)
-                        && latest.get(&section.entry.slot) == Some(&section.entry)
-                })
-                .map(|section| section.content.clone())
-                .collect::<Vec<_>>();
-            for section in signature {
-                latest.insert(section.entry.slot, section.entry);
+            let mut removed = Vec::new();
+            if let Some(signature) = stable_item_signature(item) {
+                removed.extend(
+                    signature
+                        .iter()
+                        .filter(|section| {
+                            filterable(section.entry.slot)
+                                && latest.get(&section.entry.slot) == Some(&section.entry)
+                        })
+                        .map(|section| section.content.clone()),
+                );
+                for section in signature {
+                    latest.insert(section.entry.slot, section.entry);
+                }
+            }
+            for (index, notice) in verification_ledger_updates(item) {
+                let duplicate = latest_ledger.zip(notice).is_some_and(|(previous, current)| {
+                    // Persist timestamp changes verbatim: world state verifies
+                    // retained delivery receipts against exact recorded text.
+                    previous == current
+                        || (sampling && equivalent_verification_ledger_notices(previous, current))
+                });
+                if duplicate {
+                    removed.push(index..index + 1);
+                } else {
+                    latest_ledger = notice;
+                }
             }
             removed
         })

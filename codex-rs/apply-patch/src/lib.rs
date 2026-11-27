@@ -2201,7 +2201,20 @@ fn new_contents_from_prepared(
     if chunks.iter().any(|chunk| chunk.change_context.as_deref()
         .is_some_and(|context| context.starts_with(counted_replace::PREFIX)))
     {
-        return counted_replace::replace(path, original_contents, chunks).map_err(explain_rejection);
+        return counted_replace::replace(path, original_contents, chunks).map_err(|error| {
+            // A refused shared guard diagnoses a source revision, not an
+            // individual literal. Keep its bounded current source for recovery
+            // but omit chunk-specific expected lines, which are already in the
+            // request and would prevent preflight from coalescing the evidence.
+            match error {
+                ApplyPatchError::RevisionGuardMismatch(mut message) => {
+                    let current = bounded_expected_lines(original_contents.lines());
+                    let _ = write!(message, "\nCurrent excerpt (bounded, from line 1):\n{current}");
+                    ApplyPatchError::RevisionGuardMismatch(message)
+                }
+                error => explain_rejection(error),
+            }
+        });
     }
 
     // Match logical lines, but keep the original physical lines for untouched

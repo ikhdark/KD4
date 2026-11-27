@@ -869,6 +869,7 @@ pub async fn read_command_log(
             if let Some((line, offset)) = indexed_end { line_index.record(line, offset); }
             let mut item = serde_json::json!({
                 "selector":{"kind":"lines","start":start,"end":end},
+                "exact_bytes":selection.len(),
                 "status":if error.is_some() { "selector_too_large" } else { "ok" }, "complete":complete,
             });
             item["canonical_range"] = serde_json::json!({"start":position,"end":position + selection.len() as u64});
@@ -898,6 +899,7 @@ pub async fn read_command_log(
                 "selector":{"kind":"bytes","start":start,"end":end},
                 "status":"ok", "complete":delivered_end == end,
                 "canonical_range":{"start":start,"end":delivered_end},
+                "exact_bytes":count,
             });
             match String::from_utf8(bytes) {
                 Ok(text) => item["text"] = text.into(),

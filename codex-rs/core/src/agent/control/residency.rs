@@ -21,7 +21,9 @@ use std::sync::Weak;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tracing::warn;
 
 const RESIDENCY_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -200,10 +202,14 @@ impl V2Residency {
                 max_threads: capacity,
             });
         }
-        timeout(RESIDENCY_ACQUISITION_TIMEOUT, async {
+        let deadline = Instant::now() + RESIDENCY_ACQUISITION_TIMEOUT;
+        let result = timeout_at(deadline, async {
         let mut attempted = HashSet::new();
         loop {
-            if self.try_reserve_pending_slot(capacity) {
+            if Instant::now() >= deadline {
+                return Err(residency_acquisition_timeout());
+            }
+            if self.try_reserve_pending_slot(capacity, deadline) {
                 return Ok(V2ResidencySlot {
                     residency: Arc::clone(&self),
                     active: true,
@@ -214,6 +220,7 @@ impl V2Residency {
                     manager,
                     protected_thread_id,
                     &mut attempted,
+                    deadline,
                 )
                 .await
             {
@@ -242,12 +249,14 @@ impl V2Residency {
                 }
             }
         }
-        }).await.map_err(|_| CodexErr::UnsupportedOperation(
-            "agent residency acquisition timed out; any shutdown in progress still owns its capacity".into()
-        ))?
+        }).await;
+        if Instant::now() >= deadline {
+            return Err(residency_acquisition_timeout());
+        }
+        result.map_err(|_| residency_acquisition_timeout())?
     }
 
-    fn try_reserve_pending_slot(&self, capacity: usize) -> bool {
+    fn try_reserve_pending_slot(&self, capacity: usize, deadline: Instant) -> bool {
         let mut state = self
             .state
             .lock()
@@ -261,6 +270,9 @@ impl V2Residency {
         {
             return false;
         }
+        if Instant::now() >= deadline {
+            return false;
+        }
         state.pending_slots += 1;
         true
     }
@@ -270,10 +282,14 @@ impl V2Residency {
         manager: &Arc<ThreadManagerState>,
         protected_thread_id: Option<ThreadId>,
         attempted: &mut HashSet<ThreadId>,
+        deadline: Instant,
     ) -> UnloadOneResult {
         let candidates_to_scan = self.resident_count();
         for _ in 0..candidates_to_scan {
-            let Some(claim) = self.claim_lru_candidate(protected_thread_id) else {
+            if Instant::now() >= deadline {
+                return UnloadOneResult::Retry;
+            }
+            let Some(claim) = self.claim_lru_candidate(protected_thread_id, deadline) else {
                 return UnloadOneResult::Unavailable;
             };
             let candidate_thread_id = claim.resident.thread_id;
@@ -298,6 +314,9 @@ impl V2Residency {
                 claim.restore();
                 continue;
             };
+            if Instant::now() >= deadline {
+                return UnloadOneResult::Retry;
+            }
             // Idleness alone is not ownership: exclude newly accepted input
             // through materialization, irreversible shutdown and exact removal.
             let Some(residency_pin) = candidate_thread.try_pin_for_eviction() else {
@@ -308,19 +327,24 @@ impl V2Residency {
                 claim.restore();
                 continue;
             }
-            match timeout(
-                RESIDENCY_MATERIALIZE_TIMEOUT,
+            let now = Instant::now();
+            if now >= deadline {
+                return UnloadOneResult::Retry;
+            }
+            let materialize_deadline = deadline.min(now + RESIDENCY_MATERIALIZE_TIMEOUT);
+            match timeout_at(
+                materialize_deadline,
                 candidate_thread.try_ensure_rollout_materialized(),
             )
             .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) if Instant::now() < materialize_deadline => {}
                 Ok(Err(err)) => {
                     warn!("failed to materialize v2 resident thread {candidate_thread_id}: {err}");
                     claim.restore();
                     continue;
                 }
-                Err(_) => {
+                Ok(Ok(())) | Err(_) => {
                     warn!("timed out materializing v2 resident thread {candidate_thread_id}");
                     claim.restore();
                     continue;
@@ -329,6 +353,9 @@ impl V2Residency {
             drop(publication);
             let (completion_tx, mut completion_rx) = oneshot::channel();
             let manager = Arc::clone(manager);
+            if Instant::now() >= deadline {
+                return UnloadOneResult::Retry;
+            }
             // Transfer the claim before shutdown can be accepted. Cancellation of the
             // requester must never restore a runtime whose shutdown is underway.
             tokio::spawn(async move {
@@ -377,6 +404,7 @@ impl V2Residency {
     fn claim_lru_candidate(
         self: &Arc<Self>,
         protected_thread_id: Option<ThreadId>,
+        deadline: Instant,
     ) -> Option<V2EvictionClaim> {
         let mut state = self
             .state
@@ -384,6 +412,9 @@ impl V2Residency {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let candidates_to_scan = state.residents.len();
         for _ in 0..candidates_to_scan {
+            if Instant::now() >= deadline {
+                return None;
+            }
             let resident = state.residents.pop_front()?;
             if Some(resident.thread_id) == protected_thread_id
                 || state.evicting.contains_key(&resident.thread_id)
@@ -595,6 +626,12 @@ impl Drop for V2EvictionClaim {
     fn drop(&mut self) {
         self.finish(EvictionDisposition::RestoreResident);
     }
+}
+
+fn residency_acquisition_timeout() -> CodexErr {
+    CodexErr::UnsupportedOperation(
+        "agent residency acquisition timed out; any shutdown in progress still owns its capacity".into(),
+    )
 }
 
 fn touch_resident(residents: &mut VecDeque<ResidentGeneration>, resident: ResidentGeneration) {

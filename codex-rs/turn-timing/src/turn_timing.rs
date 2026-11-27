@@ -186,12 +186,17 @@ impl SystemTurnClock {
     }
 }
 
+const PROCESS_WAIT_ATTRIBUTION_SEALED: u32 = 1 << 31;
+
 pub struct TurnTimingState {
     live_phase: StdMutex<LiveTurnPhase>,
     clock: SystemTurnClock,
     state: StdMutex<TurnTimingStateInner>,
     /// The existing observation scope, published at binding for queued producers.
     queued_observation_scope: OnceLock<String>,
+    // Immutable origin for observation on deadline-sensitive tool paths.
+    tool_deadline_origin_ns: OnceLock<u128>,
+    missed_process_wait_attributions: AtomicU32,
     relay_queue_depth: AtomicU32,
     parallel_gate_waiter_count: AtomicU32,
     sampling_gate_waiter_count: AtomicU32,
@@ -2254,6 +2259,8 @@ impl TurnTimingState {
             clock,
             state: StdMutex::new(TurnTimingStateInner::default()),
             queued_observation_scope: OnceLock::new(),
+            tool_deadline_origin_ns: OnceLock::new(),
+            missed_process_wait_attributions: AtomicU32::new(0),
             relay_queue_depth: AtomicU32::new(0),
             parallel_gate_waiter_count: AtomicU32::new(0),
             sampling_gate_waiter_count: AtomicU32::new(0),
@@ -2385,6 +2392,9 @@ impl TurnTimingState {
         let sample = self.clock.sample();
         let first_start = state.started_sample.is_none();
         let started_at = state.start(sample);
+        if let Some(start) = state.started_sample {
+            let _ = self.tool_deadline_origin_ns.set(start.time.monotonic_ns);
+        }
         state.activity_timeline.clock_domain_id = self.clock.domain_id().map(str::to_owned);
         if first_start {
             if codex_protocol::timing::observations::enabled() {
@@ -2518,6 +2528,8 @@ impl TurnTimingState {
         state.retry_decisions.finish(sample.time.monotonic_ns, None);
         // Capture the actual call, excluding lock acquisition and journal I/O.
         let started = observe.then(process_monotonic_ns);
+        self.missed_process_wait_attributions
+            .fetch_or(PROCESS_WAIT_ATTRIBUTION_SEALED, Ordering::AcqRel);
         let snapshot = state.complete(sample);
         if let Some(start_ns) = started {
             let end_ns = process_monotonic_ns();
@@ -3321,7 +3333,46 @@ impl TurnTimingState {
 
     /// Per-tool observers may outlive model work and cannot author the turn's live phase.
     pub fn record_tool_sample_block_reason(&self, reason: NextSampleBlockReason) {
-        let mut state = self.state();
+        self.apply_tool_sample_block_reason(&mut self.state(), reason);
+    }
+
+    /// Preserve legacy attribution when the collector is available. An
+    /// optional attribution must never postpone polling a process wait timer.
+    pub fn observe_process_wait_before(
+        &self,
+        deadline: std::time::Instant,
+        reason: NextSampleBlockReason,
+    ) -> Option<u64> {
+        let deadline_at_ms = self.tool_deadline_origin_ns.get().and_then(|start| {
+            codex_protocol::timing::process_monotonic_ns_at(deadline)
+                .and_then(|at| at.checked_sub(*start))
+                .map(u128_to_u64_ms)
+        });
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let _ = self.missed_process_wait_attributions.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |count| {
+                        (count < PROCESS_WAIT_ATTRIBUTION_SEALED - 1).then(|| count + 1)
+                    },
+                );
+                return deadline_at_ms;
+            }
+        };
+        if state.completed_snapshot.is_none() {
+            self.apply_tool_sample_block_reason(&mut state, reason);
+        }
+        deadline_at_ms
+    }
+
+    fn apply_tool_sample_block_reason(
+        &self,
+        state: &mut TurnTimingStateInner,
+        reason: NextSampleBlockReason,
+    ) {
         state.archive_record(serde_json::json!({"kind":"sample_block_reason", "reason":reason}), false);
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);

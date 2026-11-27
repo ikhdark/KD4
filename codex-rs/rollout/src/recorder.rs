@@ -278,9 +278,9 @@ impl Drop for RolloutLeaseCustody {
             self.0.lifecycle.load(Ordering::Acquire),
             WRITER_SHUT_DOWN | WRITER_FAILED
         ) {
-            self.0.mark_failed(&IoError::other(
-                "rollout writer stopped before terminal settlement",
-            ));
+            self.0.mark_failed(
+                IoError::other("rollout writer stopped before terminal settlement").into(),
+            );
         }
         // Close the file after the guard, still before signalling release.
         let writer_lease = self
@@ -335,7 +335,7 @@ const WRITER_FAILED: u8 = 3;
 enum MaintenanceDecision {
     Resume,
     Commit,
-    RestoreFailed,
+    RestoreFailed(Arc<IoError>),
 }
 
 /// Temporarily closes the physical writer while retaining ordered admission and
@@ -366,10 +366,10 @@ impl RolloutMaintenanceGuard {
 
     /// A failed restore must never reopen/create a replacement rollout.
     pub fn restore_failed(mut self) {
-        self.writer_task
-            .mark_failed(&IoError::other("rollout maintenance restoration failed"));
+        let error = Arc::new(IoError::other("rollout maintenance restoration failed"));
+        self.writer_task.mark_failed(Arc::clone(&error));
         if let Some(decision) = self.decision.take() {
-            let _ = decision.send(MaintenanceDecision::RestoreFailed);
+            let _ = decision.send(MaintenanceDecision::RestoreFailed(error));
         }
     }
 }
@@ -407,14 +407,13 @@ impl RolloutWriterTask {
     }
 
     /// Remember a terminal task failure for future recorder API calls.
-    fn mark_failed(&self, err: &IoError) {
-        {
-            let mut guard = self
-                .terminal_failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = Some(Arc::new(clone_io_error(err)));
-        }
+    fn mark_failed(&self, err: Arc<IoError>) {
+        let mut guard = self
+            .terminal_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A maintenance guard can publish the failure before the writer exits.
+        guard.get_or_insert(err);
         self.lifecycle.store(WRITER_FAILED, Ordering::Release);
     }
 
@@ -424,7 +423,7 @@ impl RolloutWriterTask {
             .terminal_failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.as_ref().map(|err| clone_io_error(err.as_ref()))
+        guard.as_ref().map(share_io_error)
     }
 
     fn ensure_active(&self, operation: &str) -> std::io::Result<()> {
@@ -489,8 +488,13 @@ impl RolloutWriterTask {
     }
 }
 
-fn clone_io_error(err: &IoError) -> IoError {
-    IoError::new(err.kind(), err.to_string())
+fn share_io_error(err: &Arc<IoError>) -> IoError {
+    if let Some(code) = err.raw_os_error() {
+        IoError::from_raw_os_error(code)
+    } else {
+        // Keep the original error rather than flattening it to text.
+        IoError::new(err.kind(), Arc::clone(err))
+    }
 }
 
 impl RolloutRecorderParams {
@@ -967,10 +971,13 @@ impl RolloutRecorder {
         let lease_custody = RolloutLeaseCustody(Arc::clone(&writer_task));
         let handle = tokio::task::spawn(async move {
             let _lease_custody = lease_custody;
+            // Keep queued commands and their replies alive until any terminal
+            // error is observable, even when the writer loop exits via `?`.
+            let mut rx = rx;
             let result = rollout_writer(
                 writer,
                 deferred_log_file_info,
-                rx,
+                &mut rx,
                 meta,
                 cwd,
                 known_repository_context,
@@ -982,13 +989,14 @@ impl RolloutRecorder {
             if let Err(err) = result {
                 // This is the terminal background-task failure path. Normal I/O failures stay inside
                 // `rollout_writer`, are reported through command acks, and leave items buffered for retry.
+                writer_task_for_spawn.mark_failed(Arc::clone(&err));
+                drop(rx);
                 error!(
                     "rollout writer task failed for {}: {err}; error_kind={:?}; raw_os_error={:?}",
                     rollout_path_for_spawn.display(),
                     err.kind(),
                     err.raw_os_error()
                 );
-                writer_task_for_spawn.mark_failed(&err);
             }
         });
         writer_task.set_handle(handle);
@@ -1028,20 +1036,28 @@ impl RolloutRecorder {
         origins: &DiagnosticOriginSource,
     ) -> std::io::Result<()> {
         let admission_bytes = rollout_admission_bytes(items);
-        if admission_bytes.is_err() {
+        if let Err(batch_error) = admission_bytes {
             // Validate every individual item before accepting any prefix. Bulk
             // inheritance may exceed admission even though each record fits.
-            let charges = items
-                .iter()
-                .map(|item| match rollout_admission_bytes(std::slice::from_ref(item)) {
-                    Ok(charge) => Ok(charge),
-                    Err(_) if crate::payload_artifact::is_spooled_before_admission(item) => {
-                        crate::payload_artifact::validate_replay_size(item)?;
-                        Ok(0) // Spool this record instead of cloning its body into the queue.
-                    }
-                    Err(error) => Err(error),
-                })
-                .collect::<std::io::Result<Vec<_>>>()?;
+            let individual_charge = |item, admission| match admission {
+                Ok(charge) => Ok(charge),
+                Err(_) if crate::payload_artifact::is_spooled_before_admission(item) => {
+                    crate::payload_artifact::validate_replay_size(item)?;
+                    Ok(0) // Spool this record instead of cloning its body into the queue.
+                }
+                Err(error) => Err(error),
+            };
+            let charges = if let [item] = items {
+                // The failed batch check already measured this exact singleton.
+                vec![individual_charge(item, Err(batch_error))?]
+            } else {
+                items
+                    .iter()
+                    .map(|item| {
+                        individual_charge(item, rollout_admission_bytes(std::slice::from_ref(item)))
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?
+            };
             let mut start = 0;
             let mut charge = 0usize;
             for (index, next) in charges.into_iter().enumerate() {
@@ -1709,20 +1725,27 @@ impl RolloutRecorder {
             Ok(permit) => permit,
             Err(error) => {
                 drop(enqueue_guard);
-                self.wait_for_lost_discard_custody().await;
+                self.wait_for_discard_custody_release().await;
                 return Err(self.writer_task.terminal_failure().unwrap_or_else(|| {
                     IoError::other(format!("failed to reserve rollout discard command: {error}"))
                 }));
             }
         };
-        self.writer_task.begin_shutdown()?;
+        if let Err(error) = self.writer_task.begin_shutdown() {
+            drop(permit);
+            drop(enqueue_guard);
+            if self.writer_task.lifecycle.load(Ordering::Acquire) == WRITER_FAILED {
+                self.wait_for_discard_custody_release().await;
+            }
+            return Err(error);
+        }
         let (ack, done) = oneshot::channel();
         permit.send(RolloutCmd::Discard { ack });
         drop(enqueue_guard);
         match done.await {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.wait_for_lost_discard_custody().await;
+                self.wait_for_discard_custody_release().await;
                 Err(self.writer_task.terminal_failure().unwrap_or_else(|| {
                     IoError::other(format!("failed waiting for rollout discard: {error}"))
                 }))
@@ -1730,9 +1753,9 @@ impl RolloutRecorder {
         }
     }
 
-    async fn wait_for_lost_discard_custody(&self) {
-        // The command receiver or its admitted reply was dropped. This can
-        // precede WRITER_FAILED; wait for the writer's actual unwind.
+    async fn wait_for_discard_custody_release(&self) {
+        // A published failure or a dropped receiver/reply is not lease release.
+        // The writer's actual unwind signals custody release.
         let mut released = self.writer_task.lease_custody_released.subscribe();
         let _ = released.wait_for(|released| *released).await;
     }
@@ -2647,14 +2670,14 @@ impl RolloutWriterState {
 async fn rollout_writer(
     writer: Option<JsonlWriter>,
     deferred_log_file_info: Option<LogFileInfo>,
-    mut rx: mpsc::Receiver<RolloutCmd>,
+    rx: &mut mpsc::Receiver<RolloutCmd>,
     meta: Option<SessionMeta>,
     cwd: PathBuf,
     known_repository_context: Option<Option<RepositoryContext>>,
     rollout_path: PathBuf,
     tool_manifests: crate::ToolManifestDictionary,
     writer_task: Arc<RolloutWriterTask>,
-) -> std::io::Result<()> {
+) -> Result<(), Arc<IoError>> {
     let mut state = RolloutWriterState::new(
         writer,
         deferred_log_file_info,
@@ -2732,7 +2755,9 @@ async fn rollout_writer(
                 let materialized = !state.is_deferred();
                 if !preserve_bytes && materialized && let Err(error) = state.flush().await {
                     if state.retry_blocked_error.is_some() {
-                        let _ = ack.send(Err(clone_io_error(&error)));
+                        let error = Arc::new(error);
+                        writer_task.mark_failed(Arc::clone(&error));
+                        let _ = ack.send(Err(share_io_error(&error)));
                         return Err(error);
                     }
                     let _ = ack.send(Err(error));
@@ -2748,9 +2773,7 @@ async fn rollout_writer(
                         writer_task.finish_shutdown(true);
                         return Ok(());
                     }
-                    MaintenanceDecision::RestoreFailed => {
-                        return Err(IoError::other("rollout maintenance restoration failed"));
-                    }
+                    MaintenanceDecision::RestoreFailed(error) => return Err(error),
                     MaintenanceDecision::Resume if materialized => {
                         // Restore must have succeeded: never create an empty rollout.
                         let writer = if preserve_bytes {
@@ -2784,11 +2807,12 @@ async fn rollout_writer(
         }
         if let Some(message) = state.retry_blocked_error.as_ref() {
             let pending_records = state.pending_items.len();
-            let err = IoError::other(format!(
+            let err = Arc::new(IoError::other(format!(
                 "{message}; {pending_records} buffered rollout records could not be confirmed persisted"
-            ));
+            )));
             error!(pending_records, path = %state.rollout_path.display(), "rollout writer stopped with unconfirmed buffered records");
-            writer_task.mark_failed(&err);
+            // Batching may already have removed a pending barrier from rx.
+            writer_task.mark_failed(Arc::clone(&err));
             return Err(err);
         }
     }

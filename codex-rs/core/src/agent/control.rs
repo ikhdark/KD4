@@ -44,6 +44,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::watch;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 
 pub(crate) use self::execution::AgentExecutionGuard;
@@ -1127,11 +1128,28 @@ impl AgentControl {
         turn_id: &str,
     ) -> CodexResult<HashMap<ThreadId, ThreadId>> {
         let state = self.upgrade()?;
-        let (ephemeral_owners, reused_roots) = self.state.turn_spawn_owners();
+        // Registry snapshots take a synchronous mutex. Keep them off the Stop
+        // caller's async poll so this read cannot pin its deadline or exact delivery.
+        static SNAPSHOT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+        let permit = SNAPSHOT_SLOTS.acquire().await.map_err(|_| {
+            CodexErr::Fatal("turn-owned agent discovery snapshot admission closed".into())
+        })?;
+        let registry = Arc::clone(&self.state);
+        // Drop can abort a queued snapshot. An already-running read can finish,
+        // but keeps its slot until then and cannot enqueue any interrupt.
+        let snapshot = AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let (owners, reused_roots) = registry.turn_spawn_owners();
+            let edges = registry.known_spawn_edges();
+            (owners, reused_roots, edges)
+        }));
+        let (ephemeral_owners, reused_roots, known_edges) = snapshot.await.map_err(|error| {
+            CodexErr::Fatal(format!("failed to read turn-owned agent discovery snapshot: {error}"))
+        })?;
         let mut roots = ephemeral_owners.iter().filter_map(|(child, (owner, turn))| {
                 (*owner == parent && turn == turn_id).then_some(*child)
             }).collect::<HashSet<_>>();
-        let mut parents = self.state.known_spawn_edges().into_iter()
+        let mut parents = known_edges.into_iter()
             .map(|(parent, child)| (child, parent)).collect::<HashMap<_, _>>();
         parents.extend(state.list_live_thread_spawn_edges().await.into_iter()
             .map(|(parent, child)| (child, parent)));

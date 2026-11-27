@@ -56,6 +56,21 @@ output bytes, terminal stdin, and provider-supplied reasoning text. Output
 chunks retain their protocol base64 encoding. Access and retention follow the
 existing rollout directory policy.
 
+New large `context_replay` captures use shared blocks by default. In
+`rollout_payload_artifact.payload`, `sha256` and `bytes` still identify the
+complete serialized item. `replay_chunks_v1` lists ordered
+`[encoded_sha256, encoded_bytes, decoded_bytes]` entries. Each names a single
+Zstandard frame at `rollout-payloads/<encoded_sha256>.replay-zst`. No capture
+depends on a previous rollout or on a chain of manifests. Writers keep small
+bodies (under 128 KiB) and non-replay payloads in their original format.
+
+Full readers authenticate block sizes and hashes, bounded decompression and the
+assembled hash. A portable export can instead provide the authenticated complete
+`<sha256>.json` body; it takes precedence, and a corrupt plain body is an error,
+not a reason to fall back. Do not remove block files individually: one block can
+serve several captures or rollouts. Older readers need a portable copy with the
+complete plain bodies. Existing captures are not rewritten.
+
 For request diagnostics on persisted turns, inspect the `context_replay`
 capture for the matching sampling request and physical attempt. This is
 separate from activity events. Completed summaries, plans and tool results
@@ -72,9 +87,9 @@ diagnostic/export paths still hydrate and verify the saved diagnostic bodies.
 Append preflight still reads, verifies and enrolls every referenced history
 dependency while the writer locks are held. The append visitors do not consume
 replay captures, so a recognized current-format `context_replay` reference is
-only checked for a regular body file of its recorded size and enrolled for the
-durable barrier; the body is not read, hashed or parsed. A missing or wrong-size
-body still counts as an unresolved payload. Damage that preserves the size is
+only checked for regular files of the recorded sizes (the plain body or each
+manifest block) and enrolled for the durable barrier; the files are not read,
+hashed or parsed. A missing or wrong-size file still counts as an unresolved payload. Damage that preserves the size is
 reported by the full diagnostic readers above, which still verify every body.
 Unknown formats and malformed references go through the existing read, verify
 and Value/RawValue decoders, and captures already parsed as Value can still be

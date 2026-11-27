@@ -1038,27 +1038,47 @@ async fn run_main_owned(
     if no_local_transport
         && remote_control_startup_mode == RemoteControlStartupMode::ResolvePersisted
     {
-        let persisted_enabled = match remote_control_handle
-            .resolve_persisted_preference(/*app_server_client_name*/ None)
-            .await
-        {
-            Ok(persisted_enabled) => persisted_enabled,
-            Err(err) => {
-                warn!("failed to resolve persisted remote control preference: {err}");
-                false
+        let admission = tokio::select! {
+            // Prefer a ready cutoff over a ready preference; clean up the spawned task below.
+            biased;
+            _ = &mut startup_signal => Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "app-server startup cancelled",
+            )),
+            _ = tokio::time::sleep_until(startup_deadline) => Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "app-server remote control preference admission timed out",
+            )),
+            result = remote_control_handle.resolve_persisted_preference(/*app_server_client_name*/ None) => {
+                if tokio::time::Instant::now() >= startup_deadline {
+                    Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "app-server remote control preference admission timed out",
+                    ))
+                } else {
+                    match result {
+                        Ok(true) => Ok(()),
+                        result => {
+                            if let Err(err) = result {
+                                warn!("failed to resolve persisted remote control preference: {err}");
+                            }
+                            Err(std::io::Error::new(
+                                ErrorKind::InvalidInput,
+                                if remote_control_policy == RemoteControlPolicy::DisabledByRequirements {
+                                    "no transport configured; remote control disabled by managed requirements"
+                                } else {
+                                    "no transport configured; use --listen or enable remote control"
+                                },
+                            ))
+                        }
+                    }
+                }
             }
         };
-        if !persisted_enabled {
+        if let Err(error) = admission {
             transport_shutdown_token.cancel();
             let _ = remote_control_accept_handle.await;
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                if remote_control_policy == RemoteControlPolicy::DisabledByRequirements {
-                    "no transport configured; remote control disabled by managed requirements"
-                } else {
-                    "no transport configured; use --listen or enable remote control"
-                },
-            ));
+            return Err(error);
         }
     }
     config_manager.bind_remote_control_handle(remote_control_handle.clone());

@@ -14,7 +14,10 @@ use crate::tools::context::{ToolCallSource, ToolInvocation};
 use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
 use crate::session::turn_context::TurnContext;
 
-const INDEX_BYTES: usize = 256 * 1024;
+// The complete schema-1 fix registry on active repositories exceeds 256 KiB.
+// Keep the larger allowance local to registry reads, not ledger views.
+const FIX_REGISTRY_BYTES: usize = 512 * 1024;
+const LEDGER_VIEW_BYTES: usize = 256 * 1024;
 const HISTORY_BYTES: usize = 512 * 1024;
 const ANCHOR_SCAN_LIMIT: usize = 8;
 const NOTICE_BYTES: usize = 4096;
@@ -99,7 +102,7 @@ pub(crate) async fn ledger_context(step: &crate::session::step_context::StepCont
             let paths = [root.join(".local/evidence/fixes/ledger-view.json").map_err(std::io::Error::other)?,
                 root.join(".codex/fix-evidence/ledger-view.json").map_err(std::io::Error::other)?];
             let Some(path) = fs.first_regular_file(&paths, Some(&sandbox)).await? else { continue; };
-            let Some((view, _)) = read_json(fs.as_ref(), &path, INDEX_BYTES, &sandbox).await else {
+            let Some((view, _)) = read_json(fs.as_ref(), &path, LEDGER_VIEW_BYTES, &sandbox).await else {
                 repositories.push(json!({"ledger":path.to_string(),"coverage":"unavailable"})); continue;
             };
             let Some(fixes) = view["fixes"].as_array() else {
@@ -150,7 +153,7 @@ async fn record_ledger_overlap(req: &ApplyPatchRequest, turn: &TurnContext, chan
         FindUpErrorPolicy::Ignore, Some(&sandbox)).await.ok().flatten()?;
     let paths = [root.join(".local/evidence/fixes/ledger-view.json").ok()?, root.join(".codex/fix-evidence/ledger-view.json").ok()?];
     let path = fs.first_regular_file(&paths, Some(&sandbox)).await.ok().flatten()?;
-    let (view, _) = read_json(fs.as_ref(), &path, INDEX_BYTES, &sandbox).await?;
+    let (view, _) = read_json(fs.as_ref(), &path, LEDGER_VIEW_BYTES, &sandbox).await?;
     let root_native = root.to_abs_path().ok()?;
     let relative = change.before_path.to_abs_path().ok()?.as_path().strip_prefix(root_native.as_path()).ok()?.to_string_lossy().replace('\\', "/");
     let after_relative = change.path.to_abs_path().ok()?.as_path().strip_prefix(root_native.as_path()).ok()?.to_string_lossy().replace('\\', "/");
@@ -536,9 +539,9 @@ async fn lookup(
         root.join(".codex/fix-evidence/index.json").ok()?];
     let ledger_paths = [root.join(".local/evidence/fixes/ledger-view.json").ok()?,
         root.join(".codex/fix-evidence/ledger-view.json").ok()?];
-    root_memory.needs_rebuild |= root_memory.index.refresh(fs, &index_paths, INDEX_BYTES, sandbox,
+    root_memory.needs_rebuild |= root_memory.index.refresh(fs, &index_paths, FIX_REGISTRY_BYTES, sandbox,
         |v| v["schema_version"] == 1 && v["fixes"].is_array(), false, false).await;
-    root_memory.needs_rebuild |= root_memory.ledger.refresh(fs, &ledger_paths, INDEX_BYTES, sandbox,
+    root_memory.needs_rebuild |= root_memory.ledger.refresh(fs, &ledger_paths, LEDGER_VIEW_BYTES, sandbox,
         |v| v["fixes"].is_array(), true, false).await;
     let history_path = root_memory.index.current()
         .and_then(|(index, _)| index["benchmark_advisories"].as_str())
@@ -792,6 +795,13 @@ async fn lookup(
             payload.as_object_mut()?.remove("deferred_findings");
         }
     }
+    if is_availability_only(&payload) {
+        // Different files can discover the same missing owners concurrently.
+        // Reserve the owner state before releasing the lookup lock.
+        let reservation = format!("{root_key}:availability:{evidence_revision}");
+        if state.shown.contains(&reservation) { return None; }
+        reservations.push(reservation);
+    }
     let id = hex::encode(Sha256::digest(serde_json::to_vec(&payload).ok()?));
     let guidance = if change.is_some() {
         "Historical conflict assessment, not an approval gate or behavior proof. Preserve required behavior, not its implementation. Reuse only relevant authorized verification; no automatic execution or mandatory acknowledgment. Optional Evidence Review patch metadata records reported consideration. Bounded discovery; missing coverage is unknown."
@@ -809,6 +819,19 @@ async fn lookup(
     reservations.push(path_reservation);
     state.shown.extend(reservations.iter().cloned());
     Some((text, reservations, id, payload))
+}
+
+fn is_availability_only(payload: &Value) -> bool {
+    payload["phase"] == "source_read"
+        && payload["matching_fixes"] == 0
+        && payload["fixes"].as_array().is_some_and(Vec::is_empty)
+        && payload.get("deferred_findings").is_none()
+        && payload["unavailable_evidence_owners"].as_array().is_some_and(|owners| !owners.is_empty())
+}
+
+fn same_evidence_owner_state(previous: &Value, current: &Value) -> bool {
+    ["index", "index_sha256", "history", "unavailable_evidence_owners"]
+        .into_iter().all(|key| previous[key] == current[key])
 }
 
 fn remember_notice(state: &mut State, id: String, payload: Value, status: &str,
@@ -881,11 +904,8 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
         found
     }).await.ok().flatten();
     let (text, reservations, id, payload) = found?;
-    {
-        let mut state = ledger.0.lock().await;
-        for key in &reservations { state.reservation_notices.insert(key.clone(), id.clone()); }
-    }
     let bytes = text.len();
+    let availability_only = is_availability_only(&payload);
     // Consult accepted current history, not a permanent per-thread seen set:
     // compaction/removal must allow a later turn to deliver the evidence again.
     let history = invocation.session.clone_history().await;
@@ -893,21 +913,42 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
         let ResponseItem::Message { role, content, .. } = item else { return None; };
         if role != "developer" { return None; }
         let [ContentItem::InputText { text: present }] = content.as_slice() else { return None; };
-        if !present.starts_with("<evidence_memory_advisory ") { return None; }
+        let (previous_id, _) = present.strip_prefix("<evidence_memory_advisory id=\"")?.split_once('"')?;
         let previous: Value = serde_json::from_str(present.lines().nth(2)?).ok()?;
-        (previous["phase"] == "source_read" && previous["index"] == payload["index"]
-            && previous["source_path"] == payload["source_path"]).then_some(present)
+        if previous["phase"] != "source_read" || previous["index"] != payload["index"] {
+            return None;
+        }
+        let relevant = if availability_only {
+            // An intervening owner change invalidates older availability-only
+            // coverage. A positive match in the same owner state does not.
+            !same_evidence_owner_state(&previous, &payload) || is_availability_only(&previous)
+        } else {
+            previous["source_path"] == payload["source_path"]
+        };
+        relevant.then_some((previous_id, present, previous))
     });
-    if latest == Some(&text) {
-        // The notice is already available; keep this turn's reservations but
-        // don't spend its injection allowance on a body we did not inject.
+    let reused = latest.filter(|(_, present, previous)| {
+        *present == &text || (availability_only && is_availability_only(previous)
+            && same_evidence_owner_state(previous, &payload)
+            && present.lines().nth(1) == text.lines().nth(1))
+    });
+    {
         let mut state = ledger.0.lock().await;
-        state.bytes = state.bytes.saturating_sub(bytes);
-        remember_notice(&mut state, id.clone(), payload, "context_reused", invocation,
-            &environment.environment_id);
-        return Some(json!({"schema_version":1,"id":id,"status":"context_reused",
-            "bytes":0,"existing_bytes":bytes,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
-            "phase":"source_read"}));
+        // Reuse the retained notice's identity, even if it came from another
+        // source read, so eviction requalifies these reservations.
+        let retained_id = reused.as_ref().map_or(id.as_str(), |(id, _, _)| *id);
+        for key in &reservations {
+            state.reservation_notices.insert(key.clone(), retained_id.to_owned());
+        }
+        if let Some((retained_id, retained_text, retained_payload)) = reused {
+            // Do not spend the injection allowance on a body we did not inject.
+            state.bytes = state.bytes.saturating_sub(bytes);
+            remember_notice(&mut state, retained_id.to_owned(), retained_payload, "context_reused",
+                invocation, &environment.environment_id);
+            return Some(json!({"schema_version":1,"id":retained_id,"status":"context_reused",
+                "bytes":0,"existing_bytes":retained_text.len(),"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
+                "phase":"source_read"}));
+        }
     }
     // A genuinely new source-read delivery after compaction must not collide
     // with the same turn's durable append retry key for the evicted notice.

@@ -828,12 +828,16 @@ async fn run_script_with_timeout(
     handler.stderr(Stdio::piped());
     handler.creation_flags(WINDOWS_CREATE_SUSPENDED | 0x0800_0000); // CREATE_NO_WINDOW
 
-    let managed = timeout_at(timeout_deadline, ManagedRootProcess::reserve_with_reclaim())
-        .await
-        .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))??;
+    let managed = timeout_at(
+        timeout_deadline,
+        ManagedRootProcess::reserve_with_reclaim_before(timeout_deadline),
+    )
+    .await
+    .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))?;
     if tokio::time::Instant::now() >= timeout_deadline {
         return Err(anyhow!("Snapshot command timed out for {shell_name}"));
     }
+    let managed = managed?;
     let spawn_timeout = timeout_deadline.saturating_duration_since(tokio::time::Instant::now());
     let spawn = run_windows_process_operation(spawn_timeout, move || {
         // A timed-out JoinHandle does not cancel a queued blocking operation.

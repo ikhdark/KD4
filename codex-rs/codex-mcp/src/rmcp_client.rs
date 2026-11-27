@@ -530,7 +530,7 @@ impl ManagedClientStartup {
                     .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
                 let constructor_server_name = server_name.clone();
                 let constructor_server = server.clone();
-                let (client, remaining_startup_timeout) =
+                let (client, startup_deadline) =
                     construct_with_startup_budget(startup_timeout, async move {
                         make_rmcp_client(
                             &constructor_server_name,
@@ -550,7 +550,8 @@ impl ManagedClientStartup {
                     client,
                     StartServerTaskParams {
                         is_codex_apps_mcp_server,
-                        startup_timeout: Some(remaining_startup_timeout),
+                        startup_deadline,
+                        startup_timeout,
                         tool_timeout: server
                             .configured_config()
                             .and_then(|config| config.tool_timeout_sec)
@@ -1523,25 +1524,26 @@ fn advance_tool_catalog_revision_if_changed(
 async fn construct_with_startup_budget<T, F>(
     budget: Duration,
     constructor: F,
-) -> Result<(T, Duration), StartupOutcomeError>
+) -> Result<(T, TokioInstant), StartupOutcomeError>
 where
     T: Send + 'static,
     F: Future<Output = Result<T, StartupOutcomeError>> + Send + 'static,
 {
     let deadline = TokioInstant::now() + budget;
     let owner = tokio::spawn(constructor);
-    let client = tokio::time::timeout_at(deadline, owner)
-        .await
-        .map_err(|_| StartupOutcomeError::Failed {
-            error: format!("MCP client construction exceeded startup timeout of {budget:?}"),
-            is_authentication_required: false,
-            is_timeout: true,
-        })?
+    let result = tokio::time::timeout_at(deadline, owner).await;
+    let timed_out = || StartupOutcomeError::Failed {
+        error: format!("MCP client construction exceeded startup timeout of {budget:?}"),
+        is_authentication_required: false,
+        is_timeout: true,
+    };
+    if TokioInstant::now() >= deadline {
+        return Err(timed_out());
+    }
+    let client = result
+        .map_err(|_| timed_out())?
         .map_err(|error| StartupOutcomeError::from(anyhow!(error)))??;
-    Ok((
-        client,
-        deadline.saturating_duration_since(TokioInstant::now()),
-    ))
+    Ok((client, deadline))
 }
 
 #[instrument(level = "trace", skip_all, fields(server_name = %server_name))]
@@ -1552,6 +1554,7 @@ async fn start_server_task(
 ) -> Result<ManagedClient, StartupOutcomeError> {
     let StartServerTaskParams {
         is_codex_apps_mcp_server,
+        startup_deadline,
         startup_timeout,
         tool_timeout,
         tool_filter,
@@ -1600,8 +1603,9 @@ async fn start_server_task(
     });
 
     let initialize_result = client
-        .initialize_with_notifications(
+        .initialize_with_notifications_until(
             params,
+            startup_deadline,
             startup_timeout,
             send_elicitation,
             send_progress,
@@ -1726,7 +1730,8 @@ fn mcp_server_info_from_implementation(server_info: Implementation) -> McpServer
 
 struct StartServerTaskParams {
     is_codex_apps_mcp_server: bool,
-    startup_timeout: Option<Duration>, // TODO: cancel_token should handle this.
+    startup_deadline: TokioInstant,
+    startup_timeout: Duration,
     tool_timeout: Duration,
     tool_filter: ToolFilter,
     tx_event: Sender<Event>,

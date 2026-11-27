@@ -391,17 +391,23 @@ async fn upload_openai_file_contents_with_pool(
 
         let finalize_url = file_endpoint_url(base_url, Some(&create_payload.file_id), true)?;
         let finalize_deadline = Instant::now() + OPENAI_FILE_FINALIZE_TIMEOUT;
+        let finalize_timed_out = || OpenAiFileError::UploadNotReady {
+            file_id: create_payload.file_id.clone(),
+        };
         loop {
             let remaining = finalize_deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| OpenAiFileError::UploadNotReady {
-                    file_id: create_payload.file_id.clone(),
-                })?;
+                .saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(finalize_timed_out());
+            }
             let finalize_attempt = async {
                 let mut request = codex_client::Request::new(Method::POST, finalize_url.clone())
                     .with_json(&serde_json::json!({}));
                 request.timeout = Some(remaining);
                 let request = authorized_request(http_clients, auth, request).await?;
+                if Instant::now() >= finalize_deadline {
+                    return Err(finalize_timed_out());
+                }
                 let response = codex_http_client::with_dispatch_guard(auth.dispatch_guard(), request.send()).await
                     .map_err(|source| request_error(&finalize_url, source))?;
                 let status = response.status();
@@ -413,23 +419,12 @@ async fn upload_openai_file_contents_with_pool(
                 };
                 Ok::<_, OpenAiFileError>((status, body))
             };
+            let finalize_result = tokio::time::timeout_at(finalize_deadline, finalize_attempt).await;
+            if Instant::now() >= finalize_deadline {
+                return Err(finalize_timed_out());
+            }
             let (finalize_status, finalize_body) =
-                match tokio::time::timeout_at(finalize_deadline, finalize_attempt).await {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(OpenAiFileError::Request { source, .. }))
-                        if source.is_timeout() && Instant::now() >= finalize_deadline =>
-                    {
-                        return Err(OpenAiFileError::UploadNotReady {
-                            file_id: create_payload.file_id.clone(),
-                        });
-                    }
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => {
-                        return Err(OpenAiFileError::UploadNotReady {
-                            file_id: create_payload.file_id.clone(),
-                        });
-                    }
-                };
+                finalize_result.map_err(|_| finalize_timed_out())??;
             if !finalize_status.is_success() {
                 return Err(OpenAiFileError::UnexpectedStatus {
                     url: finalize_url.clone(),

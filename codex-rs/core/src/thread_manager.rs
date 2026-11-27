@@ -750,6 +750,10 @@ impl ThreadManager {
         installation_id: String,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
     ) -> Self {
+        // Stop can address a thread before its turn has bound observations.
+        // Prepare the opt-in writer here, so the request neither initializes
+        // nor waits for an observation sink.
+        let _ = codex_protocol::timing::observations::prepare_runtime_async_lane();
         let codex_home = config.codex_home.clone();
         let restriction_product = session_source.restriction_product();
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);

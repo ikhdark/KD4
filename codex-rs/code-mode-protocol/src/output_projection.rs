@@ -1087,12 +1087,18 @@ fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
     } else if raw["success"] == false
         && raw["tool_failure"]["execution_state"] == "not_started"
         && raw["tool_failure"]["effects"] == "none"
-        && let Some(diagnostic) = raw["tool_failure"]["details"]["owner_diagnostic"].as_str()
-        && raw["text"].as_str()
-            .and_then(|text| text.strip_prefix("apply_patch verification failed: ")) == Some(diagnostic)
+        && let Some(diagnostic) = raw["text"].as_str()
+            .and_then(|text| text.strip_prefix("apply_patch verification failed: "))
     {
-        projected.shift_remove("text");
-        if let Some((reason, source)) = diagnostic.split_once("\nFile: ")
+        let details = &raw["tool_failure"]["details"];
+        let owner_diagnostic = details["owner_diagnostic"].as_str();
+        if owner_diagnostic == Some(diagnostic)
+            || details["revision_guard_diagnostic"].as_str() == Some(diagnostic)
+        {
+            projected.shift_remove("text");
+        }
+        if owner_diagnostic == Some(diagnostic)
+            && let Some((reason, source)) = diagnostic.split_once("\nFile: ")
             && reason.starts_with("Invalid codex-replace in ")
             && reason.ends_with(": every chunk must be count-guarded; do not mix with line hunks")
             && let Some((identity, _)) = source.split_once("\nExpected patch excerpt (bounded;")

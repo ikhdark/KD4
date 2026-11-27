@@ -37,6 +37,13 @@ const SESSION_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const REGISTRY_RECOVERY_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const REGISTRY_RECOVERY_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+enum RecoveryInstall {
+    Installed,
+    Retry,
+    Superseded,
+    Expired,
+}
+
 /// Validate an unbounded retained read using the same interpreter as connection
 /// recovery. Nothing is exposed until the complete suffix has been validated.
 /// `exit_known` refers only to an exit already delivered at or before `after_seq`.
@@ -572,6 +579,7 @@ impl Inner {
 
     async fn recover(self: &Arc<Self>, disconnect_message: String) {
         let deadline = Instant::now() + SESSION_RECOVERY_TIMEOUT;
+        let timeout_error = || format!("recovery timed out after {SESSION_RECOVERY_TIMEOUT:?}");
         self.fail_all_http_body_streams(disconnect_message.clone())
             .await;
         if timeout_at(deadline, self.wait_for_process_starts())
@@ -579,13 +587,14 @@ impl Inner {
             .is_err()
         {
             let message = format!(
-                "{disconnect_message}; failed to resume exec-server session: recovery timed out after {SESSION_RECOVERY_TIMEOUT:?}"
+                "{disconnect_message}; failed to resume exec-server session: {}",
+                timeout_error()
             );
-            self.fail(message).await;
+            self.fail_recovery(message).await;
             return;
         }
         if self.reconnect_strategy.is_none() {
-            self.fail(disconnect_message).await;
+            self.fail_recovery(disconnect_message).await;
             return;
         }
 
@@ -593,7 +602,7 @@ impl Inner {
             let message = format!(
                 "{disconnect_message}; failed to resume exec-server session: missing session id"
             );
-            self.fail(message).await;
+            self.fail_recovery(message).await;
             return;
         };
         let uses_registry_backoff = matches!(
@@ -602,19 +611,28 @@ impl Inner {
         );
         let mut registry_retry_attempt = 0;
         let last_error = loop {
-            match timeout_at(deadline, self.resume_once(&session_id)).await {
-                Ok(Ok(candidate)) => {
-                    if !candidate.is_disconnected() && self.install_recovered_client(candidate) {
-                        return;
+            if Instant::now() >= deadline {
+                break timeout_error();
+            }
+            let result = timeout_at(deadline, self.resume_once(&session_id)).await;
+            // A ready inner future can win even when polled at or after the deadline.
+            if Instant::now() >= deadline {
+                break timeout_error();
+            }
+            match result {
+                Ok(Ok(candidate)) if !candidate.is_disconnected() => {
+                    match self.install_recovered_client(candidate, deadline) {
+                        RecoveryInstall::Installed | RecoveryInstall::Superseded => return,
+                        RecoveryInstall::Retry => {}
+                        RecoveryInstall::Expired => break timeout_error(),
                     }
                 }
+                Ok(Ok(_)) => {}
                 Ok(Err(error)) if !is_retryable_recovery_error(&error) => {
                     break error.to_string();
                 }
                 Ok(Err(_)) => {}
-                Err(_) => {
-                    break format!("recovery timed out after {SESSION_RECOVERY_TIMEOUT:?}");
-                }
+                Err(_) => break timeout_error(),
             }
 
             let retry_delay = if uses_registry_backoff {
@@ -627,14 +645,14 @@ impl Inner {
 
             let now = Instant::now();
             if now >= deadline {
-                break format!("recovery timed out after {SESSION_RECOVERY_TIMEOUT:?}");
+                break timeout_error();
             }
             sleep(retry_delay.min(deadline - now)).await;
         };
 
         let message =
             format!("{disconnect_message}; failed to resume exec-server session: {last_error}");
-        self.fail(message).await;
+        self.fail_recovery(message).await;
     }
 
     async fn wait_for_process_starts(&self) {
@@ -653,25 +671,30 @@ impl Inner {
         }
     }
 
-    fn install_recovered_client(&self, rpc_client: Arc<RpcClient>) -> bool {
-        let installed = {
+    fn install_recovered_client(
+        &self,
+        rpc_client: Arc<RpcClient>,
+        deadline: Instant,
+    ) -> RecoveryInstall {
+        {
             let mut connection = self
                 .connection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !matches!(connection.status, ConnectionStatus::Recovering)
-                || rpc_client.is_disconnected()
-            {
-                false
-            } else {
-                connection.status = ConnectionStatus::Connected(rpc_client);
-                true
+            if !matches!(connection.status, ConnectionStatus::Recovering) {
+                return RecoveryInstall::Superseded;
             }
-        };
-        if installed {
-            self.notify_connection_changed();
+            if rpc_client.is_disconnected() {
+                return RecoveryInstall::Retry;
+            }
+            // Lock acquisition and the transport check can consume the remaining budget.
+            if Instant::now() >= deadline {
+                return RecoveryInstall::Expired;
+            }
+            connection.status = ConnectionStatus::Connected(rpc_client);
         }
-        installed
+        self.notify_connection_changed();
+        RecoveryInstall::Installed
     }
 
     fn notify_connection_changed(&self) {
@@ -774,24 +797,19 @@ impl Inner {
         Ok(())
     }
 
-    async fn fail(self: &Arc<Self>, message: String) {
-        let (message, newly_failed) = {
+    async fn fail_recovery(self: &Arc<Self>, message: String) {
+        {
             let mut connection = self
                 .connection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match &connection.status {
-                ConnectionStatus::Failed(existing) => (existing.clone(), false),
-                ConnectionStatus::Connected(_) | ConnectionStatus::Recovering => {
-                    connection.status = ConnectionStatus::Failed(message.clone());
-                    (message, true)
-                }
+            if !matches!(connection.status, ConnectionStatus::Recovering) {
+                return;
             }
-        };
-        if newly_failed {
-            self.notify_connection_changed();
-            fail_all_in_flight_work(self, message.clone()).await;
+            connection.status = ConnectionStatus::Failed(message.clone());
         }
+        self.notify_connection_changed();
+        fail_all_in_flight_work(self, message).await;
     }
 }
 

@@ -17,11 +17,17 @@ endpoints are millisecond offsets; timeline and graph spans are nanoseconds on
 the turn clock. Unions and operation sums are not additive with the exclusive
 partition. No value is a proven saving, a necessity verdict or task acceptance.
 
+With an incomplete tool inventory, the first observed material progress time is
+an upper bound, the last is a lower bound, and post-completion overhead is an
+upper bound. With no observed progress endpoint these metrics are unavailable.
+
 Shared definitions:
 
 - **Leaf executions**: model physical attempts (dispatch to completion or
   recorded owner end) and tool handler entry to exit for calls without
-  recorded nested calls.
+  recorded nested calls. These are elapsed operation spans, not CPU time or machine-only
+  work. A request for user input can be a leaf spanning the wait for an answer or timeout;
+  use the exclusive interactive partition to distinguish that time from machine activity.
 - **Ready waits**: tool acceptance to handler entry, and continuation
   sampling ready to dispatch (observed only after tool results).
 - **Critical path**: binding-predecessor walk (latest-finishing prerequisite)
@@ -45,7 +51,7 @@ Shared definitions:
 | `idleGapDuration` | Orchestration-phase time while a ready wait was pending and no leaf execution ran. Requires an exact activity timeline. |
 | `criticalPathUtilization` | Model and leaf tool execution on the critical path / its elapsed length. |
 | `workSpanRatio` | Model and leaf tool node work / execution-weighted longest dependency chain (nested cells and handoffs weigh zero). |
-| `queueingDelayAttribution` | Per-source rows for resource-contention awaits, tool first-poll, parallel-gate and authorization waits, continuation dispatch and host response-event queues. `dominantSource` ranks positioned elapsed unions; result/interrupt barriers stay under synchronization. |
+| `queueingDelayAttribution` | Per-source rows for resource-contention awaits, tool first-poll and authorization waits, the first-poll-to-admission envelope, continuation dispatch and host response-event queues. `dominantSource` ranks the retained positioned wait unions, excluding the admission envelope (legacy row key `tool:parallel_gate`, kind `first_poll_to_admission_envelope`); result/interrupt barriers stay under synchronization. |
 | `latencyAmplificationFactor` | Turn duration / critical-path execution time. A cross-run baseline is a matched comparison. |
 | `processInitializationBurden` | In-turn startup-prewarm, executor-readiness and router-build waits plus tool handler-entry-to-process-spawn launch. Components can overlap, so only lower/upper bounds are combined. Pre-turn startup and child-process initialization are outside this clock. |
 | `timeToFirstMaterialProgress` | Earliest successful domain-tool completion or accepted final content. |

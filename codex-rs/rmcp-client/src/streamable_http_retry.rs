@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 
 use anyhow::Result;
 use codex_exec_server::ExecServerError;
@@ -8,6 +7,7 @@ use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpError;
 use tokio::time;
+use tokio::time::Instant;
 use tracing::warn;
 
 use crate::elicitation_client_service::ElicitationClientService;
@@ -15,7 +15,7 @@ use crate::http_client_adapter::StreamableHttpClientAdapterError;
 use crate::http_client_adapter::is_retryable_http_status;
 use crate::oauth::OAuthPersistor;
 
-use super::InitializeTimeoutError;
+use super::InitializeBudget;
 use super::PendingTransport;
 use super::RmcpClient;
 
@@ -27,7 +27,7 @@ impl RmcpClient {
         &self,
         initial_transport: PendingTransport,
         client_service: ElicitationClientService,
-        timeout: Option<Duration>,
+        budget: Option<InitializeBudget>,
     ) -> Result<(
         Arc<RunningService<RoleClient, ElicitationClientService>>,
         Option<OAuthPersistor>,
@@ -37,7 +37,6 @@ impl RmcpClient {
             PendingTransport::StreamableHttp { .. }
             | PendingTransport::StreamableHttpWithOAuth { .. } => true,
         };
-        let retry_deadline = timeout.map(|duration| Instant::now() + duration);
         let mut pending_transport = Some(initial_transport);
 
         for (attempt, retry_delay_ms) in STREAMABLE_HTTP_RETRY_DELAYS_MS
@@ -50,26 +49,14 @@ impl RmcpClient {
             let transport = match pending_transport.take() {
                 Some(transport) => transport,
                 None => {
-                    let remaining = remaining_initialize_timeout(timeout, retry_deadline)?;
-                    match remaining {
-                        Some(remaining) => time::timeout(
-                            remaining,
-                            Self::create_pending_transport(&self.transport_recipe),
-                        )
-                        .await
-                        .map_err(|_| initialize_timeout_error(timeout, remaining))??,
-                        None => Self::create_pending_transport(&self.transport_recipe).await?,
-                    }
+                    InitializeBudget::observe(
+                        budget,
+                        Self::create_pending_transport(&self.transport_recipe),
+                    )
+                    .await??
                 }
             };
-            let attempt_timeout = remaining_initialize_timeout(timeout, retry_deadline)?;
-
-            match Self::connect_pending_transport(
-                transport,
-                client_service.clone(),
-                attempt_timeout,
-            )
-            .await
+            match Self::connect_pending_transport(transport, client_service.clone(), budget).await
             {
                 Ok(result) => return Ok(result),
                 Err(error) if should_retry && Self::is_retryable_initialize_error(&error) => {
@@ -84,9 +71,12 @@ impl RmcpClient {
                         error = %error,
                         "streamable HTTP MCP initialize failed with a retryable error; retrying"
                     );
-                    if !sleep_with_retry_deadline(delay, retry_deadline).await {
-                        let duration = timeout.unwrap_or(delay);
-                        return Err(anyhow::Error::new(InitializeTimeoutError { duration }));
+                    if let Some(budget) = budget {
+                        if !sleep_with_retry_deadline(delay, Some(budget.deadline)).await {
+                            return Err(budget.timeout_error());
+                        }
+                    } else {
+                        sleep_with_retry_deadline(delay, None).await;
                     }
                 }
                 Err(error) => return Err(error),
@@ -199,40 +189,22 @@ pub(super) fn retry_delay(error: &(dyn std::error::Error + 'static), fallback_ms
     Duration::from_millis(fallback_ms).max(advice(error).unwrap_or_default())
 }
 
-fn remaining_initialize_timeout(
-    timeout: Option<Duration>,
-    deadline: Option<Instant>,
-) -> Result<Option<Duration>> {
-    let Some(deadline) = deadline else {
-        return Ok(None);
-    };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        Err(initialize_timeout_error(timeout, remaining))
-    } else {
-        Ok(Some(remaining))
-    }
-}
-
-fn initialize_timeout_error(timeout: Option<Duration>, fallback: Duration) -> anyhow::Error {
-    let duration = timeout.unwrap_or(fallback);
-    anyhow::Error::new(InitializeTimeoutError { duration })
-}
-
 pub(super) async fn sleep_with_retry_deadline(delay: Duration, deadline: Option<Instant>) -> bool {
+    let now = Instant::now();
+    let wake_at = now.checked_add(delay);
     if let Some(deadline) = deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if now >= deadline {
             return false;
         }
-        if delay >= remaining {
-            time::sleep(remaining).await;
-            return false;
+        if let Some(wake_at) = wake_at.filter(|&wake_at| wake_at < deadline) {
+            time::sleep_until(wake_at).await;
+            return Instant::now() < deadline;
         }
-        time::timeout(remaining, time::sleep(delay)).await.is_ok()
+        time::sleep_until(deadline).await;
+        false
     } else {
-        match time::Instant::now().checked_add(delay) {
-            Some(deadline) => time::sleep_until(deadline).await,
+        match wake_at {
+            Some(wake_at) => time::sleep_until(wake_at).await,
             None => std::future::pending::<()>().await,
         }
         true

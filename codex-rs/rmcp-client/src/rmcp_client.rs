@@ -385,8 +385,46 @@ struct InitializeTimeoutError {
     duration: Duration,
 }
 
-fn initialize_timeout_error(duration: Duration) -> anyhow::Error {
-    anyhow::Error::new(InitializeTimeoutError { duration })
+#[derive(Clone, Copy)]
+struct InitializeBudget {
+    deadline: Instant,
+    timeout: Duration,
+}
+
+impl InitializeBudget {
+    fn from_timeout(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            timeout,
+        }
+    }
+
+    fn timeout_error(self) -> anyhow::Error {
+        InitializeTimeoutError {
+            duration: self.timeout,
+        }
+        .into()
+    }
+
+    fn ensure_open(self) -> Result<()> {
+        if Instant::now() >= self.deadline {
+            return Err(self.timeout_error());
+        }
+        Ok(())
+    }
+
+    async fn observe<T>(budget: Option<Self>, operation: impl Future<Output = T>) -> Result<T> {
+        let Some(budget) = budget else {
+            return Ok(operation.await);
+        };
+        budget.ensure_open()?;
+        let result = time::timeout_at(budget.deadline, operation)
+            .await
+            .map_err(|_| budget.timeout_error())?;
+        // Tokio can return a ready inner result even when the deadline is due.
+        budget.ensure_open()?;
+        Ok(result)
+    }
 }
 
 pub fn is_timeout_error(error: &anyhow::Error) -> bool {
@@ -799,6 +837,51 @@ impl RmcpClient {
         send_tool_list_changed: SendToolListChanged,
         send_resource_changed: SendResourceChanged,
     ) -> Result<InitializeResult> {
+        self.initialize_with_notifications_with_budget(
+            params,
+            timeout.map(InitializeBudget::from_timeout),
+            send_elicitation,
+            send_progress,
+            send_tool_list_changed,
+            send_resource_changed,
+        )
+        .await
+    }
+
+    /// Initialize within the caller's existing startup deadline, without
+    /// restarting the clock after transport construction.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(level = "trace", skip_all)]
+    pub async fn initialize_with_notifications_until(
+        &self,
+        params: InitializeRequestParams,
+        deadline: Instant,
+        timeout: Duration,
+        send_elicitation: SendElicitation,
+        send_progress: SendProgress,
+        send_tool_list_changed: SendToolListChanged,
+        send_resource_changed: SendResourceChanged,
+    ) -> Result<InitializeResult> {
+        self.initialize_with_notifications_with_budget(
+            params,
+            Some(InitializeBudget { deadline, timeout }),
+            send_elicitation,
+            send_progress,
+            send_tool_list_changed,
+            send_resource_changed,
+        )
+        .await
+    }
+
+    async fn initialize_with_notifications_with_budget(
+        &self,
+        params: InitializeRequestParams,
+        budget: Option<InitializeBudget>,
+        send_elicitation: SendElicitation,
+        send_progress: SendProgress,
+        send_tool_list_changed: SendToolListChanged,
+        send_resource_changed: SendResourceChanged,
+    ) -> Result<InitializeResult> {
         let client_service = ElicitationClientService::new(
             params.clone(),
             send_elicitation,
@@ -808,7 +891,7 @@ impl RmcpClient {
             self.elicitation_pause_state.clone(),
         );
         let pending_transport = {
-            let mut guard = self.state.lock().await;
+            let mut guard = InitializeBudget::observe(budget, self.state.lock()).await?;
             match &mut *guard {
                 ClientState::Connecting { transport } => match transport.take() {
                     Some(transport) => transport,
@@ -823,7 +906,7 @@ impl RmcpClient {
             .connect_pending_transport_with_initialize_retries(
                 pending_transport,
                 client_service.clone(),
-                timeout,
+                budget,
             )
             .await?;
 
@@ -843,15 +926,16 @@ impl RmcpClient {
         initialize_result.meta = peer_info.meta.clone();
 
         {
-            let mut initialize_context = self.initialize_context.lock().await;
+            let mut initialize_context =
+                InitializeBudget::observe(budget, self.initialize_context.lock()).await?;
             *initialize_context = Some(InitializeContext {
-                timeout,
+                timeout: budget.map(|budget| budget.timeout),
                 client_service,
             });
         }
 
         {
-            let mut guard = self.state.lock().await;
+            let mut guard = InitializeBudget::observe(budget, self.state.lock()).await?;
             if matches!(*guard, ClientState::Closed) {
                 return Err(anyhow!("MCP client is shut down"));
             }
@@ -862,9 +946,13 @@ impl RmcpClient {
             self.session_generation.fetch_add(1, Ordering::AcqRel);
         }
 
-        if let Some(runtime) = oauth_persistor
-        {
-            runtime.persist_if_needed().await?;
+        if let Some(runtime) = oauth_persistor {
+            // The persistence layer owns an admitted write even if observation
+            // reaches the startup deadline.
+            InitializeBudget::observe(budget, runtime.persist_if_needed()).await??;
+        }
+        if let Some(budget) = budget {
+            budget.ensure_open()?;
         }
 
         Ok(initialize_result)
@@ -1597,12 +1685,14 @@ impl RmcpClient {
     async fn connect_pending_transport(
         pending_transport: PendingTransport,
         client_service: ElicitationClientService,
-        timeout: Option<Duration>,
+        budget: Option<InitializeBudget>,
     ) -> Result<(
         Arc<RunningService<RoleClient, ElicitationClientService>>,
         Option<OAuthPersistor>,
     )> {
-        let deadline = timeout.map(|duration| Instant::now() + duration);
+        if let Some(budget) = budget {
+            budget.ensure_open()?;
+        }
         let client_service = client_service.with_fresh_progress_routes();
         let (transport, oauth_persistor, initialize_deadline, initialize_session) =
             match pending_transport {
@@ -1641,20 +1731,30 @@ impl RmcpClient {
         if let Some(initialize_deadline) = &initialize_deadline {
             *initialize_deadline
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                budget.map(|budget| budget.deadline);
         }
 
-        let service_result = match timeout {
-            Some(duration) => match time::timeout(duration, transport).await {
-                Ok(result) => {
-                    result.map_err(|source| anyhow::Error::from(HandshakeError { source }))
-                }
-                Err(_elapsed) => Err(initialize_timeout_error(duration)),
-            },
-            None => transport
-                .await
-                .map_err(|source| anyhow::Error::from(HandshakeError { source })),
-        };
+        let service_result: Result<_> = async {
+            let service = InitializeBudget::observe(budget, transport)
+                .await?
+                .map_err(|source| anyhow::Error::from(HandshakeError { source }))?;
+            if let Some(guard) = &mut initialize_session_guard {
+                guard.complete();
+            }
+
+            // rmcp 3 caches responses and serves stale ones on errors by default;
+            // keep every request fresh, as with rmcp 1.x.
+            InitializeBudget::observe(
+                budget,
+                service
+                    .peer()
+                    .set_response_cache_config(ClientCacheConfig::disabled()),
+            )
+            .await?;
+            Ok(service)
+        }
+        .await;
         let service = match service_result {
             Ok(service) => service,
             Err(error) => {
@@ -1669,21 +1769,18 @@ impl RmcpClient {
                     // Let a retry observe refreshed credentials, but keep storage I/O
                     // within the caller's remaining startup budget. Dropping the join
                     // handle leaves the owned write running to completion.
-                    if let Some(deadline) = deadline {
-                        let _ = time::timeout_at(deadline, persistence).await;
-                    } else {
-                        let _ = persistence.await;
-                    }
+                    let _ = InitializeBudget::observe(budget, persistence).await;
+                }
+                // Persistence can consume the remaining observation budget even
+                // when the handshake failed in time.
+                if let Some(budget) = budget {
+                    budget.ensure_open()?;
                 }
                 return Err(error);
             }
         };
 
-        if let Some(guard) = &mut initialize_session_guard {
-            guard.complete();
-        }
-
-        // Clear only after this worker's handshake succeeds. On failure or
+        // Clear only after the handshake and cache setup succeed. On failure or
         // caller cancellation, a delayed OAuth retry/bootstrap POST must retain
         // this attempt's deadline, never None or a later transport's budget.
         if let Some(initialize_deadline) = initialize_deadline {
@@ -1691,13 +1788,6 @@ impl RmcpClient {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
-
-        // rmcp 3 caches responses and serves stale ones on errors by default; keep
-        // every request fresh, as with rmcp 1.x.
-        service
-            .peer()
-            .set_response_cache_config(ClientCacheConfig::disabled())
-            .await;
 
         Ok((Arc::new(service), oauth_persistor))
     }
@@ -1971,18 +2061,25 @@ impl RmcpClient {
             .await
             .clone()
             .ok_or_else(|| anyhow!("MCP client cannot recover before initialize succeeds"))?;
-        let pending_transport = Self::create_pending_transport(&self.transport_recipe).await?;
+        let budget = initialize_context
+            .timeout
+            .map(InitializeBudget::from_timeout);
+        let pending_transport = InitializeBudget::observe(
+            budget,
+            Self::create_pending_transport(&self.transport_recipe),
+        )
+        .await??;
         let client_service = initialize_context.client_service.clone();
         let (service, oauth_persistor) = self
             .connect_pending_transport_with_initialize_retries(
                 pending_transport,
                 initialize_context.client_service,
-                initialize_context.timeout,
+                budget,
             )
             .await?;
 
         {
-            let mut guard = self.state.lock().await;
+            let mut guard = InitializeBudget::observe(budget, self.state.lock()).await?;
             if matches!(*guard, ClientState::Closed) {
                 return Err(anyhow!("MCP client is shut down"));
             }
@@ -1997,9 +2094,11 @@ impl RmcpClient {
         // tools/list_changed notification. The existing coalescing owner fills it.
         client_service.notify_session_changed().await;
 
-        if let Some(runtime) = oauth_persistor
-        {
-            runtime.persist_if_needed().await?;
+        if let Some(runtime) = oauth_persistor {
+            InitializeBudget::observe(budget, runtime.persist_if_needed()).await??;
+        }
+        if let Some(budget) = budget {
+            budget.ensure_open()?;
         }
 
         Ok(())

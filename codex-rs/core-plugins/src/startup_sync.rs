@@ -442,7 +442,22 @@ fn remove_stale_curated_repo_temp_dirs(parent: &Path, max_age: Duration) {
         }
     };
 
-    for entry in entries.flatten() {
+    let mut entry_error_logged = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                if !entry_error_logged {
+                    warn!(
+                        error = %err,
+                        parent = %parent.display(),
+                        "curated plugins stale cleanup skipped unreadable directory entries"
+                    );
+                    entry_error_logged = true;
+                }
+                continue;
+            }
+        };
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(err) => {
