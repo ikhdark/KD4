@@ -1,5 +1,12 @@
 # Rollout activity capture
 
+Large persisted `item_completed` command items can omit `stdout` when
+it is identical to `aggregated_output`. The item field
+`stdout_from_aggregated_output: true` is a same-record reference, not empty
+stdout. Older readers that do not know the alias still have the aggregate. Native readers restore the field; portable JSONL readers
+can resolve it without another file. Live events and distinct stream views
+are unchanged.
+
 Control intermediate activity records in the fork configuration:
 
 ```toml

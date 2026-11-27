@@ -72,7 +72,7 @@ pub enum FileSelector {
 }
 
 const FILE_SELECTOR_KINDS: &str =
-    "bytes, lines, search, section, json_pointer, structured, symbol or enclosing";
+    "bytes, lines, tail, search, section, json_pointer, structured, symbol or enclosing";
 
 /// Decodes as `#[serde(untagged)]` did (structure, then exact), but a
 /// rejection names the selector's own problem. Untagged decoding said only
@@ -96,15 +96,12 @@ impl<'de> Deserialize<'de> for FileSelector {
             Err(error) => error,
         };
         let exact = match ToolOutputSelector::deserialize(&value) {
-            Ok(ToolOutputSelector::Tail { .. }) => return Err(serde::de::Error::custom(
-                "tail is read_tool_output-only; capture this source with read_file, then tail its artifact_id",
-            )),
             Ok(selector) => return Ok(Self::Exact(selector)),
             Err(error) => error,
         };
         Err(serde::de::Error::custom(match kind {
             Some("symbol" | "enclosing") => structure.to_string(),
-            Some("bytes" | "lines" | "section" | "json_pointer" | "structured" | "search") => exact.to_string(),
+            Some("bytes" | "lines" | "tail" | "section" | "json_pointer" | "structured" | "search") => exact.to_string(),
             Some(other) => format!(
                 "unsupported read_file selector kind `{}`; use one of {FILE_SELECTOR_KINDS} ({{\"kind\":\"section\",\"id\":\"outline\"}} lists Rust/Python items or Markdown headings)",
                 other.chars().take(64).collect::<String>()

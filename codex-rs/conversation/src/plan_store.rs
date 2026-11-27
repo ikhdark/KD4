@@ -484,6 +484,9 @@ struct PlanState {
     lineage: PlanLineage,
     durably_published: bool,
     derived: std::sync::Arc<PlanDerived>,
+    /// The sampling step that made every change since its fence was captured,
+    /// each with a status-only effect on the checklist. Any other change clears it.
+    sampling_owner: Option<std::sync::Arc<()>>,
 }
 
 /// Derived views share the immutable owner revision, never durable authority.
@@ -497,8 +500,22 @@ struct PlanDerived {
 
 /// Host-only sampling fence. Every actual change detaches the immutable owner;
 /// identity also catches change-then-restore (ABA), without changing durable CAS.
+/// The second identity names the capturing step: two steps that sampled the
+/// same unchanged plan share the first and differ in this one.
 #[derive(Debug, Clone)]
-pub struct PlanSamplingRevision(std::sync::Arc<PlanDerived>);
+pub struct PlanSamplingRevision(std::sync::Arc<PlanDerived>, std::sync::Arc<()>);
+
+impl PlanSamplingRevision {
+    /// Whether both fences were captured by the same sampling step.
+    pub fn same_step(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.1, &other.1)
+    }
+
+    /// The same plan observation without the capturing step's identity.
+    pub fn without_step(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0), std::sync::Arc::new(()))
+    }
+}
 
 impl PlanState {
     fn revision(&self) -> &str {
@@ -922,7 +939,10 @@ impl StagedPlanUpdate<'_> {
 
 impl PlanStore {
     pub async fn sampling_revision(&self) -> PlanSamplingRevision {
-        PlanSamplingRevision(std::sync::Arc::clone(&self.current.lock().await.derived))
+        PlanSamplingRevision(
+            std::sync::Arc::clone(&self.current.lock().await.derived),
+            std::sync::Arc::new(()),
+        )
     }
 
     pub async fn publication_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -1021,6 +1041,7 @@ impl PlanStore {
                     lineage,
                     durably_published: false,
                     derived: Default::default(),
+                    sampling_owner: None,
                 }
             })
             .unwrap_or_default();
@@ -1060,6 +1081,13 @@ impl PlanStore {
         let unchanged_since_sampling = sampling_revision
             .as_ref()
             .is_some_and(|sampled| std::sync::Arc::ptr_eq(&sampled.0, &guard.derived));
+        // Status-only updates leave positions and step IDs where this sample
+        // read them, so its own earlier ones do not make its later status
+        // updates stale. Replacements and resolve keep the strict fence.
+        let own_status_updates_only = sampling_revision
+            .as_ref()
+            .zip(guard.sampling_owner.as_ref())
+            .is_some_and(|(sampled, owner)| std::sync::Arc::ptr_eq(&sampled.1, owner));
         let missing_revision =
             plan.is_some()
                 && guard.plan.is_some()
@@ -1097,8 +1125,9 @@ impl PlanStore {
                 statuses,
                 explanation.clone(),
                 // The fence that admits a replacement also proves the indexes
-                // and statuses this sample read are still current.
-                expected_revision.is_some() || unchanged_since_sampling,
+                // and statuses this sample read are still current; after its own
+                // status updates the sample knows every change made since.
+                expected_revision.is_some() || unchanged_since_sampling || own_status_updates_only,
                 expected_step_revisions.as_ref(),
                 &revision,
             )?)
@@ -1292,6 +1321,14 @@ impl PlanStore {
         if lineage_changed && update.effect == PlanUpdateEffect::NoOp {
             update.effect = PlanUpdateEffect::StructuralRevision;
         }
+        if !std::sync::Arc::ptr_eq(&current.derived, &guard.derived) {
+            current.sampling_owner = sampling_revision
+                .filter(|_| {
+                    update.effect == PlanUpdateEffect::StatusOnly
+                        && (unchanged_since_sampling || own_status_updates_only)
+                })
+                .map(|sampled| sampled.1);
+        }
         Ok(StagedPlanUpdate {
             current: guard,
             next: Some(current),
@@ -1366,11 +1403,11 @@ impl PlanStore {
             return Err("set must contain at least one status update".to_string());
         }
         // Positions change when the plan is revised; only a checked revision
-        // or an unchanged sampling fence proves an index refers to the plan
-        // the caller read.
+        // or a sampling fence that saw nothing but its own status updates
+        // proves an index refers to the plan the caller read.
         if !revision_checked && updates.iter().any(|update| update.index.is_some()) {
             return Err(format!(
-                "index-based status updates require expected_revision once the plan changed since this sampling step began; current revision is {revision}. Use step_id for stable addressing. When changing the status of a versioned step, also supply its current expected_step_revisions entry or expected_revision; an unchanged status may be idempotent. No changes were made."
+                "index-based status updates require expected_revision once the plan changed since this sampling step began, other than by this step's own status updates; current revision is {revision}. Use step_id for stable addressing. When changing the status of a versioned step, also supply its current expected_step_revisions entry or expected_revision; an unchanged status may be idempotent. No changes were made."
             ));
         }
         let mut seen = HashSet::new();

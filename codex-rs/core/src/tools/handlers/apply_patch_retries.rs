@@ -459,8 +459,15 @@ fn render_patch(hunks: &[Hunk], environment_id: Option<&str>, guards: &[FileRevi
         match hunk {
             Hunk::AddFile { path, contents } => {
                 text.push_str(&format!("*** Add File: {}\n", path.display()));
-                for line in contents.split_terminator('\n') {
-                    append_patch_line(&mut text, "+", line);
+                if !contents.is_empty() && !contents.ends_with('\n') {
+                    // Ordinary +lines always materialize a terminal LF. Keep the
+                    // admitted bytes distinct in both retry text and its identity.
+                    let encoded = serde_json::Value::String(contents.clone()).to_string();
+                    append_patch_line(&mut text, "@@ codex-text ", &encoded);
+                } else {
+                    for line in contents.split_terminator('\n') {
+                        append_patch_line(&mut text, "+", line);
+                    }
                 }
             }
             Hunk::DeleteFile { path } => {

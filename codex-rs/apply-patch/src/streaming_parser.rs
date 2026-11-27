@@ -48,7 +48,8 @@ enum StreamingParserMode {
     StartedPatch,
     GuardFile,
     AddFile,
-    DeleteFile,
+    // The hunk is complete; only another hunk or the end marker may follow.
+    HeaderOnly,
     UpdateFile {
         hunk_line_number: usize,
     },
@@ -149,7 +150,7 @@ impl StreamingPatchParser {
             self.state.hunks.push(DeleteFile {
                 path: PathBuf::from(path),
             });
-            self.state.mode = StreamingParserMode::DeleteFile;
+            self.state.mode = StreamingParserMode::HeaderOnly;
             return Ok(true);
         }
         if let Some(path) = trimmed.strip_prefix(UPDATE_FILE_MARKER) {
@@ -196,7 +197,7 @@ impl StreamingPatchParser {
             let line = std::mem::take(&mut self.line_buffer);
             self.line_number += 1;
             if line.trim() == END_PATCH_MARKER
-                && matches!(self.state.mode, StreamingParserMode::StartedPatch | StreamingParserMode::AddFile | StreamingParserMode::DeleteFile | StreamingParserMode::UpdateFile { .. })
+                && matches!(self.state.mode, StreamingParserMode::StartedPatch | StreamingParserMode::AddFile | StreamingParserMode::HeaderOnly | StreamingParserMode::UpdateFile { .. })
             {
                 self.ensure_update_hunk_is_not_empty(line.trim())?;
                 self.state.mode = StreamingParserMode::EndedPatch;
@@ -268,6 +269,17 @@ impl StreamingPatchParser {
                 if self.handle_hunk_headers_and_end_patch(trimmed)? {
                     return Ok(());
                 }
+                if let Some(encoded) = line.strip_prefix("@@ codex-text ")
+                    && let Some(AddFile { contents, .. }) = self.state.hunks.last_mut()
+                    && contents.is_empty()
+                {
+                    *contents = serde_json::from_str::<String>(encoded).map_err(|err| InvalidHunkError {
+                        message: format!("codex-text requires one JSON string: {err}"),
+                        line_number: self.line_number,
+                    })?;
+                    self.state.mode = StreamingParserMode::HeaderOnly;
+                    return Ok(());
+                }
                 if let Some(line_to_add) = line.strip_prefix('+')
                     && let Some(AddFile { contents, .. }) = self.state.hunks.last_mut()
                 {
@@ -282,7 +294,7 @@ impl StreamingPatchParser {
                     line_number: self.line_number,
                 })
             }
-            StreamingParserMode::DeleteFile => {
+            StreamingParserMode::HeaderOnly => {
                 if self.handle_hunk_headers_and_end_patch(trimmed)? {
                     return Ok(());
                 }

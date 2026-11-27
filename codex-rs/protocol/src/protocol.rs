@@ -5604,7 +5604,24 @@ impl<'de> Deserialize<'de> for RolloutLine {
         match version {
             0 => migrate_rollout_v0(fields).map_err(D::Error::custom)?,
             CURRENT_ROLLOUT_FORMAT_VERSION => {
-                reject_v0_fields_in_current_rollout(fields).map_err(D::Error::custom)?
+                reject_v0_fields_in_current_rollout(fields).map_err(D::Error::custom)?;
+                if let Some(item) = fields.get_mut("payload")
+                    .and_then(Value::as_object_mut)
+                    .filter(|payload| payload.get("type").and_then(Value::as_str) == Some("item_completed"))
+                    .and_then(|payload| payload.get_mut("item"))
+                    .and_then(Value::as_object_mut)
+                    && let Some(alias) = item.remove("stdout_from_aggregated_output")
+                {
+                    if alias != Value::Bool(true)
+                        || item.get("type").and_then(Value::as_str) != Some("CommandExecution")
+                        || item.contains_key("stdout")
+                    {
+                        return Err(D::Error::custom("invalid command stdout alias"));
+                    }
+                    let output = item.get("aggregated_output").and_then(Value::as_str)
+                        .ok_or_else(|| D::Error::custom("missing command stdout alias target"))?;
+                    item.insert("stdout".into(), Value::String(output.to_owned()));
+                }
             }
             _ => {
                 return Err(D::Error::custom(format!(

@@ -501,7 +501,58 @@ pub fn printed_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
             }));
         }
     }
+    if tool.namespace.is_none()
+        && matches!(tool.name.as_str(), "exec_command" | "write_stdin")
+        && raw["execution_state"] == "exited"
+        && raw["exit_code"] == 0
+        && raw["session_id"].is_null()
+        && raw["error"].is_null()
+        && raw["tool_failure"].is_null()
+        && let Some(object) = projected.as_object_mut()
+    {
+        // The standalone selector duplicates only the first part of the
+        // callable recovery recipe, which may cover several omitted ranges.
+        if let (Some(selector), Some(recovery)) =
+            (object.get("recovery_selector").filter(|value| value.is_object()), object.get("recovery"))
+            && recovery["tool"] == "read_tool_output"
+            && recovery.pointer("/arguments/artifact_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+            && recovery.pointer("/arguments/selectors")
+                .and_then(Value::as_array)
+                .and_then(|selectors| selectors.first()) == Some(selector)
+        {
+            object.shift_remove("recovery_selector");
+        }
+        compact_command_artifact_aliases(object);
+    }
     Some(projected)
+}
+
+fn compact_command_artifact_aliases(printed: &mut serde_json::Map<String, Value>) {
+    let Some(reference) = printed.get("output_reference") else {
+        return;
+    };
+    // Keep exact-range and bounded-tail recovery recipes independently.
+    if reference["capture_complete"] != true
+        || reference["retrieval_availability"] != "available"
+        || reference["missing_bytes"] != 0
+    {
+        return;
+    }
+    let repeated_id = reference["artifact_id"].as_str().is_some_and(|id| {
+        !id.is_empty() && printed.get("raw_output_artifact_id").and_then(Value::as_str) == Some(id)
+    });
+    if !repeated_id {
+        return;
+    }
+    let repeated_size = reference["retained_bytes"].as_u64().is_some_and(|bytes| {
+        printed.get("raw_output_artifact_bytes").and_then(Value::as_u64) == Some(bytes)
+    });
+    printed.shift_remove("raw_output_artifact_id");
+    if repeated_size {
+        printed.shift_remove("raw_output_artifact_bytes");
+    }
 }
 
 /// Remove only complete CSI SGR color sequences. Unknown controls and partial
@@ -551,21 +602,16 @@ fn is_complete_read(tool: &ToolName, raw: &Value) -> bool {
 /// source. Scripts keep the native value, and a partial or failed read prints in full.
 fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Value>) {
     printed.shift_remove("complete");
-    for key in ["file_complete", "retained_artifact_complete"] {
-        if raw[key] == true {
-            printed.shift_remove(key);
-        }
+    // Whole-file coverage is independent of selection success and stays explicit.
+    if raw["retained_artifact_complete"] == true {
+        printed.shift_remove("retained_artifact_complete");
     }
     if raw["environment_id"] == "local" {
         printed.shift_remove("environment_id");
     }
     if raw["file_complete"] == true {
         printed.shift_remove("canonical_bytes");
-    } else if raw["file_complete"] == false && raw.get("continuation").is_none_or(Value::is_null) {
-        // The caller selected this part; only a first page has more to continue into.
-        printed.shift_remove("file_complete");
     }
-    shorten_digest(printed, "source_sha256");
     // Recovered log text is the evidence here; read_file keeps the hash patches anchor on.
     if raw.get("source_sha256").is_none() {
         printed.shift_remove("canonical_sha256");
@@ -583,6 +629,19 @@ fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Valu
         compact_structured_row(row);
         compact_outline_row(row);
         // Hydrated search ranges resolve against their parent, so those rows stay as they are.
+        if raw["read_mode"] == "byte_ranges" {
+            // The requested end can be beyond EOF; complete selection
+            // does not then mean the entire requested interval was read.
+            if let (Some(selector), Some(actual)) = (row.get("selector"), row.get("canonical_range"))
+                && selector["kind"] == "bytes"
+                && actual.as_object().is_some_and(|fields| fields.len() == 2)
+                && actual["start"].is_u64() && actual["end"].is_u64()
+                && selector["start"] == actual["start"] && selector["end"] == actual["end"]
+            {
+                row.shift_remove("canonical_range");
+            }
+            continue;
+        }
         if row.get("text").is_none() {
             continue;
         }
@@ -636,19 +695,6 @@ fn compact_outline_row(row: &mut serde_json::Map<String, Value>) {
                 item.shift_remove(key);
             }
         }
-    }
-}
-
-/// Later cells type printed hashes into patches and read_file freshness checks, which take this
-/// 12-character form; scripts keep the whole digest.
-fn shorten_digest(object: &mut serde_json::Map<String, Value>, key: &str) {
-    if let Some(short) = object
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|digest| digest.len() == 64 && digest.is_ascii())
-        .map(|digest| digest[..12].to_string())
-    {
-        object.insert(key.into(), Value::String(short));
     }
 }
 
@@ -819,11 +865,26 @@ impl RoutineSuccess {
                         "stream_ranges",
                         "stream_chunks_complete",
                         "current_chunk_display_complete",
+                        "delivered_view_bytes",
+                        "rendered_view_bytes",
+                        "represented_producer_bytes",
+                        "produced_stdout_bytes",
                         "cumulative_streams_complete",
                         "retained_artifact_complete",
                         "process_exited",
                     ],
                 );
+                // A merged preview cannot establish pipe separation. When both
+                // pipes carry data, keep the fact that the native receipt has
+                // them separately, without printing their bodies twice.
+                if matches!(self, Self::Command)
+                    && raw["streams_complete"] == true
+                    && ["stdout", "stderr"].iter().all(|key| {
+                        raw.get(*key).and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+                    })
+                {
+                    printed.insert("streams_complete".into(), Value::Bool(true));
+                }
                 // Unusual launches keep their receipt, and so does a command that really failed:
                 // what ran can be the cause. A search miss or a confirmed cancellation did not.
                 let shutdown = raw.pointer("/session_capabilities/shutdown");
@@ -896,7 +957,13 @@ impl RoutineSuccess {
                     .get_mut("diagnostics")
                     .and_then(Value::as_array_mut)
                 {
-                    diagnostics.retain(|note| note["kind"] != "historical_reversal_check_skipped");
+                    diagnostics.retain_mut(|note| {
+                        if note["kind"] == "historical_reversal_check_skipped" {
+                            return false;
+                        }
+                        compact_unreported_patch_review(note);
+                        true
+                    });
                     no_diagnostics = diagnostics.is_empty();
                 }
                 if no_diagnostics {
@@ -918,7 +985,6 @@ impl RoutineSuccess {
                             change.get_mut("write_receipt").and_then(Value::as_object_mut)
                         {
                             receipt.shift_remove("bytes");
-                            shorten_digest(receipt, "sha256");
                         }
                     }
                 }
@@ -944,6 +1010,33 @@ impl RoutineSuccess {
         if printed.get("environment_id").is_some_and(|id| id == "local") {
             printed.shift_remove("environment_id");
         }
+    }
+}
+
+/// The unchanged v1 no-report placeholder contains no observed evidence.
+/// Preserve the unknown status; only the exact default shape can be compacted.
+fn compact_unreported_patch_review(note: &mut Value) {
+    static UNREPORTED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    if note["kind"] != "prior_evidence_review" || note["status"] != "not_reported" {
+        return;
+    }
+    let default = UNREPORTED.get_or_init(|| serde_json::json!({
+        "kind": "prior_evidence_review",
+        "schema_version": 1,
+        "advisory_only": true,
+        "status": "not_reported",
+        "consideration": "unknown",
+        "observation_boundary": "before_patch_dispatch",
+        "provider_delivery": "not_measured",
+        "applicability": "agent_reported_not_semantically_verified",
+        "coverage": "same-turn local full-read read_file snapshots only; other tools, prior turns and omitted reads remain unknown"
+    }));
+    if *note == *default {
+        *note = serde_json::json!({
+            "kind": "prior_evidence_review",
+            "status": "not_reported",
+            "consideration": "unknown",
+        });
     }
 }
 
@@ -1090,6 +1183,8 @@ fn plan_receipt(raw: &Value) -> Option<Value> {
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<serde_json::Map<_, _>>();
     let mut projected = projected;
+    // Retain literal scope here. Only request assembly can prove the
+    // original user input still precedes this result after compaction.
     if let Some(revisions) = raw["lineage"].get("step_revisions") {
         projected.insert("step_revisions".into(), revisions.clone());
     }

@@ -599,6 +599,8 @@ impl CodeModeService {
             .bind_cell_environments(cell_id, &step.environments);
         self.dispatch_broker
             .bind_cell_user_intent(cell_id, step.user_intent_epoch);
+        self.dispatch_broker
+            .bind_cell_plan_sampling(cell_id, step.plan_sampling_revision.clone());
     }
 
     pub(crate) fn record_cell_parent_call_id(&self, cell_id: &CellId, call_id: &str) {
@@ -1842,8 +1844,30 @@ pub(super) fn handle_runtime_response(
                     &into_function_call_output_content_items(content_items.clone()),
                 ),
             };
-            let directory = packet.nested_recovery.into_values()
-                .map(|entry| compact_emitted_packet_recovery(entry, &emitted))
+            let directory = packet.nested_recovery.into_iter()
+                .map(|(ordinal, entry)| {
+                    let entry = compact_emitted_packet_recovery(entry, &emitted);
+                    // A truncated successful read preview can repeat the exact
+                    // inline outcome below. Match identity AND bounded bytes;
+                    // a locator, partial directory, or failed read is not a copy.
+                    if let Some(preview) = packet.nested_results.iter().find(|r| r.ordinal == ordinal)
+                        && !preview.failed && preview.output_truncated
+                        && matches!(preview.tool_name.as_str(), "read_file" | "read_tool_output")
+                        && entry["call_id"].as_str() == Some(preview.call_id.as_str())
+                        && entry["tool_name"].as_str() == Some(preview.tool_name.as_str())
+                        && entry["failed"] == false
+                        && let Some(full) = entry.pointer("/outcome/result")
+                        && full["complete"] == true
+                        && !nested_presentations.contains_key(&ordinal)
+                        && bounded_serialized_json(full).0 == preview.output
+                    {
+                        nested_presentations.insert(ordinal, (
+                            serde_json::json!({"see":"nested_result_recovery_directory: matching call_id, outcome.result"}).to_string(),
+                            true,
+                        ));
+                    }
+                    entry
+                })
                 .collect::<Vec<_>>();
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
                 text: serde_json::json!({
@@ -3206,10 +3230,18 @@ fn retain_failed_dispatch_result(
     let service = &exec.session.services.code_mode_service;
     let result_bytes = usize::try_from(canonical.exact_bytes).unwrap_or(usize::MAX);
     let failure = &result["tool_failure"];
-    let exact_recovery_for_compact_display = failure["code"] == "invalid_syntax"
+    let syntax_refusal = failure["code"] == "invalid_syntax"
         && failure["execution_state"] == "not_started"
         && failure["effects"] == "none"
         && failure["details"]["handler_refusal"] == "powershell_syntax";
+    // A rejected plan transition already describes the conflict and remedy
+    // in its script error. Preserve the exact receipt without echoing it.
+    let settled_plan_refusal = tool_name == &ToolName::plain("update_plan")
+        && failure["code"] == "failed"
+        && failure["execution_state"] == "completed"
+        && failure["effects"] == "none"
+        && failure["live_operations"].as_array().is_some_and(Vec::is_empty);
+    let exact_recovery_for_compact_display = syntax_refusal || settled_plan_refusal;
     let inline = || serde_json::json!({
         "call_id":nested_call_id, "tool_name":tool_name.to_string(),
         "failed":true, "outcome":{"result":result},

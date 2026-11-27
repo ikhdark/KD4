@@ -9,6 +9,12 @@ use super::metadata::normalize_code_mode_identifier;
 /// alias name and its declaration cost more than the repetition they remove.
 const FRAGMENT_HOIST_MIN_BYTES: usize = 160;
 
+fn is_shared_fragment_candidate(rendered: &str) -> bool {
+    rendered.len() >= FRAGMENT_HOIST_MIN_BYTES
+        || rendered.starts_with("number /*")
+        || rendered.starts_with("(number | bigint) /*")
+}
+
 pub fn render_json_schema_to_typescript(schema: &JsonValue) -> String {
     render_json_schema_to_typescript_recording(schema).0
 }
@@ -55,10 +61,7 @@ pub fn hoist_shared_fragments(
     for fragment in fragments {
         for (hint, rendered) in &fragment.candidates {
             // Repeated numeric bounds can pay for an alias even when short.
-            if rendered.len() < FRAGMENT_HOIST_MIN_BYTES
-                && !rendered.starts_with("number /*")
-                && !rendered.starts_with("(number | bigint) /*")
-            {
+            if !is_shared_fragment_candidate(rendered) {
                 continue;
             }
             let slot = hints.entry(rendered.as_str()).or_default();
@@ -327,7 +330,7 @@ fn render_schema_position(
     // Children have already charged their rendered bytes. The enclosing shape
     // contains those same bytes; charge its final size once, not once per depth.
     budget.bytes = available_bytes.checked_sub(rendered.len()).ok_or(())?;
-    if rendered.len() >= FRAGMENT_HOIST_MIN_BYTES || rendered.starts_with("number /*") {
+    if is_shared_fragment_candidate(&rendered) {
         budget.fragments.push((None, rendered.clone()));
     }
     Ok(rendered)

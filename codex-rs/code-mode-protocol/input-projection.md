@@ -12,7 +12,7 @@ Use these opt-in recipes when the consumer needs a known subset of the result. T
 - **Unchanged results:** reuse the existing request-local reference when its owner is present. Another marker or a duplicate cache is not needed.
 
 - **Progress after resume:** use the native plan as the durable owner. When only current progress is needed, project the latest revision, stable step IDs, statuses and unresolved obligations rather than printing every intermediate plan. Retain the original requirement pins and evidence; a display summary is not completion authority. Guard a subsequent status change with the recovered revision and step identity. Do not create a second checkpoint file solely to save input tokens.
-  In [model request projection](../model-client/src/client_common/repeated_bodies.rs), a direct plan receipt can show `current_plan.steps_from` instead of repeating each `step`. Copy only the step text from the referenced earlier receipt in `step_ids` order; use the current statuses, revision and obligations. If no authenticated literal owner is included, step text remains inline. Native tool results and stored plans are unchanged.
+  In [model request projection](../model-client/src/client_common/repeated_bodies.rs), a direct plan receipt can show `current_plan.steps_from` instead of repeating each `step`. Copy only the step text from the referenced earlier receipt in `step_ids` order; use the current statuses, revision and obligations. If no authenticated literal owner is included, step text remains inline. A pin’s `text.already_in_context` can point to the earlier user text by content index and preview; read the input ID and SHA-256 from that pin’s `source`. If the selected request lacks the authenticated text, this reference is not produced. Native tool results and stored plans are unchanged.
 
 For independent literal queries with the same scope and options, pass the
 needles as one `search_files` array and read the per-pattern IDs and counts
@@ -60,6 +60,11 @@ enclosing `results` entry by its `body` index; the label still owns its selector
 and exact byte range. This is a display format only. A standalone row, mixed
 selection, or modified array does not use this shared format. For exact recovery,
 keep the native receipt or the display's own recovery arguments.
+
+For a complete live byte selection, a printed row can omit `canonical_range` when
+its bounds exactly match the requested byte selector. A read clipped at EOF
+keeps its actual bounds. This does not change the script receipt or turn a
+live byte read into a retained snapshot.
 
 When several rows come from one complete native line selection, keep the path,
 environment and source digest once, and attach each exact line by number. Do

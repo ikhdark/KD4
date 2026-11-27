@@ -20,6 +20,10 @@
   const patchHash = h => typeof h === "string" && /^[a-f0-9]{64}$/.test(h);
   const patchLimit = 64;
   const apply = body => tools.apply_patch("*** Begin Patch\n" + body + "*** End Patch");
+  const exactTextAdd = (path, content) => {
+    if (!content.isWellFormed()) throw new TypeError("expected well-formed UTF-8 text");
+    return "*** Add File: " + path + "\n@@ codex-text " + JSON.stringify(content) + "\n";
+  };
 
   Object.defineProperty(globalThis, "apply_literal_edits", {
     value: async function apply_literal_edits(from, to, files) {
@@ -39,9 +43,9 @@
   });
 
   Object.defineProperty(globalThis, "apply_patch_plan", {
-    value: async function apply_patch_plan({ update = [], add = [], guard = [] }) {
-      if (![update, add, guard].every(Array.isArray) || (!update.length && !add.length) ||
-          update.length + add.length + guard.length > patchLimit)
+    value: async function apply_patch_plan({ update = [], replace = [], add = [], guard = [] }) {
+      if (![update, replace, add, guard].every(Array.isArray) || (!update.length && !replace.length && !add.length) ||
+          update.length + replace.length + add.length + guard.length > patchLimit)
         throw new TypeError("expected 1–64 total edit and guard rows, including an edit");
       const tuple = (row, size) => {
         if (!Array.isArray(row) || row.length !== size || !patchPath(row[0]))
@@ -75,11 +79,142 @@
         previousHash = hash;
         return header + "@@ codex-range " + start + ":" + end + " sha256:" + hash + "\n" + plus(lines, false);
       });
-      const additions = Array.from(add, row => {
-        const [path, lines] = tuple(row, 2);
-        return "*** Add File: " + path + "\n" + plus(lines, true);
+      let literalPath, literalHash;
+      const replacements = Array.from(replace, row => {
+        const [path, hash, from, to, count = 1] = tuple(row, row?.length === 5 ? 5 : 4);
+        if (!patchHash(hash) || typeof from !== "string" || !from || typeof to !== "string" ||
+            !Number.isSafeInteger(count) || count < 0)
+          throw new TypeError("expected a full source hash, nonempty search text, replacement and nonnegative count");
+        const header = path === literalPath && hash === literalHash ? "" : "*** Update File: " + path + "\n";
+        literalPath = path;
+        literalHash = hash;
+        return header + "@@ codex-replace " + count + " sha256:" + hash +
+          "\n-" + JSON.stringify(from) + "\n+" + JSON.stringify(to) + "\n";
       });
-      return apply([...guards, ...updates, ...additions].join(""));
+      const additions = Array.from(add, row => {
+        const [path, content] = tuple(row, 2);
+        return typeof content === "string"
+          ? exactTextAdd(path, content)
+          : "*** Add File: " + path + "\n" + plus(content, true);
+      });
+      return apply([...guards, ...updates, ...replacements, ...additions].join(""));
+    },
+  });
+
+  // A live byte-range read has a revision and file size, not a snapshot SHA.
+  // Ask past EOF for the empty file: the native selector itself must be nonempty.
+  const smallBytes = expected => {
+    const limit = 64 * 1024;
+    if (typeof expected === "string" && expected.length <= limit && expected.isWellFormed())
+      expected = new TextEncoder().encode(expected);
+    if (!(expected instanceof Uint8Array) || expected.length > limit)
+      throw new TypeError("expected at most 64 KiB of UTF-8 text or bytes");
+    return expected;
+  };
+  const verifyBytes = async (path, bytes) => {
+    // Capture the expectation before yielding; callers may mutate a Uint8Array.
+    const size = bytes.length, end = Math.max(1, size);
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+    const r = await tools.read_file({ path, encoding: "hex", selectors: [{kind:"bytes", start:0, end}] });
+    const row = r.results?.[0];
+    if (r.read_mode !== "byte_ranges" || r.selector_coordinate_space !== "source_bytes" ||
+        r.complete !== true || r.file_bytes !== size || r.results?.length !== 1 ||
+        row?.status !== "ok" || row.complete !== true || row.canonical_range?.start !== 0 ||
+        row.canonical_range?.end !== size || row.exact_bytes !== size || row.data_hex !== hex)
+      throw Object.assign(new Error("complete file bytes did not match"), { evidence: r });
+    return { path: r.path, environment_id: r.environment_id, bytes: size, file_revision: r.file_revision,
+      ...(patchHash(r.readback_sha256) ? { readback_sha256: r.readback_sha256 } : {}) };
+  };
+  // A matched native absence probe observes the exact directory entry. A
+  // timeout, cancellation or error is unknown, never a proof of absence.
+  Object.defineProperty(globalThis, "verify_paths_absent", {
+    value: async function verify_paths_absent(paths, { timeout_ms = 1000 } = {}) {
+      if (!Array.isArray(paths) || paths.length < 1 || paths.length > 32 ||
+          !Array.from(paths).every(p => typeof p === "string" && p && !p.includes("\0")) ||
+          !Number.isSafeInteger(timeout_ms) || timeout_ms < 1 || timeout_ms > 300000)
+        throw new TypeError("expected 1–32 exact local paths and a bounded observation timeout");
+      const names = Array.from(paths);
+      const observed = await Promise.allSettled(names.map(async path => {
+        const result = await tools.inspect_files({operation: "wait",
+          arguments: {path, condition: "absent", timeout_ms}});
+        if (result.path !== path || result.status !== "matched")
+          throw Object.assign(new Error("absence not established for " + path + ": " + result.status), { evidence: result });
+        return result;
+      }));
+      const failed = observed.flatMap((r, i) => r.status === "rejected" ? [i] : []);
+      if (failed.length)
+        throw Object.assign(new Error("absence not established: " + failed.map(i => names[i]).join(", ")),
+          { evidence: observed });
+      return observed.map(r => r.value);
+    },
+  });
+  Object.defineProperty(globalThis, "verify_file_bytes", {
+    value: async (path, expected) => verifyBytes(path, smallBytes(expected)),
+  });
+  Object.defineProperty(globalThis, "create_verified_text", {
+    value: async function create_verified_text(path, content) {
+      if (!patchPath(path) || typeof content !== "string" || !content.isWellFormed())
+        throw new TypeError("expected a patch-safe path and well-formed UTF-8 text");
+      const bytes = smallBytes(content);
+      const patch = await apply(exactTextAdd(path, content));
+      if (patch.success !== true || patch.changes_exact !== true || patch.outcome !== "committed")
+        throw Object.assign(new Error("create was not confirmed; do not retry"), { evidence: patch });
+      try {
+        return { patch, readback: await verifyBytes(path, bytes) };
+      } catch (cause) {
+        throw Object.assign(new Error("create committed; readback did not verify it", { cause }),
+          { evidence: { patch, readback: cause.evidence ?? cause } });
+      }
+    },
+  });
+
+  Object.defineProperty(globalThis, "create_verified_texts", {
+    value: async function create_verified_texts(entries) {
+      if (!Array.isArray(entries) || !entries.length || entries.length > 32)
+        throw new TypeError("expected 1–32 [path, text] pairs");
+      const seen = new Set();
+      let total = 0;
+      const files = Array.from(entries, row => {
+        if (!Array.isArray(row) || row.length !== 2)
+          throw new TypeError("expected [path, text]");
+        const [path, content] = row;
+        if (!patchPath(path) || seen.has(path) || typeof content !== "string")
+          throw new TypeError("expected distinct patch paths and UTF-8 strings");
+        const bytes = smallBytes(content);
+        total += bytes.length;
+        if (total > 64 * 1024) throw new RangeError("batch exceeds 64 KiB");
+        seen.add(path);
+        return { path, bytes, hunk: exactTextAdd(path, content) };
+      });
+      const patch = await apply(files.map(file => file.hunk).join(""));
+      if (patch.success !== true || patch.changes_exact !== true || patch.outcome !== "committed")
+        throw Object.assign(new Error("batch create was not confirmed; do not retry"), { evidence: patch });
+      const settled = await Promise.allSettled(files.map(file => verifyBytes(file.path, file.bytes)));
+      const readbacks = settled.map((result, i) => result.status === "fulfilled"
+        ? { path: files[i].path, status: "verified", readback: result.value }
+        : { path: files[i].path, status: "unverified", error: result.reason?.message ?? String(result.reason),
+            evidence: result.reason?.evidence ?? result.reason?.tool_failure ?? result.reason });
+      if (readbacks.some(row => row.status !== "verified"))
+        throw Object.assign(new Error("batch committed; readbacks incomplete"), { evidence: { patch, readbacks } });
+      return { patch, readbacks };
+    },
+  });
+
+  // Never substitute a combined display, a decoded pipe or the last poll's suffix.
+  Object.defineProperty(globalThis, "save_command_streams", {
+    value: async function save_command_streams(r, stdoutPath, stderrPath) {
+      if (r?.execution_state !== "exited" || r.exit_code !== 0 || r.session_id != null ||
+          r.error != null || r.tool_failure != null || r.process_exited !== true ||
+          r.output_drained !== true || r.streams_complete !== true || r.output_encoding != null ||
+          r.stream_chunks_complete !== true || r.stream_ranges?.length !== 2)
+        throw new Error("expected a successful terminal receipt with complete separate UTF-8 streams");
+      const entries = [[stdoutPath, r.stdout], [stderrPath, r.stderr]];
+      for (const [i, [, content]] of entries.entries()) {
+        const range = r.stream_ranges[i];
+        if (typeof content !== "string" || range?.start !== 0 || range.end !== smallBytes(content).length)
+          throw new Error("stream text does not cover its original byte range");
+      }
+      return globalThis.create_verified_texts(entries);
     },
   });
 

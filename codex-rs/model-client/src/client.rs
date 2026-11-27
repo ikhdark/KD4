@@ -212,8 +212,6 @@ struct ProviderPhaseReceipt {
 struct ProviderObservations {
     version: u32,
     response_id: Option<String>,
-    response_service_tier: Option<String>,
-    response_service_tier_invalid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_diagnostics: Option<serde_json::Value>,
     prompt_cache_diagnostics_invalid: bool,
@@ -225,10 +223,6 @@ struct ProviderObservations {
     server_timing: Option<serde_json::Value>,
     server_timing_events: u64,
     server_timing_invalid: bool,
-    // Preserve the contributing labels BEFORE collapsing disagreement to unknown.
-    // Fixed-size per-attempt inventory; overflow remains explicit, never a pass.
-    service_tier_observations: Vec<ProviderTierObservation>,
-    service_tier_observations_dropped: u64,
     created_at: Option<f64>,
     completed_at: Option<f64>,
     invalid: bool,
@@ -244,15 +238,6 @@ struct ProviderObservations {
     reasoning_item_spans_invalid: bool,
     #[serde(skip)]
     reasoning_item_open_us: Option<u64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct ProviderTierObservation {
-    phase: &'static str,
-    at_us: u64,
-    response_id: Option<String>,
-    service_tier: Option<String>,
-    invalid: bool,
 }
 
 #[derive(Debug, Default)]
@@ -315,6 +300,7 @@ impl ModelAttemptClock {
         offsets.routing_hint_carrier = Some(carrier);
         offsets.routing_hint = hint
             .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or_default())
             .filter(|value| value.len() <= 256)
             .map(str::to_owned);
     }
@@ -385,32 +371,6 @@ impl ModelAttemptClock {
                 evidence.server_timing_invalid |= evidence.server_timing
                     .as_ref().is_some_and(|previous| previous != &timing);
                 evidence.server_timing.get_or_insert(timing);
-            }
-        }
-        if observation.response_service_tier.is_some() || observation.response_service_tier_invalid {
-            let invalid = observation.response_service_tier_invalid || observation.invalid_source_fields;
-            let id = observation.response_id.as_deref();
-            evidence.response_service_tier_invalid |= invalid || id.is_none()
-                || evidence.response_id.as_deref().is_some_and(|previous| Some(previous) != id)
-                || evidence.service_tier_observations.iter().any(|previous|
-                    previous.phase == observation.phase
-                        && previous.service_tier != observation.response_service_tier);
-            if !evidence.response_service_tier_invalid
-                && let Some(tier) = observation.response_service_tier.as_ref()
-                && (observation.phase == "completed" || evidence.response_service_tier.is_none())
-            {
-                evidence.response_service_tier = Some(tier.clone());
-            }
-            if evidence.service_tier_observations.len() < 16 {
-                evidence.service_tier_observations.push(ProviderTierObservation {
-                    phase: observation.phase, at_us: now_us,
-                    response_id: observation.response_id.clone(),
-                    service_tier: observation.response_service_tier.clone(),
-                    invalid: observation.response_service_tier_invalid || observation.invalid_source_fields,
-                });
-            } else {
-                evidence.service_tier_observations_dropped = evidence.service_tier_observations_dropped.saturating_add(1);
-                evidence.response_service_tier_invalid = true;
             }
         }
         if let Some(id) = observation.response_id {
@@ -760,8 +720,6 @@ struct ModelStreamDelivery {
     request_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_dialect: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_service_tier: Option<String>,
     /// `http_request` or `websocket_handshake`; with no `routing_hint`, that carrier sent none.
     #[serde(skip_serializing_if = "Option::is_none")]
     routing_hint_carrier: Option<&'static str>,
@@ -819,7 +777,6 @@ impl ModelStreamDeliveryObserver {
         identity: Option<ResponseAttemptIdentity>,
         clock: Option<ModelAttemptClock>,
         turn_timing: Option<Arc<TurnTimingState>>,
-        requested_service_tier: Option<String>,
     ) -> Self {
         Self {
             identity,
@@ -827,7 +784,6 @@ impl ModelStreamDeliveryObserver {
             turn_timing,
             summary: ModelStreamDelivery {
                 version: 1,
-                requested_service_tier,
                 clock_id: codex_protocol::timing::process_clock_domain_id(),
                 stall_threshold_us: 1_000_000,
                 payload_measurement_version: 1,
@@ -1805,7 +1761,6 @@ fn session_telemetry_for_request(
         }
     }
     session_telemetry.clone().with_inference_request(
-        request.service_tier.as_deref(),
         request
             .reasoning
             .as_ref()
@@ -1878,6 +1833,7 @@ struct ModelClientState {
     thread_id: ThreadId,
     provider: SharedModelProvider,
     auth_env_telemetry: AuthEnvTelemetry,
+    exec_cache_group: Option<Uuid>,
     session_source: SessionSource,
     originator: String,
     model_verbosity: Option<VerbosityConfig>,
@@ -2724,6 +2680,16 @@ impl ModelClient {
                 thread_id,
                 provider: model_provider,
                 auth_env_telemetry,
+                // Snapshot the opt-in once, for root exec jobs only. Keep the raw
+                // caller label out of metadata, headers, debug state and requests.
+                exec_cache_group: if matches!(session_source, SessionSource::Exec) {
+                    std::env::var("CODEX_EXEC_CACHE_GROUP")
+                        .ok()
+                        .filter(|group| !group.trim().is_empty())
+                        .map(|group| Uuid::new_v5(&Uuid::NAMESPACE_OID, group.trim().as_bytes()))
+                } else {
+                    None
+                },
                 session_source,
                 originator,
                 model_verbosity,
@@ -2832,8 +2798,14 @@ impl ModelClient {
         self
     }
 
-    fn prompt_cache_key(&self, metadata: &CodexResponsesMetadata) -> String {
-        metadata.prompt_cache_routing_id()
+    fn named_exec_cache_key(&self, metadata: &CodexResponsesMetadata) -> Option<String> {
+        if let Some(group) = self.state.exec_cache_group
+            && let Ok(installation) = Uuid::parse_str(&metadata.installation_id)
+            && !matches!(metadata.request_kind, Some(crate::responses_metadata::CodexResponsesRequestKind::Auxiliary))
+        {
+            return Some(Uuid::new_v5(&installation, group.as_bytes()).to_string());
+        }
+        None
     }
 
     /// Attach before cloning, so regular and compaction sessions share the
@@ -3280,6 +3252,7 @@ impl ModelClient {
         };
         let RequestSchemaCacheValue { tools, text } =
             self.request_schema_components(prompt, verbosity)?;
+        let named_cache_key = self.named_exec_cache_key(responses_metadata);
         let mut prefix = Vec::new();
         let (instructions, tools) = if model_info.use_responses_lite {
             if !prompt.base_instructions.text.is_empty() {
@@ -3293,11 +3266,17 @@ impl ModelClient {
                     internal_chat_message_metadata_passthrough: None,
                 });
             }
+            let tools_first = is_openai && named_cache_key.is_some() && !tools.is_empty() && !prefix.is_empty();
             prefix.push(ResponseItem::AdditionalTools {
                 id: None,
                 role: "developer".to_string(),
-                tools: tools.to_vec(),
+                tools,
             });
+            // Named exec batches may share a tool surface across policy revisions.
+            // Move only the schema envelope, never policy or history relative to messages.
+            if tools_first {
+                prefix.swap(0, 1);
+            }
             (String::new(), None)
         } else {
             (prompt.base_instructions.text.clone(), Some(tools))
@@ -3315,7 +3294,7 @@ impl ModelClient {
         if self.state.provider.info().request_output_logprobs == Some(true) && !model_info.use_responses_lite {
             include.push("message.output_text.logprobs".to_string());
         }
-        let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
+        let prompt_cache_key = Some(named_cache_key.unwrap_or_else(|| responses_metadata.prompt_cache_routing_id()));
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
@@ -6424,7 +6403,6 @@ where
                 terminal_delivery_identity.clone(),
                 attempt_clock.clone(),
                 delivery_turn_timing,
-                session_telemetry.requested_service_tier().map(str::to_owned),
             );
             let mut items_added: Vec<ResponseItem> = Vec::new();
             // Assign missing call item IDs before history and the turn receive

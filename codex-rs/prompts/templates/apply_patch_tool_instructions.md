@@ -1,6 +1,6 @@
 Operation headers:
 
-- `*** Add File: <path>`: create a file; prefix every content line with `+`.
+- `*** Add File: <path>`: create a file; prefix every content line with `+`. For exact UTF-8 text, use a single body line `@@ codex-text <JSON string>` instead. It preserves CRLF, BOM and final-newline state; the same create-only rule applies.
 - `*** Delete File: <path>`: delete a file; no body follows.
 - `*** Update File: <path>`: patch a file with one or more `@@` hunks, or rename it without hunks.
 - Put `*** Move to: <new path>` immediately after an Update header to rename it.

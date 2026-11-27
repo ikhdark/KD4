@@ -40,7 +40,7 @@ pub(crate) fn tool_output_selector_schema() -> JsonSchema {
 }
 
 pub(crate) fn file_selector_schema() -> JsonSchema {
-    let mut schema = selector_schema();
+    let mut schema = tool_output_selector_schema();
     if let Some(variants) = &mut schema.one_of
         && let Some(section) = variants.iter_mut().find(|variant| {
             variant

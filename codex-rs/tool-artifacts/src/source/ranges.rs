@@ -5,6 +5,7 @@ use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FileSystemSandboxContext;
 use codex_utils_path_uri::PathUri;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::structure::FileSelector;
 use crate::ToolOutputSelector;
@@ -79,6 +80,7 @@ pub async fn read_ranges(
     let mut remaining = args.max_bytes;
     let mut revision = args.if_file_revision.map(str::to_owned);
     let mut file_bytes = None;
+    let mut readback_sha256 = None;
     let mut results = Vec::new();
     let mut pending = Vec::new();
     let mut cursor = 0;
@@ -129,6 +131,12 @@ pub async fn read_ranges(
             let selected_end = end.min(file_bytes.expect("range acquired")).max(start);
             let complete = delivered_end == selected_end;
             remaining -= len;
+            // Hash one delivered original-byte body, not a union of live reads.
+            if args.encoding.is_some() && requested.len() == 1 && start == 0
+                && complete && file_bytes == Some(delivered_end)
+            {
+                readback_sha256 = Some(hex::encode(Sha256::digest(bytes)));
+            }
             let mut result = json!({
                 "selector":{"kind":"bytes", "start":start, "end":end},
                 "selector_index":selector_index,
@@ -172,8 +180,11 @@ pub async fn read_ranges(
         "selection_status":if complete { "complete" } else { "partial" },
         "file_complete":false, "retained_bytes":0, "retained_artifact_complete":false,
         "results":results,
-        "delivery_note":"Only the returned byte ranges were acquired. No full-file hash, line count or snapshot is available; file_revision is an opened-object metadata revision, not a content hash. Further pages reread the current file and refuse a changed revision.",
+        "delivery_note":"Live byte ranges, not a retained snapshot. file_revision guards later pages against metadata changes; it is not a content hash.",
     });
+    if let Some(hash) = readback_sha256 {
+        output["readback_sha256"] = json!(hash);
+    }
     if let Some(encoding) = args.encoding {
         output["encoding"] = json!(encoding);
     }

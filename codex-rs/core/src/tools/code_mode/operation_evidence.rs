@@ -44,6 +44,7 @@ pub(super) fn publish(
         "runtime_tool_call_id": runtime_tool_call_id,
         "tool_name": tool_name.to_string(),
     });
+    let tool_is_launch = tool_name.namespace.is_none() && tool_name.name == "exec_command";
     let session = Arc::clone(&exec.session);
     let turn = Arc::clone(&exec.turn);
     let call_id = call_id.to_string();
@@ -61,6 +62,15 @@ pub(super) fn publish(
             let text = if text.len() <= 64 * 1024 {
                 text
             } else {
+                // Keep the measured initial view attributable without requiring an
+                // exporter to reopen the entire (possibly very large) envelope.
+                // This is not the stdout artifact's retained or consumed size.
+                let command_view = (tool_is_launch && evidence["result"]["delivered_view_bytes"].is_u64()
+                    && evidence["result"]["raw_output_artifact_id"].is_string())
+                    .then(|| serde_json::json!({
+                        "output_artifact_id": evidence["result"]["raw_output_artifact_id"],
+                        "delivered_view_bytes": evidence["result"]["delivered_view_bytes"],
+                    }));
                 let canonical = codex_tools::CanonicalToolResult::json(evidence);
                 // A producer's stdout artifact is not the native JSON receipt.
                 // Retain this exact envelope with the existing artifact owner.
@@ -74,13 +84,17 @@ pub(super) fn publish(
                     session.register_tool_artifact_origin(
                         id.clone(), call_id.clone(), canonical.exact_bytes, canonical.sha256.clone(),
                     ).await;
-                    serde_json::json!({"evidence_reference": {
+                    let mut reference = serde_json::json!({"evidence_reference": {
                         "artifact_id": id, "canonical_sha256": canonical.sha256,
                         "canonical_bytes": canonical.exact_bytes,
                         "recovery": {"tool": "read_tool_output", "arguments": {
                             "artifact_id": id, "selectors": [{"kind": "bytes", "start": 0, "end": canonical.exact_bytes}],
                         }},
-                    }})
+                    }});
+                    if let Some(view) = command_view {
+                        reference["command_view"] = view;
+                    }
+                    reference
                 } else {
                     // Retention failure must not manufacture a successful
                     // receipt or leave an unresolvable reference in the export.

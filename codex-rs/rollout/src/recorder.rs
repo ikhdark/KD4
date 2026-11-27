@@ -2919,7 +2919,25 @@ impl<'a> RolloutLineRef<'a> {
     }
 
     fn write_jsonl(&self, mut writer: impl Write) -> std::io::Result<()> {
-        serde_json::to_writer(&mut writer, self)?;
+        if let RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ItemCompleted(event)) =
+            self.item
+            && let codex_protocol::items::TurnItem::CommandExecution(command) = &event.item
+            && command.stdout.as_ref().is_some_and(|s| s.len() >= crate::payload_artifact::INLINE_BYTES)
+            && command.stdout == command.aggregated_output
+        {
+            // Keep the aggregate for raw readers; only the rollout projection
+            // omits the redundant stdout field.
+            let mut value = serde_json::to_value(self)?;
+            let item = value.pointer_mut("/payload/item").and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| IoError::other("missing command completion item"))?;
+            if item.remove("stdout").is_none() {
+                return Err(IoError::other("command completion did not serialize stdout"));
+            }
+            item.insert("stdout_from_aggregated_output".into(), true.into());
+            serde_json::to_writer(&mut writer, &value)?;
+        } else {
+            serde_json::to_writer(&mut writer, self)?;
+        }
         writer.write_all(b"\n")
     }
 }

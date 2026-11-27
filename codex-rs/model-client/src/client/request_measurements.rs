@@ -38,6 +38,17 @@ use crate::client_common::ResponseAttemptIdentity;
 const MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES: i64 = 256;
 pub(super) const MATCHED_TASK_CACHE_COVERAGE_BASELINE_BPS: u64 = 8_500;
 
+fn embedded_base_index(request: &ResponsesApiRequest, base: &str) -> Option<usize> {
+    if base.is_empty() || !request.instructions.is_empty() {
+        return None;
+    }
+    request.input.prepended_items().iter().position(|item| {
+        matches!(item, ResponseItem::Message { role, content, .. }
+            if role == "developer" && matches!(content.as_slice(),
+                [ContentItem::InputText { text }] if text == base))
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct ModelRequestMeasurements {
     pub(super) tool_token_count: i64,
@@ -381,28 +392,11 @@ impl ModelRequestMeasurements {
             Some(bytes) => bytes,
             None => serialized_len_cancellable(request, cancellation)?,
         };
-        let measurement_provenance =
-            if base_instructions.is_empty() || !request.instructions.is_empty() {
-                provenance.clone()
-            } else if request.input.first().is_some_and(|item| {
-                matches!(
-                    item,
-                    ResponseItem::Message { role, content, .. }
-                        if role == "developer"
-                            && matches!(
-                                content.as_slice(),
-                                [ContentItem::InputText { text }] if text == base_instructions
-                            )
-                )
-            }) {
-                provenance.with_response_item_category(
-                    &request.input,
-                    0,
-                    PromptContextCategory::BaseSystem,
-                )
-            } else {
-                provenance.clone()
-            };
+        let measurement_provenance = if let Some(index) = embedded_base_index(request, base_instructions) {
+            provenance.with_response_item_category(&request.input, index, PromptContextCategory::BaseSystem)
+        } else {
+            provenance.clone()
+        };
         let mut context =
             PromptContextBreakdown::from_response_items(&request.input, &measurement_provenance)?;
         ensure_measurement_not_cancelled(cancellation)?;
@@ -471,20 +465,7 @@ impl ModelRequestMeasurements {
                 "encoded transport request is an incremental projection",
             )));
         }
-        let embedded_base_index = (!base_instructions.is_empty()
-            && request.instructions.is_empty()
-            && request.input.first().is_some_and(|item| {
-                matches!(
-                    item,
-                    ResponseItem::Message { role, content, .. }
-                        if role == "developer"
-                            && matches!(
-                                content.as_slice(),
-                                [ContentItem::InputText { text }] if text == base_instructions
-                            )
-                )
-            }))
-        .then_some(0);
+        let embedded_base_index = embedded_base_index(request, base_instructions);
         let mut context = PromptContextBreakdown::from_serialized_response_items(
             &request.input,
             &encoded.input,
@@ -708,6 +689,8 @@ impl ModelRequestMeasurements {
                 && previous.ordered_fixed_hashes == ordered_fixed_hashes
                 && self.fixed_prefix_items_changed == Some(false)
         });
+        // A routing change still invalidates reuse eligibility; do not publish the tier dimension.
+        self.changed_request_settings.retain(|field| *field != "service_tier");
         self.reusable_prompt_estimated_tokens = baseline
             .as_ref()
             .filter(|_| {
@@ -824,8 +807,8 @@ fn measure_input_tool_schemas(
     let mut measured = Vec::new();
     for (item_index, item) in items.iter().enumerate() {
         let tools = match item {
-            ResponseItem::AdditionalTools { tools, .. }
-            | ResponseItem::ToolSearchOutput { tools, .. } => tools,
+            ResponseItem::AdditionalTools { tools, .. } => tools.as_ref(),
+            ResponseItem::ToolSearchOutput { tools, .. } => tools.as_slice(),
             _ => continue,
         };
         ensure_measurement_not_cancelled(cancellation)?;

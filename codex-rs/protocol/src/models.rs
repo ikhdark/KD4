@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::data_url_from_bytes;
@@ -974,7 +975,7 @@ pub enum ResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ResponseItemId>,
         role: String,
-        tools: Vec<serde_json::Value>,
+        tools: Arc<[serde_json::Value]>,
     },
     Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]

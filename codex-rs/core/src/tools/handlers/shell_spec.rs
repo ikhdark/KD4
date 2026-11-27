@@ -314,6 +314,10 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
             JsonSchema::string(Some("Exact creation identity from the originating session_capabilities.incarnation. Required with session_id for polling, input, and termination; legacy numeric-only handles are rejected.".into())),
         ),
         (
+            "acknowledge_only".to_string(),
+            JsonSchema::boolean(Some("For nonempty input to piped stdin, return after the write without waiting for child output. yield_time_ms still bounds delivery. This is not EOF, exit, or proof that the child consumed input; check the interaction error before closing stdin separately.".to_string())),
+        ),
+        (
             "wait_for_output".to_string(),
             JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Defaults to true when chars is empty, yield_time_ms is omitted, and terminate and close_stdin are false; false preserves bounded polling. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
         ),
@@ -618,6 +622,10 @@ fn unified_exec_output_schema() -> Value {
             },
             "output_complete": { "type": "boolean" },
             "output_reduced": { "type": "boolean" },
+            "delivered_view_bytes": { "type": "integer", "minimum": 0, "description": "Verbatim UTF-8 bytes in this receipt's output view after CRLF normalization, excluding generated notices. Not retained or cumulative bytes, or proof of model consumption. Absent when not established." },
+            "rendered_view_bytes": { "type": "integer", "minimum": 0, "description": "UTF-8 size of this receipt's output field including generated notices; independent of separate stream delivery." },
+            "represented_producer_bytes": { "type": "integer", "minimum": 0, "description": "Unique original merged-output bytes represented in this receipt's output field, before CRLF normalization and excluding generated notices. Not the retained byte count or proof of model consumption. Absent when projection cannot be mapped exactly." },
+            "produced_stdout_bytes": { "type": "integer", "minimum": 0, "description": "Total stdout bytes for the invocation when terminal separate pipes were captured exactly. Not a poll delta." },
             "original_token_count_is_approximate": { "type": "boolean" },
             "raw_output_artifact_retention_limit_hit": { "type": ["boolean", "null"], "description": "Null when a historical receipt does not establish capture-retention limits." },
             "raw_output_artifact_retention_limit_reason": { "type": "string" },
@@ -847,7 +855,7 @@ pub(crate) fn unified_exec_eager_output_schema() -> Value {
     });
     // Share the authoritative lifecycle field schemas, not the full result union.
     let full = unified_exec_output_schema();
-    for field in ["execution_state", "process_exited", "error"] {
+    for field in ["execution_state", "process_exited", "error", "output_drained", "delivered_view_bytes", "produced_stdout_bytes"] {
         schema["$defs"]["ExecCommandResult"]["properties"][field] =
             full["properties"][field].clone();
     }
@@ -925,7 +933,7 @@ pub(crate) fn eager_exec_command_description(windows_environment: bool) -> Strin
         ""
     };
     format!(
-        "Runs an executable through `program`/`args`, or explicit shell source through `cmd` or `script_body`, and returns when it finishes; one that outlives its wait returns a live session_id instead. A silence observation can return earlier: ordinary commands default to 60000 ms without stdout/stderr; recognized validation commands disable that default. This observation does not terminate the process. Do not restart a command while it is live or its effects are uncertain.\nWith a live session_id: `await await_command(r)` collects it to completion. Otherwise `await tools.write_stdin({{session_id:r.session_id, incarnation:r.session_capabilities.incarnation, ...}})`: chars sends input, empty chars with yield_time_ms polls, terminate:true requests owned cancellation (shutdown_confirmed is the owner disposition, not proof of descendant cleanup; see write_stdin's terminate argument), and event_filter:{{contains:[\"READY\"],timeout_ms:5000}} waits for a literal. In event_filter mode omit input, yield and output-budget options; inspect subscription_end, exit_status, events, history_complete and output_cursor, not output/exit_code. A subscription timeout does not settle the command. Collect final output with ordinary write_stdin. Stop ordinary polling when a result has no session_id.\nSearch: read a known path directly. Find unknown filenames with `rg --files <literal-root> --glob '<pattern>'`, then use the returned paths; `rg -l` lists matching files and scoped `rg -n` shows matches. rg skips hidden and ignored files unless told otherwise; exit 1 means no matches, 2 a failed search. Prefer read_file selectors over shell paging.\nFilesystem safety: keep destructive operations in one shell, resolve recursive delete or move targets inside the intended directory first, and avoid unresolved variables or globs.{windows}\nThis covers launches, polling, readiness, cancellation and resume with no contract lookup; tty, pipe_stdin, login and stall_timeout_ms: `resolve_tool(\"exec_command\").section(\"arguments\")`."
+        "Runs an executable through `program`/`args`, or explicit shell source through `cmd` or `script_body`, and returns when it finishes; one that outlives its wait returns a live session_id instead. A silence observation can return earlier: ordinary commands default to 60000 ms without stdout/stderr; recognized validation commands disable that default. This observation does not terminate the process. Do not restart a command while it is live or its effects are uncertain.\nWith a live session_id: `await await_command(r)` collects it to completion. Otherwise `await tools.write_stdin({{session_id:r.session_id, incarnation:r.session_capabilities.incarnation, ...}})`: chars sends input, empty chars with yield_time_ms polls, terminate:true requests owned cancellation (shutdown_confirmed is the owner disposition, not proof of descendant cleanup; see write_stdin section `shutdown`), and event_filter:{{contains:[\"READY\"],timeout_ms:5000}} waits for a literal. In event_filter mode omit input, yield and output-budget options; inspect subscription_end, exit_status, events, history_complete and output_cursor, not output/exit_code. A subscription timeout does not settle the command. Collect final output with ordinary write_stdin. Stop ordinary polling when a result has no session_id.\nSearch: read a known path directly. Find unknown filenames with `rg --files <literal-root> --glob '<pattern>'`, then use the returned paths; `rg -l` lists matching files and scoped `rg -n` shows matches. rg skips hidden and ignored files unless told otherwise; exit 1 means no matches, 2 a failed search. Prefer read_file selectors over shell paging.\nFilesystem safety: keep destructive operations in one shell, resolve recursive delete or move targets inside the intended directory first, and avoid unresolved variables or globs.{windows}\nThis covers launches, polling, readiness, cancellation and resume with no contract lookup; for piped input launch with pipe_stdin:true and a short yield, send chars with stdin capability (use acknowledge_only:true if output requires EOF), then close separately with close_stdin:true and empty chars on the same close-capable handle (details: `piped_input` / `pipe_eof`). For observation-only waits or status, see write_stdin sections `event_filter` / `event_result` and `status_only` / `status_result`; tty, login and stall_timeout_ms: `resolve_tool(\"exec_command\").section(\"arguments\")`."
     )
 }
 

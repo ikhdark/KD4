@@ -17,7 +17,6 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use serde::Serialize;
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::client::X_CODEX_INSTALLATION_ID_HEADER;
 use crate::client::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -25,11 +24,6 @@ use crate::client::X_CODEX_TURN_METADATA_HEADER;
 use crate::client::X_CODEX_WINDOW_ID_HEADER;
 use crate::client::X_OPENAI_SUBAGENT_HEADER;
 use codex_git_utils::GitWorkspaceMetadata;
-
-/// Installation-wide prompt-cache buckets share reusable prefixes while spreading traffic.
-/// Eight is the current policy, not a measured provider overload threshold or an established
-/// optimum; modeled key-load scenarios do not establish cache residency or actual savings.
-const PROMPT_CACHE_BUCKETS: u8 = 8;
 
 pub(crate) const INSTALLATION_ID_KEY: &str = "installation_id";
 pub(crate) const SESSION_ID_KEY: &str = "session_id";
@@ -199,20 +193,12 @@ impl CodexResponsesMetadata {
         self.session_id.clone()
     }
 
-    /// Prompt-cache routing identity, sent as `prompt_cache_key`. Shared installation
-    /// buckets aim to reuse common instructions/tools without concentrating all traffic
-    /// on one key. This routing policy establishes neither provider cache residency nor
-    /// miss causes, an overload threshold, or guaranteed reuse. Each session picks a
-    /// bucket and its agent tree follows it. Requests without an installation identity,
-    /// such as auxiliary work, keep their own session.
+    /// By default, `prompt_cache_key` follows the caller's session, including its agent tree.
+    /// Independent sessions no longer share installation buckets. This removes
+    /// client-side key contention; it does not establish why the provider missed
+    /// any particular request or guarantee a warm first request.
     pub(crate) fn prompt_cache_routing_id(&self) -> String {
-        if self.installation_id.is_empty() {
-            return self.session_id.clone();
-        }
-        let session = Uuid::new_v5(&Uuid::NAMESPACE_OID, self.session_id.as_bytes());
-        let bucket = session.as_bytes()[0] % PROMPT_CACHE_BUCKETS;
-        let identity = format!("{}:{bucket}", self.installation_id);
-        Uuid::new_v5(&Uuid::NAMESPACE_OID, identity.as_bytes()).to_string()
+        self.session_id.clone()
     }
 
     /// Auxiliary work has one durable attempt identity, not a synthetic coding turn.

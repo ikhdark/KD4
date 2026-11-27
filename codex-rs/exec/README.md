@@ -2,6 +2,24 @@
 
 See [the CLI definition](src/cli.rs) for the switches accepted by `codex exec`.
 
+## Named prompt-cache routing
+
+For a series of independent `codex exec` jobs with similar prompts, set
+`CODEX_EXEC_CACHE_GROUP` to the same nonempty name in their launch environment.
+For example, in PowerShell: `$env:CODEX_EXEC_CACHE_GROUP = 'nightly-review'`.
+Use different names for unrelated or separately scheduled job streams. Remove the
+variable afterward with `Remove-Item Env:CODEX_EXEC_CACHE_GROUP` to restore the
+default for later launches.
+
+The name selects a routing hint, not a stored conversation. Only an opaque,
+installation-scoped key is sent. Session IDs and request histories stay separate.
+Unset or blank names retain per-session routing; interactive clients, spawned
+agents and auxiliary requests do not opt in. Identical prefixes can still miss
+the provider cache, and concurrent traffic in one group may contend.
+On OpenAI Responses Lite, a named group puts nonempty tool declarations before the base
+policy, so editing policy need not invalidate an unchanged tool prefix. Jobs with
+frequently changing tool declarations may do better with default session routing.
+
 ## Single-phase verification output
 
 Use `codex exec verify` when the caller already knows the phase and needs one

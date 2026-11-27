@@ -2408,8 +2408,8 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
             .saturating_add(text_bytes(call_id))
             .saturating_add(text_bytes(name.as_deref().unwrap_or_default())),
         // Preserve syntax for structured payloads, but not transport envelopes or escaping.
-        ResponseItem::AdditionalTools { tools, .. }
-        | ResponseItem::ToolSearchOutput { tools, .. } => json_content_bytes(tools),
+        ResponseItem::AdditionalTools { tools, .. } => json_content_bytes(tools.as_ref()),
+        ResponseItem::ToolSearchOutput { tools, .. } => json_content_bytes(tools),
         ResponseItem::ToolSearchCall { arguments, .. } => json_content_bytes(arguments),
         ResponseItem::LocalShellCall { action, .. } => json_content_bytes(action),
         ResponseItem::WebSearchCall { action, .. } => {

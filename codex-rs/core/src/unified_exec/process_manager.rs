@@ -1645,6 +1645,11 @@ impl UnifiedExecProcessManager {
         if let Some(response) = self.process_store.lock().await.finished_response(&request) {
             return response;
         }
+        if request.acknowledge_only && prepared_handles.tty {
+            return Err(UnifiedExecError::process_failed(
+                "acknowledge_only requires piped stdin, not a terminal; input was not delivered".into(),
+            ));
+        }
         if request.close_stdin && prepared_handles.tty {
             return Err(UnifiedExecError::CloseStdin {
                 message: "terminal input cannot be half-closed; use pipe_stdin=true with tty=false, not Ctrl-D".into(),
@@ -1788,6 +1793,14 @@ impl UnifiedExecProcessManager {
             }
         }
 
+        // The write still used the full bounded delivery deadline. Do not
+        // wait for a response after delivery when the caller will send EOF.
+        let (deadline, collection_bound) = if request.acknowledge_only {
+            let now = Instant::now();
+            (now, Some(now))
+        } else {
+            (deadline, poll_bound)
+        };
         let collected = Self::collect_output_until_deadline_with_quiet_yield(
             &output_buffer,
             &output_notify,
@@ -1796,7 +1809,7 @@ impl UnifiedExecProcessManager {
             &cancellation_token,
             pause_state,
             deadline,
-            poll_bound,
+            collection_bound,
             // Validation polls continue through progress bursts even in
             // until-output mode, bounded by exit, handoff, or the deadline.
             (!input_operation
@@ -2110,7 +2123,7 @@ impl UnifiedExecProcessManager {
             output_ranges: None,
             process_output: None,
             environment_receipt: handles.process.environment_receipt(),
-            error: None,
+            error: request.acknowledge_only.then(|| "stdin was not written before the interaction deadline".into()),
             validation: handles.process.validation(),
             event_call_id: handles.call_id.clone(),
             chunk_id: generate_chunk_id(),
@@ -3370,6 +3383,7 @@ impl UnifiedExecProcessManager {
                 process_id,
                 input: "",
                 close_stdin: false,
+                acknowledge_only: false,
                 yield_time_ms: MIN_YIELD_TIME_MS,
                 max_output_tokens: Some(max_output_tokens),
                 truncation_policy,

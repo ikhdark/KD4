@@ -58,7 +58,7 @@ pub(crate) struct ReadStatusHandler;
 /// resolve_tool keeps the complete contract, including paging and encoding detail.
 pub(crate) fn eager_read_file_description() -> String {
     format!(
-        "Read a file without shell quoting. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function, and do not print a data file that a command will process: sample it with a structured selector if its shape is unknown. Symbol, enclosing and search with enclosing:true support Rust (.rs) and Python (.py); section outline/item IDs also support Markdown; for other languages use fixed-string search or line ranges. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges. A complete inline read may have no retained artifact; that is not a read failure. Text snapshots are limited to {MAX_FILE_MIB} MiB; larger files take bytes selectors, and encoding:hex|base64 returns raw bytes. Pass a skill: locator to read its SKILL.md. Large-file paging, binary, UTF-16, HTML and unsupported-text detail: `resolve_tool(\"read_file\").section(\"details\")`.\n\nresults[] is normalized, not request-ordered: match rows by their echoed selector, and sort resolved ranges before multi-range patches. A print omits what only restates success and shortens source_sha256 to the 12 characters that patches and if_source_hash take, so no complete or status means a complete selection, and file_complete:false means a first page with more to read. Script values keep every field: path, total_lines, source_sha256, canonical_bytes, complete, file_complete, retained_artifact_complete, results[]{{selector,status,complete,canonical_range,text|value|data_hex|data_base64}} and, when partial, artifact_id, continuation and page_selectors.",
+        "Read a file without shell quoting. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Use lines for known ranges and tail for the end of a text snapshot. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function, and do not print a data file that a command will process: sample it with a structured selector if its shape is unknown. Symbol, enclosing and search with enclosing:true support Rust (.rs) and Python (.py); section outline/item IDs also support Markdown; for other languages use fixed-string search or line ranges. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges. A complete inline read may have no retained artifact; that is not a read failure. Text snapshots are limited to {MAX_FILE_MIB} MiB; larger files take bytes selectors, and encoding:hex|base64 returns raw bytes. Pass a skill: locator to read its SKILL.md. For raw filesystem bytes use `resolve_tool(\"read_file\").section(\"raw_byte_ranges\")`; for paging, UTF-16, HTML and unsupported text see `section(\"details\")`.\n\nresults[] is normalized, not request-ordered: match rows by their echoed selector, and sort resolved ranges before multi-range patches. A print keeps the full source_sha256 and omits what only restates success, so no complete or status means a complete selection, and file_complete distinguishes whole-file from bounded reads; follow continuation only when provided. Script values keep every field: path, total_lines, source_sha256, canonical_bytes, complete, file_complete, retained_artifact_complete, results[]{{selector,status,complete,canonical_range,exact_bytes,text|value|data_hex|data_base64}} and, when partial, artifact_id, continuation and page_selectors. A UTF-8 byte selection without an explicit encoding returns text and its byte length in exact_bytes; a single complete original-byte selection also returns readback_sha256. Hex/base64 results require the matching encoding option.",
     )
 }
 
@@ -377,7 +377,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page; batch known ranges here: search returns text in results[].value.hydrated_ranges (enclosing:true adds enclosing Rust/Python items), json_pointer a complete JSON value, structured projects/filters JSON, JSONL, CSV or TSV rows, {\"kind\":\"section\",\"id\":\"outline\"} lists items, symbol and enclosing share its parser with qualified names (Type::method or Class.method) to disambiguate. Oversized selections return child_selectors.".to_string()));
+        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page; batch known ranges here. On text snapshots, tail selects the last lines within a byte limit; check value.requested_lines_complete. Other selectors: search returns text in results[].value.hydrated_ranges (enclosing:true adds enclosing Rust/Python items), json_pointer a complete JSON value, structured projects/filters JSON, JSONL, CSV or TSV rows, {\"kind\":\"section\",\"id\":\"outline\"} lists items, symbol and enclosing share its parser with qualified names (Type::method or Class.method) to disambiguate. Oversized selections return child_selectors.".to_string()));
         selectors.min_items = Some(1);
         selectors.max_items = Some(READ_TOOL_OUTPUT_MAX_SELECTORS as u64);
         let mut output = read_tool_output_output_schema(file_selector_schema());
@@ -421,6 +421,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             }
         }
         output["properties"]["file_bytes"] = json!({"type":"integer", "minimum":0});
+        output["properties"]["readback_sha256"] = json!({"type":"string", "pattern":"^[0-9a-f]{64}$", "description":"Digest of original bytes delivered by a single complete byte range from zero through EOF. Omitted for partial, decoded, rendered, or non-byte selections. The digest alone is not a retention receipt."});
         output["properties"]["classification_scope"] = json!({"enum":["complete_file","prefix"], "description":"Bytes inspected for a non-display classification, not a format guarantee. Per-result live-page classification covers only canonical_range."});
         output["properties"]["inspected_bytes"] = json!({"type":"integer", "minimum":0});
         output["properties"]["file_revision"] = json!({"type":"string", "description":"Opaque opened-file identity/size/timestamps/change-time revision, not a content hash or retained snapshot. Pass as if_file_revision on later byte pages."});
@@ -545,7 +546,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
             description: format!(
-                "Read a file without shell quoting. Unsupported display text is withheld before selection: read_mode:unsupported_text returns file_bytes and classification (kind/confidence/reason, not proof of binary). A small likely-binary file may have a complete immutable artifact_id and canonical_bytes for read_tool_output byte recovery; otherwise use the bounded 256-byte hex/base64 binary_recovery recipes. Invalid UTF-8 alone is unknown encoding, not proven binary; BOM-marked UTF-16 is decoded before control-character classification. Original-byte pages encode unsupported text as data_base64 with per-result classification applying only to that range. UTF-8 and BOM-marked UTF-16LE/BE text snapshots are limited to {MAX_FILE_MIB} MiB for both original and decoded bytes. UTF-16 is strictly decoded to UTF-8 without the BOM; source_encoding names the original encoding, source_sha256 hashes original bytes including the BOM, and canonical_sha256/canonical_bytes identify the retained decoded UTF-8 snapshot. All snapshot selectors (including bytes, search offsets, lines and structure), canonical_range and read_tool_output recovery address that decoded UTF-8 snapshot, not UTF-16 bytes or code units. Use encoding:hex|base64 for original-byte offsets. UTF-16 decoded acquisition does not grant original-byte source_inspection evidence or authorize codex-range edits. Git revision reads remain UTF-8 only. Larger current filesystem files support bytes-only selectors via bounded seek reads (up to 64 KiB per script page), including binary or split UTF-8 via data_base64. These return read_mode:byte_ranges, file_bytes and file_revision, never a whole-file source_sha256, line count or retained snapshot; file_complete and retained_artifact_complete stay false. Use range_recovery.arguments with read_file, or pass if_file_revision plus byte selectors for other pages. Changed identity/metadata refuses the page; this is not an immutable snapshot. Line/search/structural selectors, host locators and Git revision reads retain the snapshot limit. Symbol, enclosing and search with enclosing:true support Rust (.rs) and Python (.py). Section outline/item IDs also support Markdown (.md, .markdown): headings have source-bound IDs, levels, parent IDs and exact byte ranges; sections include descendants until the next equal/shallower heading. Duplicate titles are distinct; fenced code is ignored and Setext headings are recognized. For other languages, use fixed-string search without enclosing or explicit line ranges; unsupported structural requests are rejected. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Omit revision for current contents; revision reads resolve immutable Git objects and reuse the same selectors and snapshots. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills.\n\nFor raw binary inspection of any current file size, set encoding:hex or encoding:base64 with explicit zero-based half-open bytes selectors. This always uses the same bounded revision-guarded range backend, returning data_hex or data_base64 and exact canonical_range offsets, never decoded text. At most 64 KiB of raw bytes per script call; direct pages may be smaller to fit delivery. Compatible byte ranges are merged before I/O within each revision-bound delivery group, then sliced and encoded at original selector boundaries. Live results retain selector_index (including duplicates); merging grants no extra coverage or revision guarantee. No execution, decompression, format detection or implicit decoding. range_recovery preserves encoding; use it with read_file, not read_tool_output.\n\n{}",
+                "Read a file without shell quoting. Unsupported display text is withheld before selection: read_mode:unsupported_text returns file_bytes and classification (kind/confidence/reason, not proof of binary). A small likely-binary file may have a complete immutable artifact_id and canonical_bytes for read_tool_output byte recovery; otherwise use the bounded 256-byte hex/base64 binary_recovery recipes. Invalid UTF-8 alone is unknown encoding, not proven binary; BOM-marked UTF-16 is decoded before control-character classification. Original-byte pages encode unsupported text as data_base64 with per-result classification applying only to that range. UTF-8 and BOM-marked UTF-16LE/BE text snapshots are limited to {MAX_FILE_MIB} MiB for both original and decoded bytes. UTF-16 is strictly decoded to UTF-8 without the BOM; source_encoding names the original encoding, source_sha256 hashes original bytes including the BOM, and canonical_sha256/canonical_bytes identify the retained decoded UTF-8 snapshot. All snapshot selectors (including bytes, search offsets, lines and structure), canonical_range and read_tool_output recovery address that decoded UTF-8 snapshot, not UTF-16 bytes or code units. Use encoding:hex|base64 for original-byte offsets. UTF-16 decoded acquisition does not grant original-byte source_inspection evidence or authorize codex-range edits. Git revision reads remain UTF-8 only. Larger current filesystem files support bytes-only selectors via bounded seek reads (up to 64 KiB per script page), including binary or split UTF-8 via data_base64. These return read_mode:byte_ranges, file_bytes and file_revision, not a snapshot source_sha256, line count or retained snapshot; file_complete and retained_artifact_complete stay false. Use range_recovery.arguments with read_file, or pass if_file_revision plus byte selectors for other pages. Changed identity/metadata refuses the page; this is not an immutable snapshot. Line/search/structural selectors, host locators and Git revision reads retain the snapshot limit. Symbol, enclosing and search with enclosing:true support Rust (.rs) and Python (.py). Section outline/item IDs also support Markdown (.md, .markdown): headings have source-bound IDs, levels, parent IDs and exact byte ranges; sections include descendants until the next equal/shallower heading. Duplicate titles are distinct; fenced code is ignored and Setext headings are recognized. For other languages, use fixed-string search without enclosing or explicit line ranges; unsupported structural requests are rejected. Use lines for known ranges and tail for the end of a text snapshot. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Omit revision for current contents; revision reads resolve immutable Git objects and reuse the same selectors and snapshots. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills.\n\nFor raw binary inspection of any current file size, set encoding:hex or encoding:base64 with explicit zero-based half-open bytes selectors. This always uses the same bounded revision-guarded range backend, returning data_hex or data_base64 and exact canonical_range offsets, never decoded text. A single encoded range covering the entire file also returns readback_sha256 over its original bytes; partial ranges do not. At most 64 KiB of raw bytes per script call; direct pages may be smaller to fit delivery. Compatible byte ranges are merged before I/O within each revision-bound delivery group, then sliced and encoded at original selector boundaries. Live results retain selector_index (including duplicates); merging grants no extra coverage or revision guarantee. No execution, decompression, format detection or implicit decoding. range_recovery preserves encoding; use it with read_file, not read_tool_output.\n\n{}",
                 include_str!("../../../templates/result_binding_checkpoint.md").trim(),
             ),
             strict: false,
@@ -605,6 +606,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                         | FileSelector::Exact(
                             ToolOutputSelector::Bytes { .. }
                                 | ToolOutputSelector::Lines { .. }
+                                | ToolOutputSelector::Tail { .. }
                                 | ToolOutputSelector::Search { .. }
                                 | ToolOutputSelector::Section { .. }
                                 | ToolOutputSelector::JsonPointer { .. }
@@ -613,7 +615,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 )
             }) {
                 return Err(FunctionCallError::RespondToModel(
-                    "read_file supports bytes, lines, search, section, json_pointer, structured, symbol, and enclosing selectors".to_string(),
+                    "read_file supports bytes, lines, tail, search, section, json_pointer, structured, symbol, and enclosing selectors".to_string(),
                 ));
             }
             if invocation.cancellation_token.is_cancelled() {
@@ -858,16 +860,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             };
             let structure_path = args.path.clone();
             let if_source_hash = args.if_source_hash;
-            let (
-                canonical,
-                mut result,
-                mut continuation,
-                page_selectors,
-                total_lines,
-                selector_errors,
-                selector_bindings,
-                rendered_from,
-            ) = tokio::task::spawn_blocking(move || {
+            let expected_hash = if_source_hash.clone();
+            let decoded_hash = decoded_source.as_ref().map(|source| source.sha256.clone());
+            let (canonical, total_lines, selected) = tokio::task::spawn_blocking(move || {
                 let mut contents = contents;
                 let mut rendered_from = None;
                 // A self-declared evidence header binds the exact document bytes.
@@ -892,6 +887,14 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     })
                     .collect::<Vec<_>>();
                 let mut canonical = file_snapshot(contents, Some(&exact))?;
+                // A default filesystem preview has no user selectors to resolve.
+                // Still read and hash the current representation; don't construct
+                // token-sized pages that a matching freshness reply discards.
+                if default_preview && expected_hash.as_deref().is_some_and(|expected|
+                    decoded_hash.as_deref().unwrap_or(&canonical.sha256).starts_with(expected))
+                {
+                    return Ok((canonical, total_lines, None));
+                }
                 let (selectors, selector_errors, selector_bindings) =
                     structure::resolve_batch(&structure_path, &mut canonical, args.selectors);
                 let selection = if script_consumer && !default_preview {
@@ -912,16 +915,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                         }
                         _ => Vec::new(),
                     };
-                    (
-                        canonical,
-                        result,
-                        continuation,
-                        pages,
-                        total_lines,
-                        selector_errors,
-                        selector_bindings,
-                        rendered_from,
-                    )
+                    (canonical, total_lines, Some((
+                        result, continuation, pages, selector_errors, selector_bindings, rendered_from,
+                    )))
                 })
             })
             .await
@@ -930,25 +926,15 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             })?
             .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
             let canonical = Arc::new(canonical);
-            result.complete &= selector_errors.is_empty();
-            if let Some(source_bytes) = rendered_from
-                && let Some(first) = result.results.first_mut()
-            {
-                let note = format!(
-                    "Rendered as text from {source_bytes} bytes of HTML outside the workspace: markup, scripts and styles removed. Lines, ranges, source_sha256 and recovery describe this text; read_file selectors return exact markup."
-                );
-                first.message = Some(match first.message.take() {
-                    Some(message) => format!("{note} {message}"),
-                    None => note,
-                });
-            }
-            let mut successful = result.selection_status() == "complete";
             // Validate/resolve the original selectors before suppressing content:
             // matching bytes must not hide an invalid symbol, missing pointer,
             // mixed failure or budget-limited selection. No retained snapshot or
             // delivered-evidence signal is created by this freshness-only reply.
             let source_hash = decoded_source.as_ref().map_or(canonical.sha256.as_str(), |source| source.sha256.as_str());
-            if successful && if_source_hash.as_deref().is_some_and(|hash| source_hash.starts_with(hash)) {
+            if selected.as_ref().is_none_or(|(result, _, _, errors, _, _)| {
+                errors.is_empty() && result.selection_status() == "complete"
+                    && if_source_hash.as_deref().is_some_and(|hash| source_hash.starts_with(hash))
+            }) {
                 let mut output = json!({
                     "path": resolved_path,
                     "environment_id": environment_id,
@@ -976,6 +962,22 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 crate::tools::context::ensure_exact_model_delivery(&output, &invocation)?;
                 return Ok(boxed_tool_output(output));
             }
+            let Some((mut result, mut continuation, page_selectors, selector_errors, selector_bindings, rendered_from)) = selected else {
+                unreachable!("a matched default preview returns its unchanged receipt above")
+            };
+            result.complete &= selector_errors.is_empty();
+            if let Some(source_bytes) = rendered_from
+                && let Some(first) = result.results.first_mut()
+            {
+                let note = format!(
+                    "Rendered as text from {source_bytes} bytes of HTML outside the workspace: markup, scripts and styles removed. Lines, ranges, source_sha256 and recovery describe this text; read_file selectors return exact markup."
+                );
+                first.message = Some(match first.message.take() {
+                    Some(message) => format!("{note} {message}"),
+                    None => note,
+                });
+            }
+            let mut successful = result.selection_status() == "complete";
             let file_complete = selector_errors.is_empty() && file_selection_complete(&result);
             // Explicit selections retain the existing immutable-snapshot contract.
             // Complete default reads stay inline; omitted bytes need one durable
@@ -1088,6 +1090,19 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             output["source_sha256"] = json!(canonical.sha256);
             encoding::annotate(&mut output, decoded_source.as_ref());
             output["file_complete"] = json!(file_complete);
+            // A complete original UTF-8 byte selection already computed this
+            // digest. Expose the same readback contract as the encoded route
+            // without forcing a second read or hashing the source again.
+            if file_complete && git_source.is_none()
+                && decoded_source.is_none() && rendered_from.is_none()
+                && !environment_id.starts_with("host-")
+                && matches!(output["results"].as_array().map(Vec::as_slice), Some([row])
+                    if row["selector"]["kind"] == "bytes" && row["text"].is_string()
+                    && row["complete"] == true && row["canonical_range"]["start"] == 0
+                    && row["canonical_range"]["end"].as_u64() == Some(canonical.exact_bytes))
+            {
+                output["readback_sha256"] = json!(canonical.sha256);
+            }
             if let Some(source) = &git_source { output["git_source"] = source.clone(); }
             if let Some(error) = inspection_proof_error {
                 output["inspection_proof_error"] = json!(error);
@@ -1148,6 +1163,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     projected["delivered_selection_complete"] = json!(false);
                     projected["selection_status"] = json!("partial");
                     projected["file_complete"] = json!(false);
+                    if let Some(fields) = projected.as_object_mut() {
+                        fields.remove("readback_sha256");
+                    }
                     projected["artifact_id"] = json!(artifact_id);
                     projected["retained_artifact_complete"] = json!(artifact_id.is_some());
                     projected["retained_bytes"] = json!(if artifact_id.is_some() { canonical.exact_bytes } else { 0 });

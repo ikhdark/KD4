@@ -288,9 +288,6 @@ impl ResponsesEventInterpreter {
                 .or_else(|| event.headers.as_ref().and_then(header_openai_model_value_from_json));
             tracing::info!(event.name = "codex.provider_reported_model",
                 response_id = response.id.as_ref().and_then(|value| value.as_str()).unwrap_or_default(),
-                reported_service_tier = response.service_tier.as_ref().and_then(|value| value.as_str())
-                    .filter(|tier| tier.len() <= 64 && tier.bytes().all(|byte|
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))),
                 reported_model, provenance = "response.model", header_model,
                 "provider-reported identity; not an inferred reroute reason");
         }
@@ -478,7 +475,6 @@ struct ResponseEnvelope {
     id: Option<Value>,
     created_at: Option<Value>,
     completed_at: Option<Value>,
-    service_tier: Option<Value>,
     prompt_cache_diagnostics: Option<Value>,
     input_transformations: Option<Value>,
     reasoning: Option<Value>,
@@ -896,11 +892,6 @@ impl ResponsesStreamEvent<'_> {
         let completed = response.and_then(|v| v.completed_at.as_ref());
         let created_at = timestamp(created);
         let completed_at = timestamp(completed);
-        let raw_tier = response.and_then(|value| value.service_tier.as_ref());
-        let response_service_tier = raw_tier.and_then(Value::as_str).filter(|tier| {
-            !tier.is_empty() && tier.len() <= 64
-                && tier.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        });
         let raw_diagnostics = response.filter(|_| phase == "completed")
             .and_then(|response| response.prompt_cache_diagnostics.as_ref())
             .filter(|value| !value.is_null());
@@ -913,9 +904,6 @@ impl ResponsesStreamEvent<'_> {
             server_timing_invalid: phase == "server_timing" && server_timing.is_none(),
             server_timing,
             phase, response_id: response_id.map(str::to_owned), created_at, completed_at,
-            response_service_tier: response_service_tier.map(str::to_owned),
-            response_service_tier_invalid: raw_tier.is_some_and(|value| !value.is_null())
-                && response_service_tier.is_none(),
             prompt_cache_diagnostics_invalid: raw_diagnostics.is_some()
                 && prompt_cache_diagnostics.is_none(),
             prompt_cache_diagnostics,

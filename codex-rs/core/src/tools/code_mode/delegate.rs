@@ -63,6 +63,8 @@ impl Drop for NestedDispatchObservation {
 struct CellDispatchState {
     ready: watch::Sender<bool>,
     user_intent_epoch: u64,
+    /// Plan fence of the authoring step; unset until the cell is bound.
+    plan_sampling: Option<crate::plan_store::PlanSamplingRevision>,
     environment_scope: Option<(u64, Vec<codex_protocol::protocol::TurnEnvironmentSelection>)>,
     terminal: bool,
     pending_continuations: Vec<PendingOwnerDrainedContinuation>,
@@ -122,6 +124,22 @@ impl CodeModeDispatchBroker {
             .get_mut(cell_id)
         {
             cell.user_intent_epoch = epoch;
+        }
+    }
+
+    pub(super) fn bind_cell_plan_sampling(
+        &self,
+        cell_id: &CellId,
+        plan_sampling: Option<crate::plan_store::PlanSamplingRevision>,
+    ) {
+        dispatch_gate(&self.cells, cell_id);
+        if let Some(cell) = self
+            .cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(cell_id)
+        {
+            cell.plan_sampling = plan_sampling;
         }
     }
 
@@ -378,12 +396,12 @@ impl CodeModeDispatchBroker {
                                 ),
                                 "code mode nested tool child started"
                             );
-                            let authoring_epoch = cells
+                            let (authoring_epoch, authoring_plan) = cells
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .get(&cell_id)
-                                .map(|cell| cell.user_intent_epoch)
-                                .unwrap_or(u64::MAX);
+                                .map(|cell| (cell.user_intent_epoch, cell.plan_sampling.clone()))
+                                .unwrap_or((u64::MAX, None));
                             let mut release_on_handoff = false;
                             let response = {
                                 let invocation = invoke_with_user_intent(
@@ -394,6 +412,7 @@ impl CodeModeDispatchBroker {
                                         invocation,
                                         cancellation,
                                         authoring_epoch,
+                                        authoring_plan,
                                         &mut release_on_handoff,
                                     ),
                                 );
@@ -501,6 +520,7 @@ fn dispatch_gate(
         .or_insert_with(|| CellDispatchState {
             ready: watch::channel(false).0,
             user_intent_epoch: 0,
+            plan_sampling: None,
             environment_scope: None,
             terminal: false,
             pending_continuations: Vec::new(),
@@ -775,12 +795,14 @@ impl CoreTurnHost {
         invocation: CodeModeNestedToolCall,
         cancellation: NestedCancellation,
         authoring_epoch: u64,
+        authoring_plan: Option<crate::plan_store::PlanSamplingRevision>,
         release_on_handoff: &mut bool,
     ) -> Result<JsonValue, String> {
         let tool_runtime = self
             .tool_runtime
             .clone()
-            .with_code_mode_user_intent(invocation.cell_id.as_str(), authoring_epoch);
+            .with_code_mode_user_intent(invocation.cell_id.as_str(), authoring_epoch)
+            .with_code_mode_plan_sampling(authoring_plan.as_ref());
         let mut paused = self.exec.session.subscribe_elicitation_pause_state();
         let timeout_cancellation = cancellation.clone();
         let cell = invocation.cell_id.clone();

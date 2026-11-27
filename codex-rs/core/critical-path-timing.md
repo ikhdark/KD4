@@ -52,6 +52,8 @@ come only from the emitting-generation and consumed-result owners. Host handoff
 boundary spans cover the intervening envelope, without assigning a CPU/wait cause.
 Checkpoints omit the graph: an in-flight observation cannot certify task finish.
 
+A rollout record timestamp describes persistence order, not a shared execution endpoint. A native command completion, the enclosing Code Mode cell, nested publication, and the outer response can be recorded in a different order. Join by call, cell and attempt identities and use the matching native clock endpoints for durations; do not subtract heterogeneous timestamps to infer handler time or clamp an invalid interval to zero.
+
 `complete` is independent of elapsed coverage. Missing identities/endpoints,
 overflow, open processes, nested fork/join and model-prefix release remain
 explicit `unavailableReasons`. In particular, `emitted_by` does not establish
@@ -72,7 +74,7 @@ and selection/retention/delivery facts. Metadata-only audits are excluded.
 The physical-model-retry inventory is unchanged; this separate inventory does
 not claim exhaustive recovery, restored task correctness or causal added delay.
 
-Code Mode callers that will select retained output can set `artifact_only_on_success: true` on `exec_command` to omit inline streams on a completely retained, noninteractive terminal success. The bounded display and artifact locator remain available. Failures, incomplete capture and live handles retain their normal projection.
+Code Mode callers that will select retained output can set `artifact_only_on_success: true` on `exec_command` to omit inline streams on a completely retained, noninteractive terminal success. The bounded display and artifact locator remain available. `rendered_view_bytes` includes generated notices; `delivered_view_bytes` counts verbatim normalized UTF-8 in the view when known. Neither is the total producer byte count. For oversized nested launch receipts, the export keeps that last measurement alongside the full receipt reference, keyed by the command output artifact ID. Failures, incomplete capture and live handles retain their normal projection.
 
 `measurementEvidence.nestedResults` reuses the complete byte count from the
 actual Code Mode result serializer, before script/outer-display projection.

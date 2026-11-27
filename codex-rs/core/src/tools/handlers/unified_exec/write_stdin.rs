@@ -46,6 +46,8 @@ struct WriteStdinArgs {
     #[serde(default)]
     close_stdin: bool,
     #[serde(default)]
+    acknowledge_only: bool,
+    #[serde(default)]
     status_only: bool,
     #[serde(default)]
     event_filter: Option<crate::unified_exec::ProcessEventFilter>,
@@ -169,6 +171,15 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        if args.acknowledge_only
+            && (args.chars.is_empty() || args.chars == "\u{3}" || args.close_stdin || args.terminate
+                || args.status_only || args.event_filter.is_some()
+                || args.wait_for_output == Some(true))
+        {
+            return Err(argument_refusal(
+                "acknowledge_only requires nonempty data (not an interrupt) and cannot be combined with a close, termination, status, or output wait",
+            ));
+        }
         if args.close_stdin && (!args.chars.is_empty() || args.terminate || args.wait_for_output == Some(true)) {
             return Err(argument_refusal(
                 "close_stdin requires empty chars and cannot be combined with terminate or wait_for_output=true; send input separately",
@@ -351,6 +362,7 @@ impl WriteStdinHandler {
                 process_id: args.session_id,
                 input: &args.chars,
                 close_stdin: args.close_stdin,
+                acknowledge_only: args.acknowledge_only,
                 yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
                 truncation_policy: turn.model_info.truncation_policy.into(),

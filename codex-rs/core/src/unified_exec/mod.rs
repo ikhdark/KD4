@@ -224,6 +224,7 @@ pub(crate) struct WriteStdinRequest<'a> {
     pub process_id: u32,
     pub input: &'a str,
     pub close_stdin: bool,
+    pub acknowledge_only: bool,
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub truncation_policy: TruncationPolicy,

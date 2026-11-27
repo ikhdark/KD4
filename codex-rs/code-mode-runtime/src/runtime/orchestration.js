@@ -144,6 +144,57 @@
     },
   });
 
+  // Exact single-file line replacement: one complete native read as the source
+  // guard, one hash-guarded patch, one readback. No retry and no fallback edit form.
+  Object.defineProperty(globalThis, "guarded_line", {
+    value: async function guarded_line(path, before, after, { expected_source_sha256 } = {}) {
+      if (![before, after].every(s => typeof s === "string" && s && !/[\r\n\0]/.test(s)) ||
+          before === after || typeof path !== "string" || !/^[\w.-]+$/.test(path) ||
+          path === "." || path === "..")
+        throw new Error("expected one local filename and distinct exact lines");
+      if (expected_source_sha256 !== undefined && (typeof expected_source_sha256 !== "string" ||
+          !/^[0-9a-f]{64}$/.test(expected_source_sha256))) throw new TypeError("expected a full source SHA-256");
+      const get = async () => {
+        const r = await capability("read_file")({ path });
+        const row = r.results?.[0];
+        if (!r.file_complete || r.results.length !== 1 || !row.complete ||
+            typeof row.text !== "string" || !/^[0-9a-f]{64}$/.test(r.source_sha256))
+          throw new Error("complete native source required");
+        return [r, row.text];
+      };
+      const [source, old] = await get();
+      const hash = source.source_sha256;
+      if (expected_source_sha256 !== undefined && expected_source_sha256 !== hash)
+        fail("source differs from expected identity; no edit attempted", { path: source.path, source_sha256: hash });
+      const lines = old.split(/(\r\n|\n)/);
+      const indices = value => lines.flatMap((line, i) => i % 2 === 0 && line === value ? [i] : []);
+      const hit = indices(before), present = indices(after);
+      if (hit.length > 1 || (hit.length && present.length) || present.length > 1)
+        return { status: "AMBIGUOUS" };
+      if (!hit.length && present.length === 1)
+        return { status: "UNCHANGED", content: old, path: source.path, environment_id: source.environment_id,
+          source_sha256: hash };
+      if (hit.length !== 1) throw new Error("old line missing");
+      lines[hit[0]] = after;
+      const n = (hit[0] / 2) + 1;
+      const patch = "*** Begin Patch\n*** Update File: " + path + "\n@@ codex-range " + n + ":" + n +
+        " sha256:" + hash + "\n+" + after + "\n*** End Patch";
+      const p = await capability("apply_patch")(patch);
+      if (p.success !== true || p.outcome !== "committed")
+        fail("edit refused; do not retry", p);
+      let readback;
+      try { readback = await get(); }
+      catch (cause) {
+        fail("edit committed; readback unavailable; do not retry", { patch: p, cause: cause.evidence ?? cause.message });
+      }
+      const [result, content] = readback;
+      if (content !== lines.join("") || result.path !== source.path || result.environment_id !== source.environment_id)
+        fail("edit committed; exact readback differs; do not retry", { patch: p, readback: result });
+      return { status: "VERIFIED", content, path: result.path, environment_id: result.environment_id,
+        before_sha256: hash, source_sha256: result.source_sha256 };
+    },
+  });
+
   Object.defineProperty(globalThis, "recover_output", {
     value: async function recover_output(initial, { max_calls = 64, max_bytes = 8 * 1024 * 1024 } = {}) {
       integer(max_calls, 1, 64, "max_calls");
@@ -675,7 +726,10 @@
       }
       // Retain all started work, including failures and successful siblings.
       const byPath = new Map(unique.map((path, i) => [path, settled[i]]));
-      return requested.map((path) => ({ path, ...byPath.get(path) }));
+      return requested.map((path) => {
+        const row = byPath.get(path);
+        return { path, ...row, file_complete: row.status === "fulfilled" && row.value.file_complete === true };
+      });
       };
       return function read_files(paths, options) {
         const helper = observeHelper?.("helper");
@@ -684,6 +738,74 @@
         return promise;
       };
     })(),
+  });
+
+  // Project an existing full read; do not reopen a file or discard its receipt.
+  Object.defineProperty(globalThis, "full_read_text", {
+    value: function full_read_text(row) {
+      if (row?.status === "rejected") throw row.reason;
+      const value = row?.value, initial = value?.initial;
+      if (row?.status !== "fulfilled" || value?.file_complete !== true ||
+          !initial || !Array.isArray(value.pages) || !Number.isSafeInteger(initial.canonical_bytes))
+        fail("full_read_text requires a complete read_files row", row);
+      const parts = [];
+      let offset = 0;
+      for (const page of [initial, ...value.pages]) {
+        if (page !== initial && (!initial.artifact_id || page.artifact_id !== initial.artifact_id ||
+            page.canonical_sha256 !== (initial.canonical_sha256 ?? initial.source_sha256) ||
+            page.canonical_bytes !== initial.canonical_bytes))
+          fail("full_read_text snapshot changed", row);
+        for (const part of page.results) {
+          if (part.status === "selector_too_large" && part.complete === false &&
+              part.text === undefined && Array.isArray(part.child_selectors)) continue;
+          if (part.status !== "ok" || part.complete !== true || typeof part.text !== "string" ||
+              part.canonical_range?.start !== offset || part.canonical_range.end !== offset + bytes(part.text))
+            fail("full_read_text needs contiguous text", row);
+          parts.push(part.text);
+          offset = part.canonical_range.end;
+        }
+      }
+      if (offset !== initial.canonical_bytes) fail("full_read_text missing bytes", row);
+      return parts.join("");
+    },
+  });
+
+  // Convert an existing native whole-original-UTF-8 readback, never decoded or rendered text.
+  Object.defineProperty(globalThis, "full_read_bytes", {
+    value: function full_read_bytes(row) {
+      const initial = row?.value?.initial;
+      if (typeof initial?.readback_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(initial.readback_sha256) ||
+          initial.readback_sha256 !== initial.source_sha256)
+        fail("full_read_bytes requires a whole original UTF-8 readback", row);
+      return new TextEncoder().encode(full_read_text(row));
+    },
+  });
+
+  // The caller chooses all statuses and resolutions; native CAS and scope
+  // checks remain authoritative. Never derive a completion from a tool result.
+  Object.defineProperty(globalThis, "set_plan_status", {
+    value: async function set_plan_status(prior, updates, resolve = [], { compact = false } = {}) {
+      if (typeof prior?.revision !== "string" || !/^[a-f0-9]{64}$/.test(prior.revision) ||
+          !Array.isArray(updates) || !updates.length || !Array.isArray(resolve))
+        throw new TypeError("expected a prior plan receipt, status pairs and optional resolution IDs");
+      const set = updates.map(pair => {
+        if (!Array.isArray(pair) || pair.length !== 2 || !Number.isSafeInteger(pair[0]) ||
+            pair[0] < 0 || !["pending","in_progress","completed"].includes(pair[1]))
+          throw new TypeError("expected [index,status] pairs");
+        return {index: pair[0], status: pair[1]};
+      });
+      return capability("update_plan")({expected_revision: prior.revision, set,
+        ...(resolve.length && {resolve}), ...(compact === true && {receipt: "status_v1"})});
+    },
+  });
+
+  // The caller certifies the outgoing step. Send both statuses in one CAS
+  // update so the plan never observes two in-progress steps.
+  Object.defineProperty(globalThis, "advance_plan_step", {
+    value: async function advance_plan_step(prior, completed, next) {
+      if (completed === next) throw new TypeError("expected distinct outgoing and incoming step indexes");
+      return globalThis.set_plan_status(prior, [[completed, "completed"], [next, "in_progress"]], [], {compact: true});
+    },
   });
 
   Object.defineProperty(globalThis, "search_files", {
@@ -1298,6 +1420,50 @@
     }),
   });
 
+  // Use before closing a plan or printing a deliverable. A failed guard is
+  // a script error for the next cell, never text eligible for final delivery.
+  Object.defineProperty(globalThis, "require_checks", {
+    value: function require_checks(checks) {
+      const rows = checks && typeof checks === "object" && !Array.isArray(checks)
+        ? Object.entries(checks) : [];
+      if (!rows.length) throw new TypeError("expected named verification checks");
+      const failed = rows.filter(([, value]) => value !== true).map(([name]) => name);
+      if (failed.length) throw new Error("Verification not established: " + JSON.stringify(failed));
+    },
+  });
+
+  // Send once, then EOF on that same pipe. On uncertainty stop with every
+  // observed effect; never replay input, substitute a handle or relaunch.
+  Object.defineProperty(globalThis, "finish_stdin", {
+    value: async function finish_stdin(launch, chars) {
+      const caps = launch?.session_capabilities;
+      if (typeof chars !== "string" || !chars || !chars.isWellFormed() ||
+          launch?.execution_state !== "running" || launch.error != null ||
+          launch.tool_failure != null || !Number.isSafeInteger(launch.session_id) ||
+          !caps?.stdin || !caps.close_stdin || typeof caps.incarnation !== "string" || !caps.incarnation)
+        throw new TypeError("expected an owned running stdin pipe and nonempty UTF-8 text");
+      const write = capability("write_stdin");
+      const handle = { session_id: launch.session_id, incarnation: caps.incarnation };
+      const evidence = { launch };
+      try {
+        const sent = evidence.sent = await write({ ...handle, chars, acknowledge_only: true, yield_time_ms: 250 });
+        if (sent?.execution_state !== "running" || sent.error != null || sent.tool_failure != null ||
+            sent.session_id !== handle.session_id || sent.session_capabilities?.incarnation !== handle.incarnation ||
+            sent.session_capabilities.close_stdin !== true)
+          throw new Error("input did not return the same running, closable pipe");
+        const eof = evidence.eof = await write({ ...handle, close_stdin: true, yield_time_ms: 1000 });
+        if (eof?.session_id != null && (eof.session_id !== handle.session_id ||
+            eof.session_capabilities?.incarnation !== handle.incarnation))
+          throw new Error("EOF returned a different owner");
+        const collection = await globalThis.await_command(eof);
+        return { sent, eof, collection, terminal: collection.terminal };
+      } catch (cause) {
+        throw Object.assign(new Error("stdin exchange incomplete: " + cause.message, { cause }),
+          { evidence: { ...evidence, failure: cause.evidence ?? cause.tool_failure ?? cause } });
+      }
+    },
+  });
+
   Object.defineProperty(globalThis, "await_command", {
     value: async function await_command(
       initial,
@@ -1315,7 +1481,7 @@
       } catch (error) {
         // The producer may already be running. A bad collection option must
         // not erase the caller's only receipt or invite a second launch.
-        error.evidence = { terminal: initial, observations: [initial] };
+        error.evidence = { success: false, terminal: initial, observations: [initial] };
         throw error;
       }
       // Capture the host's steady clock for this observation chain. Wall-clock
@@ -1337,6 +1503,9 @@
       let incarnation;
       const reject = (message, evidence, code = "failed", cause) => {
         const error = new Error(message);
+        // Collection failed, not necessarily the process. Keep the handle and
+        // terminal facts but never admit this wrapper as a successful dependency.
+        evidence.success = false;
         registerCommandEvidence(evidence);
         error.evidence = evidence;
         const inherited = cause?.tool_failure ?? current?.tool_failure;
@@ -1374,9 +1543,10 @@
         arrayPush(observations, current);
         const evidence = { terminal: current, observations };
         // The fields an exec_command receipt offers, so one result shape serves
-        // both. Not enumerable: serialized evidence and prints stay unchanged.
+        // both, including after storing the result. Don't serialize a second
+        // copy of the potentially large joined display output.
         defineProperties(evidence, {
-          exit_code: { value: current?.exit_code, configurable: true },
+          exit_code: { value: current?.exit_code, configurable: true, enumerable: true },
           output: {
             get: () => {
               let joined = "";
@@ -1469,6 +1639,7 @@
             ) {
               if (retainedBytes >= max_bytes)
                 reject("command succeeded but its completed evidence reached the byte limit; retain these observations, do not restart the command", evidence);
+              registerCommandEvidence(evidence, true);
               return evidence;
             }
             reject(

@@ -67,8 +67,6 @@ impl SseCleanupOutcome {
 pub struct ProviderObservation {
     pub phase: &'static str,
     pub response_id: Option<String>,
-    pub response_service_tier: Option<String>,
-    pub response_service_tier_invalid: bool,
     /// Bounded provider-reported comparison outcome, never inferred from usage.
     pub prompt_cache_diagnostics: Option<serde_json::Value>,
     pub prompt_cache_diagnostics_invalid: bool,

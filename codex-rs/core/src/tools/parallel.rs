@@ -1252,6 +1252,22 @@ impl ToolCallRuntime {
         self
     }
 
+    /// A cell that outlives its authoring step keeps this step's plan
+    /// observation but not its identity, so it cannot inherit the allowance
+    /// this step earns from its own status updates.
+    pub(crate) fn with_code_mode_plan_sampling(
+        mut self,
+        authoring: Option<&crate::plan_store::PlanSamplingRevision>,
+    ) -> Self {
+        if let Some(current) = self.step_context.plan_sampling_revision.as_ref()
+            && !authoring.is_some_and(|authoring| authoring.same_step(current))
+        {
+            let detached = current.without_step();
+            Arc::make_mut(&mut self.step_context).plan_sampling_revision = Some(detached);
+        }
+        self
+    }
+
     pub(crate) fn with_terminal_completion_only(mut self, terminal_only: bool) -> Self {
         self.terminal_completion_only = terminal_only;
         self

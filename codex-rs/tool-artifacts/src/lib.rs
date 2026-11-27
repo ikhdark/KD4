@@ -317,6 +317,20 @@ pub(crate) fn tail_selector_result(
     result
 }
 
+fn snapshot_tail_result(
+    selector: &ToolOutputSelector,
+    snapshot: &[u8],
+    source_budget: usize,
+) -> ToolOutputSelectorResult {
+    match tail_window_limit(selector, source_budget) {
+        Ok(limit) => tail_selector_result(
+            selector.clone(), &snapshot[snapshot.len().saturating_sub(limit)..],
+            snapshot.len() as u64, source_budget,
+        ),
+        Err(message) => invalid_selector_result(selector.clone(), message),
+    }
+}
+
 const fn artifact_search_default_context_lines() -> usize {
     codex_command_analysis::shell_output_summary::FOCUS_CONTEXT_LINES
 }
@@ -7440,13 +7454,7 @@ fn select_logical_artifact(
         return too_large_result(selector, range, children, metadata, snapshot, fragment_token_ceiling);
     }
     let mut result = if matches!(selector, ToolOutputSelector::Tail { .. }) {
-        match tail_window_limit(&selector, structured_source_bytes) {
-            Ok(limit) => tail_selector_result(
-                selector.clone(), &snapshot[snapshot.len().saturating_sub(limit)..],
-                snapshot.len() as u64, structured_source_bytes,
-            ),
-            Err(message) => invalid_selector_result(selector.clone(), message),
-        }
+        snapshot_tail_result(&selector, snapshot, structured_source_bytes)
     } else {
         exact_selector_result(metadata, snapshot, selector.clone())
     };
@@ -8260,6 +8268,8 @@ pub fn select_file_snapshot_for_script(
                 end: metadata.retained_bytes,
             }];
             result
+        } else if matches!(selector, ToolOutputSelector::Tail { .. }) {
+            snapshot_tail_result(&selector, &canonical.bytes, remaining)
         } else if matches!(selector, ToolOutputSelector::Structured { .. }) {
             let coverage_complete = metadata.capture_complete
                 && metadata.complete

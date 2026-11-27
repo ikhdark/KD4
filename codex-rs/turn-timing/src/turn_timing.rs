@@ -2329,6 +2329,7 @@ impl TurnTimingState {
             .map(|fields| {
                 fields
                     .into_iter()
+                    .filter(|(key, _)| key != "service_tier")
                     .filter_map(|(key, value)| {
                         let digest = if key == "input" {
                             CanonicalInputSection::hash(

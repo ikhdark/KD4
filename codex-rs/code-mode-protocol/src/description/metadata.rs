@@ -252,6 +252,59 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         .iter()
         .map(|alias| sanitize_contract_text(alias).into_owned())
         .collect::<Vec<_>>();
+    // Reuse the owner's byte-range paragraph without making callers fetch
+    // unrelated snapshot, structural selection and HTML contracts.
+    if definition.tool_name.namespace.is_none()
+        && definition.tool_name.name == "read_file"
+        && let Some(raw_bytes) = prose.split("\n\n")
+            .find(|paragraph| paragraph.starts_with("For raw binary inspection "))
+    {
+        schemas.push(("raw_byte_ranges", raw_bytes.to_owned()));
+    }
+    // Process workflows often need one lifecycle control, not both complete
+    // command signatures. Quote the registered field, including its restrictions;
+    // the ordinary arguments section remains the full cross-field contract.
+    if definition.tool_name.namespace.is_none() {
+        let fields: &[(&str, &str)] = match definition.tool_name.name.as_str() {
+            "exec_command" => &[("piped_input", "pipe_stdin")],
+            "write_stdin" => &[
+                ("pipe_eof", "close_stdin"),
+                ("stdin_acknowledgement", "acknowledge_only"),
+                ("shutdown", "terminate"),
+                ("status_only", "status_only"),
+                ("event_filter", "event_filter"),
+            ],
+            _ => &[],
+        };
+        for &(section, field) in fields {
+            if let Some(property) = definition.input_schema.as_ref()
+                .and_then(|schema| schema.get("properties"))
+                .and_then(|properties| properties.get(field))
+            {
+                schemas.push((section, format!("{field}: {property}")));
+            }
+        }
+    }
+    if definition.tool_name.namespace.is_none() && definition.tool_name.name == "write_stdin"
+        && let Some(branches) = definition.output_schema.as_ref()
+            .and_then(|schema| schema.get("anyOf"))
+            .and_then(serde_json::Value::as_array)
+    {
+        // Identify observation results by discriminator, not union order.
+        for (section, discriminator) in [
+            ("status_result", "/properties/status_only/const"),
+            ("event_result", "/properties/subscription_closed/const"),
+        ] {
+            let mut matches = branches.iter().filter(|branch| {
+                branch.pointer(discriminator).and_then(serde_json::Value::as_bool) == Some(true)
+            });
+            if let Some(branch) = matches.next()
+                && matches.next().is_none()
+            {
+                schemas.push((section, branch.to_string()));
+            }
+        }
+    }
     render_sectioned_contract(ContractParts {
         tool_name: &definition.name,
         input_name,

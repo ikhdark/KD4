@@ -221,7 +221,6 @@ pub struct SessionTelemetryMetadata {
     /// every metric's tag validation.
     pub(crate) metrics_model: String,
     pub(crate) slug: String,
-    pub(crate) service_tier: Option<String>,
     pub(crate) model_reasoning_effort: Option<String>,
     pub(crate) log_user_prompts: bool,
     pub(crate) app_version: &'static str,
@@ -573,13 +572,6 @@ impl SessionTelemetry {
         self.metadata.conversation_id
     }
 
-    pub fn requested_service_tier(&self) -> Option<&str> {
-        self.metadata.service_tier.as_deref().filter(|tier| {
-            !tier.is_empty() && tier.len() <= 64
-                && tier.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        })
-    }
-
     pub fn with_auth_env(mut self, auth_env: AuthEnvTelemetryMetadata) -> Self {
         self.metadata.auth_env = auth_env;
         self
@@ -594,10 +586,8 @@ impl SessionTelemetry {
 
     pub fn with_inference_request(
         mut self,
-        service_tier: Option<&str>,
         model_reasoning_effort: Option<&ReasoningEffort>,
     ) -> Self {
-        self.metadata.service_tier = service_tier.map(str::to_owned);
         self.metadata.model_reasoning_effort = model_reasoning_effort.map(ToString::to_string);
         self
     }
@@ -904,7 +894,6 @@ impl SessionTelemetry {
                 model: model.to_owned(),
                 metrics_model: sanitize_metric_tag_value(model),
                 slug: slug.to_owned(),
-                service_tier: None,
                 model_reasoning_effort: None,
                 log_user_prompts,
                 app_version: env!("CARGO_PKG_VERSION"),
@@ -1178,7 +1167,6 @@ impl SessionTelemetry {
                 sampling_request_id = response_start.and_then(|value| value.sampling_request_id),
                 physical_attempt_id = response_start.and_then(|value| value.physical_attempt_id),
                 provider_request_id = response_start.and_then(|value| value.provider_request_id),
-                requested_service_tier = self.metadata.service_tier.as_deref(),
                 request_send_started_ns = response_start.and_then(|value| value.request_send_started_ns),
                 request_send_completed_ns = None::<u64>,
                 send_completion_unavailable_reason = response_start.map(|_| "reqwest does not expose upload completion"),
@@ -1590,7 +1578,6 @@ impl SessionTelemetry {
                 tool_token_count = %tool_token_count,
                 ttft_ms = ttft_ms,
                 ttft_semantics = "decoded_content_v2",
-                service_tier = self.metadata.service_tier.as_deref(),
                 model_reasoning_effort = self.metadata.model_reasoning_effort.as_deref(),
             },
             log: {},
@@ -1679,11 +1666,6 @@ impl SessionTelemetry {
             .as_deref()
             .and_then(normalized_model_attempt_label);
         let model = normalized_model_attempt_label(&self.metadata.model);
-        let service_tier = self
-            .metadata
-            .service_tier
-            .as_deref()
-            .and_then(normalized_model_attempt_label);
         tracing::event!(
                 target: crate::targets::OTEL_LOG_ONLY_TARGET,
                 tracing::Level::INFO,
@@ -1714,7 +1696,6 @@ impl SessionTelemetry {
                 fresh_response_id_established = record.fresh_response_id_established,
                 provider = provider,
                 model = model,
-                service_tier = service_tier,
                 input_token_count = record.input_tokens,
                 cached_input_token_count = record.cached_input_tokens,
                 uncached_input_token_count = record.uncached_input_tokens,

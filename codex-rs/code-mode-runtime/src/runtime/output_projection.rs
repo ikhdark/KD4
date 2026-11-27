@@ -47,7 +47,12 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
   const commandEvidence = new WeakMap();
   const commandEvidenceOf = commandEvidence.get.bind(commandEvidence);
   const setCommandEvidence = commandEvidence.set.bind(commandEvidence);
-  const registerCommandEvidence = value => setCommandEvidence(value, {
+  const registerCommandEvidence = (value, completed = false) => setCommandEvidence(value, {
+    // Only a normally collected result owns a display alias. Errors and
+    // persisted/deserialized copies retain their ordinary representation.
+    terminal: completed ? value.terminal : undefined,
+    observations: completed ? value.observations : undefined,
+    count: completed ? value.observations.length : 0,
     output: descriptor(value, 'output').get,
     exitCode: descriptor(value, 'exit_code').value,
   });
@@ -1147,6 +1152,31 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     const rendered = render(value, (_key, item) => {
       if (typeof item === 'bigint') return displayReplacer(_key, item);
       if (item instanceof NativeError) return errorProjection(item);
+      const command = commandEvidenceOf(item);
+      if (command?.terminal && descriptor(item, 'terminal')?.value === command.terminal &&
+          descriptor(item, 'observations')?.value === command.observations &&
+          descriptor(item, 'observations').enumerable && descriptor(item, 'terminal').enumerable &&
+          command.count > 0 && command.observations.length === command.count &&
+          descriptor(command.observations, command.observations.length - 1)?.value === command.terminal &&
+          prototype(item) === objectPrototype && !descriptor(item, 'toJSON') &&
+          !descriptor(objectPrototype, 'toJSON') && inert(command.observations, new Set()) &&
+          keys(item).every(key => {
+            const field = descriptor(item, key);
+            return !field.enumerable || key === 'observations' || key === 'terminal' ||
+              ('value' in field && (field.value === null || ['boolean','string','number'].includes(typeof field.value)));
+          })) {
+        // Same object in the same displayed array, not a reconstructed or
+        // cross-request reference. The terminal keeps its native projection.
+        // Keep terminal controls first even if the display is cut short.
+        const observations = [];
+        for (let i = 0; i < command.observations.length - 1; i++) {
+          const field = descriptor(command.observations, i);
+          if (!field || !('value' in field)) return item;
+          observations.push(field.value);
+        }
+        observations.push({same_as: 'terminal'});
+        return {...item, observations};
+      }
       const entry = item !== null && typeof item === 'object' ? get(item) : undefined;
       if (!entry) return item;
       if (frames?.has(item)) {

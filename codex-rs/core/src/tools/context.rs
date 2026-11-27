@@ -2001,6 +2001,13 @@ impl ToolOutput for ExecCommandToolOutput {
             output_complete: bool,
             output_reduced: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
+            delivered_view_bytes: Option<usize>,
+            rendered_view_bytes: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            represented_producer_bytes: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            produced_stdout_bytes: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count_is_approximate: Option<bool>,
@@ -2136,12 +2143,34 @@ impl ToolOutput for ExecCommandToolOutput {
             .as_ref()
             .is_some_and(RawOutputArtifact::retention_limit_hit);
         let retained_output = (!locator_only).then(|| self.retained_terminal_output(limits.applied_limit)).flatten().map(str::to_owned);
+        let exact_view_count = |count: Option<usize>| {
+            if count == Some(0) {
+                return Some(0);
+            }
+            // Lossy decoding and buffer-inserted gap notices break the mapping
+            // to the producer. An exact chunk or transcript binds it.
+            count.filter(|_| {
+                matches!(raw_output, std::borrow::Cow::Borrowed(_))
+                    && (self.output_ranges.as_ref().is_some_and(|r| {
+                        r.gap.is_none()
+                            && r.range.end.checked_sub(r.range.start) == Some(self.raw_output.len() as u64)
+                    }) || self.process_output.as_ref().is_some_and(|s| {
+                        s.aggregated_output_is_exact && s.aggregated_output == self.raw_output
+                    }))
+            })
+        };
         let result = UnifiedExecCodeModeResult {
             output_reference: RawOutputArtifact::output_reference(self.raw_output_artifact.as_ref()),
             environment_receipt: self.environment_receipt.clone(),
             quiet_success: self.quiet_success_applied().then_some(true),
             success: self.quiet_success_applied().then_some(true),
             current_chunk_display_complete: !output_reduced,
+            rendered_view_bytes: output.len(),
+            delivered_view_bytes: exact_view_count(model_output.displayed_source_bytes),
+            represented_producer_bytes: exact_view_count(model_output.represented_producer_bytes),
+            produced_stdout_bytes: self.process_output.as_ref()
+                .filter(|s| self.process_exited && s.output_closed && s.streams_are_exact)
+                .map(|s| s.stdout.len()),
             cumulative_streams_complete: streams_complete,
             retained_artifact_complete: raw_output_artifact_id.as_ref().map(|_| {
                 self.process_exited
@@ -3268,6 +3297,8 @@ impl ExecCommandToolOutput {
     ) -> ProjectedModelOutput {
         if self.quiet_success_applied() {
             return ProjectedModelOutput {
+                displayed_source_bytes: Some(0),
+                represented_producer_bytes: Some(0),
                 text: QUIET_SUCCESS_SUMMARY.to_string(),
                 reduced: self
                     .raw_output_artifact
@@ -3278,6 +3309,7 @@ impl ExecCommandToolOutput {
                 ranked_excerpt: false,
             };
         }
+        let original_output = raw_output;
         let source_bytes = raw_output.len() as u64;
         // Recovery selectors address retained bytes, not normalized presentation.
         let summarized = self.summarized_output(raw_output, limits.applied_limit);
@@ -3297,16 +3329,17 @@ impl ExecCommandToolOutput {
         let line_summary = summarized
             .as_deref()
             .and_then(crate::tools::shell_output_summary::line_summary_omitted_group);
-        let (truncated, omitted_lines) = match summarized.as_deref() {
+        let (truncated, omitted_lines, spans) = match summarized.as_deref() {
             // These coordinates are chunk-relative. The output owner translates
             // them before exposing a cumulative artifact recovery selector.
             None => {
                 let marked = formatted_truncate_text_with_line_markers(raw_output, limits);
-                (marked.output, marked.omitted_lines)
+                (marked.output, marked.omitted_lines, marked.displayed_source_spans)
             }
             content => (
                 formatted_truncate_text_with_output_limit(content.unwrap_or(raw_output), limits),
                 line_summary.flatten().into_iter().collect(),
+                None,
             ),
         };
         let was_truncated = truncated.was_truncated;
@@ -3334,9 +3367,27 @@ impl ExecCommandToolOutput {
                 .filter(|start| *start != 0)
         {
             projected_text = format!(
-                "[line numbers below are relative to this output chunk, which starts at byte {start} of the retained artifact; use recovery_selector or byte selectors]\n{projected_text}"
+                "[line numbers below are relative to this output chunk, which starts at byte {start} of the retained artifact; use the recovery recipe or byte selectors]\n{projected_text}"
             );
         }
+        let displayed_source_bytes = spans.map(|spans| {
+            spans.into_iter().map(|(start, end)| end - start).sum::<usize>()
+        });
+        let represented_producer_bytes = spans.zip(displayed_source_bytes).map(|(spans, bytes)| {
+            // Every selected normalized newline represents both bytes of its
+            // original CRLF. Count at most once using disjoint source spans.
+            let mut extra = 0;
+            if source_bytes != raw_output.len() as u64 {
+                for (index, (offset, _)) in original_output.match_indices("\r\n").enumerate()
+                {
+                    let normalized_newline = offset - index;
+                    if spans.iter().any(|&(start, end)| (start..end).contains(&normalized_newline)) {
+                        extra += 1;
+                    }
+                }
+            }
+            bytes + extra
+        });
         ProjectedModelOutput {
             reduced: summarized.is_some()
                 || was_truncated
@@ -3348,6 +3399,8 @@ impl ExecCommandToolOutput {
                     && !raw_output.is_empty()
                     && artifact_has_more_bytes),
             text: projected_text,
+            displayed_source_bytes,
+            represented_producer_bytes,
             omitted_lines,
             ranked_excerpt: line_summary.is_some(),
         }
@@ -3515,6 +3568,8 @@ pub(crate) const QUIET_SUCCESS_SUMMARY: &str =
     "Command completed successfully (exit code 0); output retained for recovery.";
 
 struct ProjectedModelOutput {
+    displayed_source_bytes: Option<usize>,
+    represented_producer_bytes: Option<usize>,
     text: String,
     reduced: bool,
     /// Every run the text's line markers report omitted from the raw output.

@@ -3213,21 +3213,23 @@ impl CodeModeArgumentPreflight {
         });
         match diagnostic.or_else(|| native_rejection.map(reject)) {
             Some(mut failure) => {
-                // A snapshot tail on a live file is a known carrier mismatch, not
-                // twelve independent violations of mutually exclusive branches.
+                // A malformed tail selector is one error on that item, not
+                // a separate violation of every mutually exclusive branch.
                 if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "read_file"
-                    && value.as_object().is_some_and(|args| args.len() == 2)
-                    && value["path"].as_str().is_some_and(|path| !path.is_empty())
-                    && value["selectors"].as_array().is_some_and(|items| items.len() == 1 && items[0]["kind"] == "tail")
+                    && let Some(compiled) = validator.as_ref()
+                    && let Some(indices) = read_file_snapshot_tail_errors(&compiled.validator, &value)
                 {
                     let details = serde_json::json!({"message": failure.message, "field_errors": failure.field_errors,
                         "details": failure.details});
-                    failure.message = "tail is a read_tool_output snapshot selector. For a live file use lines with start and end. Full schema diagnostic: tool_failure.details.selector_branches.".into();
-                    failure.field_errors = vec![ToolFieldError {
-                        path: "/selectors/0/kind".into(),
-                        expected: "lines, bytes, search, section, json_pointer, structured, symbol or enclosing".into(),
-                        correction: "Use the advertised read_file selector and its required fields.".into(),
-                    }];
+                    failure.message = "Invalid tail selector. Use kind=tail with optional integer lines (1..2000) and max_bytes (1..1048576). In Code Mode, the native error retains the full schema diagnostic in tool_failure.details.selector_branches.".into();
+                    failure.field_errors = indices
+                        .into_iter()
+                        .map(|index| ToolFieldError {
+                            path: format!("/selectors/{index}"),
+                            expected: "tail with only optional bounded lines and max_bytes".into(),
+                            correction: "Use the advertised read_file selector and its required fields.".into(),
+                        })
+                        .collect();
                     failure.details = Some(serde_json::json!({"selector_branches": details}));
                 }
                 failure.message = format!("tool `{tool_name}` rejected before execution: {}", failure.message);
@@ -3236,6 +3238,30 @@ impl CodeModeArgumentPreflight {
             None => Ok(()),
         }
     }
+}
+
+// Only summarize errors on tail selector items themselves. A root, array,
+// sibling, or member error still needs its original independent diagnostic.
+fn read_file_snapshot_tail_errors(
+    validator: &jsonschema::Validator,
+    value: &Value,
+) -> Option<Vec<usize>> {
+    let selectors = value.get("selectors")?.as_array()?;
+    if !selectors.iter().any(|item| item["kind"] == "tail") {
+        return None;
+    }
+    let mut indices = Vec::new();
+    for error in validator.iter_errors(value) {
+        let path = error.instance_path().as_str();
+        let index = path.strip_prefix("/selectors/")?.parse::<usize>().ok()?;
+        if selectors.get(index)?["kind"] != "tail" {
+            return None;
+        }
+        indices.push(index);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    (!indices.is_empty()).then_some(indices)
 }
 
 /// Reuse validator facts, never rejected values. Shared by registry preflight

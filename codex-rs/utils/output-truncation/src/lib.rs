@@ -442,6 +442,10 @@ fn json_outline(value: &serde_json::Value, depth: usize, out: &mut String) {
     }
 }
 
+/// Ordered, non-overlapping byte spans copied verbatim from the truncator input.
+/// Empty spans pad the fixed-size array (at most head, middle, and tail).
+pub type DisplayedSourceSpans = [(usize, usize); 3];
+
 /// Also returns the exact line-marked cut ranges, including cuts after JSON
 /// outlining (which preserves line coordinates). Outlining alone and tiny
 /// budgets report no cut ranges.
@@ -449,15 +453,16 @@ fn truncate_over_budget_text_with_markers(
     content: &str,
     max_tokens: usize,
     line_markers: bool,
-) -> (String, Vec<(usize, usize)>) {
+) -> (String, Vec<(usize, usize)>, Option<DisplayedSourceSpans>) {
     if max_tokens == 0 {
-        return (String::new(), Vec::new());
+        return (String::new(), Vec::new(), Some([(0, 0); 3]));
     }
     if let Some(outlined) = outline_oversized_json_lines(content, max_tokens) {
         if !approx_token_count_exceeds(&outlined, max_tokens) {
-            return (outlined, Vec::new());
+            return (outlined, Vec::new(), None);
         }
-        return truncate_over_budget_lines_with_markers(&outlined, max_tokens, line_markers);
+        let (text, lines, _) = truncate_over_budget_lines_with_markers(&outlined, max_tokens, line_markers);
+        return (text, lines, None);
     }
     truncate_over_budget_lines_with_markers(content, max_tokens, line_markers)
 }
@@ -466,16 +471,14 @@ fn truncate_over_budget_lines_with_markers(
     content: &str,
     max_tokens: usize,
     line_markers: bool,
-) -> (String, Vec<(usize, usize)>) {
+) -> (String, Vec<(usize, usize)>, Option<DisplayedSourceSpans>) {
     const BEFORE_MIDDLE: &str = "\n[omitted before retained middle]\n";
     const AFTER_MIDDLE: &str = "\n[omitted after retained middle]\n";
     let marker_tokens = approx_token_count(BEFORE_MIDDLE) + approx_token_count(AFTER_MIDDLE);
     // Leave room for useful UTF-8 content in each retained region.
     if max_tokens <= marker_tokens + 4 {
-        return (
-            truncate_middle_to_token_ceiling(content, max_tokens),
-            Vec::new(),
-        );
+        let (text, bytes) = truncate_middle_to_token_ceiling(content, max_tokens);
+        return (text, Vec::new(), Some(bytes));
     }
 
     let mut retained_bytes =
@@ -531,7 +534,15 @@ fn truncate_over_budget_lines_with_markers(
             } else {
                 Vec::new()
             };
-            return (candidate, omitted);
+            return (
+                candidate,
+                omitted,
+                Some([
+                    (0, head_text.len()),
+                    (middle_offset, middle_offset + middle_text.len()),
+                    (tail_offset, tail_offset + tail_text.len()),
+                ]),
+            );
         }
         // Scale by the observed token density; a token delta is not a byte delta.
         retained_bytes = retained_bytes
@@ -542,10 +553,8 @@ fn truncate_over_budget_lines_with_markers(
             // changes across UTF-8 boundaries or retained regions.
             .min(retained_bytes.saturating_sub(retained_bytes.div_ceil(8)));
         if retained_bytes < 3 {
-            return (
-                truncate_middle_to_token_ceiling(content, max_tokens),
-                Vec::new(),
-            );
+            let (text, bytes) = truncate_middle_to_token_ceiling(content, max_tokens);
+            return (text, Vec::new(), Some(bytes));
         }
     }
 }
@@ -573,7 +582,7 @@ fn retained_text(content: &str, start: usize, end: usize) -> &str {
     }
 }
 
-fn truncate_middle_to_token_ceiling(content: &str, max_tokens: usize) -> String {
+fn truncate_middle_to_token_ceiling(content: &str, max_tokens: usize) -> (String, DisplayedSourceSpans) {
     const MARKER: &str = "\n[...]\n";
     let marker = if max_tokens >= approx_token_count(MARKER) + 4 {
         MARKER
@@ -597,19 +606,19 @@ fn truncate_middle_to_token_ceiling(content: &str, max_tokens: usize) -> String 
         }
         let tail = bytes - head;
         candidate.clear();
-        let _ = write!(
-            candidate,
-            "{}{marker}{}",
-            retained_text(content, 0, content.floor_char_boundary(head)),
-            retained_text(
-                content,
-                content.ceil_char_boundary(content.len() - tail),
-                content.len()
-            )
+        let head_text = retained_text(content, 0, content.floor_char_boundary(head));
+        let tail_text = retained_text(
+            content,
+            content.ceil_char_boundary(content.len() - tail),
+            content.len(),
         );
+        let _ = write!(candidate, "{head_text}{marker}{tail_text}");
         let tokens = approx_token_count(&candidate);
         if tokens <= max_tokens {
-            return candidate;
+            return (
+                candidate,
+                [(0, head_text.len()), (0, 0), (content.len() - tail_text.len(), content.len())],
+            );
         }
         bytes = bytes
             .saturating_mul(max_tokens - marker_tokens)
@@ -629,6 +638,9 @@ pub fn formatted_truncate_text_with_output_limit(
 /// A formatted truncation whose omission markers name source line ranges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineMarkedTruncation {
+    /// The supplied text byte ranges, excluding generated notices. Outlined
+    /// JSON does not have a verbatim source mapping.
+    pub displayed_source_spans: Option<DisplayedSourceSpans>,
     pub output: TruncatedTextOutput,
     /// 1-based inclusive line runs of the source that the markers report
     /// omitted, in order. Empty when no cut could be marked in line coordinates
@@ -653,9 +665,10 @@ pub fn formatted_truncate_text_with_line_markers(
     content: &str,
     limits: OutputLimitResolution,
 ) -> LineMarkedTruncation {
-    let (output, omitted_lines) =
+    let (output, omitted_lines, displayed_source_spans) =
         formatted_truncate_text_to_token_ceiling(content, limits.applied_limit, true);
     LineMarkedTruncation {
+        displayed_source_spans,
         output,
         omitted_lines,
     }
@@ -665,7 +678,7 @@ fn formatted_truncate_text_to_token_ceiling(
     content: &str,
     max_tokens: usize,
     line_markers: bool,
-) -> (TruncatedTextOutput, Vec<(usize, usize)>) {
+) -> (TruncatedTextOutput, Vec<(usize, usize)>, Option<DisplayedSourceSpans>) {
     if max_tokens == 0 {
         return (
             TruncatedTextOutput {
@@ -673,6 +686,7 @@ fn formatted_truncate_text_to_token_ceiling(
                 was_truncated: !content.is_empty(),
             },
             Vec::new(),
+            Some([(0, 0); 3]),
         );
     }
     let original_tokens = approx_token_count(content);
@@ -681,7 +695,7 @@ fn formatted_truncate_text_to_token_ceiling(
             text: content.to_owned(),
             was_truncated: false,
         };
-        return (output, Vec::new());
+        return (output, Vec::new(), Some([(0, content.len()), (0, 0), (0, 0)]));
     }
     let warning = format!(
         "Warning: truncated output (estimated original tokens: {original_tokens})\nTotal output lines: {}\n\n",
@@ -691,13 +705,13 @@ fn formatted_truncate_text_to_token_ceiling(
     // Keep at least half the budget for source evidence. At small budgets the
     // inline omission marker communicates truncation without consuming the
     // space needed to identify each retained text run.
-    let (text, omitted_lines) = if max_tokens > warning_tokens.saturating_mul(2) {
-        let (text, omitted_lines) = truncate_over_budget_text_with_markers(
+    let (text, omitted_lines, displayed_source_spans) = if max_tokens > warning_tokens.saturating_mul(2) {
+        let (text, omitted_lines, bytes) = truncate_over_budget_text_with_markers(
             content,
             max_tokens - warning_tokens,
             line_markers,
         );
-        (format!("{warning}{text}"), omitted_lines)
+        (format!("{warning}{text}"), omitted_lines, bytes)
     } else {
         truncate_over_budget_text_with_markers(content, max_tokens, line_markers)
     };
@@ -705,7 +719,7 @@ fn formatted_truncate_text_to_token_ceiling(
         text,
         was_truncated: true,
     };
-    (output, omitted_lines)
+    (output, omitted_lines, displayed_source_spans)
 }
 
 /// Recognize validation output for diagnostic budgeting and summarization.

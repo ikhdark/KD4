@@ -213,6 +213,11 @@ impl ResponsesInput {
         self.iter().next()
     }
 
+    /// Only the request-builder envelope; never includes conversation history.
+    pub fn prepended_items(&self) -> &[ResponseItem] {
+        &self.prefix
+    }
+
     /// Indexed inspection must not materialize the contiguous compatibility copy.
     pub fn get_item(&self, index: usize) -> Option<&ResponseItem> {
         if index < self.prefix.len() {

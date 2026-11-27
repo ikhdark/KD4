@@ -480,9 +480,10 @@ impl IncludedContent<'_> {
             // IDs may be stripped by the transport. Include an exact, bounded
             // beginning so the model can locate the earlier user text as well.
             let preview_end = text.char_indices().nth(48).map_or(text.len(), |(offset, _)| offset);
+            // The enclosing pin still carries source.input_id and source.sha256.
             let marker = json!({"already_in_context":{
-                "user_input_id":id,"content_index":index,"starts_with":&text[..preview_end],
-                "sha256":hash,"bytes":text.len()
+                "user_input":"this pin's source","content_index":index,
+                "starts_with":&text[..preview_end],"bytes":text.len()
             }});
             if marker.to_string().len() + 64 < text.len() {
                 pin["text"] = marker;
