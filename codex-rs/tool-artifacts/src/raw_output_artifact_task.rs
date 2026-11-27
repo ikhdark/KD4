@@ -477,7 +477,7 @@ struct CommandLogIdentity {
 
 #[derive(Clone, Default)]
 struct CommandLogLineIndex {
-    // Exact line starts only. No UTF-8 decoding or fixed-width assumption.
+    // Exact byte boundaries only. A boundary at EOF need not start a line.
     points: Vec<(usize, u64)>,
 }
 
@@ -761,11 +761,6 @@ pub async fn read_command_log(
                 continue;
             }
             ranges.push((*start, *end));
-        }
-        // Use the snapshot owner's canonical union, not independent overlapping
-        // deliveries charged repeatedly against the same response budget.
-        let ranges = super::normalize_line_ranges(ranges);
-        for (start, _) in &ranges {
             offsets.insert(*start, None);
         }
         let io_error = |error: std::io::Error| super::ReadToolOutputError::Io(error.to_string());
@@ -798,16 +793,31 @@ pub async fn read_command_log(
                 offset += count as u64;
                 if newline.is_some() { scanned_line += 1; }
             }
-            if scanned_line == *start {
+            // A final newline reaches a boundary, not another line. Keep line
+            // one selectable even when there are no retained bytes.
+            if scanned_line == *start
+                && (*start == 1 || !reader.fill_buf().map_err(io_error)?.is_empty())
+            {
                 *position = Some(offset);
                 line_index.record(scanned_line, offset);
             }
         }
+        // Check each submitted start before the canonical union can hide an
+        // invalid selector behind a valid range whose end clamps to EOF.
+        let mut valid_ranges = Vec::with_capacity(ranges.len());
         for (start, end) in ranges {
-            let position = offsets.get(&start).copied().flatten();
-            if let Some(position) = position {
-                reader.seek(SeekFrom::Start(position)).map_err(io_error)?;
+            if offsets[&start].is_some() {
+                valid_ranges.push((start, end));
+            } else {
+                results.push(invalid(
+                    &ToolOutputSelector::Lines { start, end },
+                    "line range starts beyond the retained log".into(),
+                )?);
             }
+        }
+        for (start, end) in super::normalize_line_ranges(valid_ranges) {
+            let position = offsets[&start].expect("normalized start was validated");
+            reader.seek(SeekFrom::Start(position)).map_err(io_error)?;
             let mut line = start;
             let mut selection = Vec::new();
             let mut complete = true;
@@ -815,19 +825,19 @@ pub async fn read_command_log(
             let mut next_bytes = None;
             let mut error = None;
             let mut indexed_end = None;
-            while position.is_some() && line <= end {
+            while line <= end {
                 let mut bytes = Vec::new();
                 let count = Read::by_ref(&mut reader).take(remaining.saturating_add(1) as u64)
                     .read_until(b'\n', &mut bytes)
                     .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
                 if count == 0 { break; }
                 if count > remaining {
-                    line_index.record(line, position.unwrap_or(0) + selection.len() as u64);
+                    line_index.record(line, position + selection.len() as u64);
                     if selection.is_empty() && remaining == max_bytes {
                         // Find the whole unconsumed selection's exact byte extent
                         // without buffering it, including later requested lines.
                         // read_file cannot recover oversized or non-UTF-8 logs.
-                        let start = position.unwrap_or(0);
+                        let start = position;
                         let mut byte_end = start + count as u64;
                         let mut lines_left = end - line + 1;
                         if bytes.last() == Some(&b'\n') { lines_left -= 1; }
@@ -854,16 +864,14 @@ pub async fn read_command_log(
                 let newline = bytes.last() == Some(&b'\n');
                 selection.extend_from_slice(&bytes);
                 line += 1;
-                if newline { indexed_end = Some((line, position.unwrap_or(0) + selection.len() as u64)); }
+                if newline { indexed_end = Some((line, position + selection.len() as u64)); }
             }
             if let Some((line, offset)) = indexed_end { line_index.record(line, offset); }
             let mut item = serde_json::json!({
                 "selector":{"kind":"lines","start":start,"end":end},
                 "status":if error.is_some() { "selector_too_large" } else { "ok" }, "complete":complete,
             });
-            if let Some(start) = position {
-                item["canonical_range"] = serde_json::json!({"start":start,"end":start + selection.len() as u64});
-            }
+            item["canonical_range"] = serde_json::json!({"start":position,"end":position + selection.len() as u64});
             if let Some(error) = error { item["message"] = error.into(); }
             match String::from_utf8(selection) {
                 Ok(text) => item["text"] = text.into(),

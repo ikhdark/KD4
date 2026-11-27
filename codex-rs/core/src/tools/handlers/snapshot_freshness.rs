@@ -15,6 +15,7 @@ use crate::tool_history::ReadStatusQuery;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::checksum_file::FileChecksum;
 use crate::tools::handlers::checksum_file::checksum_source;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::wait_for_tool_environment;
@@ -34,11 +35,8 @@ struct CheckInput {
     snapshot_id: Option<String>,
 }
 
-#[derive(Clone)]
 struct Observation {
-    sha256: String,
-    bytes_hashed: u64,
-    source_identity: String,
+    checksum: Result<FileChecksum, &'static str>,
     check_started_at: String,
     observed_at: String,
 }
@@ -46,7 +44,7 @@ struct Observation {
 // Invocation-local only. Serial acquisition bounds filesystem contention and
 // keeps cancellation/task lifetime with the existing checksum owner. Different
 // expected identities still share one authorized read of the same bound path.
-type Observations = BTreeMap<(String, String), Result<Observation, &'static str>>;
+type Observations = BTreeMap<(String, String), Observation>;
 
 impl CheckInput {
     fn normalize(&mut self) -> Result<(), &'static str> {
@@ -195,10 +193,9 @@ async fn observe(
     args: &CheckInput,
     observations: &mut Observations,
 ) -> serde_json::Value {
+    let started = chrono::Utc::now();
     let mut value = json!({
         "path":args.path, "status":"unknown", "reason":"source_unavailable",
-        "check_started_at":chrono::Utc::now().to_rfc3339(),
-        "observed_at":chrono::Utc::now().to_rfc3339(),
     });
     if let Some(id) = &args.snapshot_id {
         value["snapshot_id"] = json!(id);
@@ -218,7 +215,10 @@ async fn observe(
     };
     if let Err(reason) = result {
         value["reason"] = json!(reason);
-        value["observed_at"] = json!(chrono::Utc::now().to_rfc3339());
+        if value.get("observed_at").is_none() {
+            value["check_started_at"] = json!(started.to_rfc3339());
+            value["observed_at"] = json!(chrono::Utc::now().to_rfc3339());
+        }
     }
     value
 }
@@ -278,25 +278,24 @@ async fn check(
     value["source_sha256"] = json!(expected);
     let key = (environment.environment_id.clone(), path.to_string());
     if !observations.contains_key(&key) {
-        let started = chrono::Utc::now().to_rfc3339();
-        let observation =
-            checksum_source(invocation, &args.path, Some(&environment.environment_id))
-                .await
-                .map(|checksum| Observation {
-                    sha256: checksum.sha256,
-                    bytes_hashed: checksum.bytes_hashed,
-                    source_identity: checksum.source_identity,
-                    check_started_at: started,
-                    observed_at: chrono::Utc::now().to_rfc3339(),
-                })
-                .map_err(|failure| failure.reason);
-        observations.insert(key.clone(), observation);
+        let check_started_at = chrono::Utc::now().to_rfc3339();
+        let checksum = checksum_source(invocation, &args.path, Some(&environment.environment_id))
+            .await
+            .map_err(|failure| failure.reason);
+        observations.insert(
+            key.clone(),
+            Observation {
+                checksum,
+                check_started_at,
+                observed_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
     }
-    let checksum = observations
-        .get(&key)
-        .ok_or("source_unavailable")?
-        .as_ref()
-        .map_err(|reason| *reason)?;
+    let observation = observations.get(&key).ok_or("source_unavailable")?;
+    // Failures and outcome-specific uncertainty still use the acquisition interval.
+    value["check_started_at"] = json!(observation.check_started_at);
+    value["observed_at"] = json!(observation.observed_at);
+    let checksum = observation.checksum.as_ref().map_err(|reason| *reason)?;
     if invocation.cancellation_token.is_cancelled() {
         return Err("cancelled");
     }
@@ -335,8 +334,6 @@ async fn check(
     value["checked_sha256"] = json!(checksum.sha256);
     value["bytes_hashed"] = json!(checksum.bytes_hashed);
     value["source_identity"] = json!(checksum.source_identity);
-    value["check_started_at"] = json!(checksum.check_started_at);
-    value["observed_at"] = json!(checksum.observed_at);
     Ok(())
 }
 

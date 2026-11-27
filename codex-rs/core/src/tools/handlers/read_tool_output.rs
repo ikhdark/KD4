@@ -1094,7 +1094,10 @@ fn resolved_selectors(
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let normalized = crate::tools::command_output_artifact::normalize_line_ranges(ranges);
+        // The union determines the admission budget. Preserve individual starts
+        // until the artifact owner can distinguish unavailable lines from a
+        // valid range whose end merely needs clamping.
+        let normalized = crate::tools::command_output_artifact::normalize_line_ranges(ranges.clone());
         let aggregate_lines = normalized.iter().try_fold(0_usize, |total, (start, end)| {
             total.checked_add(end - start + 1)
         });
@@ -1103,7 +1106,7 @@ fn resolved_selectors(
                 "ranges may request at most {MAX_AGGREGATE_LINES} aggregate lines"
             )));
         }
-        return Ok(normalized
+        return Ok(ranges
             .into_iter()
             .map(|(start, end)| ToolOutputSelector::Lines { start, end })
             .collect());

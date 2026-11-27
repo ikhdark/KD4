@@ -54,6 +54,14 @@ fn cloud_config_eligible_auth(auth: &CodexAuth) -> bool {
             || matches!(plan_type, PlanType::Enterprise | PlanType::Edu))
 }
 
+fn policy_auth_unavailable() -> CloudConfigBundleLoadError {
+    CloudConfigBundleLoadError::new(
+        CloudConfigBundleLoadErrorCode::Internal,
+        None,
+        "could not read authentication state while loading managed policy",
+    )
+}
+
 fn optional_bundle(bundle: CloudConfigBundle) -> Option<CloudConfigBundle> {
     if bundle.is_empty() {
         None
@@ -97,9 +105,8 @@ impl CloudConfigBundleService {
         let codex_home = AbsolutePathBuf::resolve_path_against_base(codex_home, "/");
         Self {
             auth_epoch: auth_manager
-                .policy_auth_snapshot()
-                .ok()
-                .map(|(epoch, _)| epoch),
+                .with_policy_identity(|identity| identity.current_epoch)
+                .ok(),
             auth_manager,
             client,
             codex_home,
@@ -115,19 +122,20 @@ impl CloudConfigBundleService {
         &self,
         publish: impl FnOnce() -> T,
     ) -> Result<T, CloudConfigBundleLoadError> {
-        self.auth_epoch
-            .and_then(|epoch| {
-                self.auth_manager
-                    .with_policy_auth_epoch(epoch, publish)
-                    .ok()
+        let epoch = self.auth_epoch.ok_or_else(policy_auth_unavailable)?;
+        self.auth_manager
+            .with_policy_identity(|identity| {
+                // Account ID completion also retires this exact-epoch loader.
+                if identity.current_epoch != epoch {
+                    return Err(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::Auth,
+                        None,
+                        "authentication changed while loading managed policy; reload configuration",
+                    ));
+                }
+                Ok(publish())
             })
-            .ok_or_else(|| {
-                CloudConfigBundleLoadError::new(
-                    CloudConfigBundleLoadErrorCode::Auth,
-                    None,
-                    "authentication changed while loading managed policy; reload configuration",
-                )
-            })
+            .map_err(|_| policy_auth_unavailable())?
     }
 
     pub(crate) async fn load_startup_bundle_with_timeout(
@@ -414,7 +422,9 @@ impl CloudConfigBundleService {
             *auth_recovery = completed_recovery;
             match recovery {
                 Ok(_) => {
-                    let Some(refreshed_auth) = self.load_auth().await? else {
+                    let refreshed_auth = self.load_auth().await?;
+                    self.validate_current()?;
+                    let Some(refreshed_auth) = refreshed_auth else {
                         tracing::error!(
                             "Auth recovery succeeded but no auth is available for cloud config bundle"
                         );
@@ -433,7 +443,6 @@ impl CloudConfigBundleService {
                         ));
                     };
                     *auth = refreshed_auth;
-                    self.validate_current()?;
                     if !cloud_config_eligible_auth(auth) {
                         return Err(CloudConfigBundleLoadError::new(
                             CloudConfigBundleLoadErrorCode::Auth,

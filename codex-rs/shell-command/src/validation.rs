@@ -2525,6 +2525,9 @@ fn policy_kda(mut args: &[String]) -> ValidationPolicyClassification {
         return Policy::ReadOnly;
     }
     if args.first().is_some_and(|arg| arg == "op") {
+        if is_kda_static_project_gate(&args[1..]) {
+            return Policy::Tooling;
+        }
         let json = args.windows(2).find(|pair| pair[0] == "--json").map(|pair| pair[1].as_str())
             .or_else(|| args.iter().find_map(|arg| arg.strip_prefix("--json=")));
         if let Some(policy) = json.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
@@ -2536,6 +2539,51 @@ fn policy_kda(mut args: &[String]) -> ValidationPolicyClassification {
     if args.first().is_some_and(|arg| matches!(arg.as_str(), "test" | "tests" | "suite")) { return Policy::Tests; }
     if args.first().is_some_and(|arg| matches!(arg.as_str(), "check" | "lint" | "gate" | "validate")) { return Policy::Checks; }
     Policy::Tooling
+}
+
+/// Admit only a single, inspectable KDA JS/TS or Python project gate as
+/// Full .5 tooling. Other gates keep their check classification.
+fn is_kda_static_project_gate(args: &[String]) -> bool {
+    let mut pairs = args.chunks_exact(2);
+    if !pairs.remainder().is_empty() {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut inline = None;
+    for pair in &mut pairs {
+        let slot = match pair[0].as_str() {
+            "--json" => {
+                inline = Some(pair[1].as_str());
+                "--json"
+            }
+            "--jobs" | "-j" => "--jobs",
+            option @ ("--root" | "--deadline-ms" | "--progress" | "--format") => option,
+            // Files, stdin servers, and future switches are not this workflow.
+            _ => return false,
+        };
+        if !seen.insert(slot) {
+            return false;
+        }
+    }
+    let Some(request) = inline.and_then(|json| {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json).ok()
+    }) else {
+        return false;
+    };
+    if request.get("op").and_then(serde_json::Value::as_str) != Some("gate")
+        || !request.keys().all(|key| matches!(key.as_str(),
+            "op" | "project" | "root" | "expected_contract" | "execute_workspace"
+                | "all_profiles" | "profile" | "rules"))
+        || !["execute_workspace", "all_profiles"].into_iter()
+            .all(|key| request.get(key).is_none_or(|value| value.as_bool() == Some(false)))
+    {
+        return false;
+    }
+    request.get("project").and_then(serde_json::Value::as_str).is_some_and(|path| {
+        let name = path.rsplit(['/', '\\']).next().unwrap_or_default().to_ascii_lowercase();
+        matches!(name.as_str(), "tsconfig.json" | "jsconfig.json" | "pyproject.toml")
+            || std::path::Path::new(&name).extension().is_some_and(|extension| extension == "py")
+    })
 }
 
 /// Composite KDA requests execute their nested operations, so classify those

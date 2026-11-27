@@ -24,6 +24,7 @@ use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
 use crate::catalog::SkillSourceKind;
+use crate::provider::OrchestratorSkillProvider;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
 use crate::sources::SkillProviders;
@@ -215,11 +216,14 @@ impl SkillsThreadState {
             Ok(next) => {
                 let catalog = Arc::make_mut(catalog);
                 catalog.continuation = next.continuation;
-                catalog.warnings = next.warnings;
+                replace_orchestrator_warnings(&mut catalog.warnings, next.warnings);
                 catalog.extend_entries(next.entries);
             }
             Err(error) => {
-                Arc::make_mut(catalog).warnings = vec![error.model_message().to_string()];
+                replace_orchestrator_warnings(
+                    &mut Arc::make_mut(catalog).warnings,
+                    vec![error.model_message().to_string()],
+                );
             }
         }
         catalog.clone()
@@ -235,7 +239,12 @@ impl SkillsThreadState {
             .as_ref()
             .is_some_and(|cache| match cache.catalog.get() {
                 Some(Err(_)) => true,
-                Some(Ok(catalog)) => catalog.continuation.is_none() && !catalog.warnings.is_empty(),
+                Some(Ok(catalog)) => {
+                    catalog.continuation.is_none()
+                        && catalog.warnings.iter().any(|warning| {
+                            OrchestratorSkillProvider::skipped_resource_count(warning).is_none()
+                        })
+                }
                 None => cache.discovery_deadline.get().is_some_and(|deadline| {
                     *deadline <= tokio::time::Instant::now()
                 }),
@@ -469,6 +478,27 @@ struct OrchestratorGenerationCache {
     discovery_deadline: OnceLock<tokio::time::Instant>,
     continued_catalog: tokio::sync::Mutex<Option<Arc<SkillCatalog>>>,
     resources: Mutex<OrchestratorResourceCache>,
+}
+
+// Malformed records are evidence of omissions in the accumulated generation.
+// Transport and pagination warnings describe only the latest attempt.
+fn replace_orchestrator_warnings(current: &mut Vec<String>, mut next: Vec<String>) {
+    let mut skipped = current
+        .iter()
+        .filter_map(|warning| OrchestratorSkillProvider::skipped_resource_count(warning))
+        .fold(0, usize::saturating_add);
+    next.retain(|warning| {
+        if let Some(count) = OrchestratorSkillProvider::skipped_resource_count(warning) {
+            skipped = skipped.saturating_add(count);
+            false
+        } else {
+            true
+        }
+    });
+    if skipped > 0 {
+        next.push(OrchestratorSkillProvider::skipped_resource_warning(skipped));
+    }
+    *current = next;
 }
 
 fn catalog_or_warning(result: SkillProviderResult<SkillCatalog>) -> SkillCatalog {

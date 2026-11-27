@@ -101,6 +101,7 @@ struct RunningProcess {
     events: ExecProcessEventLog,
     output_notify: Arc<Notify>,
     open_streams: usize,
+    signals_in_flight: usize,
     closed: bool,
     termination_requested: Arc<std::sync::atomic::AtomicBool>,
     failure: Option<String>,
@@ -294,39 +295,60 @@ impl LocalProcess {
         }
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self, session_id: &str) {
         self.inner.notification_shutdown.cancel();
         let remaining = {
-            let processes = self.inner.processes.lock().await;
+            let mut processes = self.inner.processes.lock().await;
+            processes.retain(|_, entry| match entry {
+                ProcessEntry::Starting(start) => {
+                    start.preparation_cancelled.cancel();
+                    false
+                }
+                ProcessEntry::Running(_) => true,
+            });
             processes
                 .iter()
-                .filter_map(|(process_id, process)| match process {
-                    ProcessEntry::Starting(start) => {
-                        start.preparation_cancelled.cancel();
-                        None
+                .filter_map(|(process_id, entry)| {
+                    let ProcessEntry::Running(process) = entry else {
+                        return None;
+                    };
+                    if process.closed && !process.termination_requested.load(Ordering::Acquire) {
+                        return None;
                     }
-                    ProcessEntry::Running(process) if process.closed
-                        && !process.termination_requested.load(Ordering::Acquire) => None,
-                    ProcessEntry::Running(process) => {
-                        process.termination_requested.store(true, Ordering::Release);
-                        Some(LocalExecProcess {
-                            identity: ProcessStartIdentity(Arc::clone(&process.start_generation)),
-                            process_id: process_id.clone(),
-                            backend: self.clone(),
-                            wake_tx: process.wake_tx.clone(),
-                            events: process.events.clone(),
-                        })
-                    }
+                    // Replay expiry can remove the map entry while shutdown
+                    // waits. Take the exact native owner now, not just its ID.
+                    process.termination_requested.store(true, Ordering::Release);
+                    Some((
+                        process_id.clone(),
+                        Arc::clone(&process.session),
+                        process.wake_tx.subscribe(),
+                    ))
                 })
                 .collect::<Vec<_>>()
         };
-        for process in remaining {
-            let process_id = &process.process_id;
-            match process.terminate().await {
-                Ok(()) => tracing::info!(%process_id, cleanup_outcome = "shutdown_confirmed", "process shutdown cleanup"),
-                Err(error) => {
-                    tracing::error!(%process_id, %error, cleanup_outcome = "shutdown_uncertain", "process shutdown cleanup failed; owner retained");
-                }
+        for (process_id, session, mut wake) in remaining {
+            let deadline = tokio::time::Instant::now() + PROCESS_TERMINATION_TIMEOUT;
+            // Join the native attempt even if the root observation deadline
+            // elapses. Native errors keep the terminator; they are not closure.
+            if let Err(error) = self
+                .terminate_session(process_id.clone(), Arc::clone(&session))
+                .await
+            {
+                let message = error.message;
+                tracing::error!(%session_id, %process_id, %message, cleanup_outcome = "shutdown_uncertain", "process tree cleanup not confirmed");
+                continue;
+            }
+            let root_exited = session.has_exited()
+                || tokio::time::timeout_at(deadline, async {
+                    while !session.has_exited() && wake.changed().await.is_ok() {}
+                    session.has_exited()
+                })
+                .await
+                .unwrap_or(false);
+            if root_exited {
+                tracing::info!(%session_id, %process_id, cleanup_outcome = "shutdown_confirmed", "process tree cleanup and root exit confirmed");
+            } else {
+                tracing::error!(%session_id, %process_id, cleanup_outcome = "shutdown_uncertain", "process tree cleanup confirmed but root exit not observed");
             }
         }
     }
@@ -553,6 +575,7 @@ impl LocalProcess {
                     events: events.clone(),
                     output_notify: Arc::clone(&output_notify),
                     open_streams: 2,
+                    signals_in_flight: 0,
                     closed: false,
                     termination_requested: Arc::clone(&termination_requested),
                     failure: None,
@@ -857,7 +880,7 @@ impl LocalProcess {
         identity: Option<&ProcessStartIdentity>,
     ) -> Result<SignalResponse, JSONRPCErrorError> {
         let session = {
-            let process_map = self.inner.processes.lock().await;
+            let mut process_map = self.inner.processes.lock().await;
             if identity.is_some_and(|identity| {
                 !process_map
                     .get(&params.process_id)
@@ -867,20 +890,30 @@ impl LocalProcess {
                     "process handle has expired or was replaced".into(),
                 ));
             }
-            match process_map.get(&params.process_id) {
+            match process_map.get_mut(&params.process_id) {
                 Some(ProcessEntry::Running(process)) if process.exit_code.is_none() => {
+                    process.signals_in_flight += 1;
                     Arc::clone(&process.session)
                 }
                 _ => return Ok(SignalResponse {}),
             }
         };
-        // Signal can wait on the native terminator gate during tree cleanup.
-        // Retain this exact owner, not the global map or an async runtime worker.
-        tokio::task::spawn_blocking(move || session.signal(pty_process_signal(params.signal)))
-            .await
-            .map_err(|error| internal_error(format!("process signal worker failed: {error}")))?
-            .map_err(|err| internal_error(format!("failed to signal process: {err}")))?;
-        Ok(SignalResponse {})
+        // Keep admission through native completion, including when the RPC
+        // waiter disappears. Native control can wait on termination off-map.
+        let inner = Arc::clone(&self.inner);
+        let process_id = params.process_id;
+        let signal = pty_process_signal(params.signal);
+        tokio::spawn(async move {
+            let worker_session = Arc::clone(&session);
+            let result = tokio::task::spawn_blocking(move || worker_session.signal(signal)).await;
+            maybe_emit_closed(process_id, inner, Some(&session)).await;
+            result
+                .map_err(|error| internal_error(format!("process signal worker failed: {error}")))?
+                .map_err(|err| internal_error(format!("failed to signal process: {err}")))?;
+            Ok(SignalResponse {})
+        })
+        .await
+        .map_err(|error| internal_error(format!("process signal task failed: {error}")))?
     }
 
 
@@ -916,10 +949,17 @@ impl LocalProcess {
                 None => return Ok(TerminateResponse { running: false }),
             }
         };
+        self.terminate_session(params.process_id, session).await
+    }
+
+    async fn terminate_session(
+        &self,
+        process_id: ProcessId,
+        session: Arc<ExecCommandSession>,
+    ) -> Result<TerminateResponse, JSONRPCErrorError> {
         // Once native termination starts, the process owner must also recheck
         // closure after confirmation, even if the RPC or local caller goes away.
         let inner = Arc::clone(&self.inner);
-        let process_id = params.process_id;
         tokio::spawn(async move {
             let worker_session = Arc::clone(&session);
             tokio::task::spawn_blocking(move || worker_session.request_terminate())
@@ -927,7 +967,7 @@ impl LocalProcess {
                 .map_err(|error| internal_error(format!("shutdown uncertain: termination worker failed: {error}")))?
                 .map_err(|error| internal_error(format!("shutdown uncertain: failed to confirm process tree cleanup: {error}")))?;
             let running = !session.has_exited();
-            maybe_emit_closed(process_id.clone(), Arc::clone(&inner)).await;
+            maybe_emit_closed(process_id.clone(), Arc::clone(&inner), None).await;
             let closed = {
                 let processes = inner.processes.lock().await;
                 matches!(processes.get(&process_id), Some(ProcessEntry::Running(process))
@@ -1270,7 +1310,7 @@ async fn watch_exit(
     }
     output_notify.notify_waiters();
 
-    maybe_emit_closed(process_id, Arc::clone(&inner)).await;
+    maybe_emit_closed(process_id, Arc::clone(&inner), None).await;
 }
 
 async fn finish_output_stream(process_id: ProcessId, stream: ExecOutputStream, inner: Arc<Inner>) {
@@ -1317,16 +1357,26 @@ async fn finish_output_stream(process_id: ProcessId, stream: ExecOutputStream, i
         output_notify.notify_waiters();
     }
 
-    maybe_emit_closed(process_id, inner).await;
+    maybe_emit_closed(process_id, inner, None).await;
 }
 
-async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
-    let output_notify = {
+async fn maybe_emit_closed(
+    process_id: ProcessId,
+    inner: Arc<Inner>,
+    completed_signal: Option<&Arc<ExecCommandSession>>,
+) {
+    let (output_notify, start_generation) = {
         let mut processes = inner.processes.lock().await;
         let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {
             return;
         };
-        if process.closed || process.open_streams != 0 {
+        if let Some(session) = completed_signal {
+            if !Arc::ptr_eq(session, &process.session) {
+                return;
+            }
+            process.signals_in_flight -= 1;
+        }
+        if process.closed || process.open_streams != 0 || process.signals_in_flight != 0 {
             return;
         }
         if process.termination_requested.load(Ordering::Acquire)
@@ -1341,11 +1391,15 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         // close under the same lock that checked termination and stream state.
         // KD4 launches local processes without a sandbox; keep the wire field.
         let assessment = Some(false);
-        process.sandbox_denied = assessment.unwrap_or(false);
         // Release empty jobs promptly; retained records must still be able to
         // cancel descendants after a natural root exit, without cancelling them
         // merely because output finished or the replay record later expires.
-        process.session.finish_for_replay();
+        // An admitted control operation rechecks closure after it releases the
+        // native gate. Do not commit Closed or arm expiry before handoff.
+        if !process.session.try_finish_for_replay() {
+            return;
+        }
+        process.sandbox_denied = assessment.unwrap_or(false);
         process.closed = true;
         let seq = process.next_seq;
         process.next_seq += 1;
@@ -1354,23 +1408,30 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
             seq,
             sandbox_denied: assessment,
         });
-        Arc::clone(&process.output_notify)
+        (
+            Arc::clone(&process.output_notify),
+            Arc::clone(&process.start_generation),
+        )
     };
 
     output_notify.notify_waiters();
-    let cleanup_process_id = process_id.clone();
-    let cleanup_inner = Arc::clone(&inner);
     tokio::spawn(async move {
         tokio::time::sleep(EXITED_PROCESS_RETENTION).await;
-        let mut processes = cleanup_inner.processes.lock().await;
-        match processes.entry(cleanup_process_id) {
-            Entry::Occupied(entry) => {
-                if matches!(entry.get(), ProcessEntry::Running(process) if process.closed) {
-                    entry.remove();
+        let retired = {
+            let mut processes = inner.processes.lock().await;
+            match processes.entry(process_id) {
+                Entry::Occupied(entry)
+                    if matches!(entry.get(), ProcessEntry::Running(process)
+                        if process.closed && Arc::ptr_eq(&process.start_generation, &start_generation)) =>
+                {
+                    Some(entry.remove())
                 }
+                _ => None,
             }
-            Entry::Vacant(_) => {}
-        }
+        };
+        // An explicit termination can race replay expiry. Dropping native
+        // custody may wait for tree cleanup; never do that under the map lock.
+        drop(retired);
     });
 
 }

@@ -1626,9 +1626,7 @@ async fn load_auth(
 fn persist_tokens(
     storage: &Arc<dyn AuthStorageBackend>,
     expected: &AuthDotJson,
-    id_token: Option<String>,
-    access_token: Option<String>,
-    refresh_token: Option<String>,
+    response: &RefreshResponse,
 ) -> std::io::Result<AuthDotJson> {
     let mut auth_dot_json = expected.clone();
 
@@ -1640,14 +1638,14 @@ fn persist_tokens(
         ));
     }
     let tokens = auth_dot_json.tokens.get_or_insert_with(TokenData::default);
-    if let Some(id_token) = id_token {
-        tokens.id_token = parse_chatgpt_jwt_claims(&id_token).map_err(std::io::Error::other)?;
+    if let Some(id_token) = response.id_token.as_deref() {
+        tokens.id_token = parse_chatgpt_jwt_claims(id_token).map_err(std::io::Error::other)?;
     }
-    if let Some(access_token) = access_token {
-        tokens.access_token = access_token;
+    if let Some(access_token) = &response.access_token {
+        tokens.access_token = access_token.clone();
     }
-    if let Some(refresh_token) = refresh_token {
-        tokens.refresh_token = refresh_token;
+    if let Some(refresh_token) = &response.refresh_token {
+        tokens.refresh_token = refresh_token.clone();
     }
     auth_dot_json.last_refresh = Some(Utc::now());
     storage.save_if_unchanged(Some(expected), &auth_dot_json)?;
@@ -1769,7 +1767,7 @@ struct RefreshRequest {
     refresh_token: String,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize)]
 struct RefreshResponse {
     id_token: Option<String>,
     access_token: Option<String>,
@@ -2248,6 +2246,12 @@ pub struct AuthManager {
     state: Arc<AuthManagerState>,
 }
 
+struct PendingRotation {
+    auth: ChatgptAuth,
+    expected: AuthDotJson,
+    response: RefreshResponse,
+}
+
 struct AuthManagerState {
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
@@ -2261,7 +2265,7 @@ struct AuthManagerState {
     agent_identity_authapi_base_url: Option<String>,
     refresh_lock: Arc<Semaphore>,
     proactive_refresh_generation: AtomicU64,
-    pending_rotation: Mutex<Option<(ChatgptAuth, AuthDotJson, RefreshResponse)>>,
+    pending_rotation: Mutex<Option<Arc<PendingRotation>>>,
     agent_identity_lock: Arc<Semaphore>,
     agent_identity_bootstrap_cooldown: Mutex<AgentIdentityBootstrapCooldown>,
     external_auth: RwLock<ExternalAuthState>,
@@ -3981,11 +3985,15 @@ impl AuthManager {
         )
         .await?;
 
+        let pending = Arc::new(PendingRotation {
+            auth: auth.clone(),
+            expected,
+            response: refresh_response,
+        });
         *self.state
             .pending_rotation
             .lock()
-            .map_err(|_| std::io::Error::other("pending rotation lock poisoned"))? =
-            Some((auth.clone(), expected, refresh_response));
+            .map_err(|_| std::io::Error::other("pending rotation lock poisoned"))? = Some(pending);
         self.commit_pending_rotation(refresh_permit).await?;
 
         Ok(())
@@ -4001,8 +4009,9 @@ impl AuthManager {
             .pending_rotation
             .lock()
             .map_err(|_| std::io::Error::other("pending rotation lock poisoned"))?
-            .clone();
-        let Some((auth, expected, response)) = pending else {
+            .as_ref()
+            .map(Arc::clone);
+        let Some(pending) = pending else {
             return Ok(false);
         };
         let manager = Self {
@@ -4016,13 +4025,7 @@ impl AuthManager {
             let result = tokio::task::spawn_blocking(move || {
                 // A blocking job can outlive even its async coordinator.
                 let _storage_permit = storage_permit;
-                persist_tokens(
-                    auth.storage(),
-                    &expected,
-                    response.id_token,
-                    response.access_token,
-                    response.refresh_token,
-                )
+                persist_tokens(pending.auth.storage(), &pending.expected, &pending.response)
             })
             .await
             .map_err(std::io::Error::other)?;
@@ -4032,12 +4035,13 @@ impl AuthManager {
                     .as_ref()
                     .is_err_and(crate::auth::storage::is_auth_changed)
             {
-                manager
+                let completed = manager
                     .state
                     .pending_rotation
                     .lock()
                     .map_err(|_| std::io::Error::other("pending rotation lock poisoned"))?
                     .take();
+                drop(completed);
             }
             result.map_err(|err| {
                 if crate::auth::storage::is_auth_changed(&err) {

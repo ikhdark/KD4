@@ -63,6 +63,7 @@ use codex_app_server_protocol_types::OverloadReason;
 use codex_app_server_protocol_types::overloaded_error;
 use codex_app_server_protocol_types::RemoteControlStatusChangedNotification;
 use codex_app_server_protocol_types::ServerNotification;
+use codex_app_server_transport::ControlReserveSender;
 use codex_config::ConfigLayerSource;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::find_codex_home;
@@ -579,7 +580,7 @@ async fn run_main_owned(
         test_user_config_file_from_env(),
     )?;
     let (transport_event_tx, mut transport_event_rx) =
-        mpsc::channel::<TransportEvent>(codex_app_server_transport::INGRESS_CAPACITY);
+        ControlReserveSender::<TransportEvent>::channel(codex_app_server_transport::INGRESS_CAPACITY);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(CHANNEL_CAPACITY);
     let (outbound_control_tx, mut outbound_control_rx) =
         mpsc::channel::<OutboundControlEvent>(CHANNEL_CAPACITY);
@@ -735,12 +736,13 @@ async fn run_main_owned(
     .map(Arc::new)
     .map_err(std::io::Error::other)?;
 
-    let otel = codex_core::otel_init::build_provider(
+    let otel = codex_core::otel_init::build_provider_async(
         &config,
         env!("CARGO_PKG_VERSION"),
         Some(OTEL_SERVICE_NAME),
         default_analytics_enabled,
     )
+    .await
     .map_err(|e| {
         std::io::Error::new(
             ErrorKind::InvalidData,

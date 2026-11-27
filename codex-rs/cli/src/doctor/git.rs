@@ -29,9 +29,27 @@ struct GitCheckInputs {
 }
 
 pub(super) async fn git_check(cwd: &Path) -> DoctorCheck {
-    let selected_git = which::which("git").ok();
-    let git_candidates = git_candidates();
-    let repo_root = get_git_repo_root(cwd);
+    let probe_cwd = cwd.to_path_buf();
+    let (selected_git, git_candidates, repo_root) =
+        match tokio::task::spawn_blocking(move || {
+            let selected_git = which::which("git").ok();
+            let git_candidates = git_candidates();
+            let repo_root = get_git_repo_root(&probe_cwd);
+            (selected_git, git_candidates, repo_root)
+        })
+        .await
+        {
+            Ok(inputs) => inputs,
+            Err(err) => {
+                return DoctorCheck::new(
+                    "git.environment",
+                    "git",
+                    CheckStatus::Warning,
+                    "Git environment could not be inspected",
+                )
+                .detail(format!("Git filesystem probe: {err}"));
+            }
+        };
 
     let (git_version, git_version_error, git_exec_path, git_build_options, branch, core_fsmonitor) =
         if let Some(git_path) = selected_git.as_deref() {
@@ -54,6 +72,10 @@ pub(super) async fn git_check(cwd: &Path) -> DoctorCheck {
             (None, None, None, None, None, None)
         };
 
+    let git_entry = match repo_root.as_deref() {
+        Some(root) => Some(git_entry_summary(root).await),
+        None => None,
+    };
     git_check_from_inputs(GitCheckInputs {
         selected_git,
         git_candidates,
@@ -61,7 +83,7 @@ pub(super) async fn git_check(cwd: &Path) -> DoctorCheck {
         git_version_error,
         git_exec_path,
         git_build_options,
-        git_entry: repo_root.as_deref().map(git_entry_summary),
+        git_entry,
         repo_root,
         branch,
         core_fsmonitor,
@@ -247,19 +269,21 @@ fn command_output_text(output: Output) -> Result<String, String> {
     }
 }
 
-fn git_entry_summary(repo_root: &Path) -> String {
+async fn git_entry_summary(repo_root: &Path) -> String {
     let entry = repo_root.join(".git");
-    match std::fs::metadata(&entry) {
+    match tokio::fs::metadata(&entry).await {
         Ok(metadata) if metadata.is_dir() => "directory".to_string(),
-        Ok(metadata) if metadata.is_file() => std::fs::read_to_string(&entry)
-            .ok()
-            .and_then(|contents| {
-                contents
-                    .strip_prefix("gitdir:")
-                    .map(str::trim)
-                    .map(|path| format!("file -> {path}"))
-            })
-            .unwrap_or_else(|| "file".to_string()),
+        Ok(metadata) if metadata.is_file() => match tokio::fs::read_to_string(&entry).await {
+            Ok(contents) => match contents
+                .strip_prefix("gitdir:")
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            {
+                Some(path) => format!("file -> {path}"),
+                None => "malformed pointer file".to_string(),
+            },
+            Err(err) => format!("unreadable pointer file ({err})"),
+        },
         Ok(_) => "other".to_string(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
         Err(err) => format!("unreadable ({err})"),

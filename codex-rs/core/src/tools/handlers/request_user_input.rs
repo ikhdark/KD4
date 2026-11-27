@@ -18,6 +18,8 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use std::sync::Arc;
 
+const RECOMMENDED_ANSWER_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
+
 pub struct RequestUserInputHandler {
     pub available_modes: Vec<ModeKind>,
 }
@@ -68,7 +70,12 @@ impl RequestUserInputHandler {
         let args =
             normalize_request_user_input_args(args).map_err(FunctionCallError::RespondToModel)?;
         let response = session
-            .request_user_input_with_outcome(turn.as_ref(), call_id, args)
+            .request_user_input_with_outcome(
+                turn.as_ref(),
+                call_id,
+                args,
+                Some(RECOMMENDED_ANSWER_TIMEOUT_MS),
+            )
             .await
             .map_err(|_| {
                 FunctionCallError::RespondToModel(format!(

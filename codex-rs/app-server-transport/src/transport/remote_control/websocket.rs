@@ -21,6 +21,7 @@ use super::segment::ClientSegmentReassembler;
 use super::segment::EncodedServerPayload;
 use super::segment::REMOTE_CONTROL_SEGMENT_MAX_BYTES;
 use super::segment::encode_server_payloads_for_transport;
+use crate::transport::ControlReserveSender;
 use crate::transport::TransportEvent;
 use crate::transport::remote_control::auth::RemoteControlConnectionAuth;
 use crate::transport::remote_control::auth::load_remote_control_auth;
@@ -981,7 +982,7 @@ enum ConnectionEndReason {
 }
 
 pub(super) struct RemoteControlChannels {
-    pub(super) transport_event_tx: mpsc::Sender<TransportEvent>,
+    pub(super) transport_event_tx: ControlReserveSender<TransportEvent>,
     pub(super) status_publisher: RemoteControlStatusPublisher,
     pub(super) current_enrollment: CurrentRemoteControlEnrollment,
     pub(super) pairing_persistence_key: RemoteControlPairingPersistenceKey,

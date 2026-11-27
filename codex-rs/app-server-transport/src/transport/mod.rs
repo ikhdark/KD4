@@ -9,6 +9,8 @@ use codex_utils_home_dir::find_codex_home;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
@@ -25,34 +27,79 @@ const REJECTION_INGRESS_RESERVE: usize = 64;
 pub const INGRESS_CAPACITY: usize =
     CHANNEL_CAPACITY + REJECTION_INGRESS_RESERVE + CONTROL_INGRESS_RESERVE;
 
-/// Serialize the capacity check and reservation for cooperating producers.
-/// Ordinary senders must never transiently borrow a protected control cell.
-pub fn try_send_with_control_reserve<T>(
-    sender: &mpsc::Sender<T>,
-    message: T,
-    control: bool,
-    reserve: usize,
-) -> Result<(), mpsc::error::TrySendError<T>> {
-    static ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _admission = ADMISSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let reserve = reserve.min(sender.max_capacity().saturating_sub(1));
-    if sender.is_closed() {
-        return Err(mpsc::error::TrySendError::Closed(message));
-    }
-    if !control && sender.capacity() <= reserve {
-        return Err(mpsc::error::TrySendError::Full(message));
-    }
-    let permit = match sender.try_reserve() {
-        Ok(permit) => permit,
-        Err(mpsc::error::TrySendError::Full(())) => {
-            return Err(mpsc::error::TrySendError::Full(message));
+/// Sender for a bounded channel with capacity reserved for control traffic.
+pub struct ControlReserveSender<T> {
+    sender: mpsc::Sender<T>,
+    admission: Arc<Mutex<()>>,
+}
+
+impl<T> Clone for ControlReserveSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            admission: Arc::clone(&self.admission),
         }
-        Err(mpsc::error::TrySendError::Closed(())) => {
+    }
+}
+
+impl<T> ControlReserveSender<T> {
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<T>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let sender = Self {
+            sender,
+            admission: Arc::new(Mutex::new(())),
+        };
+        (sender, receiver)
+    }
+
+    /// Serialize the capacity check and reservation across this channel's
+    /// cooperating producers. Ordinary sends never borrow a control cell.
+    pub fn try_send_with_control_reserve(
+        &self,
+        message: T,
+        control: bool,
+        reserve: usize,
+    ) -> Result<(), mpsc::error::TrySendError<T>> {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reserve = reserve.min(self.max_capacity().saturating_sub(1));
+        if self.is_closed() {
             return Err(mpsc::error::TrySendError::Closed(message));
         }
-    };
-    permit.send(message);
-    Ok(())
+        if !control && self.sender.capacity() <= reserve {
+            return Err(mpsc::error::TrySendError::Full(message));
+        }
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                return Err(mpsc::error::TrySendError::Full(message));
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return Err(mpsc::error::TrySendError::Closed(message));
+            }
+        };
+        permit.send(message);
+        Ok(())
+    }
+
+    /// Lifecycle send that may use any available cell without admission locking.
+    pub async fn send_unreserved(&self, message: T) -> Result<(), mpsc::error::SendError<T>> {
+        self.sender.send(message).await
+    }
+
+    fn try_send_unreserved(&self, message: T) -> Result<(), mpsc::error::TrySendError<T>> {
+        self.sender.try_send(message)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    fn max_capacity(&self) -> usize {
+        self.sender.max_capacity()
+    }
 }
 
 mod remote_control;
@@ -241,7 +288,7 @@ fn next_connection_id() -> ConnectionId {
 }
 
 async fn forward_incoming_message(
-    transport_event_tx: &mpsc::Sender<TransportEvent>,
+    transport_event_tx: &ControlReserveSender<TransportEvent>,
     writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     payload: &str,
@@ -258,7 +305,7 @@ async fn forward_incoming_message(
 }
 
 async fn enqueue_incoming_message(
-    transport_event_tx: &mpsc::Sender<TransportEvent>,
+    transport_event_tx: &ControlReserveSender<TransportEvent>,
     writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     message: JSONRPCMessage,
@@ -267,12 +314,12 @@ async fn enqueue_incoming_message(
 }
 
 async fn enqueue_incoming_message_with_admission(
-    transport_event_tx: &mpsc::Sender<TransportEvent>,
+    transport_event_tx: &ControlReserveSender<TransportEvent>,
     _writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     message: JSONRPCMessage,
 ) -> (bool, bool) {
-    use std::sync::{Arc, LazyLock};
+    use std::sync::LazyLock;
     use tokio::sync::Semaphore;
     const BYTE_BUDGET: usize = 128 * 1024 * 1024;
     // Shared by every external connection; ordinary traffic cannot borrow the
@@ -292,7 +339,11 @@ async fn enqueue_incoming_message_with_admission(
         _ingress_permit: permit,
     };
     let result = if admitted_bytes {
-        try_send_with_control_reserve(transport_event_tx, event, control, ingress_reserve(transport_event_tx))
+        transport_event_tx.try_send_with_control_reserve(
+            event,
+            control,
+            ingress_reserve(transport_event_tx),
+        )
     } else {
         Err(mpsc::error::TrySendError::Full(event))
     };
@@ -316,8 +367,7 @@ async fn enqueue_incoming_message_with_admission(
             } else {
                 0
             };
-            match try_send_with_control_reserve(
-                transport_event_tx,
+            match transport_event_tx.try_send_with_control_reserve(
                 TransportEvent::RequestRejected { connection_id, request_id: request.id },
                 false,
                 reserve,
@@ -383,7 +433,7 @@ fn ingress_message_is_control(message: &JSONRPCMessage) -> bool {
     }
 }
 
-fn ingress_reserve(sender: &mpsc::Sender<TransportEvent>) -> usize {
+fn ingress_reserve(sender: &ControlReserveSender<TransportEvent>) -> usize {
     if sender.max_capacity() >= INGRESS_CAPACITY {
         REJECTION_INGRESS_RESERVE + CONTROL_INGRESS_RESERVE
     } else {

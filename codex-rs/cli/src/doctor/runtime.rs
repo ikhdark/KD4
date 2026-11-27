@@ -115,10 +115,16 @@ pub(super) async fn local_publish_check(
     target_path: PathBuf,
     target_sha256: Result<String, String>,
 ) -> DoctorCheck {
-    let current_exe = env::current_exe().ok();
-    let current_is_target = current_exe
-        .as_deref()
-        .is_some_and(|current| same_path(current, &target_path));
+    let target = target_path.clone();
+    let (current_exe, current_is_target) = tokio::task::spawn_blocking(move || {
+        let current_exe = env::current_exe().ok();
+        let current_is_target = current_exe
+            .as_deref()
+            .is_some_and(|current| same_path(current, &target));
+        (current_exe, current_is_target)
+    })
+    .await
+    .expect("doctor local publish path comparison task panicked");
     let build_info = BuildInfo::current();
     let mut details = vec![
         format!(
@@ -126,7 +132,7 @@ pub(super) async fn local_publish_check(
             target_path.parent().unwrap_or(Path::new(".")).display()
         ),
         format!("target path: {}", target_path.display()),
-        format!("target exists: {}", target_path.is_file()),
+        format!("target exists: {}", target_is_file(&target_path).await),
         format!("current executable is target: {current_is_target}"),
         format!("current version: {}", build_info.version),
         format!("current commit: {}", build_info.commit),
@@ -141,7 +147,7 @@ pub(super) async fn local_publish_check(
         Err(err) => details.push(format!("target sha256: <unavailable: {err}>")),
     }
 
-    let version_probe_error = if target_path.is_file() {
+    let version_probe_error = if target_is_file(&target_path).await {
         match command_version_lines(&target_path).await {
             Ok(lines) => {
                 for (index, line) in lines.into_iter().enumerate() {
@@ -164,7 +170,7 @@ pub(super) async fn local_publish_check(
         None
     };
 
-    let publish_readiness = if !target_path.is_file() {
+    let publish_readiness = if !target_is_file(&target_path).await {
         "missing target"
     } else if current_is_target {
         "current executable matches target path"
@@ -173,7 +179,10 @@ pub(super) async fn local_publish_check(
     };
     details.push(format!("publish readiness: {publish_readiness}"));
 
-    if let Some(repo_root) = source_repo_root() {
+    if let Some(repo_root) = tokio::task::spawn_blocking(source_repo_root)
+        .await
+        .expect("doctor source checkout lookup task panicked")
+    {
         details.push(format!("source repo root: {}", repo_root.display()));
         details.push(format!(
             "detected checkout HEAD: {}",
@@ -184,7 +193,7 @@ pub(super) async fn local_publish_check(
         details.push("detected checkout HEAD: <not detected>".to_string());
     }
 
-    if !target_path.is_file() {
+    if !target_is_file(&target_path).await {
         return DoctorCheck::new(
             "local_publish.readiness",
             "local-publish",
@@ -264,12 +273,13 @@ pub(super) async fn desktop_runtime_chain_check(
     expected_codex_home: Option<PathBuf>,
     show_details: bool,
 ) -> DoctorCheck {
+    let target_exists = target_is_file(&target_path).await;
     let mut details = vec![
         format!("local publish target: {}", target_path.display()),
-        format!("local publish target exists: {}", target_path.is_file()),
+        format!("local publish target exists: {target_exists}"),
     ];
 
-    if !target_path.is_file() {
+    if !target_exists {
         return DoctorCheck::new(
             "desktop.runtime_chain",
             "desktop",
@@ -280,7 +290,7 @@ pub(super) async fn desktop_runtime_chain_check(
         .remediation("Run just publish-local-codex-final, then restart Codex Desktop.");
     }
 
-    let processes = match desktop_process_probe(&target_path).await {
+    let (processes, matching_count) = match desktop_process_probe(&target_path).await {
         Ok(processes) => processes,
         Err(err) => {
             details.push(format!("desktop app-server probe: <unavailable: {err}>"));
@@ -294,10 +304,9 @@ pub(super) async fn desktop_runtime_chain_check(
             .remediation("Restart Codex Desktop and rerun codex doctor.");
         }
     };
-    let matching = matching_desktop_app_servers(&processes, &target_path, std::process::id());
-    push_desktop_process_details(&mut details, &processes, matching.len(), show_details);
+    push_desktop_process_details(&mut details, &processes, matching_count, show_details);
 
-    if matching.is_empty() {
+    if matching_count == 0 {
         return DoctorCheck::new(
             "desktop.runtime_chain",
             "desktop",
@@ -324,7 +333,11 @@ pub(super) async fn desktop_runtime_chain_check(
         "desktop runtime receipt: {}",
         receipt_path.display()
     ));
-    let receipt = match read_desktop_runtime_receipt(&receipt_path) {
+    let receipt = tokio::task::spawn_blocking(move || read_desktop_runtime_receipt(&receipt_path))
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|result| result);
+    let receipt = match receipt {
         Ok(receipt) => receipt,
         Err(err) => {
             details.push(format!("desktop runtime receipt status: {err}"));
@@ -527,6 +540,12 @@ fn search_provider(context: &InstallContext) -> &'static str {
     } else {
         "system"
     }
+}
+
+async fn target_is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file())
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -751,7 +770,7 @@ fn desktop_process_filter(target_path: &Path) -> String {
 
 async fn desktop_process_probe(
     target_path: &Path,
-) -> Result<Vec<self::DesktopProcessEvidence>, String> {
+) -> Result<(Vec<DesktopProcessEvidence>, usize), String> {
     let mut command = tokio::process::Command::new("powershell");
     command
         .args([
@@ -794,7 +813,15 @@ Get-CimInstance Win32_Process -Filter $env:CODEX_DOCTOR_PROCESS_FILTER -Operatio
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_str(line).map_err(|err| err.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(prioritize_desktop_processes(processes, target_path))
+    let target_path = target_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let processes = prioritize_desktop_processes(processes, &target_path);
+        let matching_count =
+            matching_desktop_app_servers(&processes, &target_path, std::process::id()).len();
+        (processes, matching_count)
+    })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 fn prioritize_desktop_processes(

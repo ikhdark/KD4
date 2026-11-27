@@ -803,6 +803,7 @@ pub struct ShellEnvironmentPolicyToml {
     /// Case-insensitive wildcard patterns for environment variable names, using `*` and `?`.
     pub include_only: Option<Vec<String>>,
 
+    /// Deprecated and ignored. Login-shell behavior is controlled by `allow_login_shell` and the command's `login` option.
     pub experimental_use_profile: Option<bool>,
 }
 
@@ -824,7 +825,6 @@ impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
             .into_iter()
             .map(|s| EnvironmentVariablePattern::new_case_insensitive(&s))
             .collect();
-        let use_profile = toml.experimental_use_profile.unwrap_or(false);
 
         Self {
             inherit,
@@ -832,7 +832,7 @@ impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
             exclude,
             r#set,
             include_only,
-            use_profile,
+            use_profile: false,
         }
     }
 }

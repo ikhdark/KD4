@@ -153,7 +153,7 @@ impl RemoteControlHandle {
             }
 
             let _persistence = acquire_persistence_lock(&self.desired_state_persistence_lock).await;
-            if lifecycle.is_cancelled() {
+            if lifecycle.is_retired() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "remote control enable superseded"));
             }
             let updated = state_db
@@ -183,7 +183,7 @@ impl RemoteControlHandle {
             self.auth_manager.with_policy_identity(|identity| {
                 let _lifecycle_commit = self.current_enrollment.lifecycle.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if lifecycle.is_cancelled() {
+                if lifecycle.is_retired() {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "remote control enable superseded"));
                 }
                 publish_current_enrollment(&mut current_enrollment, &enrollment);

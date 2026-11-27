@@ -66,6 +66,7 @@ use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 const ARTIFACT_EXPIRED_MESSAGE: &str = "artifact expired or does not belong to this thread. The producing operation already ran; a missing artifact does not mean it failed or had no effects. Use output already in context or inspect the state it changed; rerun it only if it is read-only or safely repeatable.";
 // A command's output writer holds its artifact until the process exits; a
@@ -117,6 +118,7 @@ impl ArtifactProtection {
     }
 }
 pub(crate) const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+const RAW_OUTPUT_WRITE_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 /// Per-command ceiling for a plain command log (user decision, 2026-11-15).
 /// Below it every producer byte is kept; past it nothing is appended and the
 /// omitted byte count is recorded as an explicit gap.
@@ -1541,6 +1543,18 @@ impl Eq for RawOutputArtifact {}
 
 
 
+// A deadline bounds admission, not an already running synchronous filesystem call.
+fn remaining_admission_time(deadline: tokio::time::Instant) -> std::io::Result<std::time::Duration> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "artifact admission deadline elapsed",
+        ));
+    }
+    Ok(remaining)
+}
+
 fn defer_artifact_sync(path: &Path) {
     let mut registry = lock_retention_registry();
     registry.next_sync = registry.next_sync.saturating_add(1);
@@ -1553,6 +1567,18 @@ pub fn artifact_residency_file(
     thread_id: &str,
     exclusive: bool,
 ) -> std::io::Result<File> {
+    artifact_residency_file_with_deadline(home, thread_id, exclusive, None)
+}
+
+fn artifact_residency_file_with_deadline(
+    home: &Path,
+    thread_id: &str,
+    exclusive: bool,
+    deadline: Option<tokio::time::Instant>,
+) -> std::io::Result<File> {
+    if let Some(deadline) = deadline {
+        remaining_admission_time(deadline)?;
+    }
     let directory = home.join("tool-output-residency");
     std::fs::create_dir_all(&directory)?;
     let file = File::options()
@@ -1561,12 +1587,18 @@ pub fn artifact_residency_file(
         .read(true)
         .write(true)
         .open(directory.join(format!("{thread_id}.lock")))?;
+    if let Some(deadline) = deadline {
+        remaining_admission_time(deadline)?;
+    }
     if exclusive {
         file.try_lock()
     } else {
         file.try_lock_shared()
     }
     .map_err(std::io::Error::from)?;
+    if let Some(deadline) = deadline {
+        remaining_admission_time(deadline)?;
+    }
     Ok(file)
 }
 
@@ -1905,15 +1937,25 @@ impl RawOutputArtifact {
         }
     }
 
-    pub fn reduction_notice(&self, source: &str, projection: &str) -> Option<String> {
+    /// Format a recovery notice only for coordinates supplied by the output
+    /// producer for the retained source, not inferred from the rendered text.
+    pub fn reduction_notice(
+        &self,
+        source: &str,
+        first_omitted_lines: Option<(usize, usize)>,
+    ) -> Option<String> {
         let Self::Stored { id, bytes, .. } = self else {
             return None;
         };
         if *bytes != source.len() as u64 {
             return None;
         }
-        let (start, end) =
-            codex_utils_output_truncation::first_omitted_line_range(source, projection)?;
+        let (start, end) = first_omitted_lines?;
+        // The first recovery request stays bounded even for a large contiguous omission.
+        let end = end.min(start.saturating_add(199));
+        if start == 0 || start > end || source.lines().nth(end - 1).is_none() {
+            return None;
+        }
         Some(format!(
             "[command output reduced; recover the first omitted lines with read_tool_output: {{\"artifact_id\":\"{id}\",\"selectors\":[{{\"kind\":\"lines\",\"start\":{start},\"end\":{end}}}]}}. Selection completeness does not mean full artifact delivery; do not rerun the producer.]"
         ))
@@ -1964,6 +2006,56 @@ impl RawOutputArtifact {
     }
 }
 
+// Use one bounded staging buffer in place of Tokio File's write buffer:
+// borrowed output is copied once, and its write and hash share that copy.
+// The lock and any residency lease also stay with the worker if the async
+// caller stops waiting for a write in progress.
+async fn write_raw_output_with_hash(
+    file: tokio::fs::File,
+    retained: &[u8],
+    residency: Option<Arc<File>>,
+) -> std::io::Result<(tokio::fs::File, String)> {
+    struct RawWrite {
+        file: LockedOutputFile,
+        _residency: Option<Arc<File>>,
+        buffer: Vec<u8>,
+        digest: Sha256,
+    }
+
+    let mut write = RawWrite {
+        file: LockedOutputFile(Some(file.into_std().await)),
+        _residency: residency,
+        buffer: Vec::with_capacity(retained.len().min(RAW_OUTPUT_WRITE_CHUNK_BYTES)),
+        digest: Sha256::new(),
+    };
+    let mut chunks = retained.chunks(RAW_OUTPUT_WRITE_CHUNK_BYTES).peekable();
+    loop {
+        write.buffer.clear();
+        if let Some(chunk) = chunks.next() {
+            write.buffer.extend_from_slice(chunk);
+        }
+        let last = chunks.peek().is_none();
+        let (next_write, sha256) = run_blocking_artifact_io(move || {
+            let file = write
+                .file
+                .0
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("raw output writer lost its file"))?;
+            if !write.buffer.is_empty() {
+                file.write_all(&write.buffer)?;
+                write.digest.update(&write.buffer);
+            }
+            let sha256 = last.then(|| hex::encode(std::mem::take(&mut write.digest).finalize()));
+            Ok((write, sha256))
+        })
+        .await?;
+        if let Some(sha256) = sha256 {
+            return Ok((tokio::fs::File::from_std(next_write.file.into_file()), sha256));
+        }
+        write = next_write;
+    }
+}
+
 pub async fn create_raw_output_artifact(
     codex_home: &Path,
     thread_id: &str,
@@ -1979,7 +2071,7 @@ async fn create_raw_output_artifact_inner(
     durable: bool,
 ) -> RawOutputArtifact {
     let directory = codex_home.join("tool-output").join(thread_id);
-    let _residency = match acquire_artifact_residency(codex_home, thread_id).await {
+    let residency = match acquire_artifact_residency(codex_home, thread_id).await {
         Ok(owner) => owner,
         Err(error) => {
             return RawOutputArtifact::unavailable(format!(
@@ -2007,8 +2099,6 @@ async fn create_raw_output_artifact_inner(
     let path = directory.join(format!("{id}.log"));
     let retained = &output[..output.len().min(MAX_RAW_OUTPUT_ARTIFACT_BYTES)];
     let truncated = retained.len() != output.len();
-    let mut digest = Sha256::new();
-    digest.update(retained);
     match tokio::fs::OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -2017,7 +2107,7 @@ async fn create_raw_output_artifact_inner(
         .await
     {
         Ok(file) => {
-            let mut file = match lock_output_file(file).await {
+            let file = match lock_output_file(file).await {
                 Ok(file) => file,
                 Err(err) => {
                     return failed_with_owned_path(
@@ -2029,16 +2119,20 @@ async fn create_raw_output_artifact_inner(
                     .await;
                 }
             };
-            if let Err(err) = file.write_all(retained).await {
-                let _ = unlock_output_file(file).await;
-                return failed_with_owned_path(
-                    path.clone(),
-                    0,
-                    format!("failed to write `{}`: {err}", path.display()),
-                    Some(&retention_token),
-                )
-                .await;
-            }
+            let (mut file, retained_sha256) =
+                match write_raw_output_with_hash(file, retained, Some(Arc::clone(&residency))).await
+                {
+                    Ok(written) => written,
+                    Err(err) => {
+                        return failed_with_owned_path(
+                            path.clone(),
+                            0,
+                            format!("failed to write `{}`: {err}", path.display()),
+                            Some(&retention_token),
+                        )
+                        .await;
+                    }
+                };
             if let Err(err) = file.flush().await {
                 let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
@@ -2055,7 +2149,7 @@ async fn create_raw_output_artifact_inner(
                     Some(id),
                     retained.len() as u64,
                     !truncated,
-                    hex::encode(digest.finalize()),
+                    retained_sha256,
                 )
                 .await
             {
@@ -2430,6 +2524,7 @@ const ARTIFACT_STAGE_ADMISSION_WAIT: std::time::Duration = std::time::Duration::
 // retention lock. Reserve both worker count and body/metadata workspace before cloning.
 async fn admit_artifact_stage(
     canonical: &CanonicalToolResult,
+    deadline: tokio::time::Instant,
 ) -> Result<((OwnedSemaphorePermit, OwnedSemaphorePermit), CanonicalMetadataBudget), String> {
     static COUNT: OnceLock<Arc<Semaphore>> = OnceLock::new();
     static BYTES: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -2438,7 +2533,7 @@ async fn admit_artifact_stage(
         BYTES.get_or_init(|| Arc::new(Semaphore::new(ARTIFACT_STAGE_BYTE_CAPACITY as usize))),
         ARTIFACT_STAGE_BYTE_CAPACITY,
         canonical,
-        ARTIFACT_STAGE_ADMISSION_WAIT,
+        deadline,
     )
     .await
 }
@@ -2446,8 +2541,8 @@ async fn admit_artifact_stage(
 // Holders keep both permits until commit, so one parallel batch of reads can
 // saturate admission briefly. Wait a bounded time for a release rather than
 // discarding the evidence at once. A waiter holds no slot or file, and at most a
-// worker permit while it waits for workspace; both waits share one deadline, so
-// it cannot hold that permit past the bound. Dropping it (caller cancellation)
+// worker permit while it waits for workspace; those waits and native-slot
+// admission share one deadline. Dropping it (caller cancellation)
 // releases anything acquired and leaves the queue intact; a holder stalled on
 // storage still ends the wait at the bound with a named limit.
 async fn admit_artifact_stage_from(
@@ -2455,7 +2550,7 @@ async fn admit_artifact_stage_from(
     bytes: &Arc<Semaphore>,
     byte_capacity: u32,
     canonical: &CanonicalToolResult,
-    wait: std::time::Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<((OwnedSemaphorePermit, OwnedSemaphorePermit), CanonicalMetadataBudget), String> {
     let metadata_budget = CanonicalMetadataBudget::new(canonical)?;
     let metadata = metadata_budget.for_segments(
@@ -2473,25 +2568,26 @@ async fn admit_artifact_stage_from(
         .ok()
         .filter(|charge| *charge <= byte_capacity)
         .ok_or_else(|| "artifact staging byte limit exceeded".to_string())?;
-    let deadline = tokio::time::Instant::now() + wait;
     let count = tokio::time::timeout_at(deadline, Arc::clone(count).acquire_owned())
         .await
         .ok()
         .and_then(Result::ok)
+        .filter(|_| tokio::time::Instant::now() < deadline)
         .ok_or_else(|| {
             format!(
                 "artifact staging worker limit reached; no worker was released within {}ms",
-                wait.as_millis()
+                ARTIFACT_STAGE_ADMISSION_WAIT.as_millis()
             )
         })?;
     let bytes = tokio::time::timeout_at(deadline, Arc::clone(bytes).acquire_many_owned(charge))
         .await
         .ok()
         .and_then(Result::ok)
+        .filter(|_| tokio::time::Instant::now() < deadline)
         .ok_or_else(|| {
             format!(
                 "artifact staging byte limit reached; workspace was not released within {}ms",
-                wait.as_millis()
+                ARTIFACT_STAGE_ADMISSION_WAIT.as_millis()
             )
         })?;
     Ok(((count, bytes), metadata_budget))
@@ -2516,7 +2612,8 @@ struct NativeStageSlot {
 }
 
 impl NativeStageSlot {
-    fn acquire(home: &Path) -> std::io::Result<Self> {
+    fn acquire(home: &Path, deadline: tokio::time::Instant) -> std::io::Result<Self> {
+        remaining_admission_time(deadline)?;
         let directory = home.join("tool-output-staging");
         match std::fs::create_dir(&directory) {
             Ok(()) => sync_parent_directory(&directory)?,
@@ -2525,6 +2622,7 @@ impl NativeStageSlot {
         }
         let mut last_error = None;
         for index in 0..4 {
+            remaining_admission_time(deadline)?;
             let path = directory.join(format!("slot-{index}.lock"));
             let open = |create| {
                 let mut options = File::options();
@@ -2544,10 +2642,12 @@ impl NativeStageSlot {
             if !file.metadata()?.is_file() {
                 return Err(std::io::Error::other("invalid staging slot"));
             }
+            remaining_admission_time(deadline)?;
             if let Err(error) = file.try_lock() {
                 last_error = Some(std::io::Error::from(error));
                 continue;
             }
+            remaining_admission_time(deadline)?;
             let mut slot = Self {
                 _lock: file,
                 root: home.join("tool-output"),
@@ -2555,7 +2655,11 @@ impl NativeStageSlot {
                 next_path: path.with_extension("next"),
             };
             match slot.recover_previous() {
-                Ok(()) => return Ok(slot),
+                Ok(()) => {
+                    // Finish recovery under the lock, but do not admit an expired slot.
+                    remaining_admission_time(deadline)?;
+                    return Ok(slot);
+                }
                 Err(error) => last_error = Some(error),
             }
         }
@@ -2667,6 +2771,7 @@ impl NativeStageSlot {
 async fn reserve_native_stage_slot(
     home: PathBuf,
     admission: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    deadline: tokio::time::Instant,
 ) -> Result<
     (
         (OwnedSemaphorePermit, OwnedSemaphorePermit),
@@ -2676,16 +2781,14 @@ async fn reserve_native_stage_slot(
 > {
     // The worker, not its cancellable observer, owns admission while storage is blocked.
     tokio::task::spawn_blocking(move || {
-        // Another process sharing this home can hold every slot. Wait for a
-        // release within the in-process admission bound before giving up.
-        let deadline = std::time::Instant::now() + ARTIFACT_STAGE_ADMISSION_WAIT;
+        // Another process can hold every slot. Spend only the time left by
+        // in-process admission, including time queued for this worker.
         loop {
-            match NativeStageSlot::acquire(&home) {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+            match NativeStageSlot::acquire(&home, deadline) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(
+                        remaining_admission_time(deadline)?.min(std::time::Duration::from_millis(50)),
+                    );
                 }
                 result => return result.map(|slot| (admission, slot)),
             }
@@ -3637,7 +3740,8 @@ where
     let codex_home = codex_home.to_path_buf();
     let thread_id = thread_id.to_string();
     let exact_bytes = canonical.exact_bytes;
-    let (stage_admission, metadata_budget) = match admit_artifact_stage(canonical).await {
+    let deadline = tokio::time::Instant::now() + ARTIFACT_STAGE_ADMISSION_WAIT;
+    let (stage_admission, metadata_budget) = match admit_artifact_stage(canonical, deadline).await {
         Ok(permit) => permit,
         Err(error) => {
             return CanonicalOutputArtifact {
@@ -3650,7 +3754,7 @@ where
         }
     };
     let (stage_admission, shared_slot) =
-        match reserve_native_stage_slot(codex_home.clone(), stage_admission).await {
+        match reserve_native_stage_slot(codex_home.clone(), stage_admission, deadline).await {
             Ok(admission) => admission,
             Err(error) => {
                 return CanonicalOutputArtifact {
@@ -4115,7 +4219,8 @@ pub async fn attach_canonical_output_artifact(
     let artifact_id = artifact_id.to_string();
     let id = artifact_id.parse::<ToolOutputArtifactId>().ok();
     let exact_bytes = canonical.exact_bytes;
-    let (stage_admission, metadata_budget) = match admit_artifact_stage(canonical).await {
+    let deadline = tokio::time::Instant::now() + ARTIFACT_STAGE_ADMISSION_WAIT;
+    let (stage_admission, metadata_budget) = match admit_artifact_stage(canonical, deadline).await {
         Ok(permit) => permit,
         Err(error) => {
             return CanonicalOutputArtifact {
@@ -4128,7 +4233,7 @@ pub async fn attach_canonical_output_artifact(
         }
     };
     let (stage_admission, shared_slot) =
-        match reserve_native_stage_slot(codex_home.clone(), stage_admission).await {
+        match reserve_native_stage_slot(codex_home.clone(), stage_admission, deadline).await {
             Ok(admission) => admission,
             Err(error) => {
                 return CanonicalOutputArtifact {
@@ -5333,7 +5438,7 @@ pub async fn replace_raw_output_artifact(
     match lock_artifact_handle(handle, SeekFrom::Start(0)).await {
         Ok(file) => {
             let file = tokio::fs::File::from_std(file);
-            let mut file = match lock_output_file(file).await {
+            let file = match lock_output_file(file).await {
                 Ok(file) => file,
                 Err(err) => {
                     return failed_with_owned_path(
@@ -5347,8 +5452,6 @@ pub async fn replace_raw_output_artifact(
             };
             let retained = &output[..output.len().min(MAX_RAW_OUTPUT_ARTIFACT_BYTES)];
             let truncated = retained.len() != output.len();
-            let mut digest = Sha256::new();
-            digest.update(retained);
             if let Err(error) = invalidate_raw_capture_metadata(path).await {
                 let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
@@ -5375,16 +5478,19 @@ pub async fn replace_raw_output_artifact(
                 )
                 .await;
             }
-            if let Err(err) = file.write_all(retained).await {
-                let _ = unlock_output_file(file).await;
-                return failed_with_owned_path(
-                    path.clone(),
-                    0,
-                    format!("failed to replace `{}`: {err}", path.display()),
-                    Some(&retention_token),
-                )
-                .await;
-            }
+            let (mut file, retained_sha256) =
+                match write_raw_output_with_hash(file, retained, None).await {
+                    Ok(written) => written,
+                    Err(err) => {
+                        return failed_with_owned_path(
+                            path.clone(),
+                            0,
+                            format!("failed to replace `{}`: {err}", path.display()),
+                            Some(&retention_token),
+                        )
+                        .await;
+                    }
+                };
             if let Err(err) = file.flush().await {
                 let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
@@ -5400,7 +5506,7 @@ pub async fn replace_raw_output_artifact(
                 Some(*id),
                 retained.len() as u64,
                 !truncated,
-                hex::encode(digest.finalize()),
+                retained_sha256,
             )
             .await
             {
@@ -5801,7 +5907,7 @@ fn reconcile_orphaned_artifact_on_read(path: &Path) -> Result<(), ReadToolOutput
     let lock = codex_file_system::try_acquire_atomic_write_lock(&target)
         .map_err(|error| ReadToolOutputError::Io(error.to_string()))?
         .ok_or(ReadToolOutputError::StillWriting)?;
-    advance_retention_interprocess_generation(&root, &target)
+    advance_retention_interprocess_generation(&root, &target, /*deadline*/ None)
         .map_err(|error| ReadToolOutputError::Io(error.to_string()))?;
     held_retention_locks().insert(root.clone(), lock);
     let _retention = RetentionSweepPermit { root, _process_permit: process_permit };
@@ -5813,18 +5919,80 @@ fn reconcile_orphaned_artifact_on_read(path: &Path) -> Result<(), ReadToolOutput
     Ok(())
 }
 
+// An opt-in limit for transforms that require the whole snapshot but cannot use
+// an arbitrary retained payload. Recovery and capture still use their own limits.
+struct SnapshotReadLimit {
+    max_bytes: usize,
+    cancellation: CancellationToken,
+    cancelled_message: &'static str,
+    oversized_message: &'static str,
+}
+
+impl SnapshotReadLimit {
+    fn check_cancelled(&self) -> Result<(), ReadToolOutputError> {
+        if self.cancellation.is_cancelled() {
+            return Err(ReadToolOutputError::Io(self.cancelled_message.into()));
+        }
+        Ok(())
+    }
+
+    fn check_size(&self, bytes: u64) -> Result<(), ReadToolOutputError> {
+        if bytes > self.max_bytes as u64 {
+            return Err(ReadToolOutputError::Io(self.oversized_message.into()));
+        }
+        Ok(())
+    }
+}
+
+// Check between bounded reads as well as before and after the payload operation.
+// A synchronous OS read already in progress cannot be interrupted here.
+struct CancellableSnapshotReader<'a, R> {
+    inner: R,
+    limit: &'a SnapshotReadLimit,
+}
+
+impl<R: Read> Read for CancellableSnapshotReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.limit.cancellation.is_cancelled() {
+            return Err(std::io::Error::other(self.limit.cancelled_message));
+        }
+        let chunk_len = buf.len().min(STREAMING_ARTIFACT_BUFFER_BYTES);
+        self.inner.read(&mut buf[..chunk_len])
+    }
+}
+
+fn read_snapshot_payload<T>(
+    mut reader: impl Read,
+    limit: Option<&SnapshotReadLimit>,
+    operation: impl FnOnce(&mut dyn Read) -> std::io::Result<T>,
+) -> Result<T, ReadToolOutputError> {
+    let result = if let Some(limit) = limit {
+        limit.check_cancelled()?;
+        let result = operation(&mut CancellableSnapshotReader { inner: reader, limit });
+        limit.check_cancelled()?;
+        result
+    } else {
+        operation(&mut reader)
+    };
+    result.map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))
+}
+
 fn load_logical_metadata_with_snapshot(
     path: &Path,
     id: ToolOutputArtifactId,
 ) -> Result<(LogicalArtifactMetadata, Option<Vec<u8>>, File), ReadToolOutputError> {
-    load_logical_metadata_with_observation(path, id, None)
+    load_logical_metadata_with_observation(path, id, None, None)
 }
 
 fn load_logical_metadata_with_observation(
     path: &Path,
     id: ToolOutputArtifactId,
     protected_metadata: Option<LogicalArtifactMetadata>,
+    read_limit: Option<&SnapshotReadLimit>,
 ) -> Result<(LogicalArtifactMetadata, Option<Vec<u8>>, File), ReadToolOutputError> {
+    if let Some(limit) = read_limit {
+        limit.check_cancelled()?;
+    }
     match std::fs::symlink_metadata(logical_transaction_path(path)) {
         Ok(_) => reconcile_orphaned_artifact_on_read(path)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -5887,11 +6055,29 @@ fn load_logical_metadata_with_observation(
             )));
         }
     };
+    let mut max_raw_bytes = MAX_RAW_OUTPUT_ARTIFACT_BYTES;
+    if let Some(limit) = read_limit {
+        limit.check_cancelled()?;
+        // Raw captures need the actual length, not just the sidecar's claim.
+        // Inspect this same file under the family lock, not a second path open.
+        let bytes = file
+            .metadata()
+            .map_err(|err| ReadToolOutputError::Io(format!("failed to inspect artifact: {err}")))?
+            .len();
+        limit.check_size(bytes)?;
+        max_raw_bytes = max_raw_bytes.min(limit.max_bytes);
+    }
     let mut contents = Vec::new();
-    (&file)
-        .take(MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64 + 1)
-        .read_to_end(&mut contents)
-        .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?;
+    // Limit even a file that grows after its length was observed. The lookahead
+    // distinguishes a source at the limit from an oversized one.
+    read_snapshot_payload(
+        (&file).take(max_raw_bytes as u64 + 1),
+        read_limit,
+        |reader| reader.read_to_end(&mut contents),
+    )?;
+    if let Some(limit) = read_limit {
+        limit.check_size(contents.len() as u64)?;
+    }
     if contents.len() > MAX_RAW_OUTPUT_ARTIFACT_BYTES {
         return Err(ReadToolOutputError::Io(
             "raw artifact exceeds its retained-byte limit".into(),
@@ -5954,6 +6140,19 @@ fn read_logical_range(
     metadata: &LogicalArtifactMetadata,
     range: CanonicalByteRange,
 ) -> Result<Vec<u8>, ReadToolOutputError> {
+    read_logical_range_with_limit(path, metadata, range, None)
+}
+
+fn read_logical_range_with_limit(
+    path: &Path,
+    metadata: &LogicalArtifactMetadata,
+    range: CanonicalByteRange,
+    read_limit: Option<&SnapshotReadLimit>,
+) -> Result<Vec<u8>, ReadToolOutputError> {
+    if let Some(limit) = read_limit {
+        limit.check_cancelled()?;
+        limit.check_size(range.len())?;
+    }
     if range.start > range.end || range.end > metadata.retained_bytes {
         return Err(ReadToolOutputError::InvalidRange(format!(
             "byte range must be within retained bytes 0..{}",
@@ -5977,6 +6176,9 @@ fn read_logical_range(
     }
     let mut output = Vec::new();
     for segment in &metadata.segments {
+        if let Some(limit) = read_limit {
+            limit.check_cancelled()?;
+        }
         // Validate size and read bytes through the same opened regular file.
         // Snapshot recovery used to open every segment once for validation and
         // again for delivery, including for a one-byte requested selection.
@@ -6002,8 +6204,9 @@ fn read_logical_range(
             .map_err(|_| ReadToolOutputError::Io("artifact range allocation failed".into()))?;
         let offset = output.len();
         output.resize(offset + length, 0);
-        file.read_exact(&mut output[offset..])
-            .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?;
+        read_snapshot_payload(&mut file, read_limit, |reader| {
+            reader.read_exact(&mut output[offset..])
+        })?;
     }
     if output.len() as u64 != range.len() {
         return Err(ReadToolOutputError::Io(
@@ -6016,6 +6219,14 @@ fn read_logical_range(
 fn load_validated_logical_snapshot(
     path: &Path,
     metadata: &LogicalArtifactMetadata,
+) -> Result<Vec<u8>, ReadToolOutputError> {
+    load_validated_logical_snapshot_with_limit(path, metadata, None)
+}
+
+fn load_validated_logical_snapshot_with_limit(
+    path: &Path,
+    metadata: &LogicalArtifactMetadata,
+    read_limit: Option<&SnapshotReadLimit>,
 ) -> Result<Vec<u8>, ReadToolOutputError> {
     let unavailable_ranges_are_invalid =
         metadata
@@ -6040,11 +6251,15 @@ fn load_validated_logical_snapshot(
             "artifact retained and unavailable ranges do not match metadata".to_string(),
         ));
     }
-    let snapshot = read_logical_range(
+    let snapshot = read_logical_range_with_limit(
         path,
         metadata,
         CanonicalByteRange::new(0, metadata.retained_bytes),
+        read_limit,
     )?;
+    if let Some(limit) = read_limit {
+        limit.check_cancelled()?;
+    }
     let expected_sha256 = metadata.retained_sha256.as_deref().or_else(|| {
         (metadata.complete && metadata.retained_bytes == metadata.canonical_bytes)
             .then_some(metadata.canonical_sha256.as_str())
@@ -7162,27 +7377,74 @@ fn json_pointer_miss_hint(
     pointer: &str,
 ) -> Option<String> {
     const LISTED: usize = 24;
+    const CLOSEST: usize = 3;
     const MAX_LISTED_NAME_BYTES: usize = 96;
-    struct Names(Vec<String>);
-    impl<'de> Deserialize<'de> for Names {
-        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            struct Visitor;
-            impl<'de> serde::de::Visitor<'de> for Visitor {
-                type Value = Names;
-                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    formatter.write_str("a JSON object")
+
+    #[derive(Default)]
+    struct Members {
+        count: usize,
+        listed: Vec<String>,
+        closest: Vec<(usize, String)>,
+    }
+
+    struct MemberVisitor<'a> {
+        wanted: &'a str,
+        edit_limit: usize,
+    }
+
+    impl<'de> serde::de::Visitor<'de> for MemberVisitor<'_> {
+        type Value = Members;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object or array")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Members, A::Error> {
+            let mut members = Members::default();
+            while let Some((name, _)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
+                members.count += 1;
+                if name.len() > MAX_LISTED_NAME_BYTES {
+                    continue;
                 }
-                fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Names, A::Error> {
-                    let mut names = Vec::new();
-                    while let Some((name, _)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
-                        names.push(name);
+                if members.listed.len() < LISTED {
+                    members.listed.push(name.clone());
+                }
+                // Case and containment slips first, then small edit distances.
+                let lower = name.to_lowercase();
+                let rank = if lower == self.wanted {
+                    Some(0)
+                } else if self.wanted.len() >= 3
+                    && (lower.contains(self.wanted) || self.wanted.contains(&lower))
+                {
+                    Some(1)
+                } else {
+                    bounded_edit_distance(&lower, self.wanted, self.edit_limit)
+                        .map(|distance| 1 + distance)
+                };
+                if let Some(rank) = rank {
+                    // Equal ranks keep encounter order. Retain only candidates
+                    // that can appear in the result, even for huge objects.
+                    let position = members.closest.partition_point(|(old, _)| *old <= rank);
+                    if position < CLOSEST {
+                        if members.closest.len() == CLOSEST {
+                            members.closest.pop();
+                        }
+                        members.closest.insert(position, (rank, name));
                     }
-                    Ok(Names(names))
                 }
             }
-            deserializer.deserialize_map(Visitor)
+            Ok(members)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Members, A::Error> {
+            let mut members = Members::default();
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                members.count += 1;
+            }
+            Ok(members)
         }
     }
+
     let mut end = pointer.len();
     let (parent, entry) = loop {
         end = pointer[..end].rfind('/')?;
@@ -7204,8 +7466,30 @@ fn json_pointer_miss_hint(
     };
     let text = std::str::from_utf8(validated_snapshot_range(snapshot, entry.range).ok()?).ok()?;
     let text = text.trim_start();
-    if text.starts_with('[') {
-        let count = serde_json::from_str::<Vec<serde::de::IgnoredAny>>(text).ok()?.len();
+    let array = text.starts_with('[');
+    if !array && !text.starts_with('{') {
+        return Some(format!(
+            "{owner} is a scalar value, so it has no member {}",
+            quoted(&missing)
+        ));
+    }
+    let wanted = missing.to_lowercase();
+    let edit_limit = (wanted.chars().count() / 3).clamp(1, 3);
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let Members {
+        count,
+        listed,
+        closest,
+    } = serde::Deserializer::deserialize_any(
+        &mut deserializer,
+        MemberVisitor {
+            wanted: &wanted,
+            edit_limit,
+        },
+    )
+    .ok()?;
+    deserializer.end().ok()?;
+    if array {
         let position = missing.parse::<usize>().ok().filter(|_| missing == "0" || !missing.starts_with('0'));
         return Some(match (count, position) {
             (0, _) => format!("{owner} is an empty array"),
@@ -7219,54 +7503,17 @@ fn json_pointer_miss_hint(
             ),
         });
     }
-    if !text.starts_with('{') {
-        return Some(format!(
-            "{owner} is a scalar value, so it has no member {}",
-            quoted(&missing)
-        ));
-    }
-    let Names(names) = serde_json::from_str(text).ok()?;
-    if names.is_empty() {
+    if count == 0 {
         return Some(format!("{owner} is an empty object"));
     }
     let address = |name: &str| quoted(&format!("{parent}/{}", name.replace('~', "~0").replace('/', "~1")));
-    // Case and containment slips first, then small edit distances.
-    let wanted = missing.to_lowercase();
-    let mut closest = names
-        .iter()
-        .enumerate()
-        .filter(|(_, name)| name.len() <= MAX_LISTED_NAME_BYTES)
-        .filter_map(|(position, name)| {
-            let lower = name.to_lowercase();
-            let rank = if lower == wanted {
-                0
-            } else if wanted.len() >= 3 && (lower.contains(&wanted) || wanted.contains(&lower)) {
-                1
-            } else {
-                let limit = (wanted.chars().count() / 3).clamp(1, 3);
-                let distance = bounded_edit_distance(&lower, &wanted, limit)?;
-                1 + distance
-            };
-            Some((rank, position, name))
-        })
-        .collect::<Vec<_>>();
-    closest.sort();
-    let closest = closest
-        .iter()
-        .take(3)
-        .map(|(_, _, name)| address(name))
-        .collect::<Vec<_>>();
-    let listed = names
-        .iter()
-        .filter(|name| name.len() <= MAX_LISTED_NAME_BYTES)
-        .take(LISTED)
-        .map(|name| address(name))
-        .collect::<Vec<_>>();
-    let omitted = names.len() - listed.len();
+    let closest = closest.iter().map(|(_, name)| address(name)).collect::<Vec<_>>();
+    let listed = listed.iter().map(|name| address(name)).collect::<Vec<_>>();
+    let omitted = count - listed.len();
     Some(format!(
         "{owner} is an object with {} member{}{}; members: {}{}",
-        names.len(),
-        if names.len() == 1 { "" } else { "s" },
+        count,
+        if count == 1 { "" } else { "s" },
         if closest.is_empty() { String::new() } else { format!("; closest: {}", closest.join(", ")) },
         listed.join(", "),
         if omitted == 0 { String::new() } else { format!(", … (+{omitted} more)") },
@@ -7275,8 +7522,9 @@ fn json_pointer_miss_hint(
 
 /// Levenshtein distance when it is at most `limit`; short names only.
 fn bounded_edit_distance(left: &str, right: &str, limit: usize) -> Option<usize> {
-    let left = left.chars().collect::<Vec<_>>();
-    let right = right.chars().collect::<Vec<_>>();
+    // A 65th character suffices to reject an input outside the ranking limit.
+    let left = left.chars().take(65).collect::<Vec<_>>();
+    let right = right.chars().take(65).collect::<Vec<_>>();
     if left.len().abs_diff(right.len()) > limit || left.len() > 64 || right.len() > 64 {
         return None;
     }
@@ -7674,6 +7922,18 @@ pub async fn load_tool_output_snapshot(
     thread_id: &str,
     artifact_id: &str,
 ) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
+    load_tool_output_snapshot_with_limit(codex_home, thread_id, artifact_id, None).await
+}
+
+async fn load_tool_output_snapshot_with_limit(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    read_limit: Option<SnapshotReadLimit>,
+) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
+    if let Some(limit) = &read_limit {
+        limit.check_cancelled()?;
+    }
     let id = artifact_id
         .parse::<ToolOutputArtifactId>()
         .map_err(|_| ReadToolOutputError::InvalidArtifactId)?;
@@ -7685,6 +7945,10 @@ pub async fn load_tool_output_snapshot(
         .join(thread_id)
         .join(format!("{id}.log"));
     tokio::task::spawn_blocking(move || {
+        let read_limit = read_limit.as_ref();
+        if let Some(limit) = read_limit {
+            limit.check_cancelled()?;
+        }
         // Capabilities are published before a possibly stalled writer creates
         // its metadata file. Consult custody before interpreting a missing file
         // as expiry; no disk or cache lock is held under this registry guard.
@@ -7700,12 +7964,18 @@ pub async fn load_tool_output_snapshot(
             }
         }
         #[cfg(windows)]
-        {
-            immutable_snapshot_cache::shared()
-                .load_with_metadata(&path, id, |metadata| load_tool_output_snapshot_with_observation(&path, id, metadata))
-        }
+        let snapshot = immutable_snapshot_cache::shared().load_with_metadata(&path, id, |metadata| {
+            load_tool_output_snapshot_with_observation(&path, id, metadata, read_limit)
+        })?;
         #[cfg(not(windows))]
-        load_tool_output_snapshot_uncached(&path, id)
+        let snapshot = load_tool_output_snapshot_with_observation(&path, id, None, read_limit)?;
+
+        if let Some(limit) = read_limit {
+            // A Windows lease hit skips the cold loader entirely.
+            limit.check_cancelled()?;
+            limit.check_size(snapshot.bytes.len() as u64)?;
+        }
+        Ok(snapshot)
     })
     .await
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
@@ -7816,21 +8086,21 @@ pub async fn audit_tool_output_reference(
     (audit, command_log)
 }
 
-#[cfg(not(windows))]
-fn load_tool_output_snapshot_uncached(
-    path: &Path,
-    id: ToolOutputArtifactId,
-) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
-    load_tool_output_snapshot_with_observation(path, id, None)
-}
-
 fn load_tool_output_snapshot_with_observation(
     path: &Path,
     id: ToolOutputArtifactId,
     protected_metadata: Option<LogicalArtifactMetadata>,
+    read_limit: Option<&SnapshotReadLimit>,
 ) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
-    let (metadata, snapshot, _family_lease) = load_logical_metadata_with_observation(path, id, protected_metadata)?;
-    let bytes = snapshot.map_or_else(|| load_validated_logical_snapshot(path, &metadata), Ok)?;
+    let (metadata, snapshot, _family_lease) =
+        load_logical_metadata_with_observation(path, id, protected_metadata, read_limit)?;
+    let bytes = match snapshot {
+        Some(bytes) => bytes,
+        None => load_validated_logical_snapshot_with_limit(path, &metadata, read_limit)?,
+    };
+    if let Some(limit) = read_limit {
+        limit.check_cancelled()?;
+    }
     Ok(Arc::new(ToolOutputSnapshot {
         metadata,
         bytes,
@@ -9571,9 +9841,16 @@ async fn reclaim_unresumable_thread_artifact_batch(
     let Some(move_owner) = codex_rollout::try_lock_rollout_moves(codex_home).await? else {
         return Ok(0);
     };
-    let move_owner = ReclaimMoveOwner::new(move_owner, idle.len());
+    let move_owner = Arc::new(ReclaimMoveOwner::new(move_owner, idle.len()));
     let deadline = tokio::time::Instant::now() + UNRESUMABLE_THREAD_ARTIFACT_MOVE_BUDGET;
-    if codex_rollout::has_recoverable_delete_staging(codex_home).await? {
+    let Ok(delete_staging) = tokio::time::timeout_at(
+        deadline,
+        codex_rollout::has_recoverable_delete_staging(codex_home),
+    )
+    .await else {
+        return Ok(0);
+    };
+    if delete_staging? {
         return Ok(0);
     }
     let ids = idle.iter()
@@ -9599,24 +9876,38 @@ async fn reclaim_unresumable_thread_artifact_batch(
         // Explicit-path resume has durable ownership outside the home-local
         // discovery roots. Its known provenance is not proof of unresumability.
         if !matches!(
-            tokio::fs::try_exists(
-                codex_home
-                    .join("tool-output-residency")
-                    .join(format!("{thread_id}.external-rollout"))
+            tokio::time::timeout_at(
+                deadline,
+                tokio::fs::try_exists(
+                    codex_home
+                        .join("tool-output-residency")
+                        .join(format!("{thread_id}.external-rollout")),
+                ),
             )
             .await,
-            Ok(false)
+            Ok(Ok(false))
         ) {
             continue;
         }
         let home = codex_home.to_path_buf();
         let id = thread_id.clone();
-        let residency =
-            match run_blocking_artifact_io(move || artifact_residency_file(&home, &id, true)).await
-            {
-                Ok(owner) => owner,
-                Err(_) => continue, // live or uncertain liveness: never wait under movement ownership
-            };
+        let probe_move_owner = Arc::clone(&move_owner);
+        let residency = match tokio::time::timeout_at(
+            deadline,
+            run_blocking_artifact_io(move || {
+                // Keep move exclusion with both the blocking probe and any
+                // lease awaiting delivery to a cancellable observer.
+                let lease =
+                    artifact_residency_file_with_deadline(&home, &id, true, Some(deadline))?;
+                Ok((lease, probe_move_owner))
+            }),
+        )
+        .await
+        {
+            Ok(Ok((lease, _probe_move_owner))) if tokio::time::Instant::now() < deadline => lease,
+            Ok(Err(_)) => continue, // live or uncertain liveness: do not retry under move exclusion
+            _ => return Ok(0),
+        };
         // Header/identity failures remain conservative, just like uncertain
         // liveness. The bulk inventory retains legacy filename suffixes.
         let id = codex_protocol::ThreadId::from_string(&thread_id)
@@ -9626,16 +9917,31 @@ async fn reclaim_unresumable_thread_artifact_batch(
             unresumable.push((thread_id, residency));
         }
     }
-    if unresumable.is_empty() {
+    if unresumable.is_empty() || tokio::time::Instant::now() >= deadline {
         return Ok(0);
     }
-    let Ok(Some(permit)) = tokio::time::timeout_at(deadline, retention_sweep_permit(&root)).await else {
+    // Only time out waiting for in-process admission. Generation publication
+    // and reclaim have one blocking owner with all their locks, not a timed
+    // observer that can abandon a still-mutating worker.
+    let Ok(Some((lock_root, process_permit))) =
+        tokio::time::timeout_at(deadline, retention_process_admission(&root)).await
+    else {
         return Ok(0);
     };
     run_blocking_artifact_io(move || {
-        let _permit = permit;
-        // The blocking owner retains the move exclusion if its caller is dropped.
         let _move_owner = move_owner;
+        let _permit = match retention_sweep_permit_blocking_with_deadline(
+            &lock_root,
+            process_permit,
+            Some(deadline),
+        ) {
+            Ok(permit) => permit,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Ok(0),
+            Err(error) => {
+                record_retention_sweep_permit_failure(&lock_root, &error);
+                return Ok(0);
+            }
+        };
         let mut removed = 0;
         for (thread_id, _residency) in unresumable {
             if tokio::time::Instant::now() >= deadline {
@@ -9678,6 +9984,9 @@ async fn reclaim_unresumable_thread_artifact_batch(
                 });
             if !contents_aged {
                 continue;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
             match std::fs::remove_dir_all(root.join(&thread_id)) {
                 Ok(()) => removed += 1,
@@ -10152,7 +10461,7 @@ fn without_shared_retention_lock<R>(root: &Path, pass: impl FnOnce() -> R) -> R 
     let result = pass();
     let lock_target = retention_interprocess_lock_target(&root);
     match acquire_atomic_write_lock(&lock_target).and_then(|lock| {
-        advance_retention_interprocess_generation(&root, &lock_target).map(|()| lock)
+        advance_retention_interprocess_generation(&root, &lock_target, None).map(|()| lock)
     }) {
         Ok(lock) => {
             held_retention_locks().insert(root, lock);
@@ -10217,7 +10526,11 @@ fn mark_retention_interprocess_index_stale(root: &Path) {
 fn advance_retention_interprocess_generation(
     root: &Path,
     lock_target: &Path,
+    deadline: Option<tokio::time::Instant>,
 ) -> std::io::Result<()> {
+    if let Some(deadline) = deadline {
+        remaining_admission_time(deadline)?;
+    }
     let (previous, next, recovered) = match std::fs::read_to_string(lock_target) {
         Ok(value) => match value
             .trim()
@@ -10245,6 +10558,11 @@ fn advance_retention_interprocess_generation(
     temporary.write_all(next.to_string().as_bytes())?;
     let (_file, temporary_path) = temporary.keep().map_err(|error| error.error)?;
     let temporary_path = tempfile::TempPath::try_from_path(temporary_path)?;
+    // Check at publication too: preparing the next generation can block even
+    // after the lease has been acquired. Once rename starts, finish under custody.
+    if let Some(deadline) = deadline {
+        remaining_admission_time(deadline)?;
+    }
     std::fs::rename(&temporary_path, lock_target)?;
     let root = normalized_tool_output_root(root);
     let mut states = retention_interprocess_states()
@@ -10341,11 +10659,34 @@ fn retention_sweep_permit_blocking(
     root: &Path,
     process_permit: OwnedSemaphorePermit,
 ) -> std::io::Result<RetentionSweepPermit> {
+    retention_sweep_permit_blocking_with_deadline(root, process_permit, None)
+}
+
+fn retention_sweep_permit_blocking_with_deadline(
+    root: &Path,
+    process_permit: OwnedSemaphorePermit,
+    deadline: Option<tokio::time::Instant>,
+) -> std::io::Result<RetentionSweepPermit> {
     // The OS lock acquisition can outlive its awaiter. Move admission into this
     // worker before the first filesystem wait, including on error and panic.
+    if let Some(deadline) = deadline {
+        remaining_admission_time(deadline)?;
+    }
     let lock_target = retention_interprocess_lock_target(root);
-    let interprocess_lock = acquire_atomic_write_lock(&lock_target)?;
-    advance_retention_interprocess_generation(root, &lock_target)?;
+    let interprocess_lock = if let Some(deadline) = deadline {
+        loop {
+            remaining_admission_time(deadline)?;
+            if let Some(lock) = codex_file_system::try_acquire_atomic_write_lock(&lock_target)? {
+                break lock;
+            }
+            std::thread::sleep(
+                remaining_admission_time(deadline)?.min(std::time::Duration::from_millis(50)),
+            );
+        }
+    } else {
+        acquire_atomic_write_lock(&lock_target)?
+    };
+    advance_retention_interprocess_generation(root, &lock_target, deadline)?;
     let root = normalized_tool_output_root(root);
     held_retention_locks().insert(root.clone(), interprocess_lock);
     Ok(RetentionSweepPermit {

@@ -523,7 +523,7 @@ async fn list_threads_from_files_desc(
         let mut page_cursor = cursor.cloned();
         let scan_page_size = page_size.saturating_mul(8).clamp(256, 2048);
 
-        loop {
+        let found_extra_match = loop {
             let mut page = list_threads_from_files_desc_unfiltered(
                 codex_home,
                 scan_page_size,
@@ -545,16 +545,15 @@ async fn list_threads_from_files_desc(
                 Some(search_term),
             )
             .await?;
-            matching_items.extend(page.items);
+            let found_extra_match = append_page_prefix(&mut matching_items, page.items, page_size);
             page_cursor = page.next_cursor;
-            if matching_items.len() > page_size || page_cursor.is_none() {
-                break;
+            if found_extra_match || page_cursor.is_none() {
+                break found_extra_match;
             }
-        }
+        };
 
         let more_matches_available =
-            matching_items.len() > page_size || page_cursor.is_some() || reached_scan_cap;
-        matching_items.truncate(page_size);
+            found_extra_match || page_cursor.is_some() || reached_scan_cap;
         let next_cursor = if more_matches_available {
             matching_items
                 .last()
@@ -647,7 +646,7 @@ async fn list_threads_from_files_asc(
         search_term.map_or(page_size, |_| page_size.saturating_mul(8).clamp(256, 2048));
     let mut page = ThreadsPage::default();
     let mut page_cursor = cursor.cloned();
-    loop {
+    let found_extra_match = loop {
         let mut scanned = if archived {
             get_threads_in_root_ascending(
                 codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
@@ -688,16 +687,15 @@ async fn list_threads_from_files_asc(
             search_term,
         )
         .await?;
-        page.items.extend(scanned.items);
+        let found_extra_match = append_page_prefix(&mut page.items, scanned.items, page_size);
         page_cursor = scanned.next_cursor;
-        if search_term.is_none() || page.items.len() > page_size || page_cursor.is_none() {
-            break;
+        if search_term.is_none() || found_extra_match || page_cursor.is_none() {
+            break found_extra_match;
         }
-    }
+    };
 
     let more_matches_available =
-        page_cursor.is_some() || page.items.len() > page_size || page.reached_scan_cap;
-    page.items.truncate(page_size);
+        page_cursor.is_some() || found_extra_match || page.reached_scan_cap;
     page.next_cursor = if more_matches_available {
         page.items
             .last()
@@ -706,6 +704,15 @@ async fn list_threads_from_files_asc(
         None
     };
     Ok(page)
+}
+
+/// Consume an already filtered scan batch without growing the result beyond
+/// the requested size. Report the extra match separately for cursor creation.
+fn append_page_prefix(items: &mut Vec<ThreadItem>, batch: Vec<ThreadItem>, page_size: usize) -> bool {
+    let remaining = page_size.saturating_sub(items.len());
+    let found_extra_match = batch.len() > remaining;
+    items.extend(batch.into_iter().take(remaining));
+    found_extra_match
 }
 
 async fn filter_thread_items_by_search_term(

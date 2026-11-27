@@ -50,15 +50,25 @@ pub(crate) fn advise(delta: &AppliedPatchDelta, out: &mut impl Write) {
             break;
         }
         let rust = match Path::extension(path).and_then(|ext| ext.to_str()) {
-            Some("rs") if after.contains("todo") || after.contains("unimplemented") => true,
-            Some("py") if after.contains("NotImplementedError") => false,
+            Some("rs") => true,
+            Some("py") => false,
             _ => continue,
         };
         let size = before.len().saturating_add(after.len());
         if size > 128 * 1024 || size > remaining_bytes {
             continue;
         }
+        // Charge the eligible endpoint before the marker scan, even if it
+        // turns out not to need parsing.
         remaining_bytes -= size;
+        let has_marker = if rust {
+            after.contains("todo") || after.contains("unimplemented")
+        } else {
+            after.contains("NotImplementedError")
+        };
+        if !has_marker {
+            continue;
+        }
         let language = if rust {
             tree_sitter_rust::LANGUAGE.into()
         } else {

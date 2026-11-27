@@ -11,6 +11,7 @@ use codex_agent_task_store::StoreError;
 use codex_agent_task_store::StoreResult;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::timing::observations;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -110,37 +111,51 @@ impl AgentControl {
                     let (attempt, receipt) = store
                         .get_agent_attempt(binding.assignment_id, binding.attempt_id)
                         .await?;
-                    if attempt.state == AttemptState::Active {
-                        index += 1;
-                    } else {
-                        if let Some(child) = binding.thread_id.as_deref()
-                            && let Some(timing) = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
-                            && let Some(turn) = timing.turn_timing_state()
+                    let join_state = match attempt.state {
+                        AttemptState::Active => {
+                            index += 1;
+                            continue;
+                        }
+                        AttemptState::Completed => observations::AgentJoinState::Completed,
+                        AttemptState::NeedsMain => observations::AgentJoinState::NeedsMain,
+                        AttemptState::Violated => observations::AgentJoinState::Violated,
+                        AttemptState::Abandoned => observations::AgentJoinState::Abandoned,
+                    };
+                    if let Some(child) = binding.thread_id.as_deref()
+                        && let Some(timing) = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
+                        && let Some(turn) = timing.turn_timing_state()
+                    {
+                        let execution = &timing.execution_id().0;
+                        turn.record_causal_agent("join", child, execution, turn.monotonic_offset_ms());
+                        if observations::terminal_enabled()
+                            && let Ok(child_thread_id) = ThreadId::try_from(child)
                         {
-                            turn.record_causal_agent("join", child,
-                                &timing.execution_id().0, turn.monotonic_offset_ms());
-                            if codex_protocol::timing::observations::enabled() {
-                                turn.observe_runtime("agent_joined", &timing.execution_id().0,
-                                    json!({"child_thread_id":child, "assignment_id":binding.assignment_id,
-                                        "attempt_id":binding.attempt_id, "state":attempt.state,
-                                        "receipt_available":receipt.is_some()}));
-                            }
+                            turn.observe_agent_joined(
+                                execution,
+                                observations::AgentJoinObservation {
+                                    child_thread_id,
+                                    assignment_id: binding.assignment_id.as_uuid(),
+                                    attempt_id: binding.attempt_id.as_uuid(),
+                                    state: join_state,
+                                    receipt_available: receipt.is_some(),
+                                },
+                            );
                         }
-                        result.outcomes.push(json!({
-                            "task_name": binding.agent_path, "thread_id": binding.thread_id,
-                            "assignment_id": binding.assignment_id, "attempt_id": binding.attempt_id,
-                            "state": attempt.state, "receipt_status": receipt.as_ref().map(|receipt| receipt.status),
-                            "receipt_available": receipt.is_some(),
-                            "result_recovery": {"tool": "get_agent_task", "arguments": {
-                                "assignment_id": binding.assignment_id, "attempt_id": binding.attempt_id
-                            }}
-                        }));
-                        // No await separates publication from removing the
-                        // obligation; cancellation keeps every partial outcome.
-                        result.pending.remove(index);
-                        if matches!(mode, CompletionMode::Any) {
-                            return Ok::<(), StoreError>(());
-                        }
+                    }
+                    result.outcomes.push(json!({
+                        "task_name": binding.agent_path, "thread_id": binding.thread_id,
+                        "assignment_id": binding.assignment_id, "attempt_id": binding.attempt_id,
+                        "state": attempt.state, "receipt_status": receipt.as_ref().map(|receipt| receipt.status),
+                        "receipt_available": receipt.is_some(),
+                        "result_recovery": {"tool": "get_agent_task", "arguments": {
+                            "assignment_id": binding.assignment_id, "attempt_id": binding.attempt_id
+                        }}
+                    }));
+                    // No await separates publication from removing the
+                    // obligation; cancellation keeps every partial outcome.
+                    result.pending.remove(index);
+                    if matches!(mode, CompletionMode::Any) {
+                        return Ok::<(), StoreError>(());
                     }
                 }
                 if result.pending.is_empty()

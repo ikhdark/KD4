@@ -64,17 +64,26 @@ pub(super) fn evaluate_main_module(
 }
 
 /// `exec_main.mjs:line:column` plus a bounded excerpt of the line with a caret.
-fn compile_error_location(line: usize, column: usize, source_line: &str) -> String {
+fn compile_error_location(line: usize, utf16_column: usize, source_line: &str) -> String {
     const CONTEXT_CHARS: usize = 80;
     let chars = source_line.trim_end_matches('\r').chars().collect::<Vec<_>>();
-    let column = column.min(chars.len());
-    let start = column.saturating_sub(CONTEXT_CHARS);
-    let end = column.saturating_add(CONTEXT_CHARS).min(chars.len());
+    // Keep V8's UTF-16 column in the location, but don't split a scalar in the excerpt.
+    let mut remaining = utf16_column;
+    let mut scalar_column: usize = 0;
+    for ch in &chars {
+        let Some(next) = remaining.checked_sub(ch.len_utf16()) else {
+            break;
+        };
+        remaining = next;
+        scalar_column += 1;
+    }
+    let start = scalar_column.saturating_sub(CONTEXT_CHARS);
+    let end = scalar_column.saturating_add(CONTEXT_CHARS).min(chars.len());
     let excerpt = chars[start..end].iter().collect::<String>();
     format!(
         "\n    at exec_main.mjs:{line}:{}\n{excerpt}\n{}^",
-        column + 1,
-        " ".repeat(column - start)
+        utf16_column + 1,
+        " ".repeat(scalar_column - start)
     )
 }
 

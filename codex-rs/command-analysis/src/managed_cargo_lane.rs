@@ -760,9 +760,16 @@ fn workspace_root(
     Ok(directory.to_path_buf())
 }
 
+pub struct CargoCompilationSources {
+    pub manifests: Vec<PathBuf>,
+    pub roots: Vec<PathBuf>,
+    /// Positive source evidence is usable, but the candidate set is incomplete.
+    pub target_enumeration_errors: usize,
+}
+
 /// Targeted source ownership, using the same manifest/path resolver as Cargo
 /// admission. Follow declared local dependencies, not every workspace file.
-pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<CargoCompilationSources> {
     use std::collections::{BTreeSet, VecDeque};
     let commands = serde_json::from_str::<Vec<Vec<String>>>(selection).ok()?;
     let [command] = commands.as_slice() else { return None; };
@@ -836,6 +843,7 @@ pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<(Vec<PathBuf>,
     if packages.is_empty() { pending.push_back((direct_manifest, true)); }
     let mut manifests = BTreeSet::from([workspace_manifest, workspace.join("Cargo.lock")]);
     let mut roots = BTreeSet::new();
+    let mut target_enumeration_errors = 0;
     let mut seen = BTreeSet::new();
     while let Some((manifest, selected)) = pending.pop_front() {
         let manifest = resolved(&manifest).ok()?;
@@ -873,12 +881,26 @@ pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<(Vec<PathBuf>,
                     }
                 }
                 let folder = directory.join(if kind == "bin" { "src/bin" } else { match kind { "example" => "examples", "test" => "tests", _ => "benches" } });
-                if let Ok(entries) = std::fs::read_dir(folder) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        charge(&path)?;
-                        if path.extension().is_some_and(|extension| extension == "rs") { roots.insert(path); }
-                        else if path.is_dir() && path.join("main.rs").is_file() { roots.insert(path.join("main.rs")); }
+                match std::fs::read_dir(&folder) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            let path = match entry {
+                                Ok(entry) => entry.path(),
+                                Err(_) => {
+                                    charge(&folder)?;
+                                    target_enumeration_errors += 1;
+                                    continue;
+                                }
+                            };
+                            charge(&path)?;
+                            if path.extension().is_some_and(|extension| extension == "rs") { roots.insert(path); }
+                            else if path.is_dir() && path.join("main.rs").is_file() { roots.insert(path.join("main.rs")); }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        charge(&folder)?;
+                        target_enumeration_errors += 1;
                     }
                 }
             }
@@ -911,7 +933,11 @@ pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<(Vec<PathBuf>,
             }
         }
     }
-    Some((manifests.into_iter().collect(), roots.into_iter().collect()))
+    Some(CargoCompilationSources {
+        manifests: manifests.into_iter().collect(),
+        roots: roots.into_iter().collect(),
+        target_enumeration_errors,
+    })
 }
 
 fn resolved(path: &Path) -> Result<PathBuf, String> {

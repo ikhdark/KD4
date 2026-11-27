@@ -254,6 +254,7 @@ pub(crate) use self::input_queue::InputQueue;
 pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
+use self::input_receipts::UserInputIdentity;
 pub(crate) use self::mcp_runtime::McpManagerLifecycle;
 pub use self::mcp_runtime::McpRuntimeSnapshot;
 use self::review::spawn_review_thread;
@@ -2688,6 +2689,20 @@ impl Session {
                 .config_layer_stack
                 .with_user_layer_from(&next_config.config_layer_stack)
                 .into();
+            // Validate the effective section after retaining the thread's layers.
+            // The resolver treats a malformed section like an absent one.
+            if let Some(value) = config
+                .config_layer_stack
+                .effective_config()
+                .get("tool_suggest")
+                && let Err(err) = value
+                    .clone()
+                    .try_into::<codex_config::types::ToolSuggestConfig>()
+            {
+                let message = format!("failed to parse tool_suggest while reloading layer: {err}");
+                warn!("{message}");
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, message));
+            }
             for feature in refreshed_features {
                 let enabled = next_config.features.enabled(*feature);
                 if let Err(err) = config.features.set_enabled(*feature, enabled) {
@@ -2878,19 +2893,6 @@ impl Session {
                     .with_user_config(&config_toml_path, user_config)
                     .into();
             }
-            if let Some(value) = config
-                .config_layer_stack
-                .effective_config()
-                .get("tool_suggest")
-                && let Err(err) = value
-                    .clone()
-                    .try_into::<codex_config::types::ToolSuggestConfig>()
-            {
-                warn!("failed to parse tool_suggest while reloading layer: {err}");
-                return;
-            }
-            config.tool_suggest =
-                resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
             config
         };
         self.refresh_runtime_config(next_config).await;
@@ -3043,12 +3045,21 @@ impl Session {
                 }
             }
         }
+        use codex_protocol::timing::observations::{self, CoreTerminalOutcome, TerminalPhase, TerminalSpan};
+
         // Runner cohort metadata is qualified by the operational terminal, not
         // by plan completion or a fabricated success at snapshot time.
         match &mut msg {
             EventMsg::TurnComplete(event) => {
-                turn_context.turn_timing_state.observe_runtime("core_terminal", &turn_context.sub_id,
-                    serde_json::json!({"outcome":if event.error.is_some() {"failed"} else {"success"}, "persist":persist}));
+                turn_context.turn_timing_state.observe_core_terminal(
+                    &turn_context.sub_id,
+                    if event.error.is_some() {
+                        CoreTerminalOutcome::Failed
+                    } else {
+                        CoreTerminalOutcome::Success
+                    },
+                    persist,
+                );
                 if let Some(execution) = event.timing.as_mut()
                     .and_then(|timing| timing.performance_observations.as_mut())
                     .and_then(|packet| packet.get_mut("execution"))
@@ -3057,8 +3068,11 @@ impl Session {
                 }
             }
             EventMsg::TurnAborted(event) => {
-                turn_context.turn_timing_state.observe_runtime("core_terminal", &turn_context.sub_id,
-                    serde_json::json!({"outcome":"cancelled", "reason":event.reason, "persist":persist}));
+                turn_context.turn_timing_state.observe_core_terminal(
+                    &turn_context.sub_id,
+                    CoreTerminalOutcome::Cancelled(event.reason.clone()),
+                    persist,
+                );
                 if let Some(execution) = event.timing.as_mut()
                     .and_then(|timing| timing.performance_observations.as_mut())
                     .and_then(|packet| packet.get_mut("execution"))
@@ -3077,41 +3091,26 @@ impl Session {
             // A blocked recorder must not strand interruption or successor
             // admission. Timeout means unknown, not a successful durable write;
             // a queued recorder operation may still finish after this waiter.
-            use codex_protocol::timing::observations;
-
-            let thread_id = observations::enabled().then(|| self.thread_id.to_string());
-            let start_phase = |kind| {
-                thread_id.as_ref().map(|thread_id| {
-                    observations::Span::start(
-                        kind,
-                        thread_id,
-                        &turn_context.sub_id,
-                        &turn_context.sub_id,
-                        serde_json::Value::Null,
-                    )
-                })
+            let thread_id = observations::terminal_enabled().then(|| self.thread_id.to_string());
+            let start_phase = |phase| {
+                let thread_id = thread_id.as_deref()?;
+                TerminalSpan::start(phase, thread_id, &turn_context.sub_id)
             };
             match tokio::time::timeout(Duration::from_secs(5), async {
                 if persist {
-                    let append = start_phase("terminal_rollout_append");
+                    let append = start_phase(TerminalPhase::RolloutAppend);
                     let result = self
                         .persist_rollout_items_ordered(&[RolloutItem::EventMsg(msg.clone())])
                         .await;
                     if let Some(append) = append {
-                        append.finish(
-                            if result.is_ok() { "append_acknowledged" } else { "error" },
-                            serde_json::Value::Null,
-                        );
+                        append.finish(result.is_ok());
                     }
                     result?;
                 }
-                let barrier = start_phase("terminal_rollout_barrier");
+                let barrier = start_phase(TerminalPhase::RolloutBarrier);
                 let result = durable_barrier().await;
                 if let Some(barrier) = barrier {
-                    barrier.finish(
-                        if result.is_ok() { "barrier_acknowledged" } else { "error" },
-                        serde_json::Value::Null,
-                    );
+                    barrier.finish(result.is_ok());
                 }
                 result
             })
@@ -4142,9 +4141,8 @@ impl Session {
         call_id: String,
         args: RequestUserInputArgs,
     ) -> Option<RequestUserInputResponse> {
-        // Delegated and MCP prompts retain their existing no-answer policy.
-        // The native clarification tool distinguishes a failed durable append.
-        self.request_user_input_with_outcome(turn_context, call_id, args)
+        // Approval prompts must wait for an actual answer.
+        self.request_user_input_with_outcome(turn_context, call_id, args, None)
             .await
             .ok()
             .flatten()
@@ -4159,10 +4157,10 @@ impl Session {
         turn_context: &TurnContext,
         call_id: String,
         mut args: RequestUserInputArgs,
+        auto_resolution_ms: Option<u64>,
     ) -> std::io::Result<Option<RequestUserInputResponse>> {
-        // Legacy tool calls and delegates may still supply a timeout hint.
-        // Human input waits must not advance the turn merely because time passed.
-        args.auto_resolution_ms = None;
+        // Only the trusted caller supplies a deadline, never legacy tool arguments.
+        args.auto_resolution_ms = auto_resolution_ms;
         let _elicitation = self.services.elicitations.register();
         let sub_id = turn_context.sub_id.clone();
         let cleanup = CancellationToken::new();
@@ -8443,19 +8441,21 @@ impl Session {
         self: &Arc<Self>,
         turn_context: &Arc<TurnContext>,
         input: &[UserInput],
-        client_id: Option<String>,
+        identity: UserInputIdentity,
     ) -> std::io::Result<()> {
-        let receipt = self.pending_receipt_for_input(input, client_id.as_deref()).await?;
         turn_context.turn_timing_state.record_user_input();
         let mut user_message_item = UserMessageItem::new(input);
-        let response_item_id = match receipt.as_ref() {
-            Some((_, suffix)) => ResponseItemId::with_suffix(crate::event_mapping::USER_INPUT_ITEM_ID_BASE, suffix),
-            None => ResponseItemId::with_suffix(
-                crate::event_mapping::USER_INPUT_ITEM_ID_BASE, &user_message_item.id,
-            ),
-        };
+        let suffix = identity
+            .accepted_receipt()
+            .map_or(user_message_item.id.as_str(), |receipt| {
+                receipt.item_id_suffix.as_str()
+            });
+        let response_item_id = ResponseItemId::with_suffix(
+            crate::event_mapping::USER_INPUT_ITEM_ID_BASE,
+            suffix,
+        );
         user_message_item.id = response_item_id.to_string();
-        user_message_item.client_id = client_id;
+        user_message_item.client_id = identity.client_id().map(str::to_owned);
         let mut response_item = self.response_item_from_user_input(input.to_vec()).await?;
         response_item.set_id(Some(response_item_id));
         // Persist the user message to history, but emit the turn item from `UserInput` so
@@ -8466,8 +8466,8 @@ impl Session {
         let turn_item = TurnItem::UserMessage(user_message_item);
         self.emit_turn_item_started(turn_context, &turn_item).await;
         self.emit_turn_item_completed(turn_context, turn_item).await;
-        if let Some((receipt, suffix)) = receipt {
-            if let Err(error) = self.complete_input_receipt(&receipt, &suffix).await {
+        if let UserInputIdentity::Receipted(receipt) = identity {
+            if let Err(error) = self.complete_accepted_input_receipt(&receipt).await {
                 // Canonical append has committed. Never return this prompt to
                 // runnable recovery merely because receipt settlement failed.
                 tracing::warn!(%error, "recorded input receipt settlement remains pending");
@@ -8477,7 +8477,7 @@ impl Session {
                     let _custody = custody;
                     for delay in [100, 500, 1000] {
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                        if session.complete_input_receipt(&receipt, &suffix).await.is_ok() { return; }
+                        if session.complete_accepted_input_receipt(&receipt).await.is_ok() { return; }
                     }
                     // Cold recovery recognizes the deterministic recorded ID.
                     tracing::error!("input receipt settlement deferred to durable history reconciliation");
@@ -8546,7 +8546,7 @@ impl Session {
 
     #[expect(
         clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
+        reason = "steering admission keeps turn identity stable through durable receipt and queue publication"
     )]
     async fn steer_input_inner(
         &self,
@@ -8574,74 +8574,130 @@ impl Session {
             if receipt.fingerprint != fingerprint { return Err(SteerInputError::IdempotencyConflict); }
             return Ok(receipt.turn_id);
         }
-        let mut active = self.active_turn.lock().await;
-        let Some(active_turn) = active.as_mut() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
+        let (active_turn_context, target_turn_state, target_task, _preparation_custody) = {
+            let active = self.active_turn.lock().await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(SteerInputError::ReceiptUnavailable {
+                    message: "the thread is shutting down".into(),
+                });
+            }
+            let Some(active_turn) = active.as_ref() else {
+                return Err(SteerInputError::NoActiveTurn(input));
+            };
+            let Some(active_task) = active_turn.task.as_ref() else {
+                return Err(SteerInputError::NoActiveTurn(input));
+            };
 
-        let Some(active_task) = active_turn.task.as_ref() else {
-            return Err(SteerInputError::NoActiveTurn(input));
+            let active_turn_id = &active_task.turn_context.sub_id;
+            if let Some(expected_turn_id) = expected_turn_id
+                && expected_turn_id != active_turn_id
+            {
+                return Err(SteerInputError::ExpectedTurnMismatch {
+                    expected: expected_turn_id.to_string(),
+                    actual: active_turn_id.clone(),
+                });
+            }
+
+            match active_task.kind {
+                crate::state::TaskKind::Regular => {}
+                crate::state::TaskKind::Review => {
+                    return Err(SteerInputError::ActiveTurnNotSteerable {
+                        turn_kind: NonSteerableTurnKind::Review,
+                    });
+                }
+                crate::state::TaskKind::Compact => {
+                    return Err(SteerInputError::ActiveTurnNotSteerable {
+                        turn_kind: NonSteerableTurnKind::Compact,
+                    });
+                }
+            }
+            if input.is_empty() {
+                return Err(SteerInputError::EmptyInput);
+            }
+
+            // Keyed requests already run on terminal_tasks. Track inline requests
+            // too so shutdown drains artifact preparation before retiring its writer.
+            let preparation_custody = client_user_message_id
+                .is_none()
+                .then(|| self.terminal_tasks.token());
+            (
+                Arc::clone(&active_task.turn_context),
+                Arc::clone(&active_turn.turn_state),
+                Arc::clone(&active_task.worker_done),
+                preparation_custody,
+            )
         };
-        let active_turn_context = Arc::clone(&active_task.turn_context);
         let active_turn_id = active_turn_context.sub_id.clone();
-
-        if let Some(expected_turn_id) = expected_turn_id
-            && expected_turn_id != active_turn_id
-        {
-            return Err(SteerInputError::ExpectedTurnMismatch {
-                expected: expected_turn_id.to_string(),
-                actual: active_turn_id.clone(),
-            });
-        }
-
-        match active_task.kind {
-            crate::state::TaskKind::Regular => {}
-            crate::state::TaskKind::Review => {
-                return Err(SteerInputError::ActiveTurnNotSteerable {
-                    turn_kind: NonSteerableTurnKind::Review,
-                });
-            }
-            crate::state::TaskKind::Compact => {
-                return Err(SteerInputError::ActiveTurnNotSteerable {
-                    turn_kind: NonSteerableTurnKind::Compact,
-                });
-            }
-        }
-
-        if input.is_empty() {
-            return Err(SteerInputError::EmptyInput);
-        }
+        // Recoverable context can wait on artifact I/O; do not block the turn
+        // worker or terminal coordinator while preparing it.
         let additional_context = self
             .recoverable_additional_context(additional_context)
             .await
             .map_err(|error| SteerInputError::AdditionalContextUnavailable {
                 message: error.to_string(),
             })?;
-        let receipt = match client_user_message_id.as_ref() {
+        let (receipt, identity) = match client_user_message_id {
             Some(client_id) => {
                 let mut receipt = codex_state::InputReceipt { kind: "steer".into(), scope: active_turn_id.clone(),
-                    client_id: client_id.clone(), fingerprint, turn_id: active_turn_id.clone(), payload: None };
-                receipt.payload = Some(self.receipt_payload(&receipt, &input, &additional_context)
-                    .map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?);
-                Some(receipt)
+                    client_id, fingerprint, turn_id: active_turn_id.clone(), payload: None };
+                let (payload, item_id_suffix) = self.receipt_payload(&receipt, &input, &additional_context)
+                    .map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?;
+                let identity = UserInputIdentity::Receipted(
+                    input_receipts::AcceptedInputReceipt::new(receipt.clone(), item_id_suffix),
+                );
+                receipt.payload = Some(payload);
+                (Some(receipt), identity)
             }
-            None => None,
+            None => (None, UserInputIdentity::Unreceipted(None)),
         };
-        let receipt_suffix = receipt.as_ref().map(|receipt| {
-            input_receipts::fingerprint(&(self.thread_id.to_string(), &receipt.kind, &receipt.scope, &receipt.client_id))
-        }).transpose().map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?;
+        let receipt_suffix = identity
+            .accepted_receipt()
+            .map(|receipt| receipt.item_id_suffix.clone());
+        // Preparation can overlap completion or interruption. A reused turn ID
+        // does not identify the original turn state or its exact worker.
+        let active = self.active_turn.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(SteerInputError::ReceiptUnavailable {
+                message: "the thread is shutting down".into(),
+            });
+        }
+        let Some(active_turn) = active.as_ref() else {
+            return Err(SteerInputError::NoActiveTurn(input));
+        };
+        let Some(active_task) = active_turn.task.as_ref() else {
+            return Err(SteerInputError::NoActiveTurn(input));
+        };
+        if active_task.turn_context.sub_id != active_turn_id {
+            return Err(SteerInputError::ExpectedTurnMismatch {
+                expected: active_turn_id,
+                actual: active_task.turn_context.sub_id.clone(),
+            });
+        }
+        if !Arc::ptr_eq(&active_turn.turn_state, &target_turn_state)
+            || !Arc::ptr_eq(&active_task.worker_done, &target_task)
+        {
+            return Err(SteerInputError::NoActiveTurn(input));
+        }
+
         // Keep the map with accepted input until its ordered recording commits.
         let mut pending_input = vec![TurnInput::AdditionalContext { values: additional_context, start_fence: None }];
         pending_input.push(TurnInput::UserInput {
             content: input,
-            client_id: client_user_message_id,
+            identity,
             start_fence: None,
         });
         self.input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                active_turn.turn_state.as_ref(),
+                target_turn_state.as_ref(),
                 &pending_input,
                 async || {
+                    // Shutdown can fence while admission waits on the queue locks.
+                    // Once reservation starts, its existing owner must publish it.
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        return Err(SteerInputError::ReceiptUnavailable {
+                            message: "the thread is shutting down".into(),
+                        });
+                    }
                     if let (Some(db), Some(receipt)) = (&db, &receipt) {
                         let accepted = db.reserve_input_receipt(self.thread_id, receipt).await
                             .map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?;

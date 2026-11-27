@@ -629,6 +629,18 @@ ON CONFLICT(child_thread_id) DO NOTHING
         .await
     }
 
+    /// Check the committed SQLite deletion witness for this exact owner.
+    /// Missing metadata rows alone do not prove that a delete committed.
+    pub async fn is_thread_owner_deleted(&self, id: ThreadId) -> anyhow::Result<bool> {
+        let deleted = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM deleted_thread_owners WHERE thread_id = ?)",
+        )
+        .bind(id.to_string())
+        .fetch_one(self.pool.as_ref())
+        .await?;
+        Ok(deleted)
+    }
+
     /// Find a rollout path by thread id using the underlying database.
     pub async fn find_rollout_path_by_id(
         &self,

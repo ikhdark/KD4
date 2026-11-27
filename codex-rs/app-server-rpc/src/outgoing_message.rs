@@ -163,6 +163,35 @@ impl From<oneshot::Sender<Instant>> for OutgoingWriteReceipt {
     }
 }
 
+/// Publication on the route that can race a response or notification on the
+/// other lane. A shared FIFO needs only successful enqueue.
+pub struct RoutePublicationFence {
+    writer: Option<oneshot::Receiver<Instant>>,
+    filtered: Option<oneshot::Receiver<()>>,
+}
+
+impl RoutePublicationFence {
+    /// The operation owner bounds this wait and decides how to fail its route.
+    pub async fn wait(self) -> bool {
+        let Some(mut writer) = self.writer else {
+            return true;
+        };
+        if let Some(filtered) = self.filtered {
+            tokio::select! {
+                biased;
+                result = filtered => {
+                    if result.is_ok() {
+                        return true;
+                    }
+                    // The normal forwarding path drops the filter sender.
+                }
+                result = &mut writer => return result.is_ok(),
+            }
+        }
+        writer.await.is_ok()
+    }
+}
+
 #[derive(Debug)]
 pub enum OutgoingEnvelope {
     ToConnection {
@@ -573,6 +602,11 @@ impl ThreadScopedOutgoingMessageSender {
         }
     }
 
+    /// Claim an unanswered request without racing an admitted client reply.
+    pub fn cancel_request_sync(&self, id: &RequestId) -> bool {
+        self.outgoing.cancel_request_sync(id)
+    }
+
     pub fn track_effective_permissions_approval_response(
         &self,
         request_id: RequestId,
@@ -712,6 +746,33 @@ impl OutgoingMessageSender {
 
     fn notification_sender(&self) -> &mpsc::Sender<OutgoingEnvelope> {
         self.notification_sender.as_ref().unwrap_or(&self.sender)
+    }
+
+    pub fn has_separate_notification_lane(&self) -> bool {
+        self.notification_sender.is_some()
+    }
+
+    fn publication_fence(
+        &self,
+        allow_filtering: bool,
+    ) -> (Option<OutgoingWriteReceipt>, RoutePublicationFence) {
+        if !self.has_separate_notification_lane() {
+            return (None, RoutePublicationFence { writer: None, filtered: None });
+        }
+        let (writer, writer_rx) = oneshot::channel();
+        let (filtered, filtered_rx) = if allow_filtering {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        (
+            Some(OutgoingWriteReceipt { writer, filtered }),
+            RoutePublicationFence {
+                writer: Some(writer_rx),
+                filtered: filtered_rx,
+            },
+        )
     }
 
     #[expect(
@@ -1652,8 +1713,24 @@ impl OutgoingMessageSender {
     where
         T: Into<ClientResponsePayload>,
     {
-        self.send_response_as_inner(request_id, response.into(), /*thread_originator*/ None)
+        self.send_response_as_inner(request_id, response.into(), /*thread_originator*/ None, None)
             .await;
+    }
+
+    /// Enqueue without waiting for the requester route. The returned fence
+    /// belongs to the resource owner, not the request dispatcher.
+    pub async fn send_response_with_publication_fence<T>(
+        &self,
+        request_id: ConnectionRequestId,
+        response: T,
+    ) -> Option<RoutePublicationFence>
+    where
+        T: Into<ClientResponsePayload>,
+    {
+        let (receipt, fence) = self.publication_fence(/*allow_filtering*/ false);
+        self.send_response_as_inner(request_id, response.into(), /*thread_originator*/ None, receipt)
+            .await
+            .then_some(fence)
     }
 
     pub async fn send_response_with_thread_originator<T>(
@@ -1664,7 +1741,7 @@ impl OutgoingMessageSender {
     ) where
         T: Into<ClientResponsePayload>,
     {
-        self.send_response_as_inner(request_id, response.into(), Some(thread_originator))
+        self.send_response_as_inner(request_id, response.into(), Some(thread_originator), None)
             .await;
     }
 
@@ -1673,7 +1750,7 @@ impl OutgoingMessageSender {
         request_id: ConnectionRequestId,
         response: ClientResponsePayload,
     ) {
-        self.send_response_as_inner(request_id, response, /*thread_originator*/ None)
+        self.send_response_as_inner(request_id, response, /*thread_originator*/ None, None)
             .await;
     }
 
@@ -1843,7 +1920,8 @@ impl OutgoingMessageSender {
         request_id: ConnectionRequestId,
         response: ClientResponsePayload,
         thread_originator: Option<String>,
-    ) {
+        receipt: Option<OutgoingWriteReceipt>,
+    ) -> bool {
         let connection_id = request_id.connection_id;
         let request_id_for_analytics = request_id.request_id.clone();
         let retryable_history_page = matches!(&response, ClientResponsePayload::ThreadTurnsList(_));
@@ -1880,7 +1958,7 @@ impl OutgoingMessageSender {
             .then(|| Self::observe_local_resume_response(request_context.as_ref()))
             .flatten();
 
-        match serialized_response {
+        let enqueued = match serialized_response {
             Ok((id, result)) => {
                 let outgoing_message = OutgoingMessage::Response(OutgoingResponse {
                     id,
@@ -1892,8 +1970,9 @@ impl OutgoingMessageSender {
                     connection_id,
                     outgoing_message,
                     "response",
+                    receipt,
                 )
-                .await;
+                .await
             }
             Err(err) => {
                 self.send_error_inner(
@@ -1902,11 +1981,13 @@ impl OutgoingMessageSender {
                     internal_error(format!("failed to serialize response: {err}")),
                 )
                 .await;
+                false
             }
-        }
+        };
         if let Some(observation) = response_observation {
             observation.finish("owner_returned_not_peer_receipt", serde_json::Value::Null);
         }
+        enqueued
     }
 
     pub async fn send_server_notification(&self, notification: ServerNotification) {
@@ -2071,13 +2152,38 @@ impl OutgoingMessageSender {
         notification: ServerNotification,
         cancellation: &CancellationToken,
     ) -> bool {
+        self.enqueue_server_notification_bounded(connection_id, notification, cancellation, None)
+            .await
+    }
+
+    /// A later fence on this same notification lane also covers earlier
+    /// admissions, including notifications intentionally filtered by the route.
+    pub async fn send_server_notification_with_publication_fence(
+        &self,
+        connection_id: ConnectionId,
+        notification: ServerNotification,
+        cancellation: &CancellationToken,
+    ) -> Option<RoutePublicationFence> {
+        let (receipt, fence) = self.publication_fence(/*allow_filtering*/ true);
+        self.enqueue_server_notification_bounded(connection_id, notification, cancellation, receipt)
+            .await
+            .then_some(fence)
+    }
+
+    async fn enqueue_server_notification_bounded(
+        &self,
+        connection_id: ConnectionId,
+        notification: ServerNotification,
+        cancellation: &CancellationToken,
+        receipt: Option<OutgoingWriteReceipt>,
+    ) -> bool {
         tracing::trace!(?connection_id, "app-server bounded event: {notification}");
         let send = self
             .notification_sender()
             .send(OutgoingEnvelope::ToConnection {
                 connection_id,
                 message: OutgoingMessage::AppServerNotification(notification),
-                write_complete_tx: None,
+                write_complete_tx: receipt,
             });
         let result = tokio::select! {
             biased;
@@ -2369,6 +2475,7 @@ impl OutgoingMessageSender {
             request_id.connection_id,
             outgoing_message,
             "error",
+            None,
         )
         .await;
     }
@@ -2379,14 +2486,15 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         message: OutgoingMessage,
         message_kind: &'static str,
-    ) {
+        receipt: Option<OutgoingWriteReceipt>,
+    ) -> bool {
         let route = self.active_connections.lock().await
             .get(&connection_id)
             .map(|connection| (connection.delivery_failure.clone(), connection.remote_control));
         let Some((route_failed, remote_control)) = route.filter(|(token, _)| !token.is_cancelled())
         else {
             self.finish_request_context(request_context.as_ref()).await;
-            return;
+            return false;
         };
         let message = match message {
             OutgoingMessage::Response(mut response) if remote_control => {
@@ -2415,7 +2523,7 @@ impl OutgoingMessageSender {
         let send_fut = self.sender.send(OutgoingEnvelope::ToConnection {
             connection_id,
             message,
-            write_complete_tx: None,
+            write_complete_tx: receipt,
         });
         let send_fut = async {
             tokio::select! {
@@ -2443,7 +2551,8 @@ impl OutgoingMessageSender {
             );
         }
 
-        if !matches!(&send_result, Some(Ok(Ok(())))) {
+        let enqueued = matches!(&send_result, Some(Ok(Ok(()))));
+        if !enqueued {
             self.fail_connection_delivery(connection_id).await;
         }
         // Keep the claim through admission or route failure. Cleanup from an
@@ -2459,6 +2568,7 @@ impl OutgoingMessageSender {
             ),
             None => {}
         }
+        enqueued
     }
 }
 

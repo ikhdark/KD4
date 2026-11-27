@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 const MAX_PARITY_SCAN_FILES: usize = 10_000;
 const MAX_PARITY_SCAN_ENTRIES: usize = 50_000;
+const MAX_PARITY_DB_ROWS: u32 = 10_000;
 const SAMPLE_LIMIT: usize = 5;
 const SUMMARY_LIMIT: usize = 8;
 const CHECK_ID: &str = "state.rollout_db_parity";
@@ -74,6 +75,18 @@ impl RolloutScan {
         self.reached_scan_cap = self.reached_candidate_cap();
     }
 
+    fn traversal_complete(&self) -> bool {
+        !self.reached_scan_cap && self.scan_errors.is_empty()
+    }
+
+    fn observed_suffix(&self) -> &'static str {
+        if self.traversal_complete() {
+            ""
+        } else {
+            " (observed; scan incomplete)"
+        }
+    }
+
     fn active_count(&self) -> usize {
         self.files.iter().filter(|file| !file.archived).count()
     }
@@ -100,10 +113,17 @@ async fn thread_inventory_check_for_roots(
     let scan = scan_rollout_files(codex_home).await;
     let state_db_path = codex_state::state_db_path(sqlite_home);
 
+    let observed_suffix = scan.observed_suffix();
     let mut details = vec![
         format!("default model provider: {default_provider}"),
-        format!("rollout DB active files: {}", scan.active_count()),
-        format!("rollout DB archived files: {}", scan.archived_count()),
+        format!(
+            "rollout DB active files: {}{observed_suffix}",
+            scan.active_count()
+        ),
+        format!(
+            "rollout DB archived files: {}{observed_suffix}",
+            scan.archived_count()
+        ),
         format!("rollout DB scan errors: {}", scan.scan_errors.len()),
         format!(
             "rollout DB malformed file names: {}",
@@ -124,31 +144,40 @@ async fn thread_inventory_check_for_roots(
             .map(|path| path.display().to_string()),
     );
 
-    if !state_db_path.is_file() {
-        details.push("rollout DB rows: skipped (state DB missing)".to_string());
-        return missing_state_db_check(scan, details);
+    match tokio::fs::metadata(&state_db_path).await {
+        Ok(metadata) if metadata.is_file() => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            details.push("rollout DB rows: skipped (state DB missing)".to_string());
+            return missing_state_db_check(scan, details);
+        }
+        Ok(_) => return state_db_read_error(details, "state DB path is not a regular file".into()),
+        Err(err) => return state_db_read_error(details, err.to_string()),
     }
 
-    let rows = match codex_state::read_thread_state_audit_rows(&state_db_path).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            details.push(format!("rollout DB read error: {err}"));
+    let rows = match ThreadStateAuditRow::read_bounded(&state_db_path, MAX_PARITY_DB_ROWS).await {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
+            let minimum_rows = u64::from(MAX_PARITY_DB_ROWS) + 1;
+            details.push(format!(
+                "rollout DB rows: at least {minimum_rows} (row cap exceeded)"
+            ));
             return DoctorCheck::new(
                 CHECK_ID,
                 CHECK_CATEGORY,
                 CheckStatus::Warning,
-                "state database thread inventory could not be read",
+                "rollout/state DB comparison is incomplete",
             )
             .details(details)
             .issue(
                 DoctorIssue::new(
                     CheckStatus::Warning,
-                    "state DB thread rows could not be queried",
+                    "state DB row cap exceeded; parity was not evaluated",
                 )
-                .measured(err.to_string())
-                .expected("readable threads table"),
+                .measured(format!("at least {minimum_rows} rows"))
+                .expected(format!("at most {MAX_PARITY_DB_ROWS} rows for a complete comparison")),
             );
         }
+        Err(err) => return state_db_read_error(details, err.to_string()),
     };
 
     let codex_home = codex_home.to_path_buf();
@@ -165,6 +194,25 @@ async fn thread_inventory_check_for_roots(
         )
         .detail(format!("comparison error: {err}"))
     })
+}
+
+fn state_db_read_error(mut details: Vec<String>, error: String) -> DoctorCheck {
+    details.push(format!("rollout DB read error: {error}"));
+    DoctorCheck::new(
+        CHECK_ID,
+        CHECK_CATEGORY,
+        CheckStatus::Warning,
+        "state database thread inventory could not be read",
+    )
+    .details(details)
+    .issue(
+        DoctorIssue::new(
+            CheckStatus::Warning,
+            "state DB thread rows could not be queried",
+        )
+        .measured(error)
+        .expected("readable threads table"),
+    )
 }
 
 fn missing_state_db_check(scan: RolloutScan, details: Vec<String>) -> DoctorCheck {
@@ -197,7 +245,11 @@ fn missing_state_db_check(scan: RolloutScan, details: Vec<String>) -> DoctorChec
                     CheckStatus::Warning,
                     "rollout files exist but the state DB is missing",
                 )
-                .measured(format!("{} rollout files", scan.files.len()))
+                .measured(format!(
+                    "{} rollout files{}",
+                    scan.files.len(),
+                    scan.observed_suffix()
+                ))
                 .expected("state DB contains matching thread rows")
                 .remedy("Start Codex with no state DB present so startup backfill can create it from rollout files."),
         )
@@ -254,7 +306,8 @@ fn parity_check_from_scan_and_rows(
     }
     let missing_active = missing_rollout_paths(&logical_files, &rows_by_key, false);
     let missing_archived = missing_rollout_paths(&logical_files, &rows_by_key, true);
-    let scan_complete = !scan.reached_scan_cap && scan.scan_errors.is_empty();
+    let scan_complete = scan.traversal_complete();
+    let observed_suffix = scan.observed_suffix();
     let mut stale_rows = Vec::new();
     let mut unverified_rows = Vec::new();
     let mut archive_mismatches = Vec::new();
@@ -287,12 +340,18 @@ fn parity_check_from_scan_and_rows(
 
     details.extend([
         format!("rollout DB rows: {}", rows.len()),
-        format!("rollout DB unverified rows: {}", unverified_rows.len()),
+        format!(
+            "rollout DB unverified rows: {}",
+            count_or_skipped(unverified_rows.len(), scan_complete)
+        ),
         format!("rollout DB active rows: {active_rows}"),
         format!("rollout DB archived rows: {archived_rows}"),
-        format!("rollout DB missing active rows: {}", missing_active.len()),
         format!(
-            "rollout DB missing archived rows: {}",
+            "rollout DB missing active rows: {}{observed_suffix}",
+            missing_active.len()
+        ),
+        format!(
+            "rollout DB missing archived rows: {}{observed_suffix}",
             missing_archived.len()
         ),
         format!(
@@ -304,7 +363,7 @@ fn parity_check_from_scan_and_rows(
             count_or_skipped(archive_mismatches.len(), scan_complete)
         ),
         format!(
-            "rollout DB duplicate rollout thread ids: {}",
+            "rollout DB duplicate rollout thread ids: {}{observed_suffix}",
             duplicate_rollout_thread_ids.len()
         ),
         format!(
@@ -353,34 +412,29 @@ fn parity_check_from_scan_and_rows(
         duplicate_db_paths.iter().map(PathBuf::as_path),
     );
 
-    let status = if scan.scan_errors.is_empty()
-        && scan.malformed_names.is_empty()
-        && !scan.reached_scan_cap
-        && missing_active.is_empty()
-        && missing_archived.is_empty()
-        && unverified_rows.is_empty()
-        && stale_rows.is_empty()
-        && archive_mismatches.is_empty()
-        && duplicate_rollout_thread_ids.is_empty()
-        && duplicate_db_paths.is_empty()
-    {
-        CheckStatus::Ok
-    } else {
-        CheckStatus::Warning
-    };
-
-    let summary = if status == CheckStatus::Ok {
-        "rollout files and state DB thread inventory agree"
-    } else if !missing_active.is_empty()
+    let comparison_complete =
+        scan_complete && scan.malformed_names.is_empty() && unverified_rows.is_empty();
+    let found_differences = !missing_active.is_empty()
         || !missing_archived.is_empty()
         || !stale_rows.is_empty()
         || !archive_mismatches.is_empty()
         || !duplicate_rollout_thread_ids.is_empty()
-        || !duplicate_db_paths.is_empty()
-    {
-        "rollout files and state DB thread inventory differ"
+        || !duplicate_db_paths.is_empty();
+    let (status, summary) = if !comparison_complete {
+        (
+            CheckStatus::Warning,
+            "rollout/state DB comparison is incomplete",
+        )
+    } else if found_differences {
+        (
+            CheckStatus::Warning,
+            "rollout files and state DB thread inventory differ",
+        )
     } else {
-        "rollout/state DB comparison is incomplete"
+        (
+            CheckStatus::Ok,
+            "rollout files and state DB thread inventory agree",
+        )
     };
     let mut check = DoctorCheck::new(CHECK_ID, CHECK_CATEGORY, status, summary).details(details);
 
@@ -391,7 +445,7 @@ fn parity_check_from_scan_and_rows(
                 "rollout files are missing from the state DB",
             )
             .measured(format!(
-                "{} active, {} archived",
+                "{} active, {} archived{observed_suffix}",
                 missing_active.len(),
                 missing_archived.len()
             ))
@@ -414,7 +468,7 @@ fn parity_check_from_scan_and_rows(
                 CheckStatus::Warning,
                 "state DB rows point at missing or unusable rollout files",
             )
-            .measured(format!("{} stale rows", stale_rows.len()))
+            .measured(format!("{} stale rows{observed_suffix}", stale_rows.len()))
             .expected("every state DB rollout path contains the matching thread identity"),
         );
     }
@@ -424,7 +478,10 @@ fn parity_check_from_scan_and_rows(
                 CheckStatus::Warning,
                 "state DB archive flags disagree with rollout file locations",
             )
-            .measured(format!("{} mismatched rows", archive_mismatches.len()))
+            .measured(format!(
+                "{} mismatched rows{observed_suffix}",
+                archive_mismatches.len()
+            ))
             .expected(
                 "rows under archived_sessions are archived and rows under sessions are active",
             ),
@@ -437,7 +494,7 @@ fn parity_check_from_scan_and_rows(
                 "duplicate thread inventory entries found",
             )
             .measured(format!(
-                "{} duplicate rollout thread ids, {} duplicate DB paths",
+                "{} duplicate rollout thread ids{observed_suffix}, {} duplicate DB paths",
                 duplicate_rollout_thread_ids.len(),
                 duplicate_db_paths.len()
             ))

@@ -402,17 +402,22 @@ fn bounded_runner_lookup(
             .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             .ok()?
             .ok()?;
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         if bytes.len() > limit {
             return Some(RunnerLookupOutput::Truncated(bytes));
         }
         loop {
-            if let Some(status) = child.0.try_wait().ok()? {
-                return status.success().then_some(RunnerLookupOutput::Complete(bytes));
-            }
-            if std::time::Instant::now() >= deadline {
+            let status = child.0.try_wait().ok()?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 return None;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            if let Some(status) = status {
+                return status.success().then_some(RunnerLookupOutput::Complete(bytes));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5).min(remaining));
         }
         // ChildGuard drops before the scope joins its reader, also on timeout.
     })
@@ -485,10 +490,10 @@ pub async fn resolve_command_validation_with_shell(
     shell_type: Option<codex_shell_command::shell_detect::ShellType>,
     cwd: Option<&std::path::Path>,
     declared: Option<codex_protocol::validation::ValidationCommandContext>,
-) -> Option<CommandValidation> {
+) -> Result<Option<CommandValidation>, tokio::task::JoinError> {
     resolve_command_launch_analysis_with_shell(invocation, shell_type, cwd, declared)
         .await
-        .0
+        .map(|(validation, _)| validation)
 }
 
 /// Keep native syntax work on the analysis worker, including observation policy.
@@ -498,7 +503,7 @@ pub async fn resolve_command_launch_analysis_with_shell(
     shell_type: Option<codex_shell_command::shell_detect::ShellType>,
     cwd: Option<&std::path::Path>,
     declared: Option<codex_protocol::validation::ValidationCommandContext>,
-) -> (Option<CommandValidation>, bool) {
+) -> Result<(Option<CommandValidation>, bool), tokio::task::JoinError> {
     let invocation = match invocation {
         CommandInvocation::Script(script)
             if shell_type == Some(codex_shell_command::shell_detect::ShellType::PowerShell) =>
@@ -587,7 +592,6 @@ pub async fn resolve_command_launch_analysis_with_shell(
         (validation, long_running)
     })
     .await
-    .unwrap_or_default()
 }
 
 
@@ -620,11 +624,12 @@ fn compilation_completion_args(args: &[String], managed_lane: bool) -> Option<(V
     Some((launch, locked))
 }
 
+/// A successful opaque classification is not an analysis worker failure.
 pub async fn analyze_validation_policy_with_shell(
     invocation: &CommandInvocation,
     shell_type: Option<codex_shell_command::shell_detect::ShellType>,
     cwd: Option<&std::path::Path>,
-) -> (ValidationPolicyClassification, String) {
+) -> Result<(ValidationPolicyClassification, String), tokio::task::JoinError> {
     let invocation = match invocation {
         CommandInvocation::Script(script)
             if shell_type == Some(codex_shell_command::shell_detect::ShellType::PowerShell) =>
@@ -639,7 +644,6 @@ pub async fn analyze_validation_policy_with_shell(
         analyze_policy_with_runners(&invocation, &runners)
     })
     .await
-    .unwrap_or((ValidationPolicyClassification::Opaque, String::new()))
 }
 
 pub fn classify_validation_policy(

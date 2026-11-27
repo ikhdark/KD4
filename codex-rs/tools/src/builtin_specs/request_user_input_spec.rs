@@ -104,7 +104,7 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
                 "disposition": {
                     "type": "string",
                     "enum": ["answered", "timed_out", "skipped", "interrupted", "transport_error"],
-                    "description": "How the request ended, when reported by the client. Omitted by legacy clients; missing answers are not approval."
+                    "description": "How the request ended. Timed-out answers are automatic defaults, not user approval. Legacy clients may omit this field."
                 },
                 "scope_input_provenance": {
                     "type": "object",
@@ -169,7 +169,7 @@ pub fn normalize_request_user_input_args(
 pub fn request_user_input_tool_description(available_modes: &[ModeKind]) -> String {
     let allowed_modes = format_allowed_modes(available_modes);
     format!(
-        "Request user input for one to three short questions and wait until the user responds or cancels; unanswered questions do not time out. Use this only for conflicting requirements or a decision that is the user's alone and that evidence cannot settle. This tool is only available in {allowed_modes}."
+        "Request user input for one to three short questions. After five minutes without a response, the host selects the recommended options if every question has one clear recommendation. Treat these selections as defaults, not explicit user approval, and disclose them when continuing. Use this only for conflicting requirements or a decision that is the user's alone and that evidence cannot settle. If explicit consent is required, ask in a message and wait. This tool is only available in {allowed_modes}."
     )
 }
 

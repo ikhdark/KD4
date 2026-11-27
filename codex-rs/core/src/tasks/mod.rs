@@ -75,6 +75,33 @@ const GRACEFUL_INTERRUPTION_TIMEOUT: Duration =
 const FORCED_INTERRUPTION_TIMEOUT: Duration = Duration::from_secs(1);
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 
+/// Unsettled targets in failed-turn order; a true entry is owned by a Stop.
+pub(crate) type FailedTurnStops = indexmap::IndexMap<String, bool>;
+
+/// Only a confirmed Stop consumes its exact target. Drop releases the claim
+/// after cancellation, discovery failure or unconfirmed interrupt delivery.
+struct FailedTurnStopClaim<'a> {
+    remembered: &'a std::sync::Mutex<FailedTurnStops>,
+    turn_id: &'a str,
+    needs_retry: bool,
+}
+
+impl Drop for FailedTurnStopClaim<'_> {
+    fn drop(&mut self) {
+        let mut targets = self
+            .remembered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.needs_retry {
+            if let Some(in_flight) = targets.get_mut(self.turn_id) {
+                *in_flight = false;
+            }
+        } else {
+            targets.shift_remove(self.turn_id);
+        }
+    }
+}
+
 /// Bounded, caller-owned fanout. All attempts share the original deadline,
 /// including children waiting for a fanout slot. Identity order is stable.
 async fn collect_failed_turn_interrupts<F: Future<Output = &'static str>>(
@@ -1944,11 +1971,7 @@ impl Session {
             }
         }
         if !running.is_empty() || unlisted {
-            *self
-                .agents_left_running_by_failed_turn
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(turn_context.sub_id.clone());
+            self.remember_failed_turn_stop_target(&turn_context.sub_id);
         }
         if running.is_empty() && queued.is_empty() && !unlisted {
             return;
@@ -1976,6 +1999,14 @@ impl Session {
             .await;
     }
 
+    fn remember_failed_turn_stop_target(&self, turn_id: &str) {
+        self.agents_left_running_by_failed_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(turn_id.to_owned())
+            .or_insert(false);
+    }
+
     /// Stop request for agents that a failed turn left running. With a turn
     /// id it applies only to that turn. Returns whether such a turn was
     /// remembered; the agents may already have finished.
@@ -1983,25 +2014,37 @@ impl Session {
         &self,
         expected_turn_id: Option<&str>,
     ) -> bool {
+        let remembered = &self.agents_left_running_by_failed_turn;
         let turn_id = {
-            let mut remembered = self
-                .agents_left_running_by_failed_turn
+            let mut targets = remembered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if expected_turn_id.is_some_and(|expected| remembered.as_deref() != Some(expected)) {
+            let target = match expected_turn_id {
+                Some(expected) => targets.get_full_mut(expected).map(|(_, id, claim)| (id, claim)),
+                None => targets.last_mut(),
+            };
+            let Some((turn_id, in_flight)) = target else {
                 return false;
+            };
+            if *in_flight {
+                return true;
             }
-            remembered.take()
+            *in_flight = true;
+            turn_id.clone()
         };
-        let Some(turn_id) = turn_id else {
-            return false;
+        let mut claim = FailedTurnStopClaim {
+            remembered,
+            turn_id: &turn_id,
+            needs_retry: true,
         };
-        let (_, message) = self
+        let (_, message, needs_retry) = self
             .interrupt_agents_owned_by_turn(
                 &turn_id,
                 "A stop was requested after this thread's turn ended on an error.",
             )
             .await;
+        claim.needs_retry = needs_retry;
+        drop(claim);
         if let Some(message) = message {
             self.send_event_raw(codex_protocol::protocol::Event {
                 id: turn_id,
@@ -2017,7 +2060,7 @@ impl Session {
         turn_context: &TurnContext,
         failed: bool,
     ) -> Vec<String> {
-        let (interrupted, message) = self
+        let (interrupted, message, needs_retry) = self
             .interrupt_agents_owned_by_turn(
                 &turn_context.sub_id,
                 if failed {
@@ -2027,6 +2070,9 @@ impl Session {
                 },
             )
             .await;
+        if failed && needs_retry {
+            self.remember_failed_turn_stop_target(&turn_context.sub_id);
+        }
         if let Some(message) = message {
             self.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
                 .await;
@@ -2038,7 +2084,7 @@ impl Session {
         &self,
         turn_id: &str,
         lead: &str,
-    ) -> (Vec<String>, Option<String>) {
+    ) -> (Vec<String>, Option<String>, bool) {
         let control = &self.services.agent_control;
         let label = |thread_id: codex_protocol::ThreadId| {
             control
@@ -2098,8 +2144,9 @@ impl Session {
                 queued.push(author);
             }
         }
-        if interrupted.is_empty() && queued.is_empty() && unconfirmed.is_empty() {
-            return (interrupted, None);
+        let needs_retry = !unconfirmed.is_empty();
+        if interrupted.is_empty() && queued.is_empty() && !needs_retry {
+            return (interrupted, None, false);
         }
         let mut message = lead.to_string();
         if !interrupted.is_empty() {
@@ -2120,7 +2167,7 @@ impl Session {
                 crate::session::turn_execution::bounded_path_list(&queued)
             ));
         }
-        (interrupted, Some(message))
+        (interrupted, Some(message), needs_retry)
     }
 
     async fn finalize_turn_terminal_fail_safe(

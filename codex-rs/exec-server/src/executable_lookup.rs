@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
 use std::path::Component;
@@ -10,12 +11,15 @@ use crate::protocol::LookupExecutableParams;
 use crate::protocol::LookupExecutableResponse;
 
 const MAX_CANDIDATES: usize = 4096;
+const MAX_CANDIDATE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Resolve files only: never start a shell, inspect shell profiles or launch the result.
 /// Called on the executor so host PATH/PATHEXT cannot leak into remote lookups.
 fn prepare_lookup(
     params: &LookupExecutableParams,
     max_candidates: usize,
+    bytes_left: &mut usize,
+    byte_limit_message: &str,
 ) -> io::Result<LookupPlan> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
     let name = &params.name;
@@ -90,24 +94,46 @@ fn prepare_lookup(
             .unwrap_or_default()
     };
     let mut candidates = Vec::new();
-    let mut truncated = false;
-    let mut unresolved = None;
+    let mut seen = params.all_matches.then(HashSet::new);
+    let mut candidate_count = 0;
+    let mut incomplete = None;
     'directories: for directory in directories {
         let base = cwd.as_path().join(&directory).join(program);
         for suffix in &suffixes {
-            if candidates.len() == max_candidates {
-                truncated = true;
+            if candidate_count == max_candidates {
+                incomplete = Some(format!(
+                    "executable lookup exceeded {max_candidates} candidate probes"
+                ));
                 break 'directories;
             }
             let mut candidate = base.as_os_str().to_os_string();
             candidate.push(suffix);
             match PathUri::from_host_native_path(Path::new(&candidate)) {
-                Ok(candidate) => candidates.push(candidate),
+                Ok(candidate) => {
+                    // Census deduplication does not change the candidate count limit.
+                    candidate_count += 1;
+                    let candidate_bytes = candidate.as_str().len();
+                    if candidate_bytes > *bytes_left {
+                        if seen.as_ref().is_some_and(|seen| seen.contains(&candidate)) {
+                            continue;
+                        }
+                        incomplete = Some(byte_limit_message.into());
+                        break 'directories;
+                    }
+                    if seen
+                        .as_mut()
+                        .is_some_and(|seen| !seen.insert(candidate.clone()))
+                    {
+                        continue;
+                    }
+                    *bytes_left -= candidate_bytes;
+                    candidates.push(candidate);
+                }
                 // A drive-relative entry (`D:tools`, `D:`) resolves against a
                 // process-private per-drive cwd, not the selected cwd. Like a failed
                 // probe it stops the ordered search: earlier entries still decide.
                 Err(error) => {
-                    unresolved = Some(format!(
+                    incomplete = Some(format!(
                         "unable to resolve PATH entry {}: {error}",
                         directory.display()
                     ));
@@ -116,9 +142,6 @@ fn prepare_lookup(
             }
         }
     }
-    let incomplete = unresolved.or_else(|| truncated.then(|| format!(
-        "executable lookup exceeded {max_candidates} candidate probes"
-    )));
     Ok(LookupPlan { candidates, incomplete })
 }
 
@@ -131,7 +154,13 @@ pub(crate) async fn lookup_executable(
     filesystem: &dyn ExecutorFileSystem,
     params: &LookupExecutableParams,
 ) -> io::Result<LookupExecutableResponse> {
-    let plan = prepare_lookup(params, MAX_CANDIDATES)?;
+    let mut bytes_left = MAX_CANDIDATE_BYTES;
+    let plan = prepare_lookup(
+        params,
+        MAX_CANDIDATES,
+        &mut bytes_left,
+        "candidate paths exceed 4 MiB",
+    )?;
     if params.all_matches {
         return lookup_all(filesystem, params, plan).await;
     }
@@ -160,20 +189,13 @@ async fn lookup_all(
     if let Some(error) = plan.incomplete {
         return Err(unknown(&error));
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut candidate_bytes = 0usize;
-    let mut requests = Vec::new();
-    for path in plan.candidates {
-        if seen.insert(path.clone()) {
-            candidate_bytes += path.as_str().len();
-            if candidate_bytes > 4 * 1024 * 1024 {
-                return Err(unknown("candidate paths exceed 4 MiB"));
-            }
-            requests.push(FileSystemLookup::FirstRegularFile {
-                candidates: vec![path],
-            });
-        }
-    }
+    let requests: Vec<_> = plan
+        .candidates
+        .into_iter()
+        .map(|path| FileSystemLookup::FirstRegularFile {
+            candidates: vec![path],
+        })
+        .collect();
     let mut matches = Vec::new();
     let mut match_bytes = 0usize;
     for batch in requests.chunks(32) {
@@ -220,23 +242,18 @@ pub(crate) async fn lookup_executables(
     let mut requests = Vec::new();
     let mut pending = Vec::new();
     let mut probes_left = 16_384usize;
-    let mut bytes_left = 4 * 1024 * 1024usize;
+    let mut bytes_left = MAX_CANDIDATE_BYTES;
     for name in &params.names {
         let lookup = LookupExecutableParams { name: name.clone(), all_matches: false, cwd: params.cwd.clone(), sandbox: None };
-        match prepare_lookup(&lookup, MAX_CANDIDATES.min(probes_left)) {
+        match prepare_lookup(
+            &lookup,
+            MAX_CANDIDATES.min(probes_left),
+            &mut bytes_left,
+            "executable batch exceeded 4 MiB of candidate path text",
+        ) {
             Err(error) => results.push(FileSystemLookupResult::from_result(Err(error))),
-            Ok(mut plan) => {
-                let mut retained = 0;
-                for path in &plan.candidates {
-                    if path.as_str().len() > bytes_left {
-                        plan.incomplete = Some("executable batch exceeded 4 MiB of candidate path text".into());
-                        break;
-                    }
-                    bytes_left -= path.as_str().len();
-                    retained += 1;
-                }
-                plan.candidates.truncate(retained);
-                probes_left -= retained;
+            Ok(plan) => {
+                probes_left -= plan.candidates.len();
                 pending.push((results.len(), plan.incomplete));
                 requests.push(FileSystemLookup::FirstRegularFile { candidates: plan.candidates });
                 results.push(FileSystemLookupResult::Unknown { error: "lookup not completed".into() });

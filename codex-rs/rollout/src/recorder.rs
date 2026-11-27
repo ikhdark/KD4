@@ -832,6 +832,7 @@ impl RolloutRecorder {
         // Session metadata and turn identity both record the executable hash;
         // start it now rather than on the first turn.
         codex_utils_build_info::prehash_executable();
+        let _ = codex_protocol::timing::observations::prepare_terminal_lane();
         let (writer, deferred_log_file_info, rollout_path, meta, tool_manifests) = match params {
             RolloutRecorderParams::Create {
                 session_id,
@@ -1262,7 +1263,7 @@ impl RolloutRecorder {
     /// Load valid records plus a bounded, synthetic reconstruction notice when
     /// operational records were skipped. Diagnostic ContextReplay snapshots are
     /// excluded (including their referenced bodies); use for_each_rollout_item
-    /// for full diagnostic records and payload-integrity inspection.
+    /// for supported diagnostic records and payload-integrity inspection.
     /// Keeping the notice in the existing history carrier
     /// makes gaps visible even to consumers that discard the diagnostic count.
     /// It is not written back to the source rollout by this read.
@@ -1385,7 +1386,8 @@ impl RolloutRecorder {
         }
     }
 
-    /// Visit each valid rollout item without retaining the full rollout in memory.
+    /// Visit each valid typed rollout item without retaining the full rollout in memory.
+    /// Retired diagnostics remain in the source but have no typed item to visit.
     pub async fn for_each_rollout_item<F>(
         path: &Path,
         mut visit: F,
@@ -1596,7 +1598,11 @@ impl RolloutRecorder {
                 continue;
             }
             let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(line.trim()) else {
-                parse_errors = parse_errors.saturating_add(1);
+                if !serde_json::from_str::<Value>(line.trim())
+                    .is_ok_and(|value| is_retired_terminalization_receipt(&value))
+                {
+                    parse_errors = parse_errors.saturating_add(1);
+                }
                 continue;
             };
             match rollout_line.item {
@@ -1746,6 +1752,86 @@ pub(crate) struct RolloutRecordDecoder {
     diagnostic_origin: Option<DiagnosticOrigin>,
 }
 
+// The retired receipt has no live or typed replay representation. Match its
+// historical v1 wire shape here; additional fields were ignored by its decoder.
+fn is_retired_terminalization_receipt(value: &Value) -> bool {
+    if value.get("format_version").and_then(Value::as_u64) != Some(1)
+        || value.get("timestamp").and_then(Value::as_str).is_none()
+        || value.get("type").and_then(Value::as_str) != Some("event_msg")
+    {
+        return false;
+    }
+    let Some(payload) = value.get("payload").and_then(Value::as_object) else {
+        return false;
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("turn_terminalization_complete")
+        || payload.get("turn_id").and_then(Value::as_str).is_none()
+    {
+        return false;
+    }
+    let Some(receipt) = payload.get("receipt").and_then(Value::as_object) else {
+        return false;
+    };
+    if receipt.get("terminalIdentity").and_then(Value::as_str).is_none()
+        || !matches!(
+            receipt.get("deliveryState").and_then(Value::as_str),
+            Some("not_attempted" | "claimed" | "delivered" | "delivery_failed")
+        )
+        || !matches!(
+            receipt.get("recoveryState").and_then(Value::as_str),
+            Some("none" | "pending" | "recovered")
+        )
+        || receipt.get("activeTurnDetached").and_then(Value::as_bool).is_none()
+        || receipt.get("terminalInteractionReleased").and_then(Value::as_bool).is_none()
+        || !matches!(
+            receipt.get("deadlineExhaustedPhase"),
+            None | Some(Value::Null | Value::String(_))
+        )
+    {
+        return false;
+    }
+    let Some(timing) = receipt.get("terminalization").and_then(Value::as_object) else {
+        return false;
+    };
+    ["validationProcessNs", "completionGateNs"]
+        .iter()
+        .all(|field| timing.get(*field).and_then(Value::as_u64).is_some())
+        && [
+            "finalMutationToSealNs",
+            "validationAggregateNs",
+            "reviewPreflightNs",
+            "reviewNs",
+            "checkpointTokens",
+            "preparationNs",
+            "hooksQuiescenceNs",
+            "fenceNs",
+            "freshnessNs",
+            "gateNs",
+            "durableCommitNs",
+            "deliveryAttemptNs",
+            "interactionReleaseNs",
+            "postCleanupNs",
+            "unclassifiedNs",
+        ]
+        .iter()
+        .all(|field| timing.get(*field).is_none_or(|value| value.as_u64().is_some()))
+        && [
+            "validationLaunchCount",
+            "validationAggregateCount",
+            "terminalMemoHitCount",
+            "diffReuseCount",
+            "diffRefreshCount",
+            "reviewerInfrastructureMemoHitCount",
+            "reviewsPreventedByCorrectnessCount",
+        ]
+        .iter()
+        .all(|field| {
+            timing.get(*field).is_none_or(|value| {
+                value.as_u64().is_some_and(|count| u32::try_from(count).is_ok())
+            })
+        })
+}
+
 fn discard_verified_replay_capture(value: &mut Value) {
     if value["format_version"].as_u64()
         != Some(u64::from(codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION))
@@ -1850,6 +1936,11 @@ impl RolloutRecordDecoder {
                 ErrorKind::Unsupported,
                 format!("unsupported rollout format version {version} at record {record_number}"),
             ));
+        }
+        if is_retired_terminalization_receipt(&v) {
+            // Keep the physical ordinal; only the typed projection omits this
+            // diagnostic. It is not a missing turn boundary or a history gap.
+            return Ok(None);
         }
         if is_v0 && migrate_v0_ghost_snapshot_rollout_line(&mut v) {
             trace!("skipping legacy ghost_snapshot rollout line");
@@ -2023,7 +2114,6 @@ impl LockedRolloutFile {
             _payload_sync_owner: self.payload_sync_owner,
             _append_lock: Arc::new(self.append_lock),
             _payload_retention: Arc::new(self.payload_retention),
-            diagnostic_revision: None,
         }
     }
 }
@@ -2210,10 +2300,15 @@ impl RolloutWriterState {
     }
 
     async fn flush_durable(&mut self) -> std::io::Result<()> {
-        let observation = codex_protocol::timing::observations::Span::start(
-            "durable_rollout", &self.meta.as_ref().map(|meta| meta.id.to_string()).unwrap_or_default(),
-            "", "writer_barrier", serde_json::json!({
-                "scope":"ordered_rollout_and_payload_sync_not_a_state_db_or_client_ack"}));
+        use codex_protocol::timing::observations;
+
+        let observation = if observations::terminal_enabled() {
+            observations::TerminalSpan::start_durable_rollout(
+                &self.meta.as_ref().map(|meta| meta.id.to_string()).unwrap_or_default(),
+            )
+        } else {
+            None
+        };
         self.flush().await?;
         crate::payload_artifact::sync_payload_artifacts(&self.rollout_path).await?;
         if let Some(writer) = self.writer.as_ref() {
@@ -2227,16 +2322,13 @@ impl RolloutWriterState {
                 self.namespace_sync_pending = false;
             }
         }
-        let revision = if codex_protocol::timing::observations::enabled()
-            && let Some(writer) = self.writer.as_mut() {
-            match writer.diagnostic_checkpoint().await {
-                Ok(value) => value,
-                Err(error) => serde_json::json!({"available":false,
-                    "reason":"index_checkpoint_capture_failed", "error_kind":format!("{:?}", error.kind())}),
-            }
-        } else { Value::Null };
-        observation.finish("synced", serde_json::json!({"checkpoint":revision, "materialized":self.writer.is_some(),
-            "pending_items":self.pending_items.len(), "namespace_sync_pending":self.namespace_sync_pending}));
+        if let Some(observation) = observation {
+            observation.finish(
+                self.writer.is_some(),
+                self.pending_items.len(),
+                self.namespace_sync_pending,
+            );
+        }
         Ok(())
     }
 
@@ -2351,7 +2443,6 @@ impl RolloutWriterState {
                 _payload_sync_owner: Arc::clone(&self.payload_sync_owner),
                 _append_lock: Arc::clone(append_lock),
                 _payload_retention: Arc::clone(payload_retention),
-                diagnostic_revision: None,
             }
         } else {
             tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
@@ -2882,8 +2973,6 @@ struct JsonlWriter {
     _payload_sync_owner: Arc<crate::payload_artifact::PayloadSyncOwner>,
     _append_lock: Arc<compression::RolloutAppendLock>,
     _payload_retention: Arc<std::fs::File>,
-    // Cleared by every owned append, and checked against observed file version.
-    diagnostic_revision: Option<(u64, Option<std::time::SystemTime>, serde_json::Value)>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2969,36 +3058,6 @@ impl Write for InlineRolloutLine {
 }
 
 impl JsonlWriter {
-    async fn diagnostic_checkpoint(&mut self) -> std::io::Result<Value> {
-        let path = self.path.clone();
-        let _lock = tokio::task::spawn_blocking(move || compression::lock_rollout_for_write_blocking(&path))
-            .await.map_err(IoError::other)??;
-        let before = self.file.metadata().await?;
-        if let Some((size, modified, value)) = &self.diagnostic_revision
-            && *size == before.len() && *modified == before.modified().ok() {
-            return Ok(value.clone());
-        }
-        // This scope does not claim durability of another writer's payloads.
-        // Sync the observed index under the append fence before hashing it.
-        self.file.sync_data().await?;
-        if before.len() > 64 * 1024 * 1024 {
-            return Ok(serde_json::json!({"available":false, "reason":"index_capture_limit_64_mib"}));
-        }
-        let mut reader = compression::open_rollout_line_reader(&self.path).await?;
-        reader.capture_source_revision(true);
-        while reader.next_line().await?.is_some() {}
-        let after = self.file.metadata().await?;
-        if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
-            return Ok(serde_json::json!({"available":false, "reason":"source_changed_during_capture"}));
-        }
-        let value = serde_json::json!({"available":true,
-            "store_id":crate::diagnostic_revision::store_id(&self.path),
-            "revision":reader.source_revision(), "index_bytes":after.len(),
-            "basis":"index_synced_under_cooperative_write_fence"});
-        self.diagnostic_revision = Some((after.len(), after.modified().ok(), value.clone()));
-        Ok(value)
-    }
-
     async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
         // A direct append has no queue between capture and write.
         let captured = CapturedRolloutItem::new(rollout_item.clone(), OffsetDateTime::now_utc());
@@ -3089,7 +3148,6 @@ impl JsonlWriter {
     }
 
     async fn write_transaction(&mut self, bytes: &[u8], append_start: u64) -> std::io::Result<u64> {
-        self.diagnostic_revision = None;
         let committed_end = append_start.checked_add(bytes.len() as u64)
             .ok_or_else(|| IoError::other("rollout append offset overflow"))?;
         let write_result = self.write_line_bytes(bytes).await;

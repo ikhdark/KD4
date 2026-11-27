@@ -99,6 +99,8 @@ use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionG
 use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputDisposition;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
 use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -106,6 +108,7 @@ use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
@@ -498,6 +501,10 @@ pub(crate) async fn apply_bespoke_event_handling(
             });
         }
         EventMsg::RequestUserInput(request) => {
+            let fallback = request.auto_resolution_ms.and_then(|ms| {
+                recommended_user_input_response(&request.questions)
+                    .map(|response| (Duration::from_millis(ms), response))
+            });
             let user_input_guard = thread_watch_manager
                 .note_user_input_requested(&conversation_id.to_string())
                 .await;
@@ -529,17 +536,30 @@ pub(crate) async fn apply_bespoke_event_handling(
                 item_id: request.call_id,
                 questions,
                 is_blocking: true,
-                auto_resolution_ms: request.auto_resolution_ms,
+                // The server owns the deadline; clients must not race it with
+                // their own timeout or send defaults as human answers.
+                auto_resolution_ms: None,
             };
-            let (pending_request_id, rx) = outgoing
+            let (pending_request_id, mut rx) = outgoing
                 .send_request(ServerRequestPayload::ToolRequestUserInput(params))
                 .await;
             tokio::spawn(async move {
+                let response = match (fallback, pending_request_id.as_ref()) {
+                    (Some((wait, fallback)), Some(id)) => {
+                        match tokio::time::timeout(wait, &mut rx).await {
+                            Ok(result) => request_user_input_response_from_client_result(result),
+                            Err(_) if outgoing.cancel_request_sync(id) => Some(fallback),
+                            // A reply or cancellation already owns the callback.
+                            Err(_) => request_user_input_response_from_client_result(rx.await),
+                        }
+                    }
+                    _ => request_user_input_response_from_client_result(rx.await),
+                };
                 on_request_user_input_response(
                     request_turn_id,
                     call_id,
                     pending_request_id,
-                    rx,
+                    response,
                     conversation,
                     thread_state,
                     user_input_guard,
@@ -1525,16 +1545,51 @@ async fn handle_error_notification(
         .await;
 }
 
+fn recommended_user_input_response(
+    questions: &[RequestUserInputQuestion],
+) -> Option<CoreRequestUserInputResponse> {
+    if questions.is_empty() {
+        return None;
+    }
+    let answers = questions
+        .iter()
+        .map(|question| {
+            if question.is_secret {
+                return None;
+            }
+            let mut recommended = question
+                .options
+                .as_ref()?
+                .iter()
+                .filter(|option| option.label.trim_end().ends_with("(Recommended)"));
+            let label = &recommended.next()?.label;
+            if recommended.next().is_some() {
+                return None;
+            }
+            Some((
+                question.id.clone(),
+                CoreRequestUserInputAnswer {
+                    answers: vec![label.clone()],
+                },
+            ))
+        })
+        .collect::<Option<HashMap<_, _>>>()?;
+    Some(CoreRequestUserInputResponse {
+        answers,
+        interrupted: false,
+        disposition: Some(RequestUserInputDisposition::TimedOut),
+    })
+}
+
 async fn on_request_user_input_response(
     event_turn_id: String,
     call_id: String,
     pending_request_id: Option<RequestId>,
-    receiver: oneshot::Receiver<ClientRequestResult>,
+    response: Option<CoreRequestUserInputResponse>,
     conversation: Arc<CodexThread>,
     thread_state: Arc<Mutex<ThreadState>>,
     user_input_guard: ThreadWatchActiveGuard,
 ) {
-    let response = receiver.await;
     if let Some(pending_request_id) = pending_request_id
         && let Err(error) =
             resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await
@@ -1545,7 +1600,7 @@ async fn on_request_user_input_response(
         );
     }
     drop(user_input_guard);
-    let Some(response) = request_user_input_response_from_client_result(response) else {
+    let Some(response) = response else {
         return;
     };
 

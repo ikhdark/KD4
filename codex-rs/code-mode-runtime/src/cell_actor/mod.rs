@@ -67,6 +67,7 @@ impl CellActor {
             CellHandle,
             CellEventFuture,
             impl Future<Output = ()> + Send + 'static,
+            crate::runtime::RuntimeStartGate,
         ),
         String,
     > {
@@ -75,7 +76,7 @@ impl CellActor {
         let (command_tx, command_rx) = mpsc::channel(OBSERVATION_COMMAND_CAPACITY);
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
         let output_admission = Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES));
-        let (runtime_tx, runtime_terminate_handle) = crate::runtime::spawn_runtime_with_catalog(
+        let (runtime_tx, runtime_terminate_handle, start_gate) = crate::runtime::spawn_runtime_with_catalog(
             stored_values,
             runtime_request(request),
             catalog,
@@ -108,7 +109,7 @@ impl CellActor {
                 .unwrap_or(Err(CellError::Closed))
                 .map(CellResponse::into_event)
         });
-        Ok((handle, initial_response, task))
+        Ok((handle, initial_response, task, start_gate))
     }
 }
 

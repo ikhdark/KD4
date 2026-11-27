@@ -1768,9 +1768,14 @@ impl TurnRequestProcessor {
                 internal_error(format!("failed to fence startup interrupt: {error}"))
             })?;
             if let Some(target) = target {
-                thread.interrupt_turn_if_active(&target).await.map_err(|error| {
+                let interrupted = thread.interrupt_turn_if_active(&target).await.map_err(|error| {
                     internal_error(format!("failed to interrupt startup turn: {error}"))
                 })?;
+                if !interrupted && thread.active_turn_id().await.is_none() {
+                    thread
+                        .interrupt_agents_left_running_by_failed_turn(Some(&target))
+                        .await;
+                }
             } else {
                 // No turn to stop: Stop still reaches agents that a turn which
                 // ended on an error left running.
@@ -1781,20 +1786,19 @@ impl TurnRequestProcessor {
             return Ok(Some(TurnInterruptResponse {}));
         }
 
-        // A turn that ended on an error may have left its agents running. Naming
-        // that turn stops them; any other idle target is still rejected below.
-        if thread.active_turn_id().await.is_none()
-            && thread
-                .interrupt_agents_left_running_by_failed_turn(Some(&turn_id))
-                .await
-        {
-            return Ok(Some(TurnInterruptResponse {}));
-        }
-
-        // Record turn interrupts so we can reply when TurnAborted arrives.
+        // Record active-turn interrupts so we can reply when the terminal event arrives.
         let interrupt_reservation = {
             let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
             let core_turn_id = thread.active_turn_id().await;
+            // An idle Stop may retry the exact failed turn, but must never target
+            // a different remembered turn or bypass the active-turn ID check.
+            if core_turn_id.is_none()
+                && thread
+                    .interrupt_agents_left_running_by_failed_turn(Some(&turn_id))
+                    .await
+            {
+                return Ok(Some(TurnInterruptResponse {}));
+            }
             let reservation = {
                 let mut thread_state = thread_state.lock().await;
                 validate_turn_interrupt_target(
@@ -1840,6 +1844,13 @@ impl TurnRequestProcessor {
         let state = self.thread_state_manager.thread_state(thread_uuid).await;
         let needs_response = state.lock().await.finish_interrupt(request_id);
         drop(interrupt_reservation);
+        // The exact target may have failed between validation and core's
+        // interrupt claim. Do not turn this into a Stop for its successor.
+        if needs_response && thread.active_turn_id().await.is_none() {
+            thread
+                .interrupt_agents_left_running_by_failed_turn(Some(&turn_id))
+                .await;
+        }
         Ok(needs_response.then_some(TurnInterruptResponse {}))
     }
 }

@@ -12,6 +12,55 @@ struct ReceiptInput {
     item_id_suffix: String,
 }
 
+/// The storage key and deterministic history ID of an accepted submission.
+#[derive(Debug)]
+pub(crate) struct AcceptedInputReceipt {
+    key: InputReceipt,
+    pub(super) item_id_suffix: String,
+}
+
+impl AcceptedInputReceipt {
+    pub(super) fn new(mut key: InputReceipt, item_id_suffix: String) -> Arc<Self> {
+        // Do not keep a second serialized copy of the queued prompt or context.
+        key.payload = None;
+        Arc::new(Self { key, item_id_suffix })
+    }
+}
+
+impl PartialEq for AcceptedInputReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.key.kind == other.key.kind
+            && self.key.scope == other.key.scope
+            && self.key.client_id == other.key.client_id
+            && self.key.turn_id == other.key.turn_id
+            && self.item_id_suffix == other.item_id_suffix
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum UserInputIdentity {
+    // An internal or legacy submission can carry a UI client ID without having
+    // passed durable receipt admission.
+    Unreceipted(Option<String>),
+    Receipted(Arc<AcceptedInputReceipt>),
+}
+
+impl UserInputIdentity {
+    pub(super) fn client_id(&self) -> Option<&str> {
+        match self {
+            Self::Unreceipted(client_id) => client_id.as_deref(),
+            Self::Receipted(receipt) => Some(receipt.key.client_id.as_str()),
+        }
+    }
+
+    pub(super) fn accepted_receipt(&self) -> Option<&AcceptedInputReceipt> {
+        match self {
+            Self::Unreceipted(_) => None,
+            Self::Receipted(receipt) => Some(receipt.as_ref()),
+        }
+    }
+}
+
 // Ephemeral threads deliberately have neither a rollout nor a state DB and
 // cannot be resumed. Keep their existing privacy contract while retaining the
 // same at-most-once semantics for the lifetime of the live thread.
@@ -163,36 +212,45 @@ impl Session {
         }
     }
 
-    pub(super) async fn accept_start_receipt(&self, turn_id: &str, client_id: Option<&str>, input: &[UserInput], additional_context: &IndexMap<String, AdditionalContextEntry>) -> CodexResult<()> {
-        let Some(client_id) = client_id else { return Ok(()); };
+    pub(super) async fn accept_start_receipt(
+        &self,
+        turn_id: &str,
+        client_id: Option<&str>,
+        input: &[UserInput],
+        additional_context: &IndexMap<String, AdditionalContextEntry>,
+    ) -> CodexResult<Option<Arc<AcceptedInputReceipt>>> {
+        let Some(client_id) = client_id else { return Ok(None); };
         let db = self.receipt_db()?;
-        let Some(receipt) = db.input_receipt(self.thread_id, "start", "", client_id).await.map_err(std::io::Error::other)? else { return Ok(()); };
+        let Some(receipt) = db.input_receipt(self.thread_id, "start", "", client_id).await.map_err(std::io::Error::other)? else { return Ok(None); };
         if receipt.turn_id != turn_id {
             return Err(CodexErr::InvalidRequest("client submission already belongs to another turn".into()));
         }
-        let payload = self.receipt_payload(&receipt, input, additional_context)?;
+        let (payload, item_id_suffix) = self.receipt_payload(&receipt, input, additional_context)?;
         db.accept_input_receipt(self.thread_id, "start", "", client_id, turn_id, &payload).await.map_err(std::io::Error::other)?;
         tracing::debug!(target: "codex_input_custody", phase = "accepted", thread_id = %self.thread_id, turn_id, payload_bytes = payload.len(), "input custody boundary");
-        self.input_queue.remember_input_receipt(&serde_json::from_str::<ReceiptInput>(&payload).map_err(std::io::Error::other)?.item_id_suffix);
-        Ok(())
+        self.input_queue.remember_input_receipt(&item_id_suffix);
+        Ok(Some(AcceptedInputReceipt::new(receipt, item_id_suffix)))
     }
 
-    pub(super) fn receipt_payload(&self, receipt: &InputReceipt, input: &[UserInput], additional_context: &IndexMap<String, AdditionalContextEntry>) -> std::io::Result<String> {
-        serde_json::to_string(&ReceiptInput { input: input.to_vec(), additional_context: additional_context.clone(),
-            item_id_suffix: fingerprint(&(self.thread_id.to_string(), &receipt.kind, &receipt.scope, &receipt.client_id))?,
-        }).map_err(std::io::Error::other)
+    pub(super) fn receipt_payload(
+        &self,
+        receipt: &InputReceipt,
+        input: &[UserInput],
+        additional_context: &IndexMap<String, AdditionalContextEntry>,
+    ) -> std::io::Result<(String, String)> {
+        let item_id_suffix = fingerprint(&(
+            self.thread_id.to_string(), &receipt.kind, &receipt.scope, &receipt.client_id,
+        ))?;
+        let payload = serde_json::to_string(&ReceiptInput {
+            input: input.to_vec(),
+            additional_context: additional_context.clone(),
+            item_id_suffix: item_id_suffix.clone(),
+        }).map_err(std::io::Error::other)?;
+        Ok((payload, item_id_suffix))
     }
 
-    pub(super) async fn pending_receipt_for_input(&self, input: &[UserInput], client_id: Option<&str>) -> std::io::Result<Option<(InputReceipt, String)>> {
-        let Some(client_id) = client_id else { return Ok(None); };
-        let db = self.receipt_db()?;
-        for receipt in db.pending_input_receipts(self.thread_id).await.map_err(std::io::Error::other)? {
-            if receipt.client_id != client_id { continue; }
-            let Some(payload) = receipt.payload.as_deref() else { continue; };
-            let payload: ReceiptInput = serde_json::from_str(payload).map_err(std::io::Error::other)?;
-            if payload.input == input { return Ok(Some((receipt, payload.item_id_suffix))); }
-        }
-        Ok(None)
+    pub(super) async fn complete_accepted_input_receipt(&self, receipt: &AcceptedInputReceipt) -> std::io::Result<()> {
+        self.complete_input_receipt(&receipt.key, &receipt.item_id_suffix).await
     }
 
     pub(super) async fn complete_input_receipt(&self, receipt: &InputReceipt, suffix: &str) -> std::io::Result<()> {
@@ -294,9 +352,13 @@ impl Session {
             if recorded.contains(&item_id) || cancelled.contains(&receipt.turn_id) {
                 self.complete_input_receipt(&receipt, &payload.item_id_suffix).await?;
             } else {
+                let identity = UserInputIdentity::Receipted(AcceptedInputReceipt::new(
+                    receipt,
+                    payload.item_id_suffix.clone(),
+                ));
                 recovered_input.push((payload.item_id_suffix, vec![
                     TurnInput::AdditionalContext { values: payload.additional_context, start_fence: None },
-                    TurnInput::UserInput { content: payload.input, client_id: Some(receipt.client_id), start_fence: None },
+                    TurnInput::UserInput { content: payload.input, identity, start_fence: None },
                 ]));
             }
         }

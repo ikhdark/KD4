@@ -3,13 +3,13 @@ use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::path::Path;
 
+use super::ControlReserveSender;
 use super::TransportEvent;
 use crate::transport::websocket::run_websocket_connection;
 use codex_uds::UnixListener;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::StreamExt;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_tungstenite::accept_async;
@@ -24,7 +24,7 @@ pub(super) const CONTROL_SOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_sec
 
 pub async fn start_control_socket_acceptor(
     socket_path: AbsolutePathBuf,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     shutdown_token: CancellationToken,
 ) -> IoResult<JoinHandle<()>> {
     // Endpoint admission is independent of CODEX_HOME. Lock ordering is home
@@ -64,7 +64,7 @@ pub async fn start_control_socket_acceptor(
 
 async fn run_control_socket_acceptor(
     mut listener: UnixListener,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     shutdown_token: CancellationToken,
     socket_guard: ControlSocketFileGuard,
 ) {
@@ -119,7 +119,7 @@ async fn run_control_socket_acceptor(
 
 async fn run_control_socket_connection(
     stream: UnixStream,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     shutdown_token: CancellationToken,
 ) {
     let handshake = tokio::select! {

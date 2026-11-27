@@ -8,8 +8,8 @@ use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
 use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
 use codex_utils_pty::run_windows_process_operation;
 use codex_websocket_client::WebSocketConnector;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::BufReader;
+use tokio::io::AsyncReadExt;
+use tokio::process::ChildStderr;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -39,6 +39,7 @@ use crate::relay::harness_connection_from_websocket;
 use crate::trace_context::current_trace_context_headers;
 
 const ENVIRONMENT_CLIENT_NAME: &str = "codex-environment";
+const STDIO_STDERR_PREVIEW_BYTES: usize = 4 * 1024;
 
 /// Reopens the transport for one logical exec-server client session.
 ///
@@ -413,16 +414,8 @@ async fn finish_stdio_command_setup(
 
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => debug!("exec-server stdio stderr: {line}"),
-                    Ok(None) => break,
-                    Err(err) => {
-                        warn!("failed to read exec-server stdio stderr: {err}");
-                        break;
-                    }
-                }
+            if let Err(err) = drain_stdio_stderr(stderr).await {
+                warn!("failed to read exec-server stdio stderr: {err}");
             }
         });
     }
@@ -430,5 +423,89 @@ async fn finish_stdio_command_setup(
         JsonRpcConnection::from_stdio(stdout, stdin, "exec-server stdio command".to_string())
             .with_managed_child_process(child, managed_root),
     )
+}
+
+async fn drain_stdio_stderr(mut stderr: ChildStderr) -> std::io::Result<()> {
+    let mut buffer = [0; 8 * 1024];
+    // The extra byte lets a line of exactly the preview limit keep its CRLF.
+    let preview_capacity = STDIO_STDERR_PREVIEW_BYTES + 1;
+    let mut preview = String::with_capacity(preview_capacity);
+    let mut truncated = false;
+    let mut invalid_utf8 = false;
+    let mut pending_utf8 = 0;
+
+    'read: loop {
+        let read = stderr.read(&mut buffer[pending_utf8..]).await?;
+        if read == 0 {
+            if invalid_utf8 || pending_utf8 != 0 {
+                break;
+            }
+            if !preview.is_empty() {
+                log_stdio_stderr_line(&preview, truncated, /*newline*/ false);
+            }
+            return Ok(());
+        }
+
+        let end = pending_utf8 + read;
+        pending_utf8 = 0;
+        for segment in buffer[..end].split_inclusive(|&byte| byte == b'\n') {
+            let line_end = segment.strip_suffix(b"\n");
+            let bytes = line_end.unwrap_or(segment);
+            // Validate the full line, even after the preview is full, but wait
+            // for the delimiter or EOF before treating invalid UTF-8 as fatal.
+            if !invalid_utf8 {
+                let text = match std::str::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(err) if err.error_len().is_none() && line_end.is_none() => {
+                        // An incomplete code point can span reads. Save only
+                        // its bytes, never the rest of an oversized line.
+                        let valid = err.valid_up_to();
+                        pending_utf8 = bytes.len() - valid;
+                        std::str::from_utf8(&bytes[..valid]).expect("valid UTF-8 prefix")
+                    }
+                    Err(_) => {
+                        invalid_utf8 = true;
+                        ""
+                    }
+                };
+                if !truncated {
+                    let take = text.floor_char_boundary(preview_capacity - preview.len());
+                    preview.push_str(&text[..take]);
+                    truncated = take < text.len();
+                }
+            }
+
+            if line_end.is_some() {
+                if invalid_utf8 {
+                    break 'read;
+                }
+                log_stdio_stderr_line(&preview, truncated, /*newline*/ true);
+                preview.clear();
+                truncated = false;
+            }
+        }
+        if pending_utf8 != 0 {
+            buffer.copy_within(end - pending_utf8..end, 0);
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid UTF-8",
+    ))
+}
+
+fn log_stdio_stderr_line(preview: &str, truncated: bool, newline: bool) {
+    let line = if newline && !truncated {
+        preview.strip_suffix('\r').unwrap_or(preview)
+    } else {
+        preview
+    };
+    if truncated || line.len() > STDIO_STDERR_PREVIEW_BYTES {
+        let line = &line[..line.floor_char_boundary(STDIO_STDERR_PREVIEW_BYTES)];
+        debug!("exec-server stdio stderr: {line} [truncated]");
+    } else {
+        debug!("exec-server stdio stderr: {line}");
+    }
 }
 

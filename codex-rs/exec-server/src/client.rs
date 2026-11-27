@@ -136,6 +136,9 @@ const FILE_READ_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_PAYLOAD_READ_MIN_BYTES_PER_SECOND: usize = 64 * 1024;
 pub(crate) const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
+// Match the regular RPC concurrency budget, but count the whole start task,
+// including caller acceptance and any cleanup after that RPC releases its slot.
+const MAX_IN_FLIGHT_PROCESS_STARTS: usize = 1024;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const PROCESS_EVENT_RETAINED_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_PROCESS_EVENTS: usize = 256;
@@ -240,6 +243,7 @@ struct Inner {
     instance_id: String,
     cleanup_records: StdMutex<std::collections::VecDeque<ProcessCleanupTicket>>,
     cleanup_records_evicted: AtomicU64,
+    process_start_slots: Arc<tokio::sync::Semaphore>,
     file_read_slots: Arc<tokio::sync::Semaphore>,
     // Key negative capability evidence to the transport, not the recoverable client.
     unsupported_fs_methods: StdMutex<Option<UnsupportedFsMethods>>,
@@ -609,6 +613,8 @@ pub enum ExecServerError {
     EnvironmentInfoTimedOut { timeout: Duration },
     #[error("exec-server process start timed out")]
     ProcessStartTimedOut,
+    #[error("exec-server has reached its limit of {limit} in-flight process starts; process was not started")]
+    ProcessStartCapacityExceeded { limit: usize },
     #[error("exec-server transport closed")]
     Closed,
     #[error("{0}")]
@@ -1056,6 +1062,13 @@ impl ExecServerClient {
         params: ExecParams,
         deadline: Instant,
     ) -> Result<Session, ExecServerError> {
+        // Refuse before allocating per-start state. No request or cleanup ticket
+        // belongs to a start that could not reserve a slot.
+        let start_slot = Arc::clone(&self.inner.process_start_slots)
+            .try_acquire_owned()
+            .map_err(|_| ExecServerError::ProcessStartCapacityExceeded {
+                limit: MAX_IN_FLIGHT_PROCESS_STARTS,
+            })?;
         let ticket = ProcessCleanupTicket::new(
             params.process_id.clone(),
             self.inner.session_id.get().cloned(),
@@ -1063,7 +1076,13 @@ impl ExecServerClient {
         let submitted = Arc::new(AtomicBool::new(false));
         let result = tokio::time::timeout_at(
             deadline,
-            self.start_process_inner(params, deadline, ticket.clone(), Arc::clone(&submitted)),
+            self.start_process_inner(
+                params,
+                deadline,
+                ticket.clone(),
+                Arc::clone(&submitted),
+                start_slot,
+            ),
         )
         .await
         .unwrap_or(Err(ExecServerError::ProcessStartTimedOut));
@@ -1090,29 +1109,27 @@ impl ExecServerClient {
         deadline: Instant,
         ticket: ProcessCleanupTicket,
         submitted: Arc<AtomicBool>,
+        start_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Session, ExecServerError> {
         loop {
             let rpc_client = self.rpc_client().await?;
             if Instant::now() >= deadline {
                 return Err(ExecServerError::ProcessStartTimedOut);
             }
-            if !self.inner.begin_process_start(&rpc_client) {
+            let Some(active_start) = self.inner.begin_process_start(&rpc_client) else {
                 continue;
-            }
+            };
 
             let process_id = params.process_id.clone();
             let state = Arc::new(SessionState::new(/*recoverable*/ false));
-            if let Err(error) = self.inner.insert_session(&process_id, Arc::clone(&state)) {
-                self.inner.finish_process_start();
-                return Err(error);
-            }
-            let active_start = ActiveProcessStart {
-                inner: Arc::clone(&self.inner),
-            };
+            self.inner.insert_session(&process_id, Arc::clone(&state))?;
             let client = self.clone();
             let (mut result_tx, result_rx) = tokio::sync::oneshot::channel();
             let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
             let process_start_task = async move {
+                // Keep admission until this task finishes, even after dropping the
+                // narrower recovery barrier and handing cleanup a chance to reconnect.
+                let _start_slot = start_slot;
                 let owned_params = crate::protocol::OwnedProcessParams {
                     incarnation: Some(state.incarnation.clone()),
                     params,
@@ -1256,6 +1273,7 @@ impl ExecServerClient {
             instance_id: uuid::Uuid::new_v4().to_string(),
             cleanup_records: StdMutex::new(std::collections::VecDeque::new()),
             cleanup_records_evicted: AtomicU64::new(0),
+            process_start_slots: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_PROCESS_STARTS)),
             unsupported_fs_methods: StdMutex::new(None),
             file_read_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::file_read::MAX_OPEN_FILE_READS,

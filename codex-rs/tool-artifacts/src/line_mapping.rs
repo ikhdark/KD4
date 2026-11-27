@@ -1,8 +1,9 @@
 //! Hash-bound, secondary line alignment over complete retained snapshots.
 
 use super::ReadToolOutputError;
+use super::SnapshotReadLimit;
 use super::ToolOutputSnapshot;
-use super::load_tool_output_snapshot;
+use super::load_tool_output_snapshot_with_limit;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_REQUEST_LINES: usize = 1000;
 const MAX_SOURCE_LINES: usize = 20_000;
+const CANCELLED_MESSAGE: &str = "line map cancelled; no mapping delivered";
 
 #[derive(Serialize)]
 pub(crate) struct LineMapSource {
@@ -44,7 +46,7 @@ fn refused(message: impl Into<String>) -> ReadToolOutputError {
 
 fn check_cancelled(cancellation: &CancellationToken) -> Result<(), ReadToolOutputError> {
     if cancellation.is_cancelled() {
-        Err(refused("line map cancelled; no mapping delivered"))
+        Err(refused(CANCELLED_MESSAGE))
     } else {
         Ok(())
     }
@@ -55,8 +57,20 @@ async fn load_source(
     thread: &str,
     artifact_id: &str,
     expected_sha256: &str,
+    cancellation: &CancellationToken,
 ) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
-    let snapshot = load_tool_output_snapshot(home, thread, artifact_id).await?;
+    let snapshot = load_tool_output_snapshot_with_limit(
+        home,
+        thread,
+        artifact_id,
+        Some(SnapshotReadLimit {
+            max_bytes: MAX_SOURCE_BYTES,
+            cancellation: cancellation.clone(),
+            cancelled_message: CANCELLED_MESSAGE,
+            oversized_message: "line map source exceeds 1 MiB; no partial map delivered",
+        }),
+    )
+    .await?;
     let meta = &snapshot.metadata;
     if snapshot.historical_authenticity() != "authenticated"
         || !meta.capture_complete
@@ -72,11 +86,6 @@ async fn load_source(
     if !meta.canonical_sha256.eq_ignore_ascii_case(expected_sha256) {
         return Err(refused(
             "line map SHA-256 mismatch; use the exact before/after canonical hashes",
-        ));
-    }
-    if snapshot.bytes.len() > MAX_SOURCE_BYTES {
-        return Err(refused(
-            "line map source exceeds 1 MiB; no partial map delivered",
         ));
     }
     Ok(snapshot)
@@ -115,9 +124,9 @@ pub async fn map_lines(
         }
     }
     check_cancelled(cancellation)?;
-    let before = load_source(home, thread, before_id, before_sha256).await?;
+    let before = load_source(home, thread, before_id, before_sha256, cancellation).await?;
     check_cancelled(cancellation)?;
-    let after = load_source(home, thread, after_id, after_sha256).await?;
+    let after = load_source(home, thread, after_id, after_sha256, cancellation).await?;
     check_cancelled(cancellation)?;
     let cancellation = cancellation.clone();
     // Keep bounded diff CPU work off the async executor. Cancellation discards

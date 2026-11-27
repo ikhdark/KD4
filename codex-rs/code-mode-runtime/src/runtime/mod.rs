@@ -307,6 +307,7 @@ struct RuntimeStart {
     command_rx: std_mpsc::Receiver<RuntimeCommand>,
     isolate_handle_tx: tokio::sync::oneshot::Sender<Result<StartupIsolateHandle, String>>,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
+    admission_rx: tokio::sync::oneshot::Receiver<()>,
     task_failure_handler: Option<TaskFailureHandler>,
 }
 
@@ -381,15 +382,7 @@ fn create_spare_runtime() -> std::io::Result<std_mpsc::Sender<RuntimeStart>> {
                         return;
                     }
                 };
-                run_runtime(
-                    scope,
-                    projector,
-                    start.config,
-                    start.event_tx,
-                    start.command_rx,
-                    start.isolate_handle_tx,
-                    start.runtime_command_tx,
-                );
+                run_runtime(scope, projector, start);
             })) {
                 report_runtime_panic(payload, event_tx, failure_handler);
             }
@@ -425,10 +418,18 @@ pub(crate) async fn spawn_runtime_with_catalog(
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     output_admission: Arc<OutputAdmission>,
     task_failure_handler: Option<TaskFailureHandler>,
-) -> Result<(std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle), String> {
+) -> Result<
+    (
+        std_mpsc::Sender<RuntimeCommand>,
+        RuntimeTerminationHandle,
+        RuntimeStartGate,
+    ),
+    String,
+> {
     let (command_tx, command_rx) = std_mpsc::channel();
     let runtime_command_tx = command_tx.clone();
     let (isolate_handle_tx, isolate_handle_rx) = tokio::sync::oneshot::channel();
+    let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
     let ExecuteRequest {
         tool_call_id,
         source,
@@ -456,6 +457,7 @@ pub(crate) async fn spawn_runtime_with_catalog(
         command_rx,
         isolate_handle_tx,
         runtime_command_tx,
+        admission_rx,
         task_failure_handler,
     };
     if let Err(error) = sender.send(start) {
@@ -470,11 +472,26 @@ pub(crate) async fn spawn_runtime_with_catalog(
 
     let isolate_handle =
         receive_runtime_startup(isolate_handle_rx, RUNTIME_STARTUP_TIMEOUT).await?;
-    Ok((command_tx, isolate_handle.into_inner()))
+    Ok((
+        command_tx,
+        isolate_handle.into_inner(),
+        RuntimeStartGate(admission_tx),
+    ))
+}
+
+/// Dropping this gate before release abandons startup without evaluating user code.
+pub(crate) struct RuntimeStartGate(tokio::sync::oneshot::Sender<()>);
+
+impl RuntimeStartGate {
+    pub(crate) fn release(self) -> Result<(), String> {
+        self.0
+            .send(())
+            .map_err(|()| "code mode runtime ended before cell admission".to_string())
+    }
 }
 
 // If startup times out or its caller is cancelled after the runtime sends a handle,
-// dropping the unclaimed message must stop user code on that runtime thread.
+// dropping the unclaimed message still terminates the isolate.
 struct StartupIsolateHandle(Option<RuntimeTerminationHandle>);
 
 pub(crate) struct RuntimeTerminationHandle {
@@ -1066,12 +1083,17 @@ pub(super) enum CompletionState {
 fn run_runtime(
     scope: &mut v8::PinScope<'_, '_>,
     projector: v8::Global<v8::Function>,
-    config: RuntimeConfig,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    command_rx: std_mpsc::Receiver<RuntimeCommand>,
-    isolate_handle_tx: tokio::sync::oneshot::Sender<Result<StartupIsolateHandle, String>>,
-    runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
+    start: RuntimeStart,
 ) {
+    let RuntimeStart {
+        config,
+        event_tx,
+        command_rx,
+        isolate_handle_tx,
+        runtime_command_tx,
+        admission_rx,
+        ..
+    } = start;
     if isolate_handle_tx.is_closed() {
         return;
     }
@@ -1083,6 +1105,11 @@ fn run_runtime(
         }))))
         .is_err()
     {
+        return;
+    }
+    // Initialization must report its result before the session can admit the
+    // cell. The native thread cannot evaluate user code until that admission.
+    if admission_rx.blocking_recv().is_err() {
         return;
     }
     let timer_scheduler = timers::TimerScheduler::new(runtime_command_tx);

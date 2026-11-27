@@ -15,6 +15,7 @@ use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
+use super::input_receipts::UserInputIdentity;
 use super::mailbox_storage::MailboxStorage;
 
 const MAX_PENDING_MAILBOX_COMMUNICATIONS: usize = 1_024;
@@ -36,7 +37,7 @@ impl PartialEq for StartInputFence {
 pub(crate) enum TurnInput {
     UserInput {
         content: Vec<UserInput>,
-        client_id: Option<String>,
+        identity: UserInputIdentity,
         start_fence: Option<StartInputFence>,
     },
     ResponseItem(ResponseItem),
@@ -1302,7 +1303,9 @@ fn progress_key_matches(mail: &InterAgentCommunication, key: &ProgressQuery<'_>)
 
 fn turn_input_size_bytes(input: &TurnInput) -> usize {
     match input {
-        TurnInput::UserInput { content, client_id, .. } => serialized_size(&(content, client_id)),
+        TurnInput::UserInput { content, identity, .. } => {
+            serialized_size(&(content, identity.client_id()))
+        }
         TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
             serialized_size(item)
         }

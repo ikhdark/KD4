@@ -71,10 +71,13 @@ impl StateRuntime {
             .stop
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
-        while self.backfill_worker.held_claim().is_some()
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        while self.backfill_worker.held_claim().is_some() {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let next_poll = deadline.min(now + std::time::Duration::from_millis(5));
+            tokio::time::sleep_until(next_poll).await;
         }
         let held = self.backfill_worker.held_claim().clone();
         if let Some(claim) = held

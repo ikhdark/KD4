@@ -478,12 +478,21 @@ impl ModelState {
         self.remote_models = remote_models;
     }
 
-    fn reset_for_cache_identity(&mut self, cache_identity: String) -> bool {
+    fn reset_for_cache_identity(
+        &mut self,
+        cache_identity: String,
+        has_authoritative_catalog: impl FnOnce() -> bool,
+    ) -> bool {
         if self.active_cache_identity == cache_identity {
             return false;
         }
 
-        self.replace_remote_models(load_bundled_models_or_panic());
+        let remote_models = if has_authoritative_catalog() {
+            Vec::new()
+        } else {
+            load_bundled_models_or_panic()
+        };
+        self.replace_remote_models(remote_models);
         self.etag = None;
         self.fresh_until = None;
         self.active_cache_identity = cache_identity;
@@ -799,12 +808,14 @@ impl OpenAiModelsManager {
                 .etag_refresh
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.active_etag.as_deref() == Some(etag.as_str())
-                || state
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.etag == etag)
-            {
+            // Deduplicate against the latest notice, not a superseded in-flight
+            // request. With A in flight and B pending, another A supersedes B.
+            let latest_etag = state
+                .pending
+                .as_ref()
+                .map(|pending| pending.etag.as_str())
+                .or(state.active_etag.as_deref());
+            if latest_etag == Some(etag.as_str()) {
                 return;
             }
             state.generation = state.generation.saturating_add(1);
@@ -956,16 +967,34 @@ impl OpenAiModelsManager {
                         }
                     }
                     Ok(ModelsFetchResult::NotModified) => {
-                        if !self.cache_manager.identity_is_current(&refresh_identity) {
+                        let (should_renew, identity_is_current) = {
+                            let mut model_state = self.state.write().await;
+                            let refresh_state = self
+                                .etag_refresh
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let identity_is_current = model_state.active_cache_identity
+                                == refresh_identity
+                                && self.cache_manager.identity_is_current(&refresh_identity);
+                            // An identity reset can discard the snapshot while
+                            // the conditional request is in flight.
+                            let should_renew = current_etag.is_some()
+                                && model_state.etag == current_etag
+                                && refresh_state.generation == notice.generation
+                                && identity_is_current;
+                            if should_renew {
+                                model_state.fresh_until =
+                                    Some(Instant::now() + self.cache_manager.ttl());
+                            }
+                            (should_renew, identity_is_current)
+                        };
+                        if !identity_is_current {
                             self.ensure_current_cache_identity().await;
                             continue;
                         }
-                        if current_etag.is_some() {
-                            self.mark_memory_fresh(&refresh_identity, self.cache_manager.ttl())
-                                .await;
-                        }
-                        if let (Some(etag), Some(write_basis)) =
-                            (current_etag, write_basis.as_ref())
+                        if should_renew
+                            && let (Some(etag), Some(write_basis)) =
+                                (current_etag, write_basis.as_ref())
                             && let Err(err) = self
                                 .cache_manager
                                 .renew_cache_ttl_for_identity_if_unchanged(
@@ -1198,6 +1227,7 @@ impl OpenAiModelsManager {
                         models.clone(),
                         etag.clone(),
                         &fetch_identity,
+                        /*fresh_until*/ None,
                     )
                     .await
                 {
@@ -1294,10 +1324,9 @@ impl OpenAiModelsManager {
         }
         let mut state = self.state.write().await;
         let current_identity = self.cache_manager.current_identity();
-        if state.reset_for_cache_identity(current_identity.clone()) {
-            if self.endpoint_client.has_authoritative_catalog() {
-                state.replace_remote_models(Vec::new());
-            }
+        if state.reset_for_cache_identity(current_identity.clone(), || {
+            self.endpoint_client.has_authoritative_catalog()
+        }) {
             info!(
                 mismatch_category = "provider_cache_identity",
                 "models cache: reset identity-scoped in-memory catalog"
@@ -1317,10 +1346,9 @@ impl OpenAiModelsManager {
         }
 
         let mut state = self.state.try_write()?;
-        if state.reset_for_cache_identity(self.cache_manager.current_identity()) {
-            if self.endpoint_client.has_authoritative_catalog() {
-                state.replace_remote_models(Vec::new());
-            }
+        if state.reset_for_cache_identity(self.cache_manager.current_identity(), || {
+            self.endpoint_client.has_authoritative_catalog()
+        }) {
             info!(
                 mismatch_category = "provider_cache_identity",
                 "models cache: reset identity-scoped in-memory catalog"
@@ -1335,6 +1363,7 @@ impl OpenAiModelsManager {
         models: Vec<ModelInfo>,
         etag: Option<String>,
         expected_identity: &str,
+        fresh_until: Option<Instant>,
     ) -> bool {
         let merged_models = self.merged_remote_models(models).await;
         let mut state = self.state.write().await;
@@ -1345,7 +1374,7 @@ impl OpenAiModelsManager {
         }
         state.replace_catalog(merged_models);
         state.etag = etag;
-        state.fresh_until = None;
+        state.fresh_until = fresh_until;
         true
     }
 
@@ -1441,17 +1470,21 @@ impl OpenAiModelsManager {
             self.ensure_current_cache_identity().await;
             return Ok(false);
         }
-        let remaining = self.cache_manager.ttl().saturating_sub(
-            (chrono::Utc::now() - cache.fetched_at)
-                .to_std()
-                .unwrap_or_default(),
-        );
+        // Carry the disk entry's deadline across policy preparation and the
+        // publication lock. Time spent there must not extend its freshness.
+        let now = Instant::now();
+        let Ok(age) = (chrono::Utc::now() - cache.fetched_at).to_std() else {
+            info!("models cache: cache timestamp is in the future");
+            return Ok(false);
+        };
+        let fresh_until = now + self.cache_manager.ttl().saturating_sub(age);
         let models_count = cache.models.len();
         if !self
             .apply_remote_models_and_etag_for_identity(
                 cache.models,
                 cache.etag.clone(),
                 load_identity,
+                Some(fresh_until),
             )
             .await
         {
@@ -1462,13 +1495,14 @@ impl OpenAiModelsManager {
             self.ensure_current_cache_identity().await;
             return Ok(false);
         }
-        self.mark_memory_fresh(load_identity, remaining).await;
         info!(
             models_count,
             etag = ?cache.etag,
             "models cache: cache entry applied"
         );
-        Ok(true)
+        // Keep the snapshot available to non-waiting readers even if it aged
+        // out during preparation; online-if-uncached callers must still refresh.
+        Ok(Instant::now() < fresh_until)
     }
 }
 

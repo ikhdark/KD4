@@ -614,21 +614,25 @@ impl ProcessHandle {
     /// root still has descendants. Empty native jobs release admission promptly.
     /// Nonempty jobs retain only cleanup control, not completed-root admission.
     pub fn finish_for_replay(&self) {
-        if self.has_exited() {
-            self.finish_inner(true);
-        }
+        self.try_finish_for_replay();
     }
 
-    fn finish_inner(&self, for_replay: bool) {
+    /// Returns whether replay handoff completed. A caller that commits replay
+    /// lifecycle state must retry after any in-flight control operation settles.
+    pub fn try_finish_for_replay(&self) -> bool {
+        self.has_exited() && self.finish_inner(true)
+    }
+
+    fn finish_inner(&self, for_replay: bool) -> bool {
         // Never wait on an in-flight native termination from an async reader.
         // Checking under this gate also closes the check/drop race with kill.
         let Ok(mut killer_opt) = self.killer.try_lock() else {
-            return;
+            return false;
         };
         if matches!(self.termination.load(Ordering::Acquire), 1 | 3) {
             // Do not discard the job/control handle or diagnostic readers while
             // tree cleanup is pending or uncertain, even after root exit.
-            return;
+            return false;
         }
         // Pipe drain needs a native empty-tree observation after root exit, not
         // only a termination receipt: a Unix group kill cannot see setsid
@@ -702,6 +706,7 @@ impl ProcessHandle {
         if let Ok(mut resizer) = self.resizer.lock() {
             resizer.take();
         }
+        true
     }
 }
 

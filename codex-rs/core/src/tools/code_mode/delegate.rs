@@ -325,8 +325,8 @@ impl CodeModeDispatchBroker {
                             let runtime_tool_call_id = invocation.runtime_tool_call_id.clone();
                             let tool_name = invocation.tool_name.clone();
                             let mut observation = NestedDispatchObservation {
-                                journal: codex_protocol::timing::observations::enabled().then(||
-                                    codex_protocol::timing::observations::Span::start("nested_dispatch",
+                                journal: codex_protocol::timing::observations::runtime_async_enabled().then(||
+                                    codex_protocol::timing::observations::Span::start_queued("nested_dispatch",
                                         &host.exec.session.thread_id.to_string(), &host.exec.turn.sub_id,
                                         &runtime_tool_call_id, serde_json::json!({"cell_id":cell_id.to_string(),
                                             "shared_ns":codex_code_mode::shared_monotonic_now(),

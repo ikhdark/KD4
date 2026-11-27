@@ -66,6 +66,7 @@ impl ConfigEditsBuilder {
         self
     }
 
+    /// Refuses to overwrite or remove an undecodable server entry. Repair it before retrying.
     pub fn replace_mcp_servers(mut self, servers: &BTreeMap<String, McpServerConfig>) -> Self {
         self.mcp_servers = Some(servers.clone());
         self
@@ -86,6 +87,7 @@ impl ConfigEditsBuilder {
         let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
         let mut mutated = false;
         if let Some(servers) = self.mcp_servers.as_ref() {
+            validate_mcp_replacement(&doc)?;
             replace_mcp_servers(&mut doc, servers);
             mutated = true;
         }
@@ -135,6 +137,24 @@ fn mcp_servers_from_document(
         .clone()
         .try_into()
         .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err))
+}
+
+/// Whole-table replacement can remove entries as well as update them. Refuse
+/// before either operation if it would discard a configuration we cannot decode.
+pub fn validate_mcp_replacement(doc: &DocumentMut) -> std::io::Result<()> {
+    let Some(section) = doc.get("mcp_servers") else { return Ok(()); };
+    let servers = section.as_table_like().ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "cannot replace malformed mcp_servers: expected a table")
+    })?;
+    for (name, entry) in servers.iter() {
+        if decode_existing_mcp_server(entry).is_none() {
+            // A TOML decoder error can quote credentials. Identify only the entry.
+            return Err(std::io::Error::new(ErrorKind::InvalidData, format!(
+                "cannot replace malformed MCP server {name:?}; repair its configuration before retrying"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn replace_mcp_servers(doc: &mut DocumentMut, servers: &BTreeMap<String, McpServerConfig>) {
@@ -312,16 +332,21 @@ fn complete_mcp_server_table(config: &McpServerConfig) -> TomlTable {
     table
 }
 
+fn decode_existing_mcp_server(existing: &TomlItem) -> Option<McpServerConfig> {
+    let mut document = DocumentMut::new();
+    document["server"] = existing.clone();
+    toml::from_str::<BTreeMap<String, McpServerConfig>>(&document.to_string())
+        .ok()?.remove("server")
+}
+
 /// Preserve absent versus explicit fields in an existing configuration layer.
 /// Only fields whose typed values changed are rewritten; unknown fields and
 /// explicit defaults on untouched fields remain in the original document.
 pub fn serialize_mcp_server_for_edit(config: &McpServerConfig, existing: Option<&TomlItem>) -> TomlItem {
     let Some(existing) = existing else { return serialize_mcp_server(config); };
-    let mut document = DocumentMut::new();
-    document["server"] = existing.clone();
-    let previous = toml::from_str::<BTreeMap<String, McpServerConfig>>(&document.to_string())
-        .ok().and_then(|mut servers| servers.remove("server"));
-    let Some(previous) = previous else { return serialize_mcp_server(config); };
+    // Both replacement owners validate the complete section before mutation.
+    // Never erase undecodable content if another caller omits that preflight.
+    let Some(previous) = decode_existing_mcp_server(existing) else { return existing.clone(); };
     let before = complete_mcp_server_table(&previous);
     let after = complete_mcp_server_table(config);
     let mut edited = existing.clone();

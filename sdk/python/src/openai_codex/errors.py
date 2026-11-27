@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 _OVERLOADED_ERROR_CODE = -32001
+_LEGACY_PREADMISSION_OVERLOAD_MESSAGES = frozenset(
+    {"Server overloaded; retry later.", "Serialized request queue is full"}
+)
 
 
 class CodexError(Exception):
@@ -71,6 +74,16 @@ def _structured_overload_retryable(code: int, data: Any) -> bool | None:
     return None
 
 
+def _is_legacy_preadmission_overload(code: int, message: str, data: Any) -> bool:
+    # Older local runtimes rejected these requests before accepting any work,
+    # without structured error data. Do not retry other bare server errors.
+    return (
+        code == _OVERLOADED_ERROR_CODE
+        and data is None
+        and message in _LEGACY_PREADMISSION_OVERLOAD_MESSAGES
+    )
+
+
 def _is_server_overloaded(data: Any) -> bool:
     if data is None:
         return False
@@ -114,7 +127,11 @@ def map_jsonrpc_error(code: int, message: str, data: Any = None) -> JsonRpcError
         retryable = _structured_overload_retryable(code, data)
         if retryable is False:
             return CodexRpcError(code, message, data)
-        if retryable is True or _is_server_overloaded(data):
+        if (
+            retryable is True
+            or _is_legacy_preadmission_overload(code, message, data)
+            or _is_server_overloaded(data)
+        ):
             if _contains_retry_limit_text(message):
                 return RetryLimitExceededError(code, message, data)
             return ServerBusyError(code, message, data)
@@ -137,6 +154,8 @@ def is_retryable_error(exc: BaseException) -> bool:
         return True
 
     if isinstance(exc, JsonRpcError):
-        return _is_server_overloaded(exc.data)
+        return _is_legacy_preadmission_overload(
+            exc.code, exc.message, exc.data
+        ) or _is_server_overloaded(exc.data)
 
     return False

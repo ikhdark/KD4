@@ -177,7 +177,9 @@ pub async fn load_environment_skills_from_root(
         })
         .buffered(MAX_CONCURRENT_SKILL_LOADS)
         .collect::<Vec<_>>();
-    let (namespace_resolver, skill_results) = tokio::join!(namespace_resolver, skill_results);
+    let ((namespace_resolver, warnings), skill_results) =
+        tokio::join!(namespace_resolver, skill_results);
+    outcome.warnings.extend(warnings);
 
     for (path, result) in skill_results {
         let result = result.and_then(|skill| {

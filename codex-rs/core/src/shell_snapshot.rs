@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Stdio;
@@ -850,31 +851,38 @@ async fn run_script_with_timeout(
         .await
         .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))?
         .with_context(|| format!("Failed to execute {shell_name}"))?;
-    let process_id = child.id().context("Snapshot command had no process id")?;
-    if tokio::time::Instant::now() >= timeout_deadline {
-        // Creation may finish just before expiry while its waiter is not polled.
-        // This helper creates the cleanup owner before returning its wait future.
-        // Detach only that acknowledgement: cleanup keeps the child/admission,
-        // while an expired caller must not wait for a new five-second budget.
-        drop(managed.cleanup_after_failed_attach(child));
-        return Err(anyhow!("Snapshot command timed out for {shell_name}"));
+    let containment = child
+        .id()
+        .context("Snapshot command had no process id")
+        .and_then(|process_id| {
+            // Creation may finish just before expiry while its waiter is not polled.
+            if tokio::time::Instant::now() >= timeout_deadline {
+                bail!("Snapshot command timed out for {shell_name}");
+            }
+            managed
+                .attach_and_resume(process_id)
+                .context("Failed to contain snapshot command")
+        });
+    if let Err(error) = containment {
+        let cleanup = managed.cleanup_after_failed_attach(child);
+        finish_snapshot_cleanup_before(timeout_deadline, async move {
+            if let Err(cleanup_error) = cleanup.await {
+                tracing::warn!("Failed to clean up uncontained snapshot child: {cleanup_error}");
+            }
+        })
+        .await;
+        return Err(error);
     }
-    if let Err(err) = managed.attach_and_resume(process_id) {
-        if let Err(cleanup_error) = managed.cleanup_after_failed_attach(child).await {
-            tracing::warn!("Failed to clean up uncontained snapshot child: {cleanup_error}");
-        }
-        return Err(err).context("Failed to contain snapshot command");
-    }
-    let mut stdout = child
-        .stdout
-        .take()
-        .context("Snapshot command stdout was not piped")?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .context("Snapshot command stderr was not piped")?;
 
     let output = timeout_at(timeout_deadline, async {
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("Snapshot command stdout was not piped")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("Snapshot command stderr was not piped")?;
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let (status, (), ()) = tokio::try_join!(
@@ -889,11 +897,13 @@ async fn run_script_with_timeout(
     let (status, stdout, stderr) = match output {
         Ok(Ok(output)) => output,
         failure => {
-            drop(stdout);
-            drop(stderr);
-            if let Err(error) = managed.terminate_and_reap(child).await {
-                tracing::warn!("Failed to settle timed-out snapshot process tree: {error:?}");
-            }
+            let cleanup = managed.terminate_and_reap(child);
+            finish_snapshot_cleanup_before(timeout_deadline, async move {
+                if let Err(error) = cleanup.await {
+                    tracing::warn!("Failed to settle timed-out snapshot process tree: {error:?}");
+                }
+            })
+            .await;
             return match failure {
                 Ok(Err(error)) => Err(error),
                 Err(_) => Err(anyhow!("Snapshot command timed out for {shell_name}")),
@@ -1060,18 +1070,32 @@ pub(crate) async fn run_remote_snapshot_process_before(
                 Err(_) => Err(anyhow!("Snapshot command timed out for {shell_name}")),
             },
         };
-        // Cancellation, a read failure, or an output limit can stop collection while the shell is
-        // still running. Release the remote process before returning any failure,
-        // just as we do when the total snapshot deadline expires.
-        if output.is_err()
-            && let Err(err) = process.terminate().await
-        {
-            tracing::warn!("Failed to terminate failed remote snapshot shell: {err:?}");
+        // A collection failure can leave the remote shell running. Transfer its
+        // handle before returning the original error, even on deadline expiry.
+        if output.is_err() {
+            finish_snapshot_cleanup_before(deadline, async move {
+                if let Err(err) = process.terminate().await {
+                    tracing::warn!("Failed to terminate failed remote snapshot shell: {err:?}");
+                }
+            })
+            .await;
         }
         output
     })
     .await
     .context("Remote snapshot capture task failed")?
+}
+
+async fn finish_snapshot_cleanup_before(
+    deadline: tokio::time::Instant,
+    cleanup: impl Future<Output = ()> + Send + 'static,
+) {
+    // The task owns cleanup and its diagnostics. Dropping the join handle at
+    // the deadline (or on caller cancellation) does not stop the cleanup.
+    let cleanup = tokio::spawn(cleanup);
+    if tokio::time::Instant::now() < deadline {
+        let _ = timeout_at(deadline, cleanup).await;
+    }
 }
 
 const SNAPSHOT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;

@@ -388,10 +388,12 @@ impl ModelRequestMeasurements {
         cancellation: Option<&CancellationToken>,
         logical_request_bytes: Option<u64>,
     ) -> serde_json::Result<Self> {
+        ensure_measurement_not_cancelled(cancellation)?;
         let logical_request_bytes = match logical_request_bytes {
             Some(bytes) => bytes,
             None => serialized_len_cancellable(request, cancellation)?,
         };
+        ensure_measurement_not_cancelled(cancellation)?;
         let measurement_provenance = if let Some(index) = embedded_base_index(request, base_instructions) {
             provenance.with_response_item_category(&request.input, index, PromptContextCategory::BaseSystem)
         } else {
@@ -456,6 +458,7 @@ impl ModelRequestMeasurements {
 
         ensure_measurement_not_cancelled(cancellation)?;
         let encoded: EncodedResponsesRequest<'_> = serde_json::from_slice(encoded_request)?;
+        ensure_measurement_not_cancelled(cancellation)?;
         if encoded.input.len() != request.input.len()
             || encoded.tools.as_ref().map(Vec::len)
                 != request.tools.as_deref().map(<[serde_json::Value]>::len)
@@ -1136,15 +1139,16 @@ pub(super) fn measure_responses_request_after_dispatch(
                     encoded,
                 );
             }
-            let provenance = if input_reprojected {
-                prompt
-                    .prompt_provenance
-                    .for_reprojected_items(&prompt.input, &request.input)
-            } else {
-                prompt.prompt_provenance.clone()
-            };
             let mut measured_full_encoded_input = false;
             let measurements = (|| {
+                ensure_measurement_not_cancelled(Some(&blocking_cancellation))?;
+                let provenance = if input_reprojected {
+                    prompt
+                        .prompt_provenance
+                        .for_reprojected_items(&prompt.input, &request.input)
+                } else {
+                    prompt.prompt_provenance.clone()
+                };
                 let wire_request_bytes = encoded_request.as_ref().map_or(0, |encoded| {
                     u64::try_from(encoded.len()).unwrap_or(u64::MAX)
                 });
@@ -1161,7 +1165,11 @@ pub(super) fn measure_responses_request_after_dispatch(
                         .inspect(|_| {
                             measured_full_encoded_input = true;
                         })
-                        .or_else(|_| {
+                        .or_else(|err| {
+                            // An interruption is not an encoded input mismatch.
+                            if err.io_error_kind() == Some(std::io::ErrorKind::Interrupted) {
+                                return Err(err);
+                            }
                             ModelRequestMeasurements::for_responses_request_cancellable(
                                 &request,
                                 &provenance,

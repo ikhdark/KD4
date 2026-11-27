@@ -864,8 +864,8 @@ async fn handle_spawn_agent(
 
     typed_reservation_metric.mark_retained();
     let new_thread_id = spawned_agent.thread_id;
-    if codex_protocol::timing::observations::enabled() {
-        turn.turn_timing_state.observe_runtime("agent_spawned", &call_id, serde_json::json!({
+    if turn.turn_timing_state.runtime_async_observations_enabled() {
+        turn.turn_timing_state.observe_runtime_queued("agent_spawned", &call_id, serde_json::json!({
             "parent_thread_id":session.thread_id, "parent_turn_id":turn.sub_id,
             "child_thread_id":new_thread_id, "assignment_id":typed_task.0.assignment_id.to_string(),
             "agent_path":new_agent_path.to_string()}));
@@ -947,7 +947,7 @@ impl<'a> SpawnReservationObservation<'a> {
         Self {
             turn,
             call_id,
-            started: codex_protocol::timing::observations::enabled().then(Instant::now),
+            started: turn.turn_timing_state.runtime_async_observations_enabled().then(Instant::now),
             outcome: "future_dropped",
         }
     }
@@ -956,7 +956,7 @@ impl<'a> SpawnReservationObservation<'a> {
 impl Drop for SpawnReservationObservation<'_> {
     fn drop(&mut self) {
         let Some(started) = self.started else { return };
-        self.turn.turn_timing_state.observe_runtime(
+        self.turn.turn_timing_state.observe_runtime_queued(
             "agent_spawn_reservation",
             self.call_id,
             serde_json::json!({

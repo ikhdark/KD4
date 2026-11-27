@@ -10,6 +10,7 @@ use super::protocol::StreamId;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use crate::transport::ConnectionOrigin;
+use crate::transport::ControlReserveSender;
 use crate::transport::remote_control::QueuedServerEnvelope;
 use codex_app_server_protocol_types::JSONRPCMessage;
 use std::collections::HashMap;
@@ -83,7 +84,7 @@ pub(crate) struct ClientTracker {
     data_lane: OutboundLane,
     status_lane: OutboundLane,
     unknown_replay: Arc<tokio::sync::Semaphore>,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     // Unlike the child below, this is not cancelled by tracker-only shutdown.
     transport_shutdown_token: CancellationToken,
     shutdown_token: CancellationToken,
@@ -93,7 +94,7 @@ impl ClientTracker {
     pub(crate) fn new(
         server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
         server_status_tx: mpsc::Sender<QueuedServerEnvelope>,
-        transport_event_tx: mpsc::Sender<TransportEvent>,
+        transport_event_tx: ControlReserveSender<TransportEvent>,
         shutdown_token: &CancellationToken,
     ) -> Self {
         Self {
@@ -533,7 +534,7 @@ impl ClientTracker {
         let event_name = transport_event_name(&event);
         match timeout(
             REMOTE_CONTROL_TRANSPORT_EVENT_SEND_TIMEOUT,
-            self.transport_event_tx.send(event),
+            self.transport_event_tx.send_unreserved(event),
         )
         .await
         {
@@ -581,7 +582,7 @@ impl ClientTracker {
         let transport_shutdown_token = self.transport_shutdown_token.clone();
         tokio::spawn(async move {
             let event = TransportEvent::ConnectionClosed { connection_id };
-            let result = match transport_event_tx.try_send(event) {
+            let result = match transport_event_tx.try_send_unreserved(event) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::error::TrySendError::Full(event)) => {
                     // Preserve cleanup across caller cancellation and reconnects, but
@@ -589,7 +590,7 @@ impl ClientTracker {
                     tokio::select! {
                         biased;
                         _ = transport_shutdown_token.cancelled() => return Ok(()),
-                        result = transport_event_tx.send(event) => result,
+                        result = transport_event_tx.send_unreserved(event) => result,
                     }
                 }
                 Err(mpsc::error::TrySendError::Closed(event)) => Err(mpsc::error::SendError(event)),

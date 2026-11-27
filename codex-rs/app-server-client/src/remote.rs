@@ -524,8 +524,8 @@ impl RemoteAppServerClient {
             let mut pending_ping: Option<Vec<u8>> = None;
             let mut pending_ping_write: Option<oneshot::Receiver<IoResult<()>>> = None;
             loop {
-                let can_read = pending_delivery.is_empty()
-                    || pending_requests.values().any(|waiter| !waiter.is_closed());
+                let awaiting_reply = pending_requests.values().any(|waiter| !waiter.is_closed());
+                let can_read = pending_delivery.is_empty() || awaiting_reply;
                 if !can_read || closing {
                     // Local event backpressure is not transport failure. A pong
                     // cannot be observed while this coordinator pauses reads.
@@ -773,9 +773,19 @@ impl RemoteAppServerClient {
                         }
                         match message {
                             Some(Ok(Message::Text(text))) => {
-                                let wire_credit = match pending_delivery.acquire_wire(text.len()) {
-                                    Ok(credit) => credit,
-                                    Err(error) => { worker_exit_error = Some((error.kind(), error.to_string())); break; }
+                                // With a live RPC waiter, decode one message at a time under
+                                // the WebSocket's predecode frame/message limits. Replies do
+                                // not depend on event credit held by a blocked consumer.
+                                let wire_credit = if awaiting_reply {
+                                    None
+                                } else {
+                                    match pending_delivery.acquire_wire(text.len()) {
+                                        Ok(credit) => Some(credit),
+                                        Err(error) => { worker_exit_error = Some((error.kind(), error.to_string())); break; }
+                                    }
+                                };
+                                let acquire_event_credit = || {
+                                    wire_credit.map_or_else(|| pending_delivery.acquire_wire(text.len()), Ok)
                                 };
                                 match serde_json::from_str::<JSONRPCMessage>(&text) {
                                     Ok(JSONRPCMessage::Response(response)) => {
@@ -791,6 +801,10 @@ impl RemoteAppServerClient {
                                         }
                                     }
                                     Ok(JSONRPCMessage::Notification(notification)) => {
+                                        let wire_credit = match acquire_event_credit() {
+                                            Ok(credit) => credit,
+                                            Err(error) => { worker_exit_error = Some((error.kind(), error.to_string())); break; }
+                                        };
                                         let event = match app_server_event_from_notification(notification) {
                                             Ok(event) => event,
                                             Err(err) => {
@@ -812,6 +826,10 @@ impl RemoteAppServerClient {
                                         }
                                     }
                                     Ok(JSONRPCMessage::Request(request)) => {
+                                        let wire_credit = match acquire_event_credit() {
+                                            Ok(credit) => credit,
+                                            Err(error) => { worker_exit_error = Some((error.kind(), error.to_string())); break; }
+                                        };
                                         let request_id = request.id.clone();
                                         let method = request.method.clone();
                                         match ServerRequest::try_from(request) {

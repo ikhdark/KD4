@@ -516,7 +516,9 @@ impl ExecCommandHandler {
         let (mut policy_classification, mut policy_selection) =
             crate::validation::analyze_validation_policy_with_shell(
                 original_invocation, original_resolved_command.preflight_shell_type, policy_cwd,
-            ).await;
+            )
+            .await
+            .map_err(|error| command_not_started(format!("command policy worker failed: {error}")))?;
         if let Some(refusal) = crate::validation_task::mode_refusal(
             &turn, policy_classification, args.validation.is_some(),
         ) {
@@ -548,7 +550,9 @@ impl ExecCommandHandler {
             (policy_classification, policy_selection) =
                 crate::validation::analyze_validation_policy_with_shell(
                     &command_invocation, original_resolved_command.preflight_shell_type, policy_cwd,
-                ).await;
+                )
+                .await
+                .map_err(|error| command_not_started(format!("command policy worker failed: {error}")))?;
             if let Some(refusal) = crate::validation_task::mode_refusal(
                 &turn, policy_classification, args.validation.is_some(),
             ) {
@@ -591,8 +595,10 @@ impl ExecCommandHandler {
         };
         // Pure launch analyses share inputs but not results. Join them before
         // applying observation/approval policy; no process starts in this phase.
-        let ((mut validation, long_running), search_no_match_eligible) =
+        let (validation_result, search_no_match_eligible) =
             tokio::join!(validation_analysis, search_analysis);
+        let (mut validation, long_running) = validation_result
+            .map_err(|error| command_not_started(format!("command validation worker failed: {error}")))?;
         args.apply_validation_observation_policy(
             long_running || validation
                 .as_ref()
@@ -926,7 +932,10 @@ impl ExecCommandHandler {
                 None => notice,
             });
         }
-        let process_id_reservation = manager.reserve_process_id().await;
+        let process_id_reservation = manager
+            .reserve_process_id()
+            .await
+            .map_err(|error| command_not_started(error.to_string()))?;
         let process_id = process_id_reservation.process_id();
         let exec_result = manager
             .exec_command(

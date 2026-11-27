@@ -1020,6 +1020,17 @@ pub(crate) async fn backfill_sessions_until(
     let timer = metric_client
         .as_ref()
         .and_then(|otel| otel.start_timer(DB_METRIC_BACKFILL_DURATION_MS, &[]).ok());
+    let finish_early = |timer: Option<codex_otel::Timer>| async move {
+        if let Some(timer) = timer {
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(error) = timer.finish(&[]) {
+                    tracing::error!(%error, "backfill duration metric failed");
+                }
+            })
+            .await;
+        }
+        BackfillPassReport::default()
+    };
     let backfill_state = match runtime.get_backfill_state().await {
         Ok(state) => state,
         Err(err) => {
@@ -1031,20 +1042,20 @@ pub(crate) async fn backfill_sessions_until(
         }
     };
     if backfill_state.status == BackfillStatus::Complete {
-        return BackfillPassReport::default();
+        return finish_early(timer).await;
     }
     let claim = match runtime.claim_backfill(backfill_lease_seconds).await {
         Ok(Some(claim)) => claim,
         Ok(None) => {
             info!("state db backfill already running at {}; skipping duplicate worker", codex_home.display());
-            return BackfillPassReport::default();
+            return finish_early(timer).await;
         }
         Err(err) => {
             warn!(
                 "failed to claim backfill worker at {}: {err}",
                 codex_home.display()
             );
-            return BackfillPassReport::default();
+            return finish_early(timer).await;
         }
     };
     let backfill_state = BackfillState {
@@ -1065,7 +1076,7 @@ pub(crate) async fn backfill_sessions_until(
         if let Err(error) = runtime.release_backfill_claim(&claim).await {
             warn!(%error, "failed to release paused rollout discovery claim");
         }
-        return BackfillPassReport::default();
+        return finish_early(timer).await;
     };
     let mut unresolved_failures = discovery.failed;
     let mut rollout_paths = discovery.paths.into_values().collect::<Vec<_>>();
@@ -1378,7 +1389,7 @@ pub(crate) async fn backfill_sessions_until(
                     &[("status", "failed")],
                 );
             }
-            if let Some(timer) = timer.as_ref() {
+            if let Some(timer) = timer {
                 let status = if stats.failed == 0 {
                     "success"
                 } else if stats.upserted == 0 {
@@ -1386,7 +1397,9 @@ pub(crate) async fn backfill_sessions_until(
                 } else {
                     "partial_failure"
                 };
-                let _ = timer.record(&[("status", status)]);
+                if let Err(error) = timer.finish(&[("status", status)]) {
+                    tracing::error!(%error, "backfill duration metric failed");
+                }
             }
         })
         .await;

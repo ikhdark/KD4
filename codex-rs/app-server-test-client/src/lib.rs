@@ -368,6 +368,11 @@ enum Endpoint {
 }
 
 
+fn command_deadline(timeout: Duration) -> Result<Instant> {
+    Instant::now().checked_add(timeout)
+        .context("--command-timeout-seconds exceeds the representable deadline")
+}
+
 fn validate_endpoint_options(cli: &Cli) -> Result<()> {
     if cli.command_timeout_seconds.is_some()
         && !matches!(
@@ -381,6 +386,9 @@ fn validate_endpoint_options(cli: &Cli) -> Result<()> {
         )
     {
         bail!("--command-timeout-seconds requires a finite noninteractive command");
+    }
+    if let Some(seconds) = cli.command_timeout_seconds {
+        command_deadline(Duration::from_secs(seconds))?;
     }
     if matches!(cli.command, CliCommand::Serve { .. }) {
         if cli.url.is_some() {
@@ -831,7 +839,7 @@ fn run_client_command<T>(
 ) -> Result<T> {
     match endpoint {
         Endpoint::Budgeted(_, timeout) => client
-            .with_operation_deadline(Instant::now() + *timeout, operation)
+            .with_operation_deadline(command_deadline(*timeout)?, operation)
             .context("finite command failed; remote turn cancellation was not confirmed and it may still be running; do not automatically resubmit"),
         _ => operation(client),
     }
@@ -2026,12 +2034,13 @@ impl TestClientTracing {
         let config = Config::load_with_cli_overrides(cli_kv_overrides)
             .await
             .context("error loading config")?;
-        let otel_provider = codex_core::otel_init::build_provider(
+        let otel_provider = codex_core::otel_init::build_provider_async(
             &config,
             env!("CARGO_PKG_VERSION"),
             Some(OTEL_SERVICE_NAME),
             DEFAULT_ANALYTICS_ENABLED,
         )
+        .await
         .map_err(|e| anyhow::anyhow!("error loading otel config: {e}"))?;
         let traces_enabled = otel_provider
             .as_ref()

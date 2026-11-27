@@ -112,6 +112,7 @@ const DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const EXTERNAL_WAKE_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DATABASE_FILENAME: &str = "agent_tasks.sqlite";
 const DATABASE_MAX_CONNECTIONS: u32 = 4;
+const PENDING_TERMINAL_OUTCOME_PAGE_SIZE: i64 = 64;
 
 fn workspace_actor_lease_state(
     state: &str,
@@ -386,6 +387,25 @@ impl std::fmt::Debug for LocalAgentTaskStore {
             .debug_struct("LocalAgentTaskStore")
             .field("storage", &"private coordination storage")
             .finish_non_exhaustive()
+    }
+}
+
+/// A cursor read or staged change. Dropping this value before commit rolls back
+/// any staged change, including queries already handed to the SQLite worker.
+#[must_use = "a prepared wake cursor change is rolled back unless committed"]
+pub struct PreparedAutomaticWakeCursor<T> {
+    transaction: Option<sqlx::Transaction<'static, sqlx::Sqlite>>,
+    value: T,
+}
+
+impl<T> PreparedAutomaticWakeCursor<T> {
+    /// Once admitted, await the commit without racing a caller deadline. Its
+    /// outcome determines who owns any retained delivery artifact.
+    pub async fn commit(self) -> StoreResult<T> {
+        if let Some(transaction) = self.transaction {
+            transaction.commit().await?;
+        }
+        Ok(self.value)
     }
 }
 
@@ -743,21 +763,24 @@ impl LocalAgentTaskStore {
         // Capsule publication/recovery share a per-assignment OS lease. Never
         // wait for storage ownership while holding the home-wide SQL writer.
         let lease_deadline = tokio::time::Instant::now() + DATABASE_BUSY_TIMEOUT;
-        let capsule_lease = loop {
-            if let Some(lease) = try_capsule_lease(capsule_path.with_extension("lock")).await? {
-                // The acquisition itself can finish after the caller's bound (for
-                // example while it waited for a blocking worker). Honor the bound
-                // instead of publishing late; dropping the lease releases it.
+        // Only lock acquisition is timed. A late blocking acquisition drops its
+        // File without publishing; an admitted publication still owns settlement.
+        let capsule_lease = tokio::time::timeout_at(lease_deadline, async {
+            loop {
                 if tokio::time::Instant::now() >= lease_deadline {
-                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "task capsule publication is busy").into());
+                    break Ok::<_, StoreError>(None);
                 }
-                break lease;
+                if let Some(lease) = try_capsule_lease(capsule_path.with_extension("lock")).await? {
+                    break Ok((tokio::time::Instant::now() < lease_deadline).then_some(lease));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            if tokio::time::Instant::now() >= lease_deadline {
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "task capsule publication is busy").into());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        };
+        })
+        .await
+        .ok()
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "task capsule publication is busy"))?;
         let staging_path = task_capsule_staging_path(&self.coordination_root, assignment_id);
         let staging_payload = canonical_payload.clone();
         let durable_payload = canonical_payload.clone();
@@ -2379,20 +2402,22 @@ LIMIT 1
         })
     }
 
-    async fn automatic_wake_cursor_impl(
+    /// Prepare acquisition together with the preceding delivery receipt from
+    /// the same cursor snapshot. A new cursor is not visible until commit.
+    pub async fn prepare_automatic_wake_cursor(
         &self,
         root_session_id: String,
         consuming_agent_path: String,
-    ) -> StoreResult<Option<WakeEventId>> {
+    ) -> StoreResult<PreparedAutomaticWakeCursor<(Option<WakeEventId>, Option<String>)>> {
         if root_session_id.trim().is_empty() || consuming_agent_path.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
                 "automatic wake cursor keys cannot be empty".to_string(),
             ));
         }
         // Existing cursors are read-only observations. Do not wait for a
-        // maintenance writer before the wait owner's deadline can start.
+        // maintenance writer on the existing-cursor path.
         if let Some(row) = sqlx::query(
-            "SELECT event_id FROM automatic_wake_cursors
+            "SELECT event_id, delivery_json FROM automatic_wake_cursors
              WHERE root_session_id = ? AND consuming_agent_path = ?",
         )
         .bind(&root_session_id)
@@ -2400,10 +2425,14 @@ LIMIT 1
         .fetch_optional(&self.pool)
         .await?
         {
-            return row
+            let event_id = row
                 .get::<Option<String>, _>("event_id")
                 .map(|value| WakeEventId::parse(&value))
-                .transpose();
+                .transpose()?;
+            return Ok(PreparedAutomaticWakeCursor {
+                transaction: None,
+                value: (event_id, row.get("delivery_json")),
+            });
         }
         let mut transaction = self.pool.begin().await?;
         // Reserve the writer before sampling the initial watermark. Upgrading a
@@ -2414,7 +2443,7 @@ LIMIT 1
             .execute(&mut *transaction)
             .await?;
         if let Some(row) = sqlx::query(
-            "SELECT event_id FROM automatic_wake_cursors
+            "SELECT event_id, delivery_json FROM automatic_wake_cursors
              WHERE root_session_id = ? AND consuming_agent_path = ?",
         )
         .bind(&root_session_id)
@@ -2426,8 +2455,10 @@ LIMIT 1
                 .get::<Option<String>, _>("event_id")
                 .map(|value| WakeEventId::parse(&value))
                 .transpose()?;
-            transaction.commit().await?;
-            return Ok(event_id);
+            return Ok(PreparedAutomaticWakeCursor {
+                transaction: Some(transaction),
+                value: (event_id, row.get("delivery_json")),
+            });
         }
 
         let snapshot_before = sqlx::query(
@@ -2465,18 +2496,20 @@ LIMIT 1
         .get::<Option<String>, _>("event_id")
         .map(|value| WakeEventId::parse(&value))
         .transpose()?;
-        transaction.commit().await?;
-        Ok(stored)
+        Ok(PreparedAutomaticWakeCursor {
+            transaction: Some(transaction),
+            value: (stored, None),
+        })
     }
 
-    async fn compare_and_swap_automatic_wake_cursor_impl(
+    async fn prepare_automatic_wake_cursor_change(
         &self,
         root_session_id: String,
         consuming_agent_path: String,
         expected: Option<WakeEventId>,
         next: WakeEventId,
         delivery_json: Option<String>,
-    ) -> StoreResult<bool> {
+    ) -> StoreResult<PreparedAutomaticWakeCursor<bool>> {
         async fn wake_event_sequence_tx(
             transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
             root_session_id: &str,
@@ -2521,14 +2554,18 @@ LIMIT 1
         .fetch_optional(&mut *transaction)
         .await?
         else {
-            transaction.commit().await?;
-            return Ok(false);
+            return Ok(PreparedAutomaticWakeCursor {
+                transaction: Some(transaction),
+                value: false,
+            });
         };
         let stored = row.get::<Option<String>, _>("event_id");
         let expected = expected.map(|value| value.to_string());
         if stored != expected {
-            transaction.commit().await?;
-            return Ok(false);
+            return Ok(PreparedAutomaticWakeCursor {
+                transaction: Some(transaction),
+                value: false,
+            });
         }
         let next_sequence =
             wake_event_sequence_tx(&mut transaction, &root_session_id, next).await?;
@@ -2555,8 +2592,10 @@ LIMIT 1
         .bind(&consuming_agent_path)
         .execute(&mut *transaction)
         .await?;
-        transaction.commit().await?;
-        Ok(changed.rows_affected() == 1)
+        Ok(PreparedAutomaticWakeCursor {
+            transaction: Some(transaction),
+            value: changed.rows_affected() == 1,
+        })
     }
 
     async fn reserve_stalled_nudge_impl(
@@ -3178,33 +3217,94 @@ impl LocalAgentTaskStore {
         Ok(true)
     }
 
+    /// Collect a single snapshot of all pending outcomes for explicit callers.
+    /// Startup recovery uses the paged methods instead.
     pub async fn pending_terminal_outcomes(
         &self,
         root: &str,
     ) -> StoreResult<Vec<StoreResult<PendingTerminalOutcome>>> {
-        let rows = sqlx::query("SELECT p.* FROM pending_terminal_outcomes p JOIN assignments a USING (assignment_id) WHERE a.root_session_id = ? AND p.acknowledged = 0 AND NOT EXISTS (SELECT 1 FROM pending_terminal_outcomes newer WHERE newer.attempt_id = p.attempt_id AND newer.sequence > p.sequence) ORDER BY p.sequence")
-            .bind(root).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(
+            "SELECT p.* FROM pending_terminal_outcomes p
+             JOIN assignments a USING (assignment_id)
+             WHERE a.root_session_id = ? AND p.acknowledged = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM pending_terminal_outcomes newer
+                   WHERE newer.attempt_id = p.attempt_id AND newer.sequence > p.sequence
+               )
+             ORDER BY p.sequence",
+        )
+        .bind(root)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| Self::decode_pending_terminal_outcome(row, root))
+            .collect())
+    }
+
+    /// Bound a recovery pass even if other processes keep retaining outcomes.
+    /// The sequence is an AUTOINCREMENT primary key shared across all roots.
+    pub async fn terminal_outcome_high_water(&self) -> StoreResult<Option<i64>> {
+        Ok(sqlx::query_scalar("SELECT MAX(sequence) FROM pending_terminal_outcomes")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// Read one live page for a root. Acknowledgement and supersession are
+    /// evaluated at each read; a newer row past the horizon still supersedes
+    /// an older row. Preserve the raw sequence even if its payload is invalid.
+    pub async fn pending_terminal_outcome_page(
+        &self,
+        root: &str,
+        after_sequence: i64,
+        through_sequence: i64,
+    ) -> StoreResult<Vec<(i64, StoreResult<PendingTerminalOutcome>)>> {
+        let rows = sqlx::query(
+            "SELECT p.* FROM pending_terminal_outcomes p
+             JOIN assignments a USING (assignment_id)
+             WHERE a.root_session_id = ? AND p.acknowledged = 0
+               AND p.sequence > ? AND p.sequence <= ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM pending_terminal_outcomes newer
+                   WHERE newer.attempt_id = p.attempt_id AND newer.sequence > p.sequence
+               )
+             ORDER BY p.sequence
+             LIMIT ?",
+        )
+        .bind(root)
+        .bind(after_sequence)
+        .bind(through_sequence)
+        .bind(PENDING_TERMINAL_OUTCOME_PAGE_SIZE)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .map(|row| {
-                let binding: AgentTaskBinding =
-                    decode(row.get::<String, _>("binding_json").as_str())?;
-                if binding.root_session_id != root
-                    || binding.assignment_id.to_string() != row.get::<String, _>("assignment_id")
-                    || binding.attempt_id.to_string() != row.get::<String, _>("attempt_id")
-                {
-                    return Err(StoreError::CorruptData(
-                        "pending terminal binding identity mismatch".into(),
-                    ));
-                }
-                Ok(PendingTerminalOutcome {
-                    binding,
-                    turn_id: row.get("turn_id"),
-                    status_json: row.get("status_json"),
-                    event_json: row.get("event_json"),
-                })
+                let sequence = row.get::<i64, _>("sequence");
+                (sequence, Self::decode_pending_terminal_outcome(&row, root))
             })
             .collect())
+    }
+
+    fn decode_pending_terminal_outcome(
+        row: &sqlx::sqlite::SqliteRow,
+        root: &str,
+    ) -> StoreResult<PendingTerminalOutcome> {
+        let binding: AgentTaskBinding = decode(row.try_get::<&str, _>("binding_json")?)?;
+        if binding.root_session_id != root
+            || binding.assignment_id.to_string() != row.try_get::<&str, _>("assignment_id")?
+            || binding.attempt_id.to_string() != row.try_get::<&str, _>("attempt_id")?
+        {
+            return Err(StoreError::CorruptData(
+                "pending terminal binding identity mismatch".into(),
+            ));
+        }
+        Ok(PendingTerminalOutcome {
+            binding,
+            turn_id: row.try_get("turn_id")?,
+            status_json: row.try_get("status_json")?,
+            event_json: row.try_get("event_json")?,
+        })
     }
 
     pub async fn acknowledge_terminal_outcome(&self, attempt: AttemptId, turn_id: &str) -> StoreResult<()> {
@@ -3844,8 +3944,12 @@ impl LocalAgentTaskStore {
         consuming_agent_path: String,
     ) -> TaskStoreFuture<'_, Option<WakeEventId>> {
         Box::pin(async move {
-            self.automatic_wake_cursor_impl(root_session_id, consuming_agent_path)
-                .await
+            let (event_id, _) = self
+                .prepare_automatic_wake_cursor(root_session_id, consuming_agent_path)
+                .await?
+                .commit()
+                .await?;
+            Ok(event_id)
         })
     }
 
@@ -3857,13 +3961,15 @@ impl LocalAgentTaskStore {
         next: WakeEventId,
     ) -> TaskStoreFuture<'_, bool> {
         Box::pin(async move {
-            self.compare_and_swap_automatic_wake_cursor_impl(
+            self.prepare_automatic_wake_cursor_change(
                 root_session_id,
                 consuming_agent_path,
                 expected,
                 next,
                 None,
             )
+            .await?
+            .commit()
             .await
         })
     }
@@ -3877,15 +3983,37 @@ impl LocalAgentTaskStore {
         delivery_json: String,
     ) -> TaskStoreFuture<'_, bool> {
         Box::pin(async move {
-            self.compare_and_swap_automatic_wake_cursor_impl(
+            self.prepare_automatic_wake_delivery(
                 root_session_id,
                 consuming_agent_path,
                 expected,
                 next,
-                Some(delivery_json),
+                delivery_json,
             )
+            .await?
+            .commit()
             .await
         })
+    }
+
+    /// Stage the cursor and its retained receipt atomically, but leave commit
+    /// admission to the wait owner. Dropping a losing preparation is safe.
+    pub async fn prepare_automatic_wake_delivery(
+        &self,
+        root_session_id: String,
+        consuming_agent_path: String,
+        expected: Option<WakeEventId>,
+        next: WakeEventId,
+        delivery_json: String,
+    ) -> StoreResult<PreparedAutomaticWakeCursor<bool>> {
+        self.prepare_automatic_wake_cursor_change(
+            root_session_id,
+            consuming_agent_path,
+            expected,
+            next,
+            Some(delivery_json),
+        )
+        .await
     }
 
     pub fn automatic_wake_delivery(

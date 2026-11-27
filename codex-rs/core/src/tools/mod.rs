@@ -39,7 +39,7 @@ use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use codex_utils_output_truncation::truncate_text_with_output_limit;
 pub use router::ToolRouter;
 use shell_output_summary::ShellOutputSummaryOptions;
-use shell_output_summary::summarize_shell_output_for_model_with_streams;
+use shell_output_summary::summarize_shell_output_with_source;
 
 pub(crate) const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
 pub(crate) const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
@@ -112,8 +112,8 @@ pub(crate) fn project_exec_output_for_model_with_budget(
         .saturating_sub(approx_token_count(&envelope_header));
     let summarized = approx_token_count_exceeds(&raw_content, content_limit)
         .then(|| {
-            summarize_shell_output_for_model_with_streams(
-                &raw_content,
+            summarize_shell_output_with_source(
+                &exec_output.aggregated_output.text,
                 exec_output.exit_code,
                 exec_output.timed_out,
                 ShellOutputSummaryOptions {
@@ -125,6 +125,7 @@ pub(crate) fn project_exec_output_for_model_with_budget(
             )
         })
         .flatten();
+    let summarized = summarized.map(|summary| with_timeout_notice(exec_output, summary.text, summary.is_structured));
     let content = summarized.as_deref().unwrap_or(&raw_content);
     let truncated = truncate_text_with_output_limit(content, limits);
     let total_lines = content.lines().count();
@@ -143,6 +144,7 @@ pub(crate) fn project_exec_output_for_model_with_budget(
     let text = truncate_text_to_token_ceiling(&rendered, limits.applied_limit);
     FormattedExecOutput {
         reduced: summarized.is_some() || truncated.was_truncated || text != rendered,
+        first_omitted_lines: None,
         text,
     }
 }
@@ -157,6 +159,8 @@ pub fn format_exec_output_str(
 pub(crate) struct FormattedExecOutput {
     pub(crate) text: String,
     pub(crate) reduced: bool,
+    /// Source coordinates in the retained aggregate, excluding presentation-only headers.
+    pub(crate) first_omitted_lines: Option<(usize, usize)>,
 }
 
 pub(crate) fn project_exec_output_text(
@@ -187,8 +191,8 @@ pub(crate) fn project_exec_output_text_with_budget(
     );
     let summarized = approx_token_count_exceeds(&raw_content, limits.applied_limit)
         .then(|| {
-            summarize_shell_output_for_model_with_streams(
-                &raw_content,
+            shell_output_summary::summarize_shell_output_with_source(
+                &exec_output.aggregated_output.text,
                 exec_output.exit_code,
                 exec_output.timed_out,
                 ShellOutputSummaryOptions {
@@ -200,11 +204,28 @@ pub(crate) fn project_exec_output_text_with_budget(
             )
         })
         .flatten();
-    let content = summarized.as_deref().unwrap_or(&raw_content);
-    let truncated = formatted_truncate_text_with_output_limit(content, limits);
+    let to_source = |(first, last): (usize, usize)| {
+        let prefix = usize::from(exec_output.timed_out);
+        (last > prefix).then(|| (first.saturating_sub(prefix).max(1), last - prefix))
+    };
+    let reduced_by_summary = summarized.is_some();
+    let (truncated, first_omitted_lines) = match summarized {
+        Some(summary) => {
+            let display_text = with_timeout_notice(exec_output, summary.text, summary.is_structured);
+            let display = formatted_truncate_text_with_output_limit(&display_text, limits);
+            let omitted = summary.first_omitted_line_range;
+            (display, omitted)
+        }
+        None => {
+            let (display, omitted) =
+                codex_utils_output_truncation::formatted_truncate_text_with_recovery(&raw_content, limits);
+            (display, omitted.into_iter().find_map(to_source))
+        }
+    };
     FormattedExecOutput {
-        reduced: summarized.is_some() || truncated.was_truncated,
+        reduced: reduced_by_summary || truncated.was_truncated,
         text: truncated.text,
+        first_omitted_lines,
     }
 }
 
@@ -239,6 +260,15 @@ fn resolve_exec_output_limits(
 }
 
 /// Extracts exec output content and prepends a timeout message if the command timed out.
+fn with_timeout_notice(exec_output: &ExecToolCallOutput, text: String, is_structured: bool) -> String {
+    // Compiler JSON carries its own timed_out field and must remain parseable.
+    if exec_output.timed_out && !is_structured {
+        format!("command timed out after {} milliseconds\n{text}", exec_output.duration.as_millis())
+    } else {
+        text
+    }
+}
+
 fn build_content_with_timeout(exec_output: &ExecToolCallOutput) -> Cow<'_, str> {
     if exec_output.timed_out {
         Cow::Owned(format!(

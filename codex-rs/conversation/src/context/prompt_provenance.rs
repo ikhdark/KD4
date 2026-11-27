@@ -193,10 +193,92 @@ impl PromptItemProvenance {
     }
 }
 
+#[derive(Debug)]
+enum AlignedPromptChunk {
+    Items(Arc<[PromptItemProvenance]>),
+    Pair { older: Arc<Self>, newer: Arc<Self> },
+}
+
+/// Keep the assembled prefix and append chunks immutable across snapshots.
+/// Equal-rank chunks merge by sharing their children, not copying entries.
+/// The root list and traversal stack are logarithmic in the number of appends.
+#[derive(Clone, Debug, Default)]
+struct AlignedPromptItems {
+    base: Arc<[PromptItemProvenance]>,
+    suffix: Arc<[(usize, Arc<AlignedPromptChunk>)]>,
+    len: usize,
+}
+
+impl From<Vec<PromptItemProvenance>> for AlignedPromptItems {
+    fn from(items: Vec<PromptItemProvenance>) -> Self {
+        Self {
+            len: items.len(),
+            base: items.into(),
+            ..Self::default()
+        }
+    }
+}
+
+impl AlignedPromptItems {
+    fn appended(&self, items: Arc<[PromptItemProvenance]>) -> Self {
+        if items.is_empty() {
+            return self.clone();
+        }
+        let len = self.len + items.len();
+        if self.len == 0 {
+            return Self {
+                base: items,
+                len,
+                ..Self::default()
+            };
+        }
+        let mut suffix = self.suffix.to_vec();
+        let mut rank = 0;
+        let mut chunk = Arc::new(AlignedPromptChunk::Items(items));
+        while let Some((_, older)) = suffix.pop_if(|(older_rank, _)| *older_rank == rank) {
+            chunk = Arc::new(AlignedPromptChunk::Pair {
+                older,
+                newer: chunk,
+            });
+            rank += 1;
+        }
+        suffix.push((rank, chunk));
+        Self {
+            base: Arc::clone(&self.base),
+            suffix: suffix.into(),
+            len,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &PromptItemProvenance> {
+        // Readers walk aligned positions in request order. Visit each chunk
+        // once, without flattening entries or descending the tree per item.
+        let mut pending = self
+            .suffix
+            .iter()
+            .rev()
+            .map(|(_, chunk)| chunk.as_ref())
+            .collect::<Vec<_>>();
+        let suffix = std::iter::from_fn(move || {
+            while let Some(chunk) = pending.pop() {
+                match chunk {
+                    AlignedPromptChunk::Items(items) => return Some(items.iter()),
+                    AlignedPromptChunk::Pair { older, newer } => {
+                        pending.push(newer.as_ref());
+                        pending.push(older.as_ref());
+                    }
+                }
+            }
+            None
+        });
+        self.base.iter().chain(suffix.flatten())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PromptProvenanceSidecar {
     contributions_by_item: PromptContributionsByItem,
-    aligned_items: Arc<[PromptItemProvenance]>,
+    aligned_items: AlignedPromptItems,
     current_turn_id: Option<String>,
     current_input_fingerprint: Option<[u8; 32]>,
 }
@@ -208,30 +290,45 @@ impl PromptProvenanceSidecar {
         items: &[ResponseItem],
         manifest: &StableContextManifest,
     ) -> Self {
-        let suffix = Self::from_assembled_items(items, manifest);
-        let mut aligned_items = self.aligned_items.to_vec();
-        aligned_items.extend(suffix.aligned_items.iter().cloned().zip(items).map(
-            |(mut provenance, item)| {
-                if matches!(item, ResponseItem::Message { .. }) {
-                    provenance.current_input = self
-                        .current_turn_id
-                        .as_deref()
-                        .is_some_and(|turn_id| item.turn_id() == Some(turn_id));
-                }
-                provenance
-            },
-        ));
-        let mut contributions_by_item = Arc::clone(&self.contributions_by_item);
-        if !suffix.contributions_by_item.is_empty() {
-            Arc::make_mut(&mut contributions_by_item).extend(
+        if items.is_empty() {
+            return self.clone();
+        }
+        let mut suffix = Self::from_assembled_items(items, manifest);
+        // A suffix never establishes a new current turn on the prefix sidecar.
+        for (provenance, item) in Arc::make_mut(&mut suffix.aligned_items.base)
+            .iter_mut()
+            .zip(items)
+        {
+            if matches!(item, ResponseItem::Message { .. }) {
+                provenance.current_input = self
+                    .current_turn_id
+                    .as_deref()
+                    .is_some_and(|turn_id| item.turn_id() == Some(turn_id));
+            }
+        }
+        let aligned_items = self.aligned_items.appended(suffix.aligned_items.base);
+        // Repeating an already-attributed occurrence changes alignment, not
+        // the fingerprint lookup. Only new or different lookup values merge.
+        let contributions_by_item = if suffix
+            .contributions_by_item
+            .iter()
+            .all(|(key, value)| self.contributions_by_item.get(key) == Some(value))
+        {
+            Arc::clone(&self.contributions_by_item)
+        } else if self.contributions_by_item.is_empty() {
+            suffix.contributions_by_item
+        } else {
+            let mut contributions_by_item = self.contributions_by_item.as_ref().clone();
+            contributions_by_item.extend(
                 suffix
                     .contributions_by_item
                     .iter()
                     .map(|(key, value)| (*key, Arc::clone(value))),
             );
-        }
+            Arc::new(contributions_by_item)
+        };
         Self {
-            aligned_items: aligned_items.into(),
+            aligned_items,
             contributions_by_item,
             ..self.clone()
         }
@@ -340,12 +437,11 @@ impl PromptProvenanceSidecar {
         }
         let mut contributions_by_item = Arc::clone(&self.contributions_by_item);
         let mut aligned_items = Vec::with_capacity(items.len());
-        for (index, item) in items.iter().enumerate() {
+        for (item, aligned) in items.iter().zip(self.aligned_items_with_offset(0)) {
             let ResponseItem::Message { role, content, .. } = item else {
                 aligned_items.push(PromptItemProvenance::default());
                 continue;
             };
-            let aligned = self.aligned_item(index);
             let mut categories = aligned
                 .map(|item| item.categories.to_vec())
                 .or_else(|| self.contributions(item).map(<[_]>::to_vec))
@@ -395,7 +491,7 @@ impl PromptProvenanceSidecar {
         let Some(item @ ResponseItem::Message { content, .. }) = items.get(index) else {
             return self.clone();
         };
-        let offset = items.len().saturating_sub(self.aligned_items.len());
+        let offset = items.len().saturating_sub(self.aligned_items.len);
         let mut aligned_items = vec![PromptItemProvenance::default(); offset];
         aligned_items.extend(self.aligned_items.iter().cloned());
         let Some(aligned) = aligned_items.get_mut(index) else {
@@ -414,8 +510,15 @@ impl PromptProvenanceSidecar {
         }
     }
 
-    fn aligned_item(&self, index: usize) -> Option<&PromptItemProvenance> {
-        self.aligned_items.get(index)
+    // Missing alignment must stay distinct from an aligned default entry:
+    // logical measurement can use fingerprints only for the former.
+    fn aligned_items_with_offset(
+        &self,
+        offset: usize,
+    ) -> impl Iterator<Item = Option<&PromptItemProvenance>> {
+        std::iter::repeat_n(None, offset)
+            .chain(self.aligned_items.iter().map(Some))
+            .chain(std::iter::repeat(None))
     }
 
     /// Rebuild alignment only when transport fallback replay changes the
@@ -426,7 +529,7 @@ impl PromptProvenanceSidecar {
         original: &[ResponseItem],
         items: &[ResponseItem],
     ) -> Self {
-        if self.aligned_items.is_empty() {
+        if self.aligned_items.len == 0 {
             return Self {
                 aligned_items: vec![PromptItemProvenance::default(); items.len()].into(),
                 ..self.clone()
@@ -434,15 +537,11 @@ impl PromptProvenanceSidecar {
         }
         // Fallback projection retains the order of equal messages. Carry each occurrence's
         // aligned metadata from the actual source sequence, never a category per text value.
-        let offset = original.len().saturating_sub(self.aligned_items.len());
+        let offset = original.len().saturating_sub(self.aligned_items.len);
         let mut origins = HashMap::<_, Vec<PromptItemProvenance>>::new();
-        for (index, item) in original.iter().enumerate() {
+        for (item, aligned) in original.iter().zip(self.aligned_items_with_offset(offset)) {
             if let Some(fingerprint) = response_item_fingerprint(item) {
-                let provenance = index
-                    .checked_sub(offset)
-                    .and_then(|index| self.aligned_item(index))
-                    .cloned()
-                    .unwrap_or_default();
+                let provenance = aligned.cloned().unwrap_or_default();
                 origins.entry(fingerprint).or_default().push(provenance);
             }
         }
@@ -577,8 +676,9 @@ impl PromptContextBreakdown {
     ) -> serde_json::Result<Self> {
         let mut breakdown = Self::default();
         let origins = Self::tool_origins(items);
-        let aligned_offset = items.len().saturating_sub(sidecar.aligned_items.len());
-        for (index, item) in items.iter().enumerate() {
+        let aligned_offset = items.len().saturating_sub(sidecar.aligned_items.len);
+        let aligned = sidecar.aligned_items_with_offset(aligned_offset);
+        for (index, (item, aligned)) in items.iter().zip(aligned).enumerate() {
             let serialization_started = (matches!(item,
                 ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. })
                 && tracing::enabled!(target: "codex.prompt_measurement", tracing::Level::DEBUG))
@@ -592,9 +692,6 @@ impl PromptContextBreakdown {
                     "logical prompt measurement");
             }
             breakdown.record_tool_result(index, item, &serialized_item, &origins);
-            let aligned = index
-                .checked_sub(aligned_offset)
-                .and_then(|index| sidecar.aligned_item(index));
             let before = breakdown.contribution_counts();
             breakdown.record_response_item(item, &serialized_item, sidecar, aligned)?;
             breakdown.observe_prefix_item(index, before);
@@ -626,10 +723,13 @@ impl PromptContextBreakdown {
                 "serialized request input does not match logical input",
             )));
         }
-        let aligned_offset = items.len().saturating_sub(sidecar.aligned_items.len());
+        let aligned_offset = items.len().saturating_sub(sidecar.aligned_items.len);
+        let aligned = sidecar.aligned_items_with_offset(aligned_offset);
         let mut breakdown = Self::default();
         let origins = Self::tool_origins(items);
-        for (index, (item, raw_item)) in items.iter().zip(serialized_items.iter()).enumerate() {
+        for (index, ((item, raw_item), aligned)) in
+            items.iter().zip(serialized_items).zip(aligned).enumerate()
+        {
             let serialized_item = raw_item.get().as_bytes();
             breakdown.record_tool_result(index, item, serialized_item, &origins);
             let before = breakdown.contribution_counts();
@@ -638,9 +738,6 @@ impl PromptContextBreakdown {
                 breakdown.observe_prefix_item(index, before);
                 continue;
             }
-            let aligned = index
-                .checked_sub(aligned_offset)
-                .and_then(|index| sidecar.aligned_item(index));
             breakdown.record_serialized_response_item(item, serialized_item, raw_item, aligned)?;
             breakdown.observe_prefix_item(index, before);
         }

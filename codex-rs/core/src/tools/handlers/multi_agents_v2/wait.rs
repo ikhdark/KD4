@@ -128,26 +128,64 @@ impl Handler {
         let maintenance_interval =
             Duration::from_millis(u64::try_from(default_timeout_ms.max(0)).unwrap_or(u64::MAX));
 
-        let turn_state = session
-            .input_queue
-            .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
-            .await;
-        let (activity_rx, _) = session
-            .input_queue
-            .subscribe_agent_activity(turn_state.as_deref())
-            .await;
+        let wait_started = Instant::now();
+        let deadline = earliest_deadline(
+            explicit_timeout_ms
+                .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64)),
+            crate::unified_exec::nested_poll_bound(source.nested_deadline()),
+        );
+        let parsed_cursor = args.cursor.as_deref().map(WakeEventId::parse).transpose();
+        let setup = async {
+            let turn_state = session
+                .input_queue
+                .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
+                .await;
+            let (activity_rx, _) = session
+                .input_queue
+                .subscribe_agent_activity(turn_state.as_deref())
+                .await;
+            (turn_state, activity_rx)
+        };
+        let (turn_state, activity_rx) = if deadline.is_some() {
+            let interrupted = |reason| {
+                unopened_wait_result(
+                    &turn, &args, parsed_cursor.as_ref().ok().copied().flatten(), wait_started, reason,
+                ).map(boxed_tool_output)
+            };
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return interrupted("cancelled"),
+                _ = wait_until_deadline(deadline) => return interrupted("timed_out"),
+                input = setup => input,
+            }
+        } else {
+            setup.await
+        };
 
         let mut input = AgentWaitInput {
             session: &session,
             turn_state: turn_state.as_deref(),
             receiver: activity_rx,
         };
-        let wait_started = Instant::now();
-        let observation = codex_protocol::timing::observations::Span::start(
+        // Preserve the maintenance clock for a wait with no absolute bound.
+        let wait_started = if deadline.is_none() {
+            Instant::now()
+        } else {
+            wait_started
+        };
+        if deadline.is_some() && (cancellation_token.is_cancelled() || deadline_elapsed(deadline)) {
+            let reason = if cancellation_token.is_cancelled() { "cancelled" } else { "timed_out" };
+            return unopened_wait_result(
+                &turn, &args, parsed_cursor.as_ref().ok().copied().flatten(), wait_started, reason,
+            ).map(boxed_tool_output);
+        }
+        let observation = codex_protocol::timing::observations::Span::start_queued(
             "agent_wait", &session.thread_id.to_string(), &turn.sub_id, &call_id,
             json!({"explicit_targets":args.targets.is_some(), "mailbox_only":args.mailbox_only,
                 "dependencies_only":args.dependencies_only}));
 
+        // Once admitted, finish this paired lifecycle publication. It cannot
+        // be dropped safely between the rollout append and live delivery.
         session
             .emit_turn_item_started(
                 &turn,
@@ -171,22 +209,18 @@ impl Handler {
         let mut nudged_assignment_ids: Vec<String> = Vec::new();
         // Close the published item on ordinary validation, store and cancellation errors.
         let mut result: Result<WaitAgentResult, FunctionCallError> = async {
+            if deadline.is_some() && (cancellation_token.is_cancelled() || deadline_elapsed(deadline)) {
+                let reason = if cancellation_token.is_cancelled() { "cancelled" } else { "timed_out" };
+                return unopened_wait_result(
+                    &turn, &args, parsed_cursor.as_ref().ok().copied().flatten(), wait_started, reason,
+                );
+            }
             let explicit_cursor = args.cursor.is_some();
-            let parsed_cursor = args
-                .cursor
-                .as_deref()
-                .map(WakeEventId::parse)
-                .transpose()
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "wait_agent cursor is invalid or no longer retained: {error}"
-                    ))
-                })?;
-            let deadline = earliest_deadline(
-                explicit_timeout_ms
-                    .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64)),
-                crate::unified_exec::nested_poll_bound(source.nested_deadline()),
-            );
+            let parsed_cursor = parsed_cursor.map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "wait_agent cursor is invalid or no longer retained: {error}"
+                ))
+            })?;
             if let Some(targets) = &args.targets {
                 let resolve = async {
                     let mut children = Vec::new();
@@ -198,8 +232,11 @@ impl Handler {
                 let resolved = tokio::select! {
                     biased;
                     _ = cancellation_token.cancelled() => Err("cancelled"),
-                    _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => Err("timed_out"),
-                    result = resolve => Ok(result?),
+                    _ = wait_until_deadline(deadline) => Err("timed_out"),
+                    result = resolve => {
+                        if deadline_elapsed(deadline) { Err("timed_out") } else { Ok(result?) }
+                    }
+
                 };
                 let completion = match resolved {
                     Ok(children) => serde_json::to_value(session.services.agent_control.wait_for_child_completions(
@@ -207,29 +244,81 @@ impl Handler {
                         &children, args.completion_mode.unwrap_or_default(), &cancellation_token, deadline,
                     ).await.map_err(|error| task_store_context_error("wait_agent", "selected completion wait failed", error))?)
                         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?,
-                    Err(reason) => json!({"reason": reason, "mode": args.completion_mode.unwrap_or_default(), "outcomes": [], "unresolved_targets": targets, "acceptance": "not_evaluated"}),
+                    Err(reason) => return unopened_wait_result(&turn, &args, parsed_cursor, wait_started, reason),
                 };
                 return Ok(WaitAgentResult {
-                    message: "Selected-child wait ended; terminal outcomes are not deliverable acceptance.".into(),
+                    message: SELECTED_WAIT_MESSAGE.into(),
                     timed_out: completion["reason"] == "timed_out",
                     completion: Some(completion),
                     ..Default::default()
                 });
             }
+            let mut previous_delivery_at_start = None;
+            let mut folded_admission_events = 0_usize;
+            let mut folded_completion_events = 0_usize;
+            macro_rules! timed_out {
+                ($cursor:expr) => {{
+                    let mut result = input_only_result(&turn, WaitOutcome::TimedOut, $cursor, wait_started);
+                    result.previous_delivery = previous_delivery_at_start.clone();
+                    if folded_admission_events > 0 {
+                        result.message.push_str(&admission_fold_note(folded_admission_events));
+                    }
+                    if folded_completion_events > 0 {
+                        result.message.push_str(&completion_fold_note(folded_completion_events));
+                    }
+                    return Ok(result);
+                }};
+            }
+            macro_rules! delivery_checkpoint {
+                ($cursor:expr) => {
+                    if deadline.is_some() {
+                        if cancellation_token.is_cancelled() {
+                            return Err(wait_cancelled());
+                        }
+                        if deadline_elapsed(deadline) {
+                            timed_out!($cursor);
+                        }
+                    }
+                };
+            }
             macro_rules! before_delivery {
                 ($future:expr, $cursor:expr) => {
                     tokio::select! {
                         biased;
-                        _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string())),
-                        outcome = input.next() => return Ok(input_only_result(&turn, outcome, $cursor, wait_started)),
-                        result = $future => result,
+                        _ = cancellation_token.cancelled() => return Err(wait_cancelled()),
+                        outcome = input.next() => {
+                            delivery_checkpoint!($cursor);
+                            return Ok(input_only_result(&turn, outcome, $cursor, wait_started));
+                        },
+                        _ = wait_until_deadline(deadline) => timed_out!($cursor),
+                        result = $future => {
+                            delivery_checkpoint!($cursor);
+                            result
+                        },
+                    }
+                };
+            }
+            macro_rules! pending_input {
+                ($cursor:expr) => {
+                    if deadline.is_some() {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation_token.cancelled() => return Err(wait_cancelled()),
+                            _ = wait_until_deadline(deadline) => timed_out!($cursor),
+                            outcome = input.current() => {
+                                delivery_checkpoint!($cursor);
+                                outcome
+                            },
+                        }
+                    } else {
+                        input.current().await
                     }
                 };
             }
             if cancellation_token.is_cancelled() {
-                return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string()));
+                return Err(wait_cancelled());
             }
-            if let Some(outcome) = input.current().await {
+            if let Some(outcome) = pending_input!(parsed_cursor) {
                 return Ok(input_only_result(&turn, outcome, parsed_cursor, wait_started));
             }
             if args.mailbox_only {
@@ -239,15 +328,11 @@ impl Handler {
                 let (outcome, _) = tokio::select! {
                     biased;
                     _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string())),
-                    result = wait_for_activity(&mut input, deadline, None, None, parsed_cursor) => {
+                    result = wait_for_activity(&mut input, deadline, None, None, None, parsed_cursor) => {
                         result.map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
                     }
                 };
-                let outcome = if outcome == WaitOutcome::BoundaryElapsed {
-                    WaitOutcome::TimedOut
-                } else {
-                    outcome
-                };
+                delivery_checkpoint!(parsed_cursor);
                 return Ok(input_only_result(&turn, outcome, parsed_cursor, wait_started));
             }
             let coordinator = session.services.agent_control.task_coordinator();
@@ -305,16 +390,8 @@ impl Handler {
                     root, caller_binding.map(|binding| (binding.assignment_id, binding.attempt_id)),
                     targets.clone()), parsed_cursor)
                     .map_err(|error| task_store_context_error("wait_agent", "acceptance subscription failed", error))?;
-                let readiness = tokio::select! {
-                    biased;
-                    _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("wait_agent cancelled".into())),
-                    outcome = input.next() => return Ok(input_only_result(&turn, outcome, parsed_cursor, wait_started)),
-                    _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
-                        return Ok(input_only_result(&turn, WaitOutcome::TimedOut, parsed_cursor, wait_started));
-                    }
-                    result = subscription.next(args.acceptance_cursor.as_deref()) => result
-                        .map_err(|error| task_store_context_error("wait_agent", "acceptance observation failed", error))?,
-                };
+                let readiness = before_delivery!(subscription.next(args.acceptance_cursor.as_deref()), parsed_cursor)
+                    .map_err(|error| task_store_context_error("wait_agent", "acceptance observation failed", error))?;
                 return Ok(WaitAgentResult {
                     message: "Selected criteria observed; this neither completes the whole task nor cancels any required work. Revalidate evidence before consumption.".into(),
                     typed_deltas: vec![json!({"acceptance_readiness": readiness})],
@@ -329,16 +406,8 @@ impl Handler {
                 let mut subscription = before_delivery!(store.subscribe_dependency_readiness(
                     binding.assignment_id, binding.attempt_id), parsed_cursor)
                     .map_err(|error| task_store_context_error("wait_agent", "dependency subscription failed", error))?;
-                let readiness = tokio::select! {
-                    biased;
-                    _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("wait_agent cancelled".into())),
-                    outcome = input.next() => return Ok(input_only_result(&turn, outcome, parsed_cursor, wait_started)),
-                    _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
-                        return Ok(input_only_result(&turn, WaitOutcome::TimedOut, parsed_cursor, wait_started));
-                    }
-                    result = subscription.next(args.dependency_cursor.as_deref()) => result
-                        .map_err(|error| task_store_context_error("wait_agent", "dependency authority observation failed", error))?,
-                };
+                let readiness = before_delivery!(subscription.next(args.dependency_cursor.as_deref()), parsed_cursor)
+                    .map_err(|error| task_store_context_error("wait_agent", "dependency authority observation failed", error))?;
                 return Ok(WaitAgentResult {
                     message: if readiness.ready {
                         "Declared prerequisites are authoritatively accepted at this observation; revalidate authority before consuming them."
@@ -356,27 +425,38 @@ impl Handler {
                 .unwrap_or_else(AgentPath::root)
                 .to_string();
             let cursor = match (explicit_cursor, store.as_ref(), root_session_id.as_deref()) {
-                (false, Some(store), Some(root_session_id)) => before_delivery!(store
-                    .automatic_wake_cursor(root_session_id.to_string(), consuming_agent_path.clone()), parsed_cursor)
-                    .map_err(|error| {
-                        task_store_context_error(
-                            "wait_agent",
-                            "wait_agent could not initialize its automatic cursor",
-                            error,
-                        )
-                    })?,
+                (false, Some(store), Some(root_session_id)) => {
+                    let acquisition_error = |error| task_store_context_error(
+                        "wait_agent",
+                        "wait_agent could not initialize its automatic cursor",
+                        error,
+                    );
+                    if deadline.is_some() {
+                        let prepared = before_delivery!(store.prepare_automatic_wake_cursor(
+                            root_session_id.to_string(), consuming_agent_path.clone(),
+                        ), parsed_cursor).map_err(acquisition_error)?;
+                        let (cursor, previous_delivery) = prepared.commit().await.map_err(acquisition_error)?;
+                        // Only committed or observed cursors can be returned on timeout.
+                        previous_delivery_at_start = previous_delivery
+                            .and_then(|value| serde_json::from_str(&value).ok());
+                        delivery_checkpoint!(cursor);
+                        cursor
+                    } else {
+                        before_delivery!(store.automatic_wake_cursor(
+                            root_session_id.to_string(), consuming_agent_path.clone(),
+                        ), parsed_cursor).map_err(acquisition_error)?
+                    }
+                }
                 _ => parsed_cursor,
             };
             // Admission is not progress. Admission-only pages advance this scan
             // cursor without ending the wait; `cursor` stays the input-only report
             // and the compare-and-swap expectation until a result is delivered.
             let mut scan_cursor = cursor;
-            let mut folded_admission_events = 0_usize;
-            let mut folded_completion_events = 0_usize;
             let mut maintenance_deadline = Some(wait_started + maintenance_interval);
             let mut drained_event_pages = 0_u32;
             let (outcome, wake_read, hydrated_assignments, settled_revision) = 'wait_owner: loop {
-                if let Some(outcome) = input.current().await {
+                if let Some(outcome) = pending_input!(cursor) {
                     return Ok(input_only_result(&turn, outcome, cursor, wait_started));
                 }
                 {
@@ -405,10 +485,10 @@ impl Handler {
                         }
                     }
                 }
-                let boundary_deadline = earliest_deadline(deadline, maintenance_deadline);
                 let wait = wait_for_activity(
                     &mut input,
-                    boundary_deadline,
+                    deadline,
+                    maintenance_deadline,
                     store.as_ref(),
                     root_session_id.as_deref(),
                     scan_cursor,
@@ -422,7 +502,10 @@ impl Handler {
                             "wait_agent cancelled".to_string(),
                         ));
                     }
-                    result = wait => result,
+                    result = wait => {
+                        delivery_checkpoint!(cursor);
+                        result
+                    },
                 }
                 .map_err(|error| {
                     turn.turn_timing_state
@@ -434,93 +517,82 @@ impl Handler {
                     )
                 })?;
 
+                if outcome == WaitOutcome::TimedOut {
+                    timed_out!(cursor);
+                }
                 if outcome == WaitOutcome::BoundaryElapsed {
                     let now = Instant::now();
                     let maintenance_due = maintenance_deadline.is_some_and(|value| now >= value);
-                    let explicit_deadline_due = deadline.is_some_and(|value| now >= value);
-                    if maintenance_due && !explicit_deadline_due {
+                    if maintenance_due {
                         let maintenance = async {
-                            let nudged = if !turn.session_source.is_non_root_agent() {
+                            if turn.session_source.is_non_root_agent() {
+                                false
+                            } else {
                                 nudge_stalled_assignments(
                                     session.as_ref(),
                                     turn.as_ref(),
                                     store.as_ref(),
                                     root_session_id.as_deref(),
                                     turn_state.as_deref(),
+                                    &mut nudged_assignment_ids,
                                 )
                                 .await
-                            } else {
-                                Vec::new()
-                            };
-                            let read = read_wake_events(
-                                store.as_ref(),
-                                root_session_id.as_deref(),
-                                scan_cursor,
-                            )
-                            .await;
-                            (nudged, read)
+                            }
                         };
-                        let completed = tokio::select! {
+                        let fresh_nudge = tokio::select! {
                             biased;
                             _ = cancellation_token.cancelled() => {
                                 turn.turn_timing_state.record_internally_drained_waits(drained_event_pages);
                                 return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string()));
                             }
-                            _ = async {
-                                match deadline {
-                                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                                    None => std::future::pending::<()>().await,
-                                }
-                            } => None,
-                            completed = maintenance => Some(completed),
+                            _ = wait_until_deadline(deadline) => timed_out!(cursor),
+                            completed = maintenance => completed,
                         };
-                        if let Some((nudged, read)) = completed {
-                            let fresh_nudge = !nudged.is_empty();
-                            for assignment_id in nudged {
-                                if !nudged_assignment_ids.contains(&assignment_id) {
-                                    nudged_assignment_ids.push(assignment_id);
-                                }
-                            }
-                            maintenance_deadline = if maintenance_interval.is_zero() {
-                                None
-                            } else {
-                                Some(now + maintenance_interval)
-                            };
-                            wake_read = read.map_err(|error| {
+                        delivery_checkpoint!(cursor);
+                        let read = tokio::select! {
+                            biased;
+                            _ = cancellation_token.cancelled() => {
                                 turn.turn_timing_state.record_internally_drained_waits(drained_event_pages);
-                                task_store_context_error(
-                                    "wait_agent",
-                                    "wait_agent could not reread durable typed-task progress after maintenance",
-                                    error,
-                                )
-                            })?;
-                            if !wake_read.updated_agents.is_empty() {
-                                outcome = WaitOutcome::DurableActivity;
+                                return Err(wait_cancelled());
                             }
-                            // A nudge is maintenance, not a deliverable update. A caller
-                            // that gave timeout_ms keeps waiting until its deadline and
-                            // receives the accumulated nudges with that result.
-                            if outcome == WaitOutcome::BoundaryElapsed
-                                && fresh_nudge
-                                && explicit_timeout_ms.is_none()
-                            {
-                                outcome = WaitOutcome::MaintenanceActivity;
-                            }
+                            _ = wait_until_deadline(deadline) => timed_out!(cursor),
+                            read = read_wake_events(store.as_ref(), root_session_id.as_deref(), scan_cursor) => {
+                                delivery_checkpoint!(cursor);
+                                read
+                            },
+                        };
+                        maintenance_deadline = if maintenance_interval.is_zero() {
+                            None
                         } else {
-                            outcome = WaitOutcome::TimedOut;
-                            wake_read.timed_out = true;
+                            Some(now + maintenance_interval)
+                        };
+                        wake_read = read.map_err(|error| {
+                            turn.turn_timing_state.record_internally_drained_waits(drained_event_pages);
+                            task_store_context_error(
+                                "wait_agent",
+                                "wait_agent could not reread durable typed-task progress after maintenance",
+                                error,
+                            )
+                        })?;
+                        if !wake_read.updated_agents.is_empty() {
+                            outcome = WaitOutcome::DurableActivity;
                         }
-                    }
-                    if outcome == WaitOutcome::BoundaryElapsed && explicit_deadline_due {
-                        outcome = WaitOutcome::TimedOut;
-                        wake_read.timed_out = true;
+                        // A nudge is maintenance, not a deliverable update. A caller
+                        // that gave timeout_ms keeps waiting until its deadline and
+                        // receives the accumulated nudges with that result.
+                        if outcome == WaitOutcome::BoundaryElapsed
+                            && fresh_nudge
+                            && explicit_timeout_ms.is_none()
+                        {
+                            outcome = WaitOutcome::MaintenanceActivity;
+                        }
                     }
                     if outcome == WaitOutcome::BoundaryElapsed {
                         continue;
                     }
                 }
 
-                if let Some(outcome) = input.current().await {
+                if let Some(outcome) = pending_input!(cursor) {
                     return Ok(input_only_result(&turn, outcome, cursor, wait_started));
                 }
                 if matches!(outcome, WaitOutcome::Steered | WaitOutcome::MailboxActivity | WaitOutcome::DeferredCompletion) {
@@ -571,11 +643,17 @@ impl Handler {
                         next_cursor,
                         &mut input,
                         &cancellation_token,
+                        deadline,
                     )
                     .await
                     {
-                        BacklogPageRead::Page(Ok(page)) => page,
+                        BacklogPageRead::Page(Ok(page)) => {
+                            delivery_checkpoint!(cursor);
+                            page
+                        },
+                        BacklogPageRead::TimedOut => timed_out!(cursor),
                         BacklogPageRead::Page(Err(error)) => {
+                            delivery_checkpoint!(cursor);
                             tracing::debug!(
                                 %error,
                                 cursor = %next_cursor,
@@ -605,7 +683,7 @@ impl Handler {
                             "wait_agent cancelled".to_string(),
                         ));
                     }
-                    if let Some(activity) = input.current().await
+                    if let Some(activity) = pending_input!(cursor)
                     {
                         drain_outcome = activity;
                         break;
@@ -632,7 +710,7 @@ impl Handler {
                             "wait_agent cancelled".to_string(),
                         ));
                     }
-                    if let Some(activity) = input.current().await
+                    if let Some(activity) = pending_input!(cursor)
                     {
                         drain_outcome = activity;
                         break;
@@ -661,7 +739,7 @@ impl Handler {
                             "wait_agent cancelled".to_string(),
                         ));
                     }
-                    if let Some(activity) = input.current().await
+                    if let Some(activity) = pending_input!(cursor)
                     {
                         drain_outcome = activity;
                     } else if drain.internally_drained_pages() > 0 {
@@ -773,7 +851,7 @@ impl Handler {
                                 .record_internally_drained_waits(drained_event_pages);
                             return Ok(input_only_result(&turn, outcome, cursor, wait_started));
                         }
-                        _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {}
+                        _ = wait_until_deadline(deadline) => timed_out!(cursor),
                         _ = tokio::time::sleep(COMPLETION_MAIL_GRACE) => {}
                     }
                 }
@@ -782,7 +860,7 @@ impl Handler {
             turn.turn_timing_state
                 .record_internally_drained_waits(drained_event_pages);
             let mut typed_deltas = Vec::with_capacity(wake_read.updated_agents.len());
-            if let Some(outcome) = input.current().await {
+            if let Some(outcome) = pending_input!(cursor) {
                 return Ok(input_only_result(&turn, outcome, cursor, wait_started));
             }
             // Reuse the settled payload only behind a cross-connection fence.
@@ -871,7 +949,7 @@ impl Handler {
                     .map(|event_id| event_id.to_string()),
                 typed_deltas,
                 wake_read.truncated_count,
-                std::mem::take(&mut nudged_assignment_ids),
+                nudged_assignment_ids.clone(),
             );
             if outcome == WaitOutcome::MaintenanceActivity
                 && result.nudged_assignment_ids.is_empty()
@@ -933,27 +1011,10 @@ impl Handler {
                     },
                 );
             }
-            turn.session_telemetry.counter(
-                "codex.multi_agent.root_wait",
-                1,
-                &[(
-                    "outcome",
-                    match outcome {
-                        WaitOutcome::MailboxActivity => "mailbox",
-                        WaitOutcome::DeferredCompletion => "deferred_completion",
-                        WaitOutcome::DurableActivity => "durable_progress",
-                        WaitOutcome::MaintenanceActivity => "maintenance_activity",
-                        WaitOutcome::Steered => "steered",
-                        WaitOutcome::BoundaryElapsed => "boundary_elapsed",
-                        WaitOutcome::TimedOut => "timed_out",
-                    },
-                )],
-            );
-            turn.session_telemetry.histogram(
-                "codex.multi_agent.root_wait_duration_ms",
-                i64::try_from(wait_started.elapsed().as_millis()).unwrap_or(i64::MAX),
-                &[],
-            );
+            delivery_checkpoint!(cursor);
+            if deadline.is_none() {
+                record_delivered_wait(&turn, outcome, wait_started);
+            }
 
             // Finish every fallible hydration before acknowledgment. Retain the
             // exact prepared result before atomically publishing its cursor and
@@ -975,38 +1036,70 @@ impl Handler {
                     let retained = serde_json::to_value(&result).map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
                     // The cursor outlives tool-response delivery and history pruning.
                     // Retain its recovery chain under that durable owner before CAS.
-                    let artifact = crate::tools::command_output_artifact::create_durable_receipt_artifact(
-                        &turn.config.codex_home, &session.thread_id.to_string(),
-                        &codex_tools::CanonicalToolResult::json(retained),
-                    ).await;
-                    if !artifact.complete {
+                    let canonical = codex_tools::CanonicalToolResult::json(retained);
+                    let capture = PendingWakeArtifact::capture(&session, &turn.config.codex_home, canonical);
+                    let mut retained_artifact = if deadline.is_some() {
+                        before_delivery!(capture, cursor)
+                    } else {
+                        capture.await
+                    }.map_err(|error| FunctionCallError::RespondToModel(format!(
+                        "wait_agent delivery capture owner failed: {error}"
+                    )))?;
+                    if !retained_artifact.artifact.complete {
                         return Err(FunctionCallError::RespondToModel("wait_agent could not retain its delivery; cursor unchanged".to_string()));
                     }
-                    let artifact_id = artifact.artifact_id().ok_or_else(|| FunctionCallError::RespondToModel("wait_agent retained delivery has no identity".to_string()))?;
+                    let artifact_id = retained_artifact.artifact.artifact_id().ok_or_else(|| FunctionCallError::RespondToModel("wait_agent retained delivery has no identity".to_string()))?;
                     let receipt = json!({"cursor": result.cursor, "artifact_id": artifact_id, "thread_id": session.thread_id, "recovery_tool": "read_tool_output"});
-                    let published = store.publish_automatic_wake_delivery(root.to_string(), consuming_agent_path.clone(), cursor, next, receipt.to_string())
-                        .await.map_err(|error| task_store_context_error("wait_agent", "wait_agent could not publish its retained delivery", error))?;
-                    if !published {
-                        let home = turn.config.codex_home.clone();
-                        let thread_id = session.thread_id.to_string();
-                        if let Some(id) = artifact.id {
-                            // No await before transferring this confirmed loser's cleanup.
-                            // Errors/unknown CAS outcomes above deliberately retain custody.
-                            session.terminal_tasks.spawn(async move {
-                                crate::tools::command_output_artifact::release_unpublished_durable_receipt_artifact(
-                                    &home, &thread_id, id,
-                                ).await
-                            }).await
-                                .map_err(|error| FunctionCallError::RespondToModel(format!(
-                                    "wait_agent unpublished delivery cleanup owner failed: {error}"
-                                )))?
-                                .map_err(|error| FunctionCallError::RespondToModel(format!(
+                    let publish_error = |error| task_store_context_error(
+                        "wait_agent", "wait_agent could not publish its retained delivery", error,
+                    );
+                    let prepare = store.prepare_automatic_wake_delivery(
+                        root.to_string(), consuming_agent_path.clone(), cursor, next, receipt.to_string(),
+                    );
+                    let prepared = if deadline.is_some() {
+                        before_delivery!(prepare, cursor)
+                    } else {
+                        prepare.await
+                    }.map_err(publish_error)?;
+                    // No await before handing off the admitted commit. The
+                    // tracked owner settles custody even if the handler is
+                    // aborted: committed or ambiguous results stay protected;
+                    // only a confirmed CAS loser can be released.
+                    let home = turn.config.codex_home.clone();
+                    let thread_id = session.thread_id.to_string();
+                    let published = session.terminal_tasks.spawn(async move {
+                        retained_artifact.retain();
+                        let published = prepared.commit().await.map_err(publish_error)?;
+                        if !published
+                            && let Some(id) = retained_artifact.artifact.id
+                        {
+                            crate::tools::command_output_artifact::release_unpublished_durable_receipt_artifact(
+                                &home, &thread_id, id,
+                            ).await.map_err(|error| {
+                                tracing::warn!(%error, "wait_agent unpublished delivery cleanup failed");
+                                FunctionCallError::RespondToModel(format!(
                                     "wait_agent unpublished delivery cleanup failed: {error}"
-                                )))?;
+                                ))
+                            })?;
                         }
+                        Ok::<_, FunctionCallError>(published)
+                    }).await.map_err(|error| FunctionCallError::RespondToModel(format!(
+                        "wait_agent delivery commit owner failed: {error}"
+                    )))??;
+                    if !published {
                         return Err(FunctionCallError::RespondToModel("wait_agent concurrent consumer advanced the cursor; call wait_agent again to recover its retained delivery".to_string()));
                     }
+                    if deadline.is_some() {
+                        record_delivered_wait(&turn, outcome, wait_started);
+                    }
+                    // The cursor and recovery pointer committed together. Do
+                    // not turn a committed result into a timeout or cancel it.
+                    return Ok(result);
                 }
+            }
+            delivery_checkpoint!(cursor);
+            if deadline.is_some() {
+                record_delivered_wait(&turn, outcome, wait_started);
             }
             Ok(result)
         }
@@ -1014,7 +1107,8 @@ impl Handler {
 
         let mut receivers = WaitReceivers::default();
         if let Ok(result) = &mut result {
-            // Only an input-only exit leaves nudges here; a delivered result took them.
+            // Input-only exits, including timeout during delivery preparation,
+            // may not yet carry the nudges already sent during maintenance.
             if !nudged_assignment_ids.is_empty() && result.nudged_assignment_ids.is_empty() {
                 result
                     .message
@@ -1069,6 +1163,121 @@ impl Handler {
 
         result.map(boxed_tool_output)
     }
+}
+
+// A wait may stop observing capture while artifact I/O is still in
+// progress. Keep a guard in the tracked producer and its returned value so
+// a deadline or forced abort cannot strand an unpublished artifact.
+struct PendingWakeArtifact {
+    artifact: crate::tools::command_output_artifact::CanonicalOutputArtifact,
+    cleanup: Option<(tokio_util::task::TaskTracker, std::path::PathBuf, String)>,
+}
+
+impl PendingWakeArtifact {
+    async fn capture(
+        session: &crate::session::session::Session,
+        home: &std::path::Path,
+        canonical: codex_tools::CanonicalToolResult,
+    ) -> Result<Self, tokio::sync::oneshot::error::RecvError> {
+        let tracker = session.terminal_tasks.clone();
+        let home = home.to_path_buf();
+        let thread_id = session.thread_id.to_string();
+        let (captured, receipt) = tokio::sync::oneshot::channel();
+        session.terminal_tasks.spawn(async move {
+            let artifact = crate::tools::command_output_artifact::create_durable_receipt_artifact(
+                &home, &thread_id, &canonical,
+            ).await;
+            // If the receiver is gone, drop the guard before this producer
+            // leaves the tracker so shutdown also owns the cleanup.
+            let _ = captured.send(Self { artifact, cleanup: Some((tracker, home, thread_id)) });
+        });
+        receipt.await
+    }
+
+    fn retain(&mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl Drop for PendingWakeArtifact {
+    fn drop(&mut self) {
+        if !self.artifact.complete {
+            return;
+        }
+        if let Some((tracker, home, thread_id)) = self.cleanup.take()
+            && let Some(id) = self.artifact.id
+        {
+            tracker.spawn(async move {
+                if let Err(error) = crate::tools::command_output_artifact::release_unpublished_durable_receipt_artifact(
+                    &home, &thread_id, id,
+                ).await {
+                    tracing::warn!(%error, "wait_agent abandoned delivery cleanup failed");
+                }
+            });
+        }
+    }
+}
+
+const SELECTED_WAIT_MESSAGE: &str =
+    "Selected-child wait ended; terminal outcomes are not deliverable acceptance.";
+
+fn wait_cancelled() -> FunctionCallError {
+    FunctionCallError::RespondToModel("wait_agent cancelled".to_string())
+}
+
+fn unopened_wait_result(
+    turn: &crate::session::turn_context::TurnContext,
+    args: &WaitArgs,
+    cursor: Option<WakeEventId>,
+    started: Instant,
+    reason: &'static str,
+) -> Result<WaitAgentResult, FunctionCallError> {
+    if let Some(targets) = &args.targets {
+        return Ok(WaitAgentResult {
+            message: SELECTED_WAIT_MESSAGE.into(),
+            timed_out: reason == "timed_out",
+            completion: Some(json!({
+                "reason": reason,
+                "mode": args.completion_mode.unwrap_or_default(),
+                "outcomes": [],
+                "unresolved_targets": targets,
+                "acceptance": "not_evaluated",
+            })),
+            ..Default::default()
+        });
+    }
+    if reason == "cancelled" {
+        return Err(wait_cancelled());
+    }
+    Ok(input_only_result(turn, WaitOutcome::TimedOut, cursor, started))
+}
+
+fn record_delivered_wait(
+    turn: &crate::session::turn_context::TurnContext,
+    outcome: WaitOutcome,
+    wait_started: Instant,
+) {
+    turn.session_telemetry.counter(
+        "codex.multi_agent.root_wait",
+        1,
+        &[(
+            "outcome",
+            match outcome {
+                WaitOutcome::MailboxActivity => "mailbox",
+                WaitOutcome::DeferredCompletion => "deferred_completion",
+                WaitOutcome::DurableActivity => "durable_progress",
+                WaitOutcome::MaintenanceActivity => "maintenance_activity",
+                WaitOutcome::Steered => "steered",
+                WaitOutcome::BoundaryElapsed => "boundary_elapsed",
+                WaitOutcome::TimedOut => "timed_out",
+            },
+        )],
+    );
+    turn.session_telemetry.histogram(
+        "codex.multi_agent.root_wait_duration_ms",
+        i64::try_from(wait_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        &[],
+    );
 }
 
 fn durable_receipt_pointer(assignment_id: String, available: bool) -> JsonValue {
@@ -1401,6 +1610,7 @@ enum BacklogPageRead {
     Page(codex_agent_task_store::StoreResult<WakeRead>),
     Activity(WaitOutcome),
     Cancelled,
+    TimedOut,
 }
 
 async fn read_next_wake_page(
@@ -1409,11 +1619,19 @@ async fn read_next_wake_page(
     cursor: WakeEventId,
     input: &mut AgentWaitInput<'_>,
     cancellation_token: &CancellationToken,
+    deadline: Option<Instant>,
 ) -> BacklogPageRead {
     tokio::select! {
         biased;
         _ = cancellation_token.cancelled() => BacklogPageRead::Cancelled,
-        outcome = input.next() => BacklogPageRead::Activity(outcome),
+        outcome = input.next() => {
+            if deadline_elapsed(deadline) {
+                BacklogPageRead::TimedOut
+            } else {
+                BacklogPageRead::Activity(outcome)
+            }
+        },
+        _ = wait_until_deadline(deadline) => BacklogPageRead::TimedOut,
         page = store.read_wake_events(root_session_id.to_string(), Some(cursor)) => BacklogPageRead::Page(page),
     }
 }
@@ -2057,9 +2275,10 @@ async fn nudge_stalled_assignments(
     store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
     turn_state: Option<&tokio::sync::Mutex<crate::state::TurnState>>,
-) -> Vec<String> {
+    nudged: &mut Vec<String>,
+) -> bool {
     let (Some(store), Some(root_session_id)) = (store, root_session_id) else {
-        return Vec::new();
+        return false;
     };
     if let Err(error) = session
         .services
@@ -2078,11 +2297,11 @@ async fn nudge_stalled_assignments(
         .list_agent_task_bindings(root_session_id.to_string(), None)
         .await
     else {
-        return Vec::new();
+        return false;
     };
     let no_progress_before = chrono::Utc::now()
         - chrono::Duration::seconds(codex_agent_task_store::DEFAULT_WORKSPACE_LEASE_SECONDS);
-    let mut nudged = Vec::new();
+    let mut fresh_nudge = false;
     for binding in bindings {
         if session
             .input_queue
@@ -2213,12 +2432,16 @@ async fn nudge_stalled_assignments(
             .await
             .is_ok()
         {
-            nudged.push(binding.assignment_id.to_string());
+            fresh_nudge = true;
+            let assignment_id = binding.assignment_id.to_string();
+            if !nudged.contains(&assignment_id) {
+                nudged.push(assignment_id);
+            }
         } else {
             release_undelivered_nudge().await;
         }
     }
-    nudged
+    fresh_nudge
 }
 
 fn stalled_assignment_nudge(author: AgentPath, recipient: AgentPath) -> InterAgentCommunication {
@@ -2291,6 +2514,18 @@ enum WaitOutcome {
     TimedOut,
 }
 
+fn deadline_elapsed(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+async fn wait_until_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) if Instant::now() < deadline => tokio::time::sleep_until(deadline).await,
+        Some(_) => {}
+        None => std::future::pending().await,
+    }
+}
+
 fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
     match (first, second) {
         (Some(first), Some(second)) => Some(std::cmp::min(first, second)),
@@ -2342,51 +2577,49 @@ async fn wait_wake_events(
 // every wake source participating in this private wait state machine.
 async fn wait_for_activity(
     input: &mut AgentWaitInput<'_>,
-    boundary_deadline: Option<Instant>,
+    deadline: Option<Instant>,
+    maintenance_deadline: Option<Instant>,
     store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
     cursor: Option<WakeEventId>,
 ) -> codex_agent_task_store::StoreResult<(WaitOutcome, WakeRead)> {
-    if let Some(outcome) = input.current().await {
+    let timed_out = || Ok((WaitOutcome::TimedOut, input_only_read(cursor)));
+    let activity = if deadline.is_some() {
+        tokio::select! {
+            biased;
+            _ = wait_until_deadline(deadline) => return timed_out(),
+            activity = input.current() => activity,
+        }
+    } else {
+        input.current().await
+    };
+    if let Some(outcome) = activity {
         return Ok((outcome, input_only_read(cursor)));
     }
-    if boundary_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        return tokio::select! {
+    if !deadline_elapsed(maintenance_deadline) {
+        tokio::select! {
             biased;
-            outcome = input.next() => Ok((outcome, input_only_read(cursor))),
-            current = read_wake_events(store, root_session_id, cursor) => {
-                let current = current?;
-                Ok(if current.updated_agents.is_empty() {
-                    (WaitOutcome::BoundaryElapsed, current)
-                } else {
-                    (WaitOutcome::DurableActivity, current)
-                })
-            }
-        };
-    }
-    let boundary = async {
-        match boundary_deadline {
-            Some(deadline) => tokio::time::sleep_until(deadline).await,
-            None => std::future::pending::<()>().await,
+            outcome = input.next() => return Ok((outcome, input_only_read(cursor))),
+            _ = wait_until_deadline(deadline) => return timed_out(),
+            durable = wait_wake_events(store, root_session_id, cursor) => {
+                return Ok((WaitOutcome::DurableActivity, durable?));
+            },
+            _ = wait_until_deadline(maintenance_deadline) => {},
         }
-    };
+    }
+    // Maintenance may sample the stream. The caller's absolute deadline may
+    // not: a final read or hydration could block beyond it.
     tokio::select! {
         biased;
         outcome = input.next() => Ok((outcome, input_only_read(cursor))),
-        durable = wait_wake_events(store, root_session_id, cursor) => Ok((WaitOutcome::DurableActivity, durable?)),
-        _ = boundary => {
-            tokio::select! {
-                biased;
-                outcome = input.next() => Ok((outcome, input_only_read(cursor))),
-                current = read_wake_events(store, root_session_id, cursor) => {
-                    let current = current?;
-                    Ok(if current.updated_agents.is_empty() {
-                        (WaitOutcome::BoundaryElapsed, current)
-                    } else {
-                        (WaitOutcome::DurableActivity, current)
-                    })
-                }
-            }
-        }
+        _ = wait_until_deadline(deadline) => timed_out(),
+        current = read_wake_events(store, root_session_id, cursor) => {
+            let current = current?;
+            Ok(if current.updated_agents.is_empty() {
+                (WaitOutcome::BoundaryElapsed, current)
+            } else {
+                (WaitOutcome::DurableActivity, current)
+            })
+        },
     }
 }

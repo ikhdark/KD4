@@ -77,7 +77,7 @@ impl ToolExecutor<ToolCall> for ListTool {
     fn spec(&self) -> ToolSpec {
         skill_function_tool::<ListArgs, ListResponse>(
             TOOL_NAME,
-            "List a page of enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Use name for an exact name or query for a substring search (not both, at most 256 bytes). search_complete=false means no-match is not definitive. discovery_blocked=true means this bounded attempt encountered repeated pagination, not a permanent block; known skills remain readable. Returns opaque package and main-resource handles for skills.read. Pass next_cursor back as cursor with the same filters to continue or retry incomplete discovery; restart from the first page if stale. An explicit first-page request retries failed discovery. Reuse a completed enumeration only with the same catalog generation, filters, authority, and access scope.",
+            "List a page of enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Use name for an exact name or query for a substring search (not both, at most 256 bytes). search_complete=false means no-match is not definitive, even without a next_cursor if discovery skipped malformed records. discovery_blocked=true means this bounded attempt encountered repeated pagination, not a permanent block; known skills remain readable. Returns opaque package and main-resource handles for skills.read. Pass next_cursor back as cursor with the same filters to continue or retry incomplete discovery; restart from the first page if stale. An explicit first-page request retries failed discovery. Reuse a completed enumeration only with the same catalog generation, filters, authority, and access scope.",
         )
     }
 
@@ -142,8 +142,9 @@ impl ToolExecutor<ToolCall> for ListTool {
                 }
             }
             let incomplete = catalog.continuation.is_some();
-            // Warnings can represent failed provider discovery; never turn
-            // that absence into a definitive targeted-search miss.
+            // A finished traversal can still have skipped malformed records
+            // earlier in this generation. Use all warnings, before output limits,
+            // so that neither omitted records nor failed discovery imply a definitive miss.
             let search_complete = search.then_some(
                 !incomplete
                     && catalog.warnings.is_empty()

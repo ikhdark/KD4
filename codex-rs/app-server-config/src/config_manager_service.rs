@@ -426,12 +426,14 @@ impl ConfigManager {
         let manager = self.clone();
         let observation = codex_protocol::timing::client_probe::instance();
         codex_protocol::timing::client_probe::record(710, observation, 0, 0, 0, [0; 4]);
-        // Keep policy publication fenced through the existing locked writer.
-        // This synchronous guard lives on the blocking owner, never across an
-        // async suspension or on the RPC caller's cancellation lifetime.
+        // Acquire the file lock and prepare the edit without holding the policy
+        // or auth read fence. Recheck the epoch before committing, with the file
+        // lock still held, so a policy change during staging cannot authorize it.
         let committed_config = tokio::task::spawn_blocking(move || {
             codex_protocol::timing::client_probe::record(711, observation, 0, 0, 0, [0; 4]);
-            manager.with_current_policy(policy_generation, || builder.apply_blocking_with_config())
+            manager.with_current_policy(policy_generation, || ())?;
+            let prepared = builder.prepare_blocking_with_config();
+            manager.with_current_policy(policy_generation, || prepared.and_then(|commit| commit()))
         })
             .await
             .map_err(|err| ConfigManagerError::io("config persistence task failed", std::io::Error::other(err)))?

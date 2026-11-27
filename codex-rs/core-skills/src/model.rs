@@ -16,6 +16,8 @@ use codex_utils_path_uri::PathUri;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::root_loader::InstallationReadLease;
+
 const SKILL_CATALOG_ID_DOMAIN: &[u8] = b"codex.skill-catalog-id.v1";
 pub const SKILL_CATALOG_LOCATOR_PREFIX: &str = "skill:";
 
@@ -113,6 +115,8 @@ pub struct SkillLoadOutcome {
     pub(crate) skill_root_by_path: Arc<HashMap<AbsolutePathBuf, AbsolutePathBuf>>,
     pub(crate) file_systems_by_skill_path: SkillFileSystemsByPath,
     pub(crate) plugin_installations: Option<crate::PluginSkillSnapshots>,
+    /// Partial discovery must be returned to the caller but not memoized as complete.
+    pub(crate) has_retryable_read_failures: bool,
     /// The turn's filesystem authority that discovered repository-scoped skills;
     /// reads of those skills stay under it. Host-owned scopes are unaffected.
     pub(crate) repository_sandbox: Option<codex_exec_server::FileSystemSandboxContext>,
@@ -144,18 +148,20 @@ impl SkillLoadOutcome {
             .map(|skill| (skill, self.is_skill_enabled(skill)))
     }
 
-    pub(crate) fn acquire_skill_read_lease(
+    async fn acquire_skill_read_lease(
         &self,
         skill: &SkillMetadata,
-    ) -> io::Result<Option<Box<dyn Send + Sync>>> {
+    ) -> io::Result<Option<InstallationReadLease>> {
         match (&self.plugin_installations, skill.plugin_id.as_deref()) {
-            (Some(installations), Some(plugin_id)) => installations.read_guard_for_plugin(plugin_id),
+            (Some(installations), Some(plugin_id)) => {
+                installations.read_guard_for_plugin(plugin_id).await
+            }
             _ => Ok(None),
         }
     }
 
     pub(crate) async fn read_skill_text(&self, skill: &SkillMetadata) -> io::Result<String> {
-        let _installation_read = self.acquire_skill_read_lease(skill)?;
+        let _installation_read = self.acquire_skill_read_lease(skill).await?;
         let fs = self.file_system_for_skill(skill).unwrap_or_else(|| Arc::clone(&LOCAL_FS));
         let path = PathUri::from_abs_path(&skill.path_to_skills_md);
         fs.read_file_text(&path, self.sandbox_for_skill(skill)).await
@@ -166,7 +172,7 @@ impl SkillLoadOutcome {
         skill: &SkillMetadata,
         max_bytes: usize,
     ) -> io::Result<String> {
-        let _installation_read = self.acquire_skill_read_lease(skill)?;
+        let _installation_read = self.acquire_skill_read_lease(skill).await?;
         let fs = self.file_system_for_skill(skill).unwrap_or_else(|| Arc::clone(&LOCAL_FS));
         let path = PathUri::from_abs_path(&skill.path_to_skills_md);
         fs.read_file_text_prefix(&path, max_bytes, self.sandbox_for_skill(skill)).await
@@ -251,7 +257,7 @@ impl HostSkillsSnapshot {
         skill: &SkillMetadata,
         max_bytes: usize,
     ) -> io::Result<(String, AbsolutePathBuf)> {
-        let _installation_read = self.outcome.acquire_skill_read_lease(skill)?;
+        let _installation_read = self.outcome.acquire_skill_read_lease(skill).await?;
         let fs = self
             .outcome
             .file_system_for_skill(skill)

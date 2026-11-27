@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -189,6 +190,8 @@ pub struct TurnTimingState {
     live_phase: StdMutex<LiveTurnPhase>,
     clock: SystemTurnClock,
     state: StdMutex<TurnTimingStateInner>,
+    /// The existing observation scope, published at binding for queued producers.
+    queued_observation_scope: OnceLock<String>,
     relay_queue_depth: AtomicU32,
     parallel_gate_waiter_count: AtomicU32,
     sampling_gate_waiter_count: AtomicU32,
@@ -2174,6 +2177,7 @@ impl TurnTimingState {
             live_phase: Default::default(),
             clock,
             state: StdMutex::new(TurnTimingStateInner::default()),
+            queued_observation_scope: OnceLock::new(),
             relay_queue_depth: AtomicU32::new(0),
             parallel_gate_waiter_count: AtomicU32::new(0),
             sampling_gate_waiter_count: AtomicU32::new(0),

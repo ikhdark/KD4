@@ -11,6 +11,7 @@ use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout_at;
 
+use super::ActiveProcessStart;
 use super::ConnectionStatus;
 use super::ExecServerClient;
 use super::ExecServerError;
@@ -486,19 +487,24 @@ impl Inner {
         }
     }
 
-    pub(super) fn begin_process_start(&self, expected: &Arc<RpcClient>) -> bool {
+    pub(super) fn begin_process_start(
+        self: &Arc<Self>,
+        expected: &Arc<RpcClient>,
+    ) -> Option<ActiveProcessStart> {
         let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ConnectionStatus::Connected(current) = &connection.status else {
-            return false;
+            return None;
         };
         if !Arc::ptr_eq(current, expected) || expected.is_disconnected() {
-            return false;
+            return None;
         }
         connection.active_process_starts += 1;
-        true
+        Some(ActiveProcessStart {
+            inner: Arc::clone(self),
+        })
     }
 
     pub(super) fn finish_process_start(&self) {

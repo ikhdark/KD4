@@ -161,8 +161,12 @@ pub(crate) async fn reserve_policy(
             let (selection, command, cwd) = (selection.clone(), command.to_vec(), cwd.to_path_buf());
             if let Ok(Some((named, current))) = tokio::task::spawn_blocking(move || {
                 let cwd = codex_command_analysis::validation::compilation_cargo_cwd(&command, &cwd)?;
-                let (manifests, roots) = codex_command_analysis::command_preflight::compilation_sources(&selection, &cwd)?;
-                crate::git_workspace::compilation_rust_inputs(manifests, roots)
+                let sources = codex_command_analysis::command_preflight::compilation_sources(&selection, &cwd)?;
+                if sources.target_enumeration_errors != 0 {
+                    tracing::debug!(errors = sources.target_enumeration_errors,
+                        "Cargo repair input enumeration incomplete; retaining only observed source evidence");
+                }
+                crate::git_workspace::compilation_rust_inputs(sources.manifests, sources.roots)
             }).await {
                 paths = named;
                 fingerprints = current;

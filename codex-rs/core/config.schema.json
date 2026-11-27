@@ -1844,6 +1844,7 @@
           "type": "array"
         },
         "experimental_use_profile": {
+          "description": "Deprecated and ignored. Login-shell behavior is controlled by `allow_login_shell` and the command's `login` option.",
           "type": "boolean"
         },
         "ignore_default_excludes": {

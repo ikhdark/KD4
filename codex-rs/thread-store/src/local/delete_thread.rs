@@ -65,17 +65,22 @@ fn auxiliary_owners(
     Ok(owners)
 }
 
+const STORAGE_RETIRED_MARKER: &[u8] = b"KD4_THREAD_STORAGE_RETIRED_V1\n";
+
+fn storage_retired_marker_path(home: &Path, id: codex_protocol::ThreadId) -> PathBuf {
+    home.join("tool-history").join(format!("{id}.retired"))
+}
+
 fn mark_storage_retired(home: &Path, id: codex_protocol::ThreadId) -> std::io::Result<()> {
-    let directory = home.join("tool-history");
-    std::fs::create_dir_all(&directory)?;
-    let path = directory.join(format!("{id}.retired"));
+    std::fs::create_dir_all(home.join("tool-history"))?;
+    let path = storage_retired_marker_path(home, id);
     match std::fs::File::options()
         .write(true)
         .create_new(true)
         .open(&path)
     {
         Ok(mut file) => {
-            std::io::Write::write_all(&mut file, b"KD4_THREAD_STORAGE_RETIRED_V1\n")?;
+            std::io::Write::write_all(&mut file, STORAGE_RETIRED_MARKER)?;
             file.sync_all()
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -102,6 +107,145 @@ fn retire_auxiliary_storage(home: &Path, id: codex_protocol::ThreadId) -> std::i
 }
 
 const AUXILIARY_RETIREMENT_PENDING: &str = ".auxiliary-retirement.pending";
+const SQLITE_BACKED_STAGING: &str = "sqlite-backed";
+const SQLITE_LESS_STAGING: &str = "sqlite-less";
+const COMMITTED_STAGING: &str = "committed";
+const STAGING_KINDS: [&str; 5] = [
+    "indexed",
+    "unindexed",
+    SQLITE_BACKED_STAGING,
+    SQLITE_LESS_STAGING,
+    COMMITTED_STAGING,
+];
+
+async fn staging_marker_metadata(path: &Path) -> ThreadStoreResult<Option<std::fs::Metadata>> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
+        Ok(_) => Err(delete_recovery_error(
+            "invalid staging marker; files retained",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(delete_recovery_error(error)),
+    }
+}
+
+async fn has_storage_retired_marker(
+    home: &Path,
+    id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<bool> {
+    use tokio::io::AsyncReadExt;
+
+    let path = storage_retired_marker_path(home, id);
+    let Some(metadata) = staging_marker_metadata(&path).await? else {
+        return Ok(false);
+    };
+    let canonical_home = tokio::fs::canonicalize(home)
+        .await
+        .map_err(delete_recovery_error)?;
+    if metadata.len() != STORAGE_RETIRED_MARKER.len() as u64
+        || tokio::fs::canonicalize(&path)
+            .await
+            .map_err(delete_recovery_error)?
+            != storage_retired_marker_path(&canonical_home, id)
+    {
+        return Err(delete_recovery_error(
+            "invalid retired storage marker; files retained",
+        ));
+    }
+    let mut contents = Vec::new();
+    tokio::fs::File::open(path)
+        .await
+        .map_err(delete_recovery_error)?
+        .take(STORAGE_RETIRED_MARKER.len() as u64 + 1)
+        .read_to_end(&mut contents)
+        .await
+        .map_err(delete_recovery_error)?;
+    if contents != STORAGE_RETIRED_MARKER {
+        return Err(delete_recovery_error(
+            "invalid retired storage marker; files retained",
+        ));
+    }
+    Ok(true)
+}
+
+async fn require_sqlite_absent(store: &LocalThreadStore) -> ThreadStoreResult<()> {
+    let path = codex_state::state_db_path(&store.config.sqlite_home);
+    match tokio::fs::symlink_metadata(&path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(delete_recovery_error(error)),
+        Ok(_) => Err(delete_recovery_error(
+            "state database exists but is unavailable; staged files retained",
+        )),
+    }
+}
+
+async fn should_restore_staged_delete(
+    store: &LocalThreadStore,
+    kind: &str,
+    root: &Path,
+    id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<bool> {
+    if kind == COMMITTED_STAGING {
+        return Ok(false);
+    }
+    if let Some(db) = &store.state_db
+        && db
+            .is_thread_owner_deleted(id)
+            .await
+            .map_err(delete_recovery_error)?
+    {
+        return Ok(false);
+    }
+    if has_storage_retired_marker(&store.config.codex_home, id).await? {
+        return Ok(false);
+    }
+    if kind == SQLITE_LESS_STAGING {
+        if store.state_db.is_none() {
+            require_sqlite_absent(store).await?;
+        }
+        return Ok(true);
+    }
+    if kind != SQLITE_BACKED_STAGING {
+        let mut entries = tokio::fs::read_dir(root).await.map_err(delete_recovery_error)?;
+        if entries.next_entry().await.map_err(delete_recovery_error)?.is_none() {
+            // A previous cleanup can stop after discarding its last artifact
+            // but before removing the empty per-thread directory.
+            return Ok(true);
+        }
+    }
+    let db = store.state_db.as_ref().ok_or_else(|| {
+        delete_recovery_error(
+            "staged deletion recovery requires its state database; staged files retained",
+        )
+    })?;
+    if kind == SQLITE_BACKED_STAGING {
+        return Ok(true);
+    }
+    // Both legacy directory names predate the transactional tombstone. The
+    // pending-retirement file was introduced with it, and identifies a stage
+    // for which a successful tombstone read can prove the delete never committed.
+    let pending = staging_marker_metadata(&root.join(AUXILIARY_RETIREMENT_PENDING)).await?;
+    if let Some(pending) = pending {
+        if pending.len() != 0 {
+            return Err(delete_recovery_error(
+                "invalid pending retirement marker; files retained",
+            ));
+        }
+        return Ok(true);
+    }
+    if kind == "indexed"
+        && db
+            .get_thread(id)
+            .await
+            .map_err(delete_recovery_error)?
+            .is_some()
+    {
+        return Ok(true);
+    }
+    Err(delete_recovery_error(
+        "legacy deletion has no commit or rollback witness; staged files retained",
+    ))
+}
 
 pub(super) fn delete_recovery_error(error: impl std::fmt::Display) -> ThreadStoreError {
     ThreadStoreError::Internal {
@@ -179,7 +323,7 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
             let known = if name == ".owner" {
                 kind.is_file()
             } else {
-                (name == "indexed" || name == "unindexed" || name == "committed") && kind.is_dir()
+                kind.is_dir() && STAGING_KINDS.iter().any(|known| name == *known)
             };
             if !known {
                 return Err(delete_recovery_error(
@@ -188,7 +332,7 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
             }
         }
         let mut decisions = Vec::new();
-        for kind in ["indexed", "unindexed", "committed"] {
+        for kind in STAGING_KINDS {
             let root = directory.join(kind);
             let entries = match tokio::fs::read_dir(&root).await {
                 Ok(entries) => entries,
@@ -213,22 +357,9 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                 let id =
                     codex_protocol::ThreadId::from_string(&entry.file_name().to_string_lossy())
                         .map_err(delete_recovery_error)?;
-                let restore = match kind {
-                    "indexed" => {
-                        let db = store.state_db.as_ref().ok_or_else(|| delete_recovery_error(
-                            "indexed deletion recovery requires its state database; staged files retained"))?;
-                        db.get_thread(id)
-                            .await
-                            .map_err(delete_recovery_error)?
-                            .is_some()
-                    }
-                    "unindexed" => {
-                        let marker = store.config.codex_home.join("tool-history").join(format!("{id}.retired"));
-                        !tokio::fs::try_exists(marker.as_path()).await.map_err(delete_recovery_error)?
-                    }
-                    _ => false,
-                };
-                decisions.push((entry.path(), id, restore));
+                let root = entry.path();
+                let restore = should_restore_staged_delete(store, kind, &root, id).await?;
+                decisions.push((root, id, restore));
             }
         }
         let home = store.config.codex_home.clone();
@@ -250,6 +381,7 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                 if !restore { mark_storage_retired(&home, id).map_err(delete_recovery_error)?; }
                 let mut directories = vec![root.clone()];
                 let mut empty_directories = Vec::new();
+                let mut pending_retirement = None;
                 while let Some(parent) = directories.pop() {
                     empty_directories.push(parent.clone());
                     for entry in std::fs::read_dir(parent).map_err(delete_recovery_error)? {
@@ -265,7 +397,7 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                         let relative = path.strip_prefix(&root).map_err(delete_recovery_error)?;
                         if relative == Path::new(AUXILIARY_RETIREMENT_PENDING) {
                             if !restore { retire_auxiliary_storage(&home, id).map_err(delete_recovery_error)?; }
-                            std::fs::remove_file(&path).map_err(delete_recovery_error)?;
+                            pending_retirement = Some(path);
                             continue;
                         }
                         let first = relative.components().next().ok_or_else(|| delete_recovery_error("empty staged identity"))?;
@@ -299,12 +431,19 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                     }
                 }
                 for directory in empty_directories.into_iter().rev() {
+                    // Keep the legacy rollback witness until the last staged
+                    // rollout was restored, including across a second crash.
+                    if directory == root
+                        && let Some(path) = &pending_retirement
+                    {
+                        std::fs::remove_file(path).map_err(delete_recovery_error)?;
+                    }
                     std::fs::remove_dir(directory).map_err(delete_recovery_error)?;
                 }
             }
             // Remove only directories proven empty. Never recursively erase
             // unknown evidence or files added while recovery was in progress.
-            for kind in ["indexed", "unindexed", "committed"] {
+            for kind in STAGING_KINDS {
                 match std::fs::remove_dir(directory.join(kind)) {
                     Ok(()) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -410,12 +549,12 @@ impl StagedThreadDelete<'_> {
                 return custody;
             };
             let staging = files.staging_dir.as_ref().map(|directory| directory.path().to_path_buf());
-            // SQLite is the commit witness for indexed threads. For SQLite-less
-            // files, move the existing staging subtree to its committed name.
+            // The primary transaction witnesses all SQLite-backed threads,
+            // including absent rows. Only a filesystem-owned batch needs a rename.
             if let Some(directory) = staging.as_ref() {
-                let pending = directory.join("unindexed");
+                let pending = directory.join(SQLITE_LESS_STAGING);
                 if pending.exists()
-                    && let Err(err) = std::fs::rename(&pending, directory.join("committed"))
+                    && let Err(err) = std::fs::rename(&pending, directory.join(COMMITTED_STAGING))
                 {
                     tracing::warn!(%err, "failed to mark SQLite-less staged deletion committed");
                 }
@@ -425,7 +564,7 @@ impl StagedThreadDelete<'_> {
                 let result = mark_storage_retired(&home, id)
                     .and_then(|()| retire_auxiliary_storage(&home, id)).and_then(|()| {
                     if let Some(directory) = &staging {
-                        for kind in ["indexed", "unindexed", "committed"] {
+                        for kind in STAGING_KINDS {
                             let pending = directory.join(kind).join(id.to_string()).join(AUXILIARY_RETIREMENT_PENDING);
                             match std::fs::remove_file(pending) {
                                 Ok(()) => {}
@@ -560,6 +699,23 @@ impl Drop for StagedRolloutFiles {
     }
 }
 
+#[derive(Clone)]
+struct RollbackStagingRetry {
+    deadline: tokio::time::Instant,
+    conflict_message: String,
+}
+
+fn check_rollback_staging_cutoff(retry: Option<&RollbackStagingRetry>) -> ThreadStoreResult<()> {
+    if let Some(retry) = retry
+        && tokio::time::Instant::now() >= retry.deadline
+    {
+        return Err(ThreadStoreError::Conflict {
+            message: retry.conflict_message.clone(),
+        });
+    }
+    Ok(())
+}
+
 pub(super) async fn rollback_created_thread(
     store: &LocalThreadStore,
     thread_id: codex_protocol::ThreadId,
@@ -579,12 +735,16 @@ pub(super) async fn rollback_created_thread(
         // guards before sleeping; the existing owned task retains cleanup if
         // the request stops waiting.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            match stage_thread_deletes(&store, &[thread_id]).await {
-                Ok(staged) => return commit_thread_delete(staged, thread_id).await,
-                Err(ThreadStoreError::Conflict { .. })
-                    if tokio::time::Instant::now() < deadline =>
-                {
+        let mut retry = None;
+        let staged = loop {
+            match stage_thread_deletes_inner(&store, &[thread_id], None, retry.clone()).await {
+                Ok(staged) => break staged,
+                Err(ThreadStoreError::Conflict { message }) => {
+                    let retry = retry.get_or_insert(RollbackStagingRetry {
+                        deadline,
+                        conflict_message: message,
+                    });
+                    check_rollback_staging_cutoff(Some(retry))?;
                     tokio::time::sleep_until(
                         deadline.min(
                             tokio::time::Instant::now() + std::time::Duration::from_millis(25),
@@ -594,7 +754,8 @@ pub(super) async fn rollback_created_thread(
                 }
                 Err(error) => return Err(error),
             }
-        }
+        };
+        commit_thread_delete(staged, thread_id).await
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
@@ -657,14 +818,16 @@ pub(super) async fn stage_thread_deletes<'a>(
     store: &'a LocalThreadStore,
     thread_ids: &[codex_protocol::ThreadId],
 ) -> ThreadStoreResult<StagedThreadDelete<'a>> {
-    stage_thread_deletes_inner(store, thread_ids, None).await
+    stage_thread_deletes_inner(store, thread_ids, None, None).await
 }
 
 async fn stage_thread_deletes_inner<'a>(
     store: &'a LocalThreadStore,
     thread_ids: &[codex_protocol::ThreadId],
     archive_cutoff: Option<i64>,
+    rollback_retry: Option<RollbackStagingRetry>,
 ) -> ThreadStoreResult<StagedThreadDelete<'a>> {
+    check_rollback_staging_cutoff(rollback_retry.as_ref())?;
     // Retry recovery even if initialization skipped a then-live owner.
     if !recover_staged_deletes(store).await? {
         return Err(ThreadStoreError::Conflict {
@@ -730,6 +893,14 @@ async fn stage_thread_deletes_inner<'a>(
     } else {
         (moves, recorder_pauses, writer_leases)
     };
+    let staging_kind = if store.state_db.is_some() {
+        SQLITE_BACKED_STAGING
+    } else {
+        // No handle may mean that initialization failed, not that this home
+        // has no SQLite owner. Never stage a filesystem-only deletion then.
+        require_sqlite_absent(store).await?;
+        SQLITE_LESS_STAGING
+    };
     let mut found_thread_ids = Vec::new();
     let mut candidates = Vec::new();
     let mut auxiliary_threads = Vec::new();
@@ -753,10 +924,11 @@ async fn stage_thread_deletes_inner<'a>(
             false
         };
         if !paths.is_empty() || indexed {
-            auxiliary_threads.push((*thread_id, indexed));
+            auxiliary_threads.push(*thread_id);
         }
-        candidates.extend(paths.into_iter().map(|path| (*thread_id, indexed, path)));
+        candidates.extend(paths.into_iter().map(|path| (*thread_id, path)));
     }
+    check_rollback_staging_cutoff(rollback_retry.as_ref())?;
     let codex_home = store.config.codex_home.clone();
     let runtime = tokio::runtime::Handle::current();
     let files =
@@ -774,9 +946,11 @@ async fn stage_thread_deletes_inner<'a>(
                 retirement_pending: false,
                 _moves: Some(moves),
             };
+            // A queued worker may not start until after the retry cutoff.
+            check_rollback_staging_cutoff(rollback_retry.as_ref())?;
             let mut paths: Vec<_> = candidates
                 .iter()
-                .map(|(_, _, path)| codex_rollout::plain_rollout_path(path))
+                .map(|(_, path)| codex_rollout::plain_rollout_path(path))
                 .collect();
             paths.sort();
             paths.dedup();
@@ -789,7 +963,7 @@ async fn stage_thread_deletes_inner<'a>(
             let mut original_paths = Vec::new();
             let canonical_home =
                 std::fs::canonicalize(&codex_home).map_err(delete_recovery_error)?;
-            for (thread_id, indexed, rollout_path) in candidates {
+            for (thread_id, rollout_path) in candidates {
                 let plain_path = codex_rollout::plain_rollout_path(&rollout_path);
                 for path in [plain_path.clone(), plain_path.with_extension("jsonl.zst")] {
                     if !path.try_exists().map_err(|err| ThreadStoreError::Internal {
@@ -803,12 +977,15 @@ async fn stage_thread_deletes_inner<'a>(
                     let checked_path = checked_rollout_path(&codex_home, &path, thread_id)?;
                     if !original_paths
                         .iter()
-                        .any(|(_, _, path)| path == &checked_path)
+                        .any(|(_, path)| path == &checked_path)
                     {
-                        original_paths.push((thread_id, indexed, checked_path));
+                        original_paths.push((thread_id, checked_path));
                     }
                 }
             }
+            // Admit the retry before creating any staged state. Once admitted,
+            // finish staging and commit (or restore) even if the cutoff passes.
+            check_rollback_staging_cutoff(rollback_retry.as_ref())?;
             let staging_dir = if original_paths.is_empty() && auxiliary_threads.is_empty() {
                 None
             } else {
@@ -840,10 +1017,10 @@ async fn stage_thread_deletes_inner<'a>(
             files.staging_dir = staging_dir;
             files.owner_lock = owner_lock;
             if let Some(directory) = &files.staging_dir {
-                for (id, indexed) in auxiliary_threads {
+                for id in auxiliary_threads {
                     let pending = directory
                         .path()
-                        .join(if indexed { "indexed" } else { "unindexed" })
+                        .join(staging_kind)
                         .join(id.to_string())
                         .join(AUXILIARY_RETIREMENT_PENDING);
                     std::fs::create_dir_all(
@@ -858,7 +1035,7 @@ async fn stage_thread_deletes_inner<'a>(
                     files.retirement_pending = true;
                 }
             }
-            for (thread_id, indexed, original_path) in original_paths {
+            for (thread_id, original_path) in original_paths {
                 let relative = original_path
                     .strip_prefix(&canonical_home)
                     .map_err(delete_recovery_error)?;
@@ -869,7 +1046,7 @@ async fn stage_thread_deletes_inner<'a>(
                         message: "thread deletion staging directory is missing".to_string(),
                     })?
                     .path()
-                    .join(if indexed { "indexed" } else { "unindexed" })
+                    .join(staging_kind)
                     .join(thread_id.to_string())
                     .join(relative);
                 let staged_parent = staged_path.parent().ok_or_else(|| {
@@ -939,7 +1116,7 @@ pub(super) async fn expire_archives(store: &LocalThreadStore, cutoff: i64) -> Th
         let Some(parent) = indexed.rollout_path.parent() else {continue};
         if tokio::fs::canonicalize(parent).await.ok().as_ref() != Some(&archive) {continue}
         let indexed_name = codex_rollout::plain_rollout_path(&indexed.rollout_path);
-        let staged = match stage_thread_deletes_inner(store, &[id], Some(cutoff)).await {
+        let staged = match stage_thread_deletes_inner(store, &[id], Some(cutoff), None).await {
             Ok(staged) => staged,
             Err(err) => { tracing::warn!(%id, %err, "archive expiry deferred"); continue }
         };

@@ -1,5 +1,6 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
+use super::ControlReserveSender;
 use super::TransportEvent;
 use super::auth::WebsocketAuthPolicy;
 use super::auth::authorize_upgrade;
@@ -85,7 +86,7 @@ fn print_websocket_startup_banner(addr: SocketAddr) {
 
 #[derive(Clone)]
 struct WebSocketListenerState {
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     auth_policy: Arc<WebsocketAuthPolicy>,
     shutdown_token: CancellationToken,
     connection_tasks: TaskTracker,
@@ -163,7 +164,7 @@ async fn websocket_upgrade_handler(
 
 pub async fn start_websocket_acceptor(
     bind_address: SocketAddr,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     shutdown_token: CancellationToken,
     auth_policy: WebsocketAuthPolicy,
 ) -> IoResult<JoinHandle<()>> {
@@ -179,7 +180,7 @@ pub async fn start_websocket_acceptor(
 
 fn start_websocket_acceptor_with_listener(
     listener: TcpListener,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     shutdown_token: CancellationToken,
     auth_policy: WebsocketAuthPolicy,
 ) -> IoResult<JoinHandle<()>> {
@@ -237,7 +238,7 @@ pub fn validate_websocket_listener(
 pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
     websocket_writer: impl futures::sink::Sink<M, Error = SinkError> + Send + 'static,
     websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     shutdown_token: CancellationToken,
 ) where
     M: AppServerWebSocketMessage + Send + 'static,
@@ -254,7 +255,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
         _ = disconnect_token.cancelled() => return,
         _ = tokio::time::sleep(Duration::from_secs(30)) => return,
         result = transport_event_tx
-        .send(TransportEvent::ConnectionOpened {
+        .send_unreserved(TransportEvent::ConnectionOpened {
             connection_id,
             origin: ConnectionOrigin::WebSocket,
             writer: writer_tx,
@@ -318,12 +319,12 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
     // During listener shutdown it may no longer drain ingress: retain an
     // immediately publishable close, but never hold shutdown behind a full queue.
     if let Err(mpsc::error::TrySendError::Full(event)) =
-        transport_event_tx.try_send(TransportEvent::ConnectionClosed { connection_id })
+        transport_event_tx.try_send_unreserved(TransportEvent::ConnectionClosed { connection_id })
     {
         tokio::select! {
             biased;
             _ = shutdown_token.cancelled() => {}
-            _ = transport_event_tx.send(event) => {}
+            _ = transport_event_tx.send_unreserved(event) => {}
         }
     }
 }
@@ -476,7 +477,7 @@ async fn run_websocket_outbound_loop<M, SinkError>(
 
 async fn run_websocket_inbound_loop<M, StreamError>(
     websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     writer_tx_for_reader: mpsc::Sender<QueuedOutgoingMessage>,
     writer_control_tx: mpsc::Sender<WebSocketControl>,
     connection_id: ConnectionId,

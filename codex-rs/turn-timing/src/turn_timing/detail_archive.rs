@@ -72,15 +72,27 @@ struct JournalLine<'a> {
     event: Value,
 }
 
-#[derive(Default)]
-struct BoundedLine(Vec<u8>);
+struct BoundedLine {
+    bytes: Vec<u8>,
+    limit: usize,
+}
 
 impl Write for BoundedLine {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_PENDING_BYTES.saturating_sub(self.0.len()) {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
             return Err(io::Error::other("overflow journal record exceeds ingress byte budget"));
         }
-        self.0.extend_from_slice(bytes);
+        let len = self.bytes.len() + bytes.len();
+        if len > self.bytes.capacity() {
+            let capacity = len
+                .max(self.bytes.capacity().saturating_mul(2))
+                .max(64)
+                .min(self.limit);
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .map_err(io::Error::other)?;
+        }
+        self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -141,7 +153,11 @@ impl Archive {
         let Ingress::Active { sender: Some(sender), byte_budget, accepted, .. } = &mut *ingress else {
             return;
         };
-        if sender.0.is_closed() || sender.0.is_full() {
+        // All producers serialize under this guard and the writer only
+        // releases budget. Do not encode a whole line when stalled storage
+        // has left fewer bytes than the next record needs.
+        let limit = byte_budget.available_permits();
+        if limit == 0 || sender.0.is_closed() || sender.0.is_full() {
             return;
         }
         let event = JournalLine {
@@ -151,17 +167,20 @@ impl Archive {
             turn_id: &self.turn_id,
             event,
         };
-        let mut line = BoundedLine::default();
+        let mut line = BoundedLine {
+            bytes: Vec::new(),
+            limit,
+        };
         if serde_json::to_writer(&mut line, &event).is_err() || line.write_all(b"\n").is_err() {
             return;
         }
-        let Ok(capacity) = u32::try_from(line.0.capacity()) else {
+        let Ok(capacity) = u32::try_from(line.bytes.capacity()) else {
             return;
         };
         let Ok(bytes) = Arc::clone(byte_budget).try_acquire_many_owned(capacity) else {
             return;
         };
-        if sender.0.try_send(Record { line: line.0, _bytes: bytes }).is_ok() {
+        if sender.0.try_send(Record { line: line.bytes, _bytes: bytes }).is_ok() {
             *accepted = accepted.saturating_add(1);
         }
     }

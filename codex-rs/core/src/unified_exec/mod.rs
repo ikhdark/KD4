@@ -35,6 +35,8 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use rand::RngExt;
 use rand::rng;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
@@ -236,12 +238,92 @@ pub(crate) struct WriteStdinRequest<'a> {
     pub nested_deadline: Option<std::time::Instant>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteStdinObservation {
+    Poll,
+    UntilOutput,
+    BackgroundCompletion,
+}
+
+const FIRST_PROCESS_ID: u32 = 1_000;
+const PROCESS_ID_COUNT: u64 = (u32::MAX - FIRST_PROCESS_ID) as u64 + 1;
+
+/// Issue every numeric handle at most once, without a tombstone per launch.
+/// The random starting point separates independent managers' handle ranges;
+/// restored IDs outside the issued range are explicitly skipped.
+struct ProcessIdHistory {
+    start: u32,
+    consumed: u64,
+    restored: HashSet<u32>,
+    incarnation_key: [u8; 32],
+}
+
+impl Default for ProcessIdHistory {
+    fn default() -> Self {
+        let mut rng = rng();
+        Self {
+            start: rng.random_range(FIRST_PROCESS_ID..=u32::MAX),
+            consumed: 0,
+            restored: HashSet::new(),
+            incarnation_key: rng.random(),
+        }
+    }
+}
+
+impl ProcessIdHistory {
+    fn offset(&self, id: u32) -> Option<u64> {
+        if id < FIRST_PROCESS_ID {
+            return None;
+        }
+        let id = u64::from(id);
+        let start = u64::from(self.start);
+        Some((id + PROCESS_ID_COUNT - start) % PROCESS_ID_COUNT)
+    }
+
+    fn exclude_restored(&mut self, id: u32) {
+        // Already consumed candidates can never be reassigned. Don't invalidate
+        // a handle that this manager already issued.
+        if self.offset(id).is_some_and(|offset| offset >= self.consumed) {
+            self.restored.insert(id);
+        }
+    }
+
+    fn allocate(&mut self) -> Option<u32> {
+        let start = u64::from(self.start - FIRST_PROCESS_ID);
+        while self.consumed < PROCESS_ID_COUNT {
+            let id = FIRST_PROCESS_ID + ((start + self.consumed) % PROCESS_ID_COUNT) as u32;
+            self.consumed += 1;
+            if !self.restored.contains(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn incarnation(&self, id: u32) -> uuid::Uuid {
+        // The keyed digest over a fixed-width ID lets an issued incarnation
+        // authenticate even after its output expires, without accepting IDs
+        // paired with an arbitrary UUID. Only a stored process gets this tag.
+        let digest = Sha256::new()
+            .chain_update(self.incarnation_key)
+            .chain_update(id.to_be_bytes())
+            .finalize();
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        uuid::Builder::from_random_bytes(bytes).into_uuid()
+    }
+
+    fn issued_incarnation(&self, id: u32) -> Option<uuid::Uuid> {
+        (self.offset(id)? < self.consumed && !self.restored.contains(&id))
+            .then(|| self.incarnation(id))
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ProcessStore {
     processes: HashMap<u32, ProcessEntry>,
     reserved_process_ids: HashSet<u32>,
-    // Never assign an observed handle to another process, even after replay eviction.
-    used_process_ids: HashMap<u32, Option<uuid::Uuid>>,
+    process_id_history: ProcessIdHistory,
     finished: VecDeque<(u32, crate::tools::context::ExecCommandToolOutput, Option<[u64; 2]>)>,
     // Capacity admitted before launch, not yet transferred to `processes`.
     reserved_process_slots: HashSet<u32>,
@@ -277,13 +359,22 @@ impl ProcessIdReservation {
 }
 
 impl ProcessStore {
+    // This proves identity, not that a live owner or result is still retained.
+    fn issued_process_incarnation(&self, id: u32) -> Option<uuid::Uuid> {
+        self.process_id_history.issued_incarnation(id)
+    }
+
+    fn release_reservation(&mut self, id: u32) {
+        self.reserved_process_ids.remove(&id);
+        self.reserved_process_slots.remove(&id);
+    }
+
     fn remember_finished(
         &mut self,
         id: u32,
         response: &crate::tools::context::ExecCommandToolOutput,
     ) {
         const MAX_FINISHED: usize = 32;
-        self.used_process_ids.entry(id).or_insert(None);
         if self.finished.len() == MAX_FINISHED {
             self.finished.pop_front();
         }
@@ -351,16 +442,11 @@ impl ProcessStore {
     }
 
     fn remove(&mut self, process_id: u32) -> Option<ProcessEntry> {
-        self.reserved_process_ids.remove(&process_id);
-        self.reserved_process_slots.remove(&process_id);
+        self.release_reservation(process_id);
         let entry = self.processes.remove(&process_id)?;
         // A transport ID can never authorize a previous owner's completion.
         // Retirement republishes this owner's result after removal.
         self.finished.retain(|(id, _, _)| *id != process_id);
-        self.used_process_ids.insert(
-            process_id,
-            Some(entry.process.session_capabilities(entry.tty).incarnation),
-        );
         Some(entry)
     }
 }

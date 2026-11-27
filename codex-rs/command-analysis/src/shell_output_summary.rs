@@ -41,8 +41,16 @@ pub struct ShellOutputSummaryOptions<'a> {
 }
 
 
-/// `streams` must be complete, producer-owned stdout/stderr for this output,
-/// not a cumulative snapshot paired with a later polling chunk.
+/// Model text plus recovery coordinates owned by the summary producer.
+pub struct ShellOutputSummary {
+    pub text: String,
+    pub first_omitted_line_range: Option<(usize, usize)>,
+    /// Prefer this over an unselected head when recovering a diagnostic excerpt.
+    pub first_omitted_diagnostic_group: Option<(usize, usize)>,
+    pub is_ranked_excerpt: bool,
+    pub is_structured: bool,
+}
+
 pub fn summarize_shell_output_for_model_with_streams(
     output: &str,
     exit_code: i32,
@@ -50,6 +58,19 @@ pub fn summarize_shell_output_for_model_with_streams(
     options: ShellOutputSummaryOptions<'_>,
     streams: Option<(&str, &str)>,
 ) -> Option<String> {
+    summarize_shell_output_with_source(output, exit_code, timed_out, options, streams)
+        .map(|summary| summary.text)
+}
+
+/// `streams` must be complete, producer-owned stdout/stderr for this output,
+/// not a cumulative snapshot paired with a later polling chunk.
+pub fn summarize_shell_output_with_source(
+    output: &str,
+    exit_code: i32,
+    timed_out: bool,
+    options: ShellOutputSummaryOptions<'_>,
+    streams: Option<(&str, &str)>,
+) -> Option<ShellOutputSummary> {
     if !options.enabled {
         return None;
     }
@@ -137,7 +158,14 @@ pub fn summarize_shell_output_for_model_with_streams(
         options.applied_token_limit,
         streams,
     ) {
-        return Some(summary);
+        // Structured compiler summaries carry their own recovery selectors.
+        return Some(ShellOutputSummary {
+            text: summary,
+            first_omitted_line_range: None,
+            first_omitted_diagnostic_group: None,
+            is_ranked_excerpt: false,
+            is_structured: true,
+        });
     }
 
     // A successful command with no diagnostic line has nothing to rank, so the
@@ -190,6 +218,12 @@ pub fn summarize_shell_output_for_model_with_streams(
             selection.collapsed_progress_lines
         ));
     }
+    let first_omitted_diagnostic_group = selection.first_omitted_group.map(|index| {
+        (
+            index.saturating_sub(FOCUS_CONTEXT_LINES) + 1,
+            (index + FOCUS_CONTEXT_LINES + 1).min(line_count),
+        )
+    });
     if selection.omitted_groups > 0 {
         let qualifier = if selection.groups_overflowed {
             " (group inventory also capped)"
@@ -198,15 +232,8 @@ pub fn summarize_shell_output_for_model_with_streams(
         };
         // Name the first omitted group so recovery can start at a diagnostic
         // instead of at whatever line the summary happens to skip first.
-        let first = selection
-            .first_omitted_group
-            .map(|index| {
-                format!(
-                    "; {FIRST_OMITTED_GROUP_LABEL} {}-{}",
-                    index.saturating_sub(FOCUS_CONTEXT_LINES) + 1,
-                    (index + FOCUS_CONTEXT_LINES + 1).min(line_count),
-                )
-            })
+        let first = first_omitted_diagnostic_group
+            .map(|(start, end)| format!("; {FIRST_OMITTED_GROUP_LABEL} {start}-{end}"))
             .unwrap_or_default();
         builder.push_line(format!("- omitted_diagnostic_groups: at least {} (selection-stage lower bound{qualifier}){first}; final fitting may omit additional diagnostics. To read an omitted group, select its line range (numbers at left) or search the retained artifact with read_tool_output instead of reading it whole", selection.omitted_groups));
     }
@@ -304,19 +331,26 @@ pub fn summarize_shell_output_for_model_with_streams(
         }
     }
     let render = |selected: &[(usize, &str)], budget| {
-        render_selected_lines(builder.clone(), selected, budget, line_count, false)
+        render_selected_lines(
+            builder.clone(),
+            selected,
+            budget,
+            line_count,
+            false,
+            first_omitted_diagnostic_group,
+        )
     };
     let mut line_budget = low;
     let mut summary = render(&selected, line_budget)?;
     if let Some(limit) = options.applied_token_limit
-        && codex_utils_string::approx_token_count_exceeds(&summary, limit)
+        && codex_utils_string::approx_token_count_exceeds(&summary.text, limit)
     {
         if !(failed || validation) && line_count <= COMPLETE_SUCCESS_MAX_LINES {
             // Every line is selected; abbreviate the long ones further before
             // omitting any whole line.
             let fits = |budget| {
                 render(&selected, budget).filter(
-                    |rendered| !codex_utils_string::approx_token_count_exceeds(rendered, limit),
+                    |rendered| !codex_utils_string::approx_token_count_exceeds(&rendered.text, limit),
                 )
             };
             if let Some(minimum) = fits(MIN_COMPLETE_LINE_BYTES.min(line_budget)) {
@@ -333,7 +367,7 @@ pub fn summarize_shell_output_for_model_with_streams(
                         None => high = mid - 1,
                     }
                 }
-                return (summary.len() < output.len()).then_some(summary);
+                return (summary.text.len() < output.len()).then_some(summary);
             }
         }
         // The byte ceiling does not honor a caller's smaller token budget (or
@@ -359,7 +393,7 @@ pub fn summarize_shell_output_for_model_with_streams(
             });
         selected = kept;
         summary = render(&selected, line_budget)?;
-        if !codex_utils_string::approx_token_count_exceeds(&summary, limit) {
+        if !codex_utils_string::approx_token_count_exceeds(&summary.text, limit) {
             // Pruning is coarse. Return the remaining budget to the pruned
             // lines, nearest the tail first, so an output slightly over the
             // budget does not collapse to its diagnostics alone.
@@ -372,17 +406,17 @@ pub fn summarize_shell_output_for_model_with_streams(
                 candidate.extend_from_slice(&pruned[..mid]);
                 candidate.sort_unstable_by_key(|(index, _)| *index);
                 let rendered = render(&candidate, line_budget)?;
-                if codex_utils_string::approx_token_count_exceeds(&rendered, limit) {
+                if codex_utils_string::approx_token_count_exceeds(&rendered.text, limit) {
                     high = mid - 1;
                 } else {
                     low = mid;
                     summary = rendered;
                 }
             }
-            return (summary.len() < output.len()).then_some(summary);
+            return (summary.text.len() < output.len()).then_some(summary);
         }
         let minimum = render(&selected, 0)?;
-        if codex_utils_string::approx_token_count_exceeds(&minimum, limit) {
+        if codex_utils_string::approx_token_count_exceeds(&minimum.text, limit) {
             // Even metadata does not fit. Use ordinary truncation/recovery.
             return None;
         }
@@ -392,7 +426,7 @@ pub fn summarize_shell_output_for_model_with_streams(
         while low < high {
             let mid = low + (high - low).div_ceil(2);
             let candidate = render(&selected, mid)?;
-            if codex_utils_string::approx_token_count_exceeds(&candidate, limit) {
+            if codex_utils_string::approx_token_count_exceeds(&candidate.text, limit) {
                 high = mid - 1;
             } else {
                 low = mid;
@@ -410,18 +444,24 @@ pub fn summarize_shell_output_for_model_with_streams(
             let (index, line) = run[0];
             line.len() >= 24 && run[1] == (index + 1, line) && run[2] == (index + 2, line)
         })
-        && let Some(folded) =
-            render_selected_lines(builder, &selected, line_budget, line_count, true)
-        && folded.len() < summary.len()
+        && let Some(folded) = render_selected_lines(
+            builder,
+            &selected,
+            line_budget,
+            line_count,
+            true,
+            first_omitted_diagnostic_group,
+        )
+        && folded.text.len() < summary.text.len()
         && options.applied_token_limit.is_none_or(|limit| {
-            !codex_utils_string::approx_token_count_exceeds(&folded, limit)
+            !codex_utils_string::approx_token_count_exceeds(&folded.text, limit)
         })
     {
         // Fold after ordinary selection and budget fitting, never inside the
         // search that adds or removes selected diagnostic context.
         summary = folded;
     }
-    (summary.len() < output.len()).then_some(summary)
+    (summary.text.len() < output.len()).then_some(summary)
 }
 
 
@@ -869,38 +909,19 @@ const SUMMARY_HEADING: &str = "Shell output summary:";
 const FIRST_OMITTED_GROUP_LABEL: &str = "first omitted group at lines";
 const SELECTED_LINES_HEADING: &str = "Selected output lines:";
 
-/// For a rendered line summary, the source lines (1-based, inclusive) of the
-/// first diagnostic group it names as omitted, if any; `None` for other text.
-/// Its lines are a ranked excerpt, so aligning it with the raw output finds
-/// the unselected head rather than an omitted diagnostic.
-pub fn line_summary_omitted_group(summary: &str) -> Option<Option<(usize, usize)>> {
-    let mut lines = summary.lines();
-    if lines.next()? != SUMMARY_HEADING {
-        return None;
-    }
-    // Only the header may name the group; selected lines are command output.
-    Some(
-        lines
-            .take_while(|line| *line != SELECTED_LINES_HEADING)
-            .find_map(|line| {
-                let (_, rest) = line
-                    .strip_prefix("- omitted_diagnostic_groups:")?
-                    .split_once(FIRST_OMITTED_GROUP_LABEL)?;
-                let (start, end) = rest.split(';').next()?.split_once('-')?;
-                Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
-            }),
-    )
-}
-
 fn render_selected_lines(
     mut builder: SummaryBuilder,
     selected: &[(usize, &str)],
     line_budget: usize,
     line_count: usize,
     collapse_adjacent: bool,
-) -> Option<String> {
+    first_omitted_diagnostic_group: Option<(usize, usize)>,
+) -> Option<ShellOutputSummary> {
     let mut previous = None;
     let mut emitted_source_lines = 0;
+    // A folded run of identical full lines represents every occurrence; an
+    // abbreviated row leaves each covered source line eligible for recovery.
+    let mut fully_displayed_lines = Vec::with_capacity(selected.len());
     let mut remaining = selected;
     while let Some((&(index, line), rest)) = remaining.split_first() {
         // Only collapse a consecutive run actually selected for display.
@@ -938,14 +959,16 @@ fn render_selected_lines(
             break;
         }
         {
-            builder.capped |= line.len() > line_budget;
-            let line = summarize_oversized_line(line, line_budget);
+            let source_line = line;
+            builder.capped |= source_line.len() > line_budget;
+            let line = summarize_oversized_line(source_line, line_budget);
             let rendered = if count > 1 {
                 format!("{:>5}: [×{count}, through line {}] {line}", index + 1, index + count)
             } else {
                 format!("{:>5}: {line}", index + 1)
             };
-            if !builder.push_line(rendered) {
+            let before_row = builder.text.len() + usize::from(!builder.text.is_empty());
+            if !builder.push_line(&rendered) {
                 // A gap describes the next retained line. Keep the pair atomic
                 // when the gap uses the last available byte or line slot.
                 builder.text.truncate(before_gap.0);
@@ -953,15 +976,38 @@ fn render_selected_lines(
                 break;
             }
             emitted_source_lines += count;
+            if line.len() == source_line.len()
+                && builder.text.len() == before_row + rendered.len()
+            {
+                fully_displayed_lines.extend(index + 1..=index + count);
+            }
         }
         previous = Some(index + count - 1);
         remaining = &remaining[count..];
     }
-    builder.finish(emitted_source_lines, line_count)
+    let text = builder.finish(emitted_source_lines, line_count)?;
+    Some(ShellOutputSummary {
+        text,
+        first_omitted_line_range: codex_utils_output_truncation::first_omitted_line_range(
+            line_count,
+            fully_displayed_lines,
+        ),
+        first_omitted_diagnostic_group,
+        is_ranked_excerpt: true,
+        is_structured: false,
+    })
 }
 
+// Bound the borrowed path inventory and the work of ranking it, independently
+// of how many records fit in the displayed directory.
+const MAX_RG_SUMMARY_PATHS: usize = 4_096;
+
 /// Count path-prefixed rg records before selecting a source-ordered excerpt.
-fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> Option<String> {
+fn rg_file_summary(
+    output: &str,
+    command: &str,
+    token_limit: Option<usize>,
+) -> Option<ShellOutputSummary> {
     // Arguments, quoted examples and comments are not executable identity.
     // Mixed readers have no per-command output boundaries, so retain their
     // source-order truncation path rather than labeling source as search hits.
@@ -995,7 +1041,17 @@ fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> O
     // Count every visible hit, never just the excerpt selected below.
     for line in output.lines() {
         if let Some(hit) = HIT.captures(line) {
-            *files.entry(hit.get(1)?.as_str()).or_default() += 1;
+            let path = hit.get(1)?.as_str();
+            if let Some(count) = files.get_mut(path) {
+                *count += 1;
+            } else {
+                if files.len() >= MAX_RG_SUMMARY_PATHS {
+                    // Let the caller truncate the original output rather than
+                    // rank an incomplete inventory or publish partial totals.
+                    return None;
+                }
+                files.insert(path, 1);
+            }
             hits += 1;
         } else {
             other_lines += 1;
@@ -1039,11 +1095,22 @@ fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> O
     if listed == 0 || remaining == 0 {
         return None;
     }
-    summary.push_str(&codex_utils_output_truncation::formatted_truncate_text(
-        output,
-        codex_utils_output_truncation::TruncationPolicy::Tokens(remaining),
-    ));
-    (summary.len() < output.len()).then_some(summary)
+    let limits = codex_utils_output_truncation::OutputLimitResolution {
+        requested_limit: Some(remaining),
+        default_limit: limit,
+        hard_limit: limit,
+        applied_limit: remaining,
+    };
+    let (excerpt, omitted_lines) =
+        codex_utils_output_truncation::formatted_truncate_text_with_recovery(output, limits);
+    summary.push_str(&excerpt.text);
+    (summary.len() < output.len()).then_some(ShellOutputSummary {
+        text: summary,
+        first_omitted_line_range: omitted_lines.first().copied(),
+        first_omitted_diagnostic_group: None,
+        is_ranked_excerpt: false,
+        is_structured: false,
+    })
 }
 
 /// Text records are not self-describing: `1:worker:123:...` may be content

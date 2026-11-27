@@ -187,6 +187,13 @@ pub struct SamplingReplaySnapshot {
 
 #[derive(Clone, Debug)]
 pub struct PreparedPromptInput {
+    projection: PreparedHistoryProjection,
+    replay_snapshot: SamplingReplaySnapshot,
+}
+
+// Cache the prepared projection without pinning the canonical transcript or ledger.
+#[derive(Clone, Debug)]
+struct PreparedHistoryProjection {
     items: PreparedPromptItems,
     fallback_items: PreparedPromptItems,
     unreplaced_items: PreparedPromptItems,
@@ -197,7 +204,6 @@ pub struct PreparedPromptInput {
     prompt_provenance: PromptProvenanceSidecar,
     fingerprint: Option<PreparedHistoryFingerprint>,
     policy: PreparedHistoryPolicy,
-    replay_snapshot: SamplingReplaySnapshot,
 }
 
 impl PreparedPromptInput {
@@ -206,37 +212,38 @@ impl PreparedPromptInput {
     }
 
     pub fn items(&self) -> &[ResponseItem] {
-        self.items.as_slice()
+        self.projection.items.as_slice()
     }
 
     pub fn shared_items(&self) -> Arc<[ResponseItem]> {
-        self.items.shared()
+        self.projection.items.shared()
     }
 
     pub fn shared_fallback_items(&self) -> Arc<[ResponseItem]> {
-        self.fallback_items.shared()
+        self.projection.fallback_items.shared()
     }
 
 
 
     pub fn tool_history_substitutions(&self) -> Arc<[ToolHistorySubstitution]> {
-        Arc::clone(&self.tool_history_substitutions)
+        Arc::clone(&self.projection.tool_history_substitutions)
     }
 
     pub fn fallback_tool_history_substitutions(&self) -> Arc<[ToolHistorySubstitution]> {
-        Arc::clone(&self.fallback_tool_history_substitutions)
+        Arc::clone(&self.projection.fallback_tool_history_substitutions)
     }
 
     pub fn stable_context_manifest(&self) -> &StableContextManifest {
-        &self.stable_context_manifest
+        &self.projection.stable_context_manifest
     }
 
     pub fn prompt_provenance(&self) -> &PromptProvenanceSidecar {
-        &self.prompt_provenance
+        &self.projection.prompt_provenance
     }
 
     pub fn fingerprint(&self) -> Option<[u8; 32]> {
-        self.fingerprint
+        self.projection
+            .fingerprint
             .as_ref()
             .map(|fingerprint| fingerprint.digest)
     }
@@ -248,10 +255,10 @@ impl PreparedPromptInput {
     /// also the one retry bookkeeping holds.
     pub fn shared_prompt_projections(&self) -> SharedPromptProjections {
         [
-            self.items.shared(),
-            self.fallback_items.shared(),
-            self.unreplaced_items.shared(),
-            self.unreplaced_fallback_items.shared(),
+            self.projection.items.shared(),
+            self.projection.fallback_items.shared(),
+            self.projection.unreplaced_items.shared(),
+            self.projection.unreplaced_fallback_items.shared(),
         ]
     }
 }
@@ -304,7 +311,7 @@ impl PreparedHistoryFingerprint {
 struct PreparedHistoryCacheEntry {
     source_items: Weak<Vec<ResponseItem>>,
     projection_revision: u64,
-    prepared: PreparedPromptInput,
+    prepared: PreparedHistoryProjection,
     pending_source_items: Option<Weak<Vec<ResponseItem>>>,
     pending_append: Vec<ResponseItem>,
 }
@@ -329,7 +336,7 @@ struct SamplingProjectionCacheEntry {
 }
 
 impl SamplingProjectionCacheEntry {
-    fn new(anchor: SamplingProjectionAnchor, prepared: &PreparedPromptInput) -> Self {
+    fn new(anchor: SamplingProjectionAnchor, prepared: &PreparedHistoryProjection) -> Self {
         Self {
             anchor,
             fingerprint: prepared.fingerprint.clone(),
@@ -339,7 +346,7 @@ impl SamplingProjectionCacheEntry {
         }
     }
 
-    fn metadata_matches(&self, prepared: &PreparedPromptInput) -> bool {
+    fn metadata_matches(&self, prepared: &PreparedHistoryProjection) -> bool {
         let previous = &self.stable_context_manifest;
         let current = &prepared.stable_context_manifest;
         self.policy == prepared.policy
@@ -686,13 +693,15 @@ impl ContextManager {
                     .with_local_reused(/*local_reused*/ true);
                 entry.prepared.clone()
             });
-        if let Some(mut prepared) = prepared {
+        if let Some(projection) = prepared {
             if let Some(metrics) = codex_otel::global() {
                 let _ = metrics.counter("codex.history.prepared_cache", 1, &[("result", "hit")]);
             }
             // Consumption/failure state can advance without changing prompt bytes.
-            prepared.replay_snapshot = replay_snapshot;
-            return prepared;
+            return PreparedPromptInput {
+                projection,
+                replay_snapshot,
+            };
         }
         if let Some(metrics) = codex_otel::global() {
             let _ = metrics.counter("codex.history.prepared_cache", 1, &[("result", "miss")]);
@@ -764,7 +773,7 @@ impl ContextManager {
         let projected_items = items;
         let items = PreparedPromptItems::from_shared(Arc::clone(&projected_items));
         let fallback_items = items.clone();
-        let prepared = PreparedPromptInput {
+        let prepared = PreparedHistoryProjection {
             unreplaced_items: items.clone(),
             unreplaced_fallback_items: fallback_items.clone(),
             items,
@@ -775,7 +784,6 @@ impl ContextManager {
             prompt_provenance,
             fingerprint,
             policy,
-            replay_snapshot,
         };
         if prepared.fingerprint.is_some() {
             *self
@@ -790,7 +798,10 @@ impl ContextManager {
                     pending_append: Vec::new(),
                 });
         }
-        prepared
+        PreparedPromptInput {
+            projection: prepared,
+            replay_snapshot,
+        }
     }
 
     pub fn prepare_for_sampling_prompt_with_completed_tool_projection(
@@ -956,7 +967,7 @@ impl ContextManager {
                             prepared_items: items,
                             projection,
                         },
-                        &prepared,
+                        &prepared.projection,
                     ));
                 return prepared;
             }
@@ -1006,7 +1017,7 @@ impl ContextManager {
                         prepared_items: items,
                         projection,
                     },
-                    &prepared,
+                    &prepared.projection,
                 ));
         }
         prepared
@@ -1126,7 +1137,7 @@ impl ContextManager {
             &projected,
             tail,
             base_instructions,
-            Some(prepared.policy),
+            Some(prepared.projection.policy),
         )
     }
 
@@ -1534,7 +1545,11 @@ impl ContextManager {
         let source = prepared.shared_items();
         let (projected, tail) = self.sampling_items_for_estimate(&source);
         let committed = self.estimate_projected_items_token_count(
-            &source, &projected, tail, base_instructions, Some(prepared.policy),
+            &source,
+            &projected,
+            tail,
+            base_instructions,
+            Some(prepared.projection.policy),
         );
         let active = if self.requires_local_context_estimate() {
             committed.unwrap_or(0)
@@ -2068,7 +2083,7 @@ impl ContextManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PreparedHistoryCacheEntry {
             source_items: Arc::downgrade(&self.items),
             projection_revision: self.projection_revision,
-            prepared: PreparedPromptInput {
+            prepared: PreparedHistoryProjection {
                 items,
                 fallback_items,
                 unreplaced_items,
@@ -2081,7 +2096,6 @@ impl ContextManager {
                 prompt_provenance,
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
-                replay_snapshot: self.sampling_replay_snapshot(),
             },
             pending_source_items: None,
             pending_append: Vec::new(),
@@ -2101,13 +2115,14 @@ impl ContextManager {
 }
 
 fn apply_tool_history_projection(
-    mut prepared: PreparedPromptInput,
+    mut input: PreparedPromptInput,
     projection: ToolHistoryProjection,
     fallback_projection: ToolHistoryProjection,
     // Only supplied after project_continuation_with_workspace_cache has proven
     // that this projection extends the anchor. Do not compare that prefix again.
     continuation: Option<&SamplingProjectionCacheEntry>,
 ) -> PreparedPromptInput {
+    let prepared = &mut input.projection;
     let prepared_items = prepared.items.shared();
     let prepared_unreplaced_items = if prepared
         .unreplaced_items
@@ -2137,7 +2152,7 @@ fn apply_tool_history_projection(
         && fallback_projection.substitutions.as_ref()
             == prepared.fallback_tool_history_substitutions.as_ref()
     {
-        return prepared;
+        return input;
     }
 
     let projected_items = projection.items;
@@ -2182,10 +2197,11 @@ fn apply_tool_history_projection(
     prepared.unreplaced_fallback_items = unreplaced_fallback_items;
     prepared.fallback_tool_history_substitutions = fallback_projection.substitutions;
     let metadata = continuation
-        .filter(|entry| entry.metadata_matches(&prepared))
+        .filter(|entry| entry.metadata_matches(prepared))
         .and_then(|entry| {
             let tail = prepared
-                .items()
+                .items
+                .as_slice()
                 .get(entry.anchor.projection.items.len()..)?;
             // A new user turn reclassifies current-input attribution in the
             // prefix, even when its serialized bytes happen to be unchanged.
@@ -2210,17 +2226,17 @@ fn apply_tool_history_projection(
         prepared.fingerprint = Some(fingerprint);
     } else {
         prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
-            prepared.items(),
+            prepared.items.as_slice(),
             &prepared.stable_context_manifest,
         );
         prepared.fingerprint = PreparedHistoryFingerprint::new(
-            prepared.items(),
+            prepared.items.as_slice(),
             &prepared.stable_context_manifest,
             prepared.policy,
         )
         .ok();
     }
-    prepared
+    input
 }
 
 

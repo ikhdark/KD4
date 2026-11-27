@@ -407,7 +407,9 @@ impl ConfigManager {
             if loader.supplied_at_startup {
                 startup_identity_changed
             } else {
-                loader.bundle.validate_current().is_err()
+                loader.bundle.validate_current().is_err_and(|error| {
+                    error.code() == codex_config::CloudConfigBundleLoadErrorCode::Auth
+                })
             }
         };
         if !needs_rebind(&self.current_cloud_config_loader()) {

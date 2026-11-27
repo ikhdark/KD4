@@ -5,13 +5,14 @@ use std::time::Duration;
 use crate::client::ModelClientSession;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::retry::backoff_with_cap;
+use crate::session::get_service_tier;
 use crate::session::session::Session;
-use crate::session::turn::service_tier_for_sampling;
 use crate::session::turn_context::TurnContext;
 use crate::turn_timing::retries::RetryAction;
 use crate::turn_timing::retries::RetryStreamFailure;
 use crate::turn_timing::retries::RetryStreamFailureClass;
 use crate::turn_timing::retries::RetryTrigger;
+use codex_features::Feature;
 use codex_http_client::RetryAfter;
 use codex_model_client::client_common::ResponseAttemptIdentity;
 use codex_model_provider_info::ModelProviderInfo;
@@ -304,24 +305,41 @@ pub(crate) async fn handle_retryable_response_stream_error(
             "provider closed the stream and invited a reconnect; rebuilding the websocket"
         );
         client_session.replace_websocket_for_recovery();
-        if matches!(request, ResponsesStreamRequest::Sampling) {
-            // Overlap connection setup with the backoff instead of following it. The
-            // request is still dispatched only at the same retry deadline, and a failed
-            // or unfinished prewarm leaves dispatch to connect as it otherwise would.
-            let metadata = turn_context.turn_metadata_state.to_responses_metadata(
-                sess.installation_id.clone(),
-                sess.current_window_id().await,
-                CodexResponsesRequestKind::Turn,
-            );
-            let service_tier = service_tier_for_sampling(sess, turn_context).await;
-            client_session
-                .prewarm_websocket_during_backoff(
-                    &turn_context.model_info,
-                    service_tier,
-                    &turn_context.session_telemetry,
-                    &metadata,
-                )
-                .await;
+        let prewarm_deadline = wait_deadline.map_or(retry_at, |limit| retry_at.min(limit));
+        if matches!(request, ResponsesStreamRequest::Sampling)
+            && tokio::time::Instant::now() < prewarm_deadline
+        {
+            // Preparation is optional too: state reads or preconnect setup must not
+            // delay dispatch or the retry owner's normal deadline handling.
+            tokio::select! {
+                biased;
+                result = wait_for_retry_deadline(prewarm_deadline, cancellation_token) => result?,
+                () = async {
+                    let metadata = turn_context.turn_metadata_state.to_responses_metadata(
+                        sess.installation_id.clone(),
+                        sess.current_window_id().await,
+                        CodexResponsesRequestKind::Turn,
+                    );
+                    // Only dispatch should publish a tier warning or update its dedup state.
+                    let service_tier = get_service_tier(
+                        sess.configured_service_tier().await,
+                        turn_context.config.features.enabled(Feature::FastMode),
+                        &turn_context.model_info,
+                    );
+                    if !cancellation_token.is_cancelled()
+                        && tokio::time::Instant::now() < prewarm_deadline
+                    {
+                        client_session
+                            .prewarm_websocket_during_backoff(
+                                &turn_context.model_info,
+                                service_tier,
+                                &turn_context.session_telemetry,
+                                &metadata,
+                            )
+                            .await;
+                    }
+                } => {}
+            }
         }
         send_retry_notice_until(
             sess.notify_stream_error(

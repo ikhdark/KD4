@@ -2948,6 +2948,11 @@ impl Config {
             ));
         }
 
+        if cfg.shell_environment_policy.experimental_use_profile.is_some() {
+            startup_warnings.push(
+                "shell_environment_policy.experimental_use_profile is deprecated and ignored. Remove it; login-shell behavior is unchanged.".to_string(),
+            );
+        }
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
 

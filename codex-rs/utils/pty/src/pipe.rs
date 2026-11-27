@@ -521,8 +521,6 @@ async fn finish_pipe_process_setup(
     #[cfg(unix)]
     let wait_group = Arc::clone(&process_group);
     let wait_handle: JoinHandle<()> = tokio::spawn(async move {
-        // Keep admission even after request_terminate removes the control handle.
-        let _managed = wait_managed;
         #[cfg(unix)]
         wait_group.disarm_after_exit().await;
         let status = match child.wait().await {
@@ -537,14 +535,25 @@ async fn finish_pipe_process_setup(
                 }
             }
         };
+        let finish_exit = move || {
+            // Keep admission through exit publication even if the control handle was removed.
+            let _managed = wait_managed;
+            #[cfg(windows)]
+            if let Err(err) = _managed.preserve_descendants() {
+                log::warn!("Windows pipe failed to preserve descendants after root exit: {err}");
+            }
+            let code = exit_code_from_status(status);
+            observation.cleanup_observed("root_reaped; descendants_unknown");
+            publish_exit_status(&wait_exit_status, &wait_exit_code, code);
+            let _ = exit_tx.send(code);
+        };
         #[cfg(windows)]
-        if let Err(err) = _managed.preserve_descendants() {
-            log::warn!("Windows pipe failed to preserve descendants after root exit: {err}");
+        {
+            // Job mutation, diagnostics, and the waiter's admission release can block.
+            let _ = tokio::task::spawn_blocking(finish_exit).await;
         }
-        let code = exit_code_from_status(status);
-        observation.cleanup_observed("root_reaped; descendants_unknown");
-        publish_exit_status(&wait_exit_status, &wait_exit_code, code);
-        let _ = exit_tx.send(code);
+        #[cfg(not(windows))]
+        finish_exit();
     });
 
     let handle = ProcessHandle::new(

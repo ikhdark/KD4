@@ -631,9 +631,20 @@ async fn handle_request_user_input(
     let id = event.turn_id;
     let args = RequestUserInputArgs {
         questions: event.questions,
-        auto_resolution_ms: event.auto_resolution_ms,
+        auto_resolution_ms: None,
     };
-    let response_fut = parent_session.request_user_input(parent_ctx, call_id.clone(), args);
+    let response_fut = async {
+        parent_session
+            .request_user_input_with_outcome(
+                parent_ctx,
+                call_id.clone(),
+                args,
+                event.auto_resolution_ms,
+            )
+            .await
+            .ok()
+            .flatten()
+    };
     let response = await_user_input_with_cancel(
         response_fut,
         parent_session,

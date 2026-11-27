@@ -434,14 +434,84 @@ impl TurnTimingState {
         }
     }
 
+    pub fn runtime_async_observations_enabled(&self) -> bool {
+        self.queued_observation_scope.get().is_some()
+            && codex_protocol::timing::observations::runtime_async_enabled()
+    }
+
+    pub fn observe_runtime_queued(&self, kind: &str, operation: &str, data: Value) {
+        if let Some(scope) = self.queued_observation_scope.get() {
+            let _ = codex_protocol::timing::observations::enqueue_runtime(
+                kind, "", scope, operation, data,
+            );
+        }
+    }
+
+    /// Use the existing scope identity without waiting for a timing-state owner.
+    /// Terminal publication and its timeout never enter the synchronous journal.
+    pub fn observe_core_terminal(
+        &self,
+        turn: &str,
+        outcome: codex_protocol::timing::observations::CoreTerminalOutcome,
+        persist: bool,
+    ) {
+        if let Some(scope) = self.terminal_observation_scope() {
+            codex_protocol::timing::observations::record_core_terminal(&scope, turn, outcome, persist);
+        }
+    }
+
+    pub fn observe_agent_joined(
+        &self,
+        operation: &str,
+        join: codex_protocol::timing::observations::AgentJoinObservation,
+    ) {
+        if let Some(scope) = self.terminal_observation_scope() {
+            codex_protocol::timing::observations::record_agent_joined(&scope, operation, join);
+        }
+    }
+
+    fn terminal_observation_scope(&self) -> Option<String> {
+        use codex_protocol::timing::observations;
+        use std::sync::TryLockError;
+
+        if !observations::terminal_enabled() {
+            return None;
+        }
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                observations::note_terminal_scope_loss();
+                return None;
+            }
+        };
+        let scope = &state.measurements.observation_scope;
+        (!scope.is_empty()).then(|| scope.clone())
+    }
+
     pub fn bind_runtime_observations(&self, thread: &str, turn: &str) {
         if !codex_protocol::timing::observations::enabled() { return; }
         let state = self.state();
         let scope = state.measurements.observation_scope.clone();
         let origin = state.started_sample.map(|sample| sample.time.monotonic_ns);
         drop(state);
+        let terminal_journal = if codex_protocol::timing::observations::prepare_terminal_lane() {
+            "expected"
+        } else {
+            "unavailable"
+        };
+        let runtime_async_journal =
+            if codex_protocol::timing::observations::prepare_runtime_async_lane() {
+                "expected"
+            } else {
+                "unavailable"
+            };
         let _ = codex_protocol::timing::observations::record("scope_bound", thread, turn, &scope,
-            json!({"origin_ns":origin}));
+            json!({"origin_ns":origin, "terminal_journal":terminal_journal,
+                "runtime_async_journal":runtime_async_journal}));
+        if !scope.is_empty() {
+            let _ = self.queued_observation_scope.set(scope);
+        }
     }
 
     /// Bind the output at its originating completion owner, before later

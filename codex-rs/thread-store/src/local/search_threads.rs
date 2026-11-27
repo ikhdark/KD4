@@ -155,9 +155,11 @@ async fn search_threads_inner(
             next_cursor: None,
         });
     }
-    let candidates: Vec<_> = matching_rollouts.keys().cloned().collect();
-    for path in &candidates {
-        if state_db.is_none() {
+    if state_db.is_none() {
+        // Validate in place rather than clone every path before the async reads.
+        // The producer only emits nonempty snippets, so an empty snippet marks
+        // source exclusions without conflating them with metadata-only hits.
+        for (path, snippet) in &mut matching_rollouts {
             if let Some(item) = codex_rollout::read_thread_item_from_rollout(path.clone()).await {
                 if !params.allowed_sources.is_empty()
                     && item
@@ -165,21 +167,19 @@ async fn search_threads_inner(
                         .as_ref()
                         .is_none_or(|source| !params.allowed_sources.contains(source))
                 {
-                    matching_rollouts.remove(path);
+                    *snippet = Some(String::new());
                 }
             } else {
                 if let Ok(header) = codex_rollout::read_session_meta_line(path).await {
                     if !params.allowed_sources.is_empty()
                         && !params.allowed_sources.contains(&header.meta.source)
                     {
-                        matching_rollouts.remove(path);
+                        *snippet = Some(String::new());
                         continue;
                     }
                     // Valid empty-preview archives are listable; snippetless hits
                     // have no visible result for either discovery policy.
-                    if params.archived
-                        || matching_rollouts.get(path).is_some_and(Option::is_none)
-                    {
+                    if params.archived || snippet.is_none() {
                         continue;
                     }
                 }
@@ -190,6 +190,9 @@ async fn search_threads_inner(
                     ),
                 });
             }
+        }
+        if !params.allowed_sources.is_empty() {
+            matching_rollouts.retain(|_, snippet| snippet.as_deref() != Some(""));
         }
     }
     if let Some(runtime) = state_db.as_deref() {
@@ -327,6 +330,9 @@ async fn search_threads_inner(
             break;
         }
     }
+
+    // Unconsumed candidates are no longer needed while hydrating this page.
+    drop(remaining_rollouts);
 
     let more_matches_available = matching_items.len() > params.page_size;
     matching_items.truncate(params.page_size);

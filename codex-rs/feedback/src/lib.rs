@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::collections::btree_map::Entry;
+use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
@@ -54,6 +56,11 @@ const MAX_FEEDBACK_TAGS: usize = 64;
 const MAX_FEEDBACK_TAG_VALUE_BYTES: usize = 1024;
 const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES: usize = 40 * 1024 * 1024;
+/// Maximum extra attachment candidates considered per upload, excluding built-in logs
+/// and feedback diagnostics. Failed and oversized candidates still consume attempts.
+pub const MAX_FEEDBACK_EXTRA_ATTACHMENT_ATTEMPTS: usize = 64;
+const MAX_OMITTED_ATTACHMENT_DETAILS: usize = 16;
+const MAX_OMISSION_DETAIL_BYTES: usize = 256;
 
 /// Structured request/auth fields that should be attached to feedback uploads.
 pub struct FeedbackRequestTags<'a> {
@@ -494,18 +501,32 @@ impl FeedbackSnapshot {
     /// upload deadline expires; async callers must run it on a blocking thread. An error means
     /// the report was not accepted.
     pub fn upload_feedback(&self, options: FeedbackUploadOptions<'_>) -> Result<()> {
+        self.upload_feedback_with_unexamined_candidates(options, 0)
+    }
+
+    /// Includes the number of extra attachment inputs the caller did not examine because
+    /// of its own collection limit. These inputs are not necessarily distinct attachments.
+    pub fn upload_feedback_with_unexamined_candidates(
+        &self,
+        options: FeedbackUploadOptions<'_>,
+        unexamined_candidates: usize,
+    ) -> Result<()> {
         let dsn: Dsn = SENTRY_DSN
             .parse()
             .map_err(|e| anyhow!("invalid DSN: {e}"))?;
         let client = BlockingHttpClientBuilder::new()
             .build_with_transport_default_proxy()
             .map_err(|err| anyhow!("failed to build feedback upload client: {err}"))?;
-        let body = self.encode_envelope(options)?;
+        let body = self.encode_envelope(options, unexamined_candidates)?;
         let deadline = upload_deadline(body.len());
         send_envelope(&client, &dsn, body, deadline)
     }
 
-    fn encode_envelope(&self, options: FeedbackUploadOptions<'_>) -> Result<Vec<u8>> {
+    fn encode_envelope(
+        &self,
+        options: FeedbackUploadOptions<'_>,
+        unexamined_candidates: usize,
+    ) -> Result<Vec<u8>> {
         use sentry::protocol::Envelope;
         use sentry::protocol::EnvelopeItem;
         use sentry::protocol::Event;
@@ -554,10 +575,25 @@ impl FeedbackSnapshot {
             options.logs_override,
         );
         // Skips are otherwise only logged locally, after the uploaded logs were captured.
-        if !omitted.is_empty() {
-            event
-                .extra
-                .insert("omitted_attachments".to_string(), Value::from(omitted));
+        if !omitted.details.is_empty() {
+            event.extra.insert(
+                "omitted_attachments".to_string(),
+                Value::from(omitted.details),
+            );
+        }
+        if omitted.unrecorded_details != 0 {
+            event.extra.insert(
+                "omitted_attachment_details_unrecorded".to_string(),
+                Value::from(omitted.unrecorded_details as u64),
+            );
+        }
+        let unexamined_candidates =
+            unexamined_candidates.saturating_add(omitted.unexamined_candidates);
+        if unexamined_candidates != 0 {
+            event.extra.insert(
+                "unexamined_extra_attachment_candidates".to_string(),
+                Value::from(unexamined_candidates as u64),
+            );
         }
         envelope.add_item(EnvelopeItem::Event(Box::new(event)));
 
@@ -635,10 +671,20 @@ impl FeedbackSnapshot {
         extra_attachments: &'a [FeedbackAttachment],
         extra_attachment_paths: &[FeedbackAttachmentPath],
         logs_override: Option<Vec<u8>>,
-    ) -> (Vec<FeedbackUploadAttachment<'a>>, Vec<String>) {
+    ) -> (Vec<FeedbackUploadAttachment<'a>>, AttachmentOmissions) {
+        // Buffered attachments already take priority over paths in the byte budget.
+        // Keep that order for the shared attempt budget as well.
+        let (extra_attachments, unexamined_attachments) = extra_attachments
+            .split_at(extra_attachments.len().min(MAX_FEEDBACK_EXTRA_ATTACHMENT_ATTEMPTS));
+        let remaining_attempts = MAX_FEEDBACK_EXTRA_ATTACHMENT_ATTEMPTS - extra_attachments.len();
+        let (extra_attachment_paths, unexamined_paths) =
+            extra_attachment_paths.split_at(extra_attachment_paths.len().min(remaining_attempts));
 
         let mut attachments = Vec::new();
-        let mut omitted = Vec::new();
+        let mut omitted = AttachmentOmissions {
+            unexamined_candidates: unexamined_attachments.len().saturating_add(unexamined_paths.len()),
+            ..Default::default()
+        };
         let mut remaining = MAX_TOTAL_ATTACHMENT_BYTES;
 
         if include_logs {
@@ -726,7 +772,7 @@ impl FeedbackSnapshot {
                         error = %err,
                         "failed to read log attachment; skipping"
                     );
-                    omitted.push(format!("{filename}: read failed: {err}"));
+                    omitted.record(format_args!("{filename}: read failed: {err}"));
                     continue;
                 }
             };
@@ -756,11 +802,53 @@ impl FeedbackSnapshot {
     }
 }
 
+#[derive(Default)]
+struct AttachmentOmissions {
+    details: Vec<String>,
+    unrecorded_details: usize,
+    unexamined_candidates: usize,
+}
+
+impl AttachmentOmissions {
+    fn record(&mut self, message: fmt::Arguments<'_>) {
+        if self.details.len() == MAX_OMITTED_ATTACHMENT_DETAILS {
+            self.unrecorded_details += 1;
+            return;
+        }
+        let mut detail = BoundedOmissionDetail(String::new());
+        if detail.write_fmt(message).is_err() {
+            const ELLIPSIS: &str = "…";
+            let end = detail
+                .0
+                .floor_char_boundary(MAX_OMISSION_DETAIL_BYTES - ELLIPSIS.len());
+            detail.0.truncate(end);
+            detail.0.push_str(ELLIPSIS);
+        }
+        self.details.push(detail.0);
+    }
+}
+
+// Limit formatting as it writes, rather than allocating an entire filename/error message first.
+struct BoundedOmissionDetail(String);
+
+impl fmt::Write for BoundedOmissionDetail {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let remaining = MAX_OMISSION_DETAIL_BYTES - self.0.len();
+        if text.len() <= remaining {
+            self.0.push_str(text);
+            Ok(())
+        } else {
+            self.0.push_str(&text[..text.floor_char_boundary(remaining)]);
+            Err(fmt::Error)
+        }
+    }
+}
+
 fn reserve_attachment_bytes(
     filename: &str,
     bytes: usize,
     remaining: &mut usize,
-    omitted: &mut Vec<String>,
+    omitted: &mut AttachmentOmissions,
 ) -> bool {
     if bytes > MAX_ATTACHMENT_BYTES || bytes > *remaining {
         tracing::warn!(
@@ -769,11 +857,15 @@ fn reserve_attachment_bytes(
             "feedback attachment exceeds upload byte budget; skipping"
         );
         // Path-backed reads stop one byte past the limit, so report the limit, not a size.
-        omitted.push(if bytes > MAX_ATTACHMENT_BYTES {
-            format!("{filename}: exceeds the {MAX_ATTACHMENT_BYTES}-byte attachment limit")
+        if bytes > MAX_ATTACHMENT_BYTES {
+            omitted.record(format_args!(
+                "{filename}: exceeds the {MAX_ATTACHMENT_BYTES}-byte attachment limit"
+            ));
         } else {
-            format!("{filename}: exceeds the remaining {remaining}-byte upload budget")
-        });
+            omitted.record(format_args!(
+                "{filename}: exceeds the remaining {remaining}-byte upload budget"
+            ));
+        }
         return false;
     }
     *remaining -= bytes;

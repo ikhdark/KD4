@@ -169,7 +169,7 @@ pub(super) async fn spawn_review_thread(
             // Review prompt is synthesized; no UI element ranges to preserve.
             text_elements: Vec::new(),
         }],
-        client_id: None,
+        identity: UserInputIdentity::Unreceipted(None),
         start_fence: None,
     }];
     let tc = Arc::new(review_turn_context);

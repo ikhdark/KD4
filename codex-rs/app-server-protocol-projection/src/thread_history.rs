@@ -305,10 +305,10 @@ impl ThreadHistoryBuilder {
     /// This function should handle all EventMsg variants that can be persisted in a rollout file.
     /// See `should_persist_event_msg` in `codex-rs/core/rollout/policy.rs`.
     pub fn handle_event(&mut self, event: &EventMsg) {
-        // Background exec output can arrive between the canonical user item and
-        // its legacy mirror without changing history. Keep only the user token
-        // across that delta; other events still end its matching window.
-        if !matches!(event, EventMsg::ExecCommandOutputDelta(_))
+        // Background exec output is not a history item. It can interleave with
+        // canonical messages and their legacy mirrors without ending their match.
+        let is_exec_output_delta = matches!(event, EventMsg::ExecCommandOutputDelta(_));
+        if !is_exec_output_delta
             && let Some(mirror) = self.pending_legacy_user_mirror.take()
             && let EventMsg::UserMessage(payload) = event
             && payload.client_id == mirror.client_id
@@ -321,9 +321,14 @@ impl ThreadHistoryBuilder {
         {
             return;
         }
-        // Core emits the legacy compatibility event immediately after its canonical item.
-        // Consume only that mirror; later messages and compactions remain distinct items.
-        if let Some(mut item) = self.pending_legacy_item_mirror.take() {
+        // Keep pending assistant and reasoning parts across exec output only.
+        // Other events still end the window unless they are the expected mirror.
+        let keep_item_mirror = is_exec_output_delta
+            && matches!(
+                &self.pending_legacy_item_mirror,
+                Some(LegacyItemMirror::AgentMessage { .. } | LegacyItemMirror::Reasoning { .. })
+            );
+        if !keep_item_mirror && let Some(mut item) = self.pending_legacy_item_mirror.take() {
             let is_mirror = match (&mut item, event) {
                 (LegacyItemMirror::AgentMessage { content, phase }, EventMsg::AgentMessage(payload))
                     if payload.phase == *phase && content.as_slice().first().is_some_and(|text| text == &payload.message) => {

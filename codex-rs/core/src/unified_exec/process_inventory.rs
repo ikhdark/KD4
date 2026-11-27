@@ -73,7 +73,7 @@ impl UnifiedExecProcessManager {
             return (entry.process.incarnation() == incarnation)
                 .then(|| entry.process.output_reference());
         }
-        if store.used_process_ids.get(&process_id).copied().flatten() != Some(incarnation) {
+        if store.issued_process_incarnation(process_id) != Some(incarnation) {
             return None;
         }
         store.finished.iter().find(|(id, _, _)| *id == process_id).map(|(_, output, _)| {
@@ -103,7 +103,7 @@ impl UnifiedExecProcessManager {
                 error,
             )
         } else {
-            if store.used_process_ids.get(&process_id).copied().flatten() != Some(incarnation) {
+            if store.issued_process_incarnation(process_id) != Some(incarnation) {
                 return Err("process handle is unavailable or its incarnation is stale; no status observed".into());
             }
             match store.finished.iter().find(|(id, _, _)| *id == process_id) {
@@ -112,7 +112,7 @@ impl UnifiedExecProcessManager {
                     output.process_exited.then_some(output.exit_code).flatten(),
                     output.error.clone(),
                 ),
-                // An excluded/retired ID is not evidence that a process exited.
+                // An issued ID alone is not evidence that a process exited.
                 None => ("unavailable", None, None),
             }
         };
@@ -171,7 +171,7 @@ impl UnifiedExecProcessManager {
             // A retained result alone is not proof the root process exited.
             entries.push(serde_json::json!({
                 "session_id": id,
-                "incarnation": store.used_process_ids.get(id).copied().flatten(),
+                "incarnation": store.issued_process_incarnation(*id),
                 "call_id": output.event_call_id,
                 "status": if output.process_exited { "exited" } else { "uncertain" },
                 "shutdown": output.session_capabilities.and_then(|capabilities| capabilities.shutdown),

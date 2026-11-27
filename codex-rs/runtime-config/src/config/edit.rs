@@ -273,7 +273,10 @@ impl ConfigDocument {
                 &[NOTICE_TABLE_KEY, "model_migrations", from.as_str()],
                 value(to.clone()),
             )),
-            ConfigEdit::ReplaceMcpServers(servers) => Ok(self.replace_mcp_servers(servers)),
+            ConfigEdit::ReplaceMcpServers(servers) => {
+                codex_config::validate_mcp_replacement(&self.doc)?;
+                Ok(self.replace_mcp_servers(servers))
+            }
             ConfigEdit::AddToolSuggestDisabledTool(disabled_tool) => {
                 Ok(self.add_tool_suggest_disabled_tool(disabled_tool))
             }
@@ -794,21 +797,39 @@ fn apply_blocking_to_resolved_file(
     edits: &[ConfigEdit],
     expected_version: Option<&str>,
 ) -> anyhow::Result<ConfigApplyOutcome> {
-    apply_blocking_to_resolved_file_with_snapshot(
+    prepare_blocking_to_resolved_file_with_snapshot(
         resolved_config_file, edits, expected_version, |_| Ok(()),
-    ).map(|receipt| match receipt {
+    )?.commit().map(|receipt| match receipt {
         Some(()) => ConfigApplyOutcome::Applied,
         None => ConfigApplyOutcome::VersionConflict,
     })
 }
 
-fn apply_blocking_to_resolved_file_with_snapshot<T>(
+struct PreparedConfigWrite<T> {
+    _lock: codex_file_system::AtomicWriteLock,
+    write_path: PathBuf,
+    contents: Option<String>,
+    receipt: Option<T>,
+}
+
+impl<T> PreparedConfigWrite<T> {
+    fn commit(self) -> anyhow::Result<Option<T>> {
+        if let Some(contents) = self.contents {
+            write_atomically(&self.write_path, &contents).with_context(|| {
+                format!("failed to persist config at {}", self.write_path.display())
+            })?;
+        }
+        Ok(self.receipt)
+    }
+}
+
+fn prepare_blocking_to_resolved_file_with_snapshot<T>(
     resolved_config_file: &Path,
     edits: &[ConfigEdit],
     expected_version: Option<&str>,
     snapshot: impl FnOnce(&str) -> anyhow::Result<T>,
-) -> anyhow::Result<Option<T>> {
-    let (write_paths, _lock) = acquire_resolved_atomic_write_lock(resolved_config_file)
+) -> anyhow::Result<PreparedConfigWrite<T>> {
+    let (write_paths, lock) = acquire_resolved_atomic_write_lock(resolved_config_file)
         .with_context(|| {
             format!(
                 "failed to lock config at {}",
@@ -816,6 +837,12 @@ fn apply_blocking_to_resolved_file_with_snapshot<T>(
             )
         })?;
 
+    let prepare = |receipt, contents| PreparedConfigWrite {
+        _lock: lock,
+        write_path: write_paths.write_path,
+        contents,
+        receipt,
+    };
     let serialized = match write_paths.read_path {
         Some(path) => match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
@@ -832,12 +859,12 @@ fn apply_blocking_to_resolved_file_with_snapshot<T>(
             &serialized
         })?;
         if version_for_toml(&value) != expected_version {
-            return Ok(None);
+            return Ok(prepare(None, None));
         }
     }
 
     if edits.is_empty() {
-        return snapshot(&serialized).map(Some);
+        return Ok(prepare(Some(snapshot(&serialized)?), None));
     }
 
     let mut doc = if serialized.is_empty() {
@@ -867,21 +894,14 @@ fn apply_blocking_to_resolved_file_with_snapshot<T>(
                 _ => false,
             }))
     {
-        return snapshot(&serialized).map(Some);
+        return Ok(prepare(Some(snapshot(&serialized)?), None));
     }
 
     let serialized = document.doc.to_string();
     // Construct any fallible receipt from the exact buffer before committing,
     // while the same lock still excludes independent writers.
     let receipt = snapshot(&serialized)?;
-    write_atomically(&write_paths.write_path, &serialized).with_context(|| {
-        format!(
-            "failed to persist config at {}",
-            write_paths.write_path.display()
-        )
-    })?;
-
-    Ok(Some(receipt))
+    Ok(prepare(Some(receipt), Some(serialized)))
 }
 
 /// Persist edits asynchronously by offloading the blocking writer.
@@ -970,6 +990,7 @@ impl ConfigEditsBuilder {
         self
     }
 
+    /// Refuses to overwrite or remove an undecodable server entry. Repair it before retrying.
     pub fn replace_mcp_servers(mut self, servers: &BTreeMap<String, McpServerConfig>) -> Self {
         self.edits
             .push(ConfigEdit::ReplaceMcpServers(servers.clone()));
@@ -1059,7 +1080,15 @@ impl ConfigEditsBuilder {
     /// Read-time migration does not rewrite a no-op, and all fallible receipt
     /// construction completes before persistence.
     pub fn apply_blocking_with_config(self) -> anyhow::Result<Option<toml::Value>> {
-        apply_blocking_to_resolved_file_with_snapshot(
+        self.prepare_blocking_with_config()?()
+    }
+
+    /// Stage the receipt and bytes under the writer lock. The returned operation
+    /// retains that lock; dropping it without calling it leaves config untouched.
+    pub fn prepare_blocking_with_config(
+        self,
+    ) -> anyhow::Result<impl FnOnce() -> anyhow::Result<Option<toml::Value>>> {
+        let prepared = prepare_blocking_to_resolved_file_with_snapshot(
             &self.config_path,
             &self.edits,
             self.expected_version.as_deref(),
@@ -1072,7 +1101,8 @@ impl ConfigEditsBuilder {
                     config, base_dir,
                 )?)
             },
-        )
+        )?;
+        Ok(move || prepared.commit())
     }
 
     /// Apply edits asynchronously via a blocking offload.

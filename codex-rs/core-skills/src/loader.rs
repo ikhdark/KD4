@@ -82,6 +82,7 @@ struct SkillMetadataFile {
 
 #[derive(Default)]
 struct LoadedSkillMetadata {
+    has_retryable_read_failure: bool,
     interface: Option<SkillInterface>,
     dependencies: Option<SkillDependencies>,
     policy: Option<SkillPolicy>,
@@ -228,6 +229,7 @@ pub(crate) struct SkillRootSnapshot {
     pub(crate) root: AbsolutePathBuf,
     pub(crate) skills: Vec<SkillMetadata>,
     pub(crate) errors: Vec<SkillError>,
+    pub(crate) has_retryable_read_failures: bool,
     pub(crate) file_system: Arc<dyn ExecutorFileSystem>,
 }
 
@@ -287,6 +289,7 @@ pub(crate) async fn load_skill_root(
         root,
         skills: outcome.skills,
         errors: outcome.errors,
+        has_retryable_read_failures: outcome.has_retryable_read_failures,
         file_system,
     }
 }
@@ -616,6 +619,7 @@ async fn load_skills_under_root(
         plugin_roots,
         mut namespace_roots,
         warnings,
+        has_retryable_read_failures,
     } = discover_skills(
         fs,
         &PathUri::from_abs_path(root),
@@ -628,6 +632,7 @@ async fn load_skills_under_root(
         sandbox,
     )
     .await;
+    outcome.has_retryable_read_failures |= has_retryable_read_failures;
     for warning in warnings {
         error!("{warning}");
         outcome.errors.push(SkillError {
@@ -679,7 +684,10 @@ async fn load_skills_under_root(
         .collect::<Vec<_>>();
     let namespace_resolver = async {
         match plugin_namespace {
-            Some(namespace) => SkillNamespaceResolver::with_provided_namespace(namespace),
+            Some(namespace) => (
+                SkillNamespaceResolver::with_provided_namespace(namespace),
+                Vec::new(),
+            ),
             None => {
                 SkillNamespaceResolver::discover(
                     fs,
@@ -707,26 +715,41 @@ async fn load_skills_under_root(
                     plugin_root,
                     sandbox,
                 )
-                .await
-                .map_err(|err| err.to_string());
+                .await;
                 (index, skill.path, skill.path_uri, result)
             }
         })
         .buffer_unordered(MAX_CONCURRENT_SKILL_LOADS)
         .collect::<Vec<_>>()
         .boxed();
-    let (namespace_resolver, mut skill_results) = tokio::join!(namespace_resolver, skill_results);
+    let ((namespace_resolver, warnings), mut skill_results) =
+        tokio::join!(namespace_resolver, skill_results);
+    outcome.has_retryable_read_failures |= !warnings.is_empty();
+    for warning in warnings {
+        error!("{warning}");
+        outcome.errors.push(SkillError {
+            path: root.clone(),
+            message: warning,
+            is_warning: false,
+        });
+    }
     skill_results.sort_unstable_by_key(|(index, _, _, _)| *index);
     for (_, path, path_uri, result) in skill_results {
-        let result = result.and_then(|(mut skill, errors)| {
-            outcome.errors.extend(errors);
-            skill.name = namespace_resolver
-                .for_skill(&root_uri, &path_uri)
-                .qualify(&skill.name);
-            validate_len(&skill.name, MAX_QUALIFIED_NAME_LEN, "qualified name")
-                .map_err(|err| err.to_string())?;
-            Ok(skill)
-        });
+        if matches!(&result, Err(SkillParseError::Read(error)) if retryable_skill_io(error)) {
+            outcome.has_retryable_read_failures = true;
+        }
+        let result = result
+            .map_err(|err| err.to_string())
+            .and_then(|(mut skill, errors, retryable)| {
+                outcome.has_retryable_read_failures |= retryable;
+                outcome.errors.extend(errors);
+                skill.name = namespace_resolver
+                    .for_skill(&root_uri, &path_uri)
+                    .qualify(&skill.name);
+                validate_len(&skill.name, MAX_QUALIFIED_NAME_LEN, "qualified name")
+                    .map_err(|err| err.to_string())?;
+                Ok(skill)
+            });
         match result {
             Ok(skill) => outcome.skills.push(skill),
             Err(err) if scope != SkillScope::System => {
@@ -746,7 +769,7 @@ async fn parse_skill_file(
     plugin_id: Option<&str>,
     plugin_root: Option<&AbsolutePathBuf>,
     sandbox: Option<&FileSystemSandboxContext>,
-) -> Result<(SkillMetadata, Vec<SkillError>), SkillParseError> {
+) -> Result<(SkillMetadata, Vec<SkillError>, bool), SkillParseError> {
     let metadata_path = path_uri
         .parent()
         .and_then(|parent| parent.join(SKILLS_METADATA_DIR).ok())
@@ -768,6 +791,7 @@ async fn parse_skill_file(
         short_description,
     } = parse_skill_frontmatter_metadata_inner(&contents, || default_skill_name(path))?;
     let LoadedSkillMetadata {
+        has_retryable_read_failure,
         interface,
         dependencies,
         policy,
@@ -809,6 +833,7 @@ async fn parse_skill_file(
             plugin_id: plugin_id.map(str::to_string),
         },
         errors,
+        has_retryable_read_failure,
     ))
 }
 
@@ -874,6 +899,16 @@ fn default_skill_name(path: &AbsolutePathBuf) -> String {
         .unwrap_or_else(|| "skill".to_string())
 }
 
+fn retryable_skill_io(error: &io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::FileTooLarge
+            | io::ErrorKind::Unsupported
+    )
+}
+
 async fn load_skill_metadata(
     fs: &dyn ExecutorFileSystem,
     skill_path: &AbsolutePathBuf,
@@ -907,6 +942,7 @@ async fn load_skill_metadata(
                         "ignoring {path}: failed to stat {SKILLS_METADATA_FILENAME}: {error}"
                     ));
                     return LoadedSkillMetadata {
+                        has_retryable_read_failure: retryable_skill_io(&error),
                         diagnostics,
                         ..LoadedSkillMetadata::default()
                     };
@@ -923,6 +959,7 @@ async fn load_skill_metadata(
                 "ignoring {metadata_path_uri}: failed to read {SKILLS_METADATA_FILENAME}: {error}"
             ));
             return LoadedSkillMetadata {
+                has_retryable_read_failure: retryable_skill_io(&error),
                 diagnostics,
                 ..LoadedSkillMetadata::default()
             };
@@ -951,6 +988,7 @@ async fn load_skill_metadata(
         policy,
     } = parsed;
     LoadedSkillMetadata {
+        has_retryable_read_failure: false,
         interface: resolve_interface(&mut diagnostics, interface, &skill_dir, plugin_root),
         dependencies: resolve_dependencies(&mut diagnostics, dependencies),
         policy: resolve_policy(policy),

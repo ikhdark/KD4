@@ -986,27 +986,40 @@ async fn apply_hunks_to_files(
                 path.inferred_native_path_string()
             );
         };
-        let new_contents = new_contents_from_chunks(&path, &source, chunks, Some(index + 1))
-            .map_err(|mut error| {
-                mark_chained_mismatch(&mut error, previous_update);
-                error
-            })?;
-        let update = AppliedPatch {
-            new_contents,
-            original_contents: source,
-        };
-        // Rebuilding against a newer snapshot must enforce the same guard as
-        // preflight.
-        if let Some(error) =
-            update_json_regression(hunk.path(), index, &previous_updates, &prepared, &update)
-        {
-            return Err(ApplyPatchError::ComputeReplacements(format!(
-                "{} was valid JSON before this patch; candidate is invalid: {error}",
-                path.inferred_native_path_string(),
-            ))
-            .into());
-        }
-        prepared[index] = Some(update);
+        let hunk_path = hunk.path().to_path_buf();
+        let json_first = json_regression_first_update(index, &previous_updates);
+        let extra_source_bytes = prior_json_source(json_first, index, &prepared).map_or(0, str::len);
+        prepared = run_patch_text_work(
+            &path,
+            source,
+            chunks,
+            extra_source_bytes,
+            move |path, source, chunks| {
+                let new_contents =
+                    new_contents_from_chunks(path, &source, chunks, Some(index + 1))
+                        .map_err(|mut error| {
+                            mark_chained_mismatch(&mut error, previous_update);
+                            error
+                        })?;
+                let update = AppliedPatch {
+                    new_contents,
+                    original_contents: source,
+                };
+                // Rebuilding against a newer snapshot must enforce the same guard as
+                // preflight.
+                if let Some(error) =
+                    update_json_regression(&hunk_path, index, json_first, &prepared, &update)
+                {
+                    return Err(ApplyPatchError::ComputeReplacements(format!(
+                        "{} was valid JSON before this patch; candidate is invalid: {error}",
+                        path.inferred_native_path_string(),
+                    )));
+                }
+                prepared[index] = Some(update);
+                Ok(prepared)
+            },
+        )
+        .await?;
     }
 
     // Recheck read-only dependencies and absence as well as mutation sources.
@@ -1437,79 +1450,93 @@ pub(crate) async fn preflight_hunks(
                         }
                     },
                 };
-                let source = PreparedSource::new(&original_contents);
-                match new_contents_from_prepared(&path, &source, chunks, hunk_ordinal) {
-                    Ok(new_contents) => {
-                        let update = AppliedPatch {
-                            original_contents,
-                            new_contents,
-                        };
-                        // Validate the complete candidate before any hunk is
-                        // published. Existing JSONC and malformed documents can
-                        // still be edited; only strict-JSON regressions fail.
-                        if let Some(error) = update_json_regression(
-                            hunk.path(),
-                            ordinal,
-                            previous_updates,
-                            &prepared,
-                            &update,
-                        ) {
-                            failures.push(ApplyPatchError::ComputeReplacements(format!(
-                                "{} was valid JSON before this patch; candidate is invalid: {error}. No files were changed.",
-                                hunk.path().display()
-                            )));
-                            prepared.push(None);
-                        } else {
-                            prepared.push(Some(update));
-                        }
-                    }
-                    Err(mut error) => {
-                        mark_chained_mismatch(&mut error, previous_update);
-                        // Keep the ordered matching error, then enumerate later
-                        // independently broken chunks against this same snapshot.
-                        // Chunks through the failing one either matched in order
-                        // or are that failure, so alone they add nothing new.
-                        let failed_chunks = match &error {
-                            ApplyPatchError::PatchContextMismatch(mismatch) => {
-                                mismatch.chunk_ordinal
-                            }
-                            _ => 0,
-                        };
-                        let first = error.to_string();
-                        failures.push(error);
-                        for (index, chunk) in chunks.iter().enumerate().skip(failed_chunks) {
-                            if let Err(mut error) = new_contents_from_prepared(
-                                &path,
-                                &source,
-                                std::slice::from_ref(chunk),
-                                hunk_ordinal,
-                            ) {
-                                if let ApplyPatchError::PatchContextMismatch(ref mut mismatch) =
-                                    error
-                                {
-                                    // Alone, a later chunk loses the anchor its
-                                    // predecessors give it in sequence, so an
-                                    // ambiguity found here is not independent.
-                                    if index > 0
-                                        && mismatch.kind == PatchContextMismatchKind::AmbiguousMatch
-                                    {
-                                        continue;
-                                    }
-                                    mismatch.chunk_ordinal = index + 1;
+                let hunk_path = hunk.path().to_path_buf();
+                let json_first = json_regression_first_update(ordinal, previous_updates);
+                let extra_source_bytes =
+                    prior_json_source(json_first, ordinal, &prepared).map_or(0, str::len);
+                (prepared, failures) = run_patch_text_work(
+                    &path,
+                    original_contents,
+                    chunks,
+                    extra_source_bytes,
+                    move |path, original_contents, chunks| {
+                        let source = PreparedSource::new(&original_contents);
+                        match new_contents_from_prepared(path, &source, chunks, hunk_ordinal) {
+                            Ok(new_contents) => {
+                                let update = AppliedPatch {
+                                    original_contents,
+                                    new_contents,
+                                };
+                                // Validate the complete candidate before any hunk is
+                                // published. Existing JSONC and malformed documents can
+                                // still be edited; only strict-JSON regressions fail.
+                                if let Some(error) = update_json_regression(
+                                    &hunk_path,
+                                    ordinal,
+                                    json_first,
+                                    &prepared,
+                                    &update,
+                                ) {
+                                    failures.push(ApplyPatchError::ComputeReplacements(format!(
+                                        "{} was valid JSON before this patch; candidate is invalid: {error}. No files were changed.",
+                                        hunk_path.display()
+                                    )));
+                                    prepared.push(None);
+                                } else {
+                                    prepared.push(Some(update));
                                 }
+                            }
+                            Err(mut error) => {
                                 mark_chained_mismatch(&mut error, previous_update);
-                                if error.to_string() != first
-                                    && !failures
-                                        .iter()
-                                        .any(|prior| prior.to_string() == error.to_string())
-                                {
-                                    failures.push(error);
+                                // Keep the ordered matching error, then enumerate later
+                                // independently broken chunks against this same snapshot.
+                                // Chunks through the failing one either matched in order
+                                // or are that failure, so alone they add nothing new.
+                                let failed_chunks = match &error {
+                                    ApplyPatchError::PatchContextMismatch(mismatch) => {
+                                        mismatch.chunk_ordinal
+                                    }
+                                    _ => 0,
+                                };
+                                let first = error.to_string();
+                                failures.push(error);
+                                for (index, chunk) in chunks.iter().enumerate().skip(failed_chunks) {
+                                    if let Err(mut error) = new_contents_from_prepared(
+                                        path,
+                                        &source,
+                                        std::slice::from_ref(chunk),
+                                        hunk_ordinal,
+                                    ) {
+                                        if let ApplyPatchError::PatchContextMismatch(ref mut mismatch) =
+                                            error
+                                        {
+                                            // Alone, a later chunk loses the anchor its
+                                            // predecessors give it in sequence, so an
+                                            // ambiguity found here is not independent.
+                                            if index > 0
+                                                && mismatch.kind == PatchContextMismatchKind::AmbiguousMatch
+                                            {
+                                                continue;
+                                            }
+                                            mismatch.chunk_ordinal = index + 1;
+                                        }
+                                        mark_chained_mismatch(&mut error, previous_update);
+                                        if error.to_string() != first
+                                            && !failures
+                                                .iter()
+                                                .any(|prior| prior.to_string() == error.to_string())
+                                        {
+                                            failures.push(error);
+                                        }
+                                    }
                                 }
+                                prepared.push(None);
                             }
                         }
-                        prepared.push(None);
-                    }
-                }
+                        Ok((prepared, failures))
+                    },
+                )
+                .await?;
             }
             Hunk::DeleteFile { .. } => match fs.read_file_text(&path, sandbox).await {
                 Ok(contents) => prepared.push(Some(AppliedPatch {
@@ -1631,24 +1658,33 @@ fn mark_chained_mismatch(error: &mut ApplyPatchError, previous_update: Option<us
     }
 }
 
+fn json_regression_first_update(index: usize, previous_updates: &[Option<usize>]) -> Option<usize> {
+    // An intermediate hunk of one file may leave an incomplete document.
+    (!previous_updates.contains(&Some(index))).then(|| first_update(previous_updates, index))
+}
+
+fn prior_json_source(
+    first: Option<usize>,
+    index: usize,
+    prepared: &[Option<AppliedPatch>],
+) -> Option<&str> {
+    let first = first.filter(|first| *first != index)?;
+    Some(&prepared.get(first)?.as_ref()?.original_contents)
+}
+
 /// The strict-JSON regression an update introduces. Repeated updates of one
-/// file are checked once, from the source the first read to the last result,
-/// because an intermediate result may be incomplete.
+/// file are checked once, from the source the first read to the last result.
 fn update_json_regression(
     path: &std::path::Path,
     index: usize,
-    previous_updates: &[Option<usize>],
+    first: Option<usize>,
     prepared: &[Option<AppliedPatch>],
     update: &AppliedPatch,
 ) -> Option<serde_json::Error> {
-    if previous_updates.contains(&Some(index)) {
-        return None;
-    }
-    let first = first_update(previous_updates, index);
-    let source = if first == index {
-        &update.original_contents
+    let source = if first? == index {
+        update.original_contents.as_str()
     } else {
-        &prepared.get(first)?.as_ref()?.original_contents
+        prior_json_source(first, index, prepared)?
     };
     invalid_json_candidate(path, source, &update.new_contents)
 }
@@ -1952,6 +1988,65 @@ struct AppliedPatch {
     new_contents: String,
 }
 
+/// Derive and check candidates off the async executor when input work is
+/// large. The blocking job owns only snapshots and edit data; filesystem
+/// checks, publication, rollback, and receipts remain with its caller.
+async fn run_patch_text_work<T, F>(
+    path: &PathUri,
+    original_contents: String,
+    chunks: &[UpdateFileChunk],
+    extra_source_bytes: usize,
+    work: F,
+) -> Result<T, ApplyPatchError>
+where
+    T: Send + 'static,
+    F: FnOnce(&PathUri, String, &[UpdateFileChunk]) -> Result<T, ApplyPatchError> + Send + 'static,
+{
+    const OFFLOAD_BYTES: usize = 256 * 1024;
+    static TEXT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+    let mut bytes = original_contents.len().saturating_add(extra_source_bytes);
+    let large = bytes >= OFFLOAD_BYTES
+        || chunks.iter().any(|chunk| {
+            // These operations can amplify small inputs into large outputs.
+            if json_edit::is_json_chunk(chunk)
+                || chunk
+                    .change_context
+                    .as_deref()
+                    .is_some_and(|context| context.starts_with(counted_replace::PREFIX))
+            {
+                return true;
+            }
+            bytes = bytes
+                .saturating_add(1)
+                .saturating_add(chunk.change_context.as_ref().map_or(0, String::len));
+            bytes >= OFFLOAD_BYTES
+                || chunk.old_lines.iter().chain(&chunk.new_lines).any(|line| {
+                    // Count empty lines too, since matching still visits them.
+                    bytes = bytes.saturating_add(line.len()).saturating_add(1);
+                    bytes >= OFFLOAD_BYTES
+                })
+        });
+    if !large {
+        return work(path, original_contents, chunks);
+    }
+
+    let permit = TEXT_SLOTS.acquire().await.map_err(|error| {
+        ApplyPatchError::ComputeReplacements(format!("patch text worker unavailable: {error}"))
+    })?;
+    let path = path.clone();
+    let chunks = chunks.to_vec();
+    tokio::task::spawn_blocking(move || {
+        // Keep the permit until the CPU work ends, even if its waiter is dropped.
+        let _permit = permit;
+        work(&path, original_contents, &chunks)
+    })
+    .await
+    .map_err(|error| {
+        ApplyPatchError::ComputeReplacements(format!("patch text worker failed: {error}"))
+    })?
+}
+
 fn invalid_json_candidate(
     path: &std::path::Path,
     original_contents: &str,
@@ -1977,21 +2072,31 @@ async fn derive_new_contents_from_chunks(
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> std::result::Result<AppliedPatch, ApplyPatchError> {
     let original_contents = read_update_source(path, fs, sandbox).await?;
-    let new_contents = new_contents_from_chunks(path, &original_contents, chunks, hunk_ordinal)?;
-    if let Some(error) =
-        invalid_json_candidate(&path.to_path_buf(), &original_contents, &new_contents)
-    {
-        // Rebuilding against a newer snapshot must enforce the same guard as
-        // preflight. Earlier hunks may already be committed at this point.
-        return Err(ApplyPatchError::ComputeReplacements(format!(
-            "{} was valid JSON before this patch; candidate is invalid: {error}",
-            path.inferred_native_path_string(),
-        )));
-    }
-    Ok(AppliedPatch {
+    run_patch_text_work(
+        path,
         original_contents,
-        new_contents,
-    })
+        chunks,
+        0,
+        move |path, original_contents, chunks| {
+            let new_contents =
+                new_contents_from_chunks(path, &original_contents, chunks, hunk_ordinal)?;
+            if let Some(error) =
+                invalid_json_candidate(&path.to_path_buf(), &original_contents, &new_contents)
+            {
+                // Rebuilding against a newer snapshot must enforce the same guard as
+                // preflight. Earlier hunks may already be committed at this point.
+                return Err(ApplyPatchError::ComputeReplacements(format!(
+                    "{} was valid JSON before this patch; candidate is invalid: {error}",
+                    path.inferred_native_path_string(),
+                )));
+            }
+            Ok(AppliedPatch {
+                original_contents,
+                new_contents,
+            })
+        },
+    )
+    .await
 }
 
 async fn read_update_source(

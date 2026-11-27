@@ -211,7 +211,7 @@ pub struct ShellEnvironmentPolicy {
     /// Environment variable names to retain in the environment.
     pub include_only: Vec<EnvironmentVariablePattern>,
 
-    /// If true, the shell profile will be used to run the command.
+    /// Legacy field retained for compatibility; the execution backend ignores it.
     pub use_profile: bool,
 }
 

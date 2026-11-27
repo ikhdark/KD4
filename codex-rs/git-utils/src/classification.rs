@@ -334,17 +334,37 @@ fn read_prefix(path: &Path) -> Result<Option<String>, String> {
     if !metadata.is_file() || metadata.is_symlink() {
         return Ok(None);
     }
-    let file = codex_file_system::open_regular_file_no_follow(path)
+    let mut file = codex_file_system::open_regular_file_no_follow(path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(HEADER_LIMIT)
+    file.by_ref()
+        .take(HEADER_LIMIT)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
     // Header markers are ASCII. Non-UTF-8/binary prefixes never prove absence.
-    Ok(std::str::from_utf8(&bytes)
-        .ok()
-        .filter(|text| !text.contains('\0'))
-        .map(str::to_owned))
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => Some(text),
+        Err(error) if error.error_len().is_none() && bytes.len() as u64 == HEADER_LIMIT => {
+            // Look past the cap only to validate an incomplete UTF-8 code point.
+            let end = error.valid_up_to();
+            let partial = &bytes[end..];
+            let width = partial[0].leading_ones() as usize;
+            let mut code_point = [0; 4];
+            code_point[..partial.len()].copy_from_slice(partial);
+            match file.read_exact(&mut code_point[partial.len()..width]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            }
+            if std::str::from_utf8(&code_point[..width]).is_err() {
+                return Ok(None);
+            }
+            // Neither the partial code point nor its lookahead participates in marker matching.
+            std::str::from_utf8(&bytes[..end]).ok()
+        }
+        Err(_) => None,
+    };
+    Ok(text.filter(|text| !text.contains('\0')).map(str::to_owned))
 }
 
 fn check_control(control: &GitCommandControl) -> Result<(), String> {

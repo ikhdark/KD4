@@ -36,6 +36,7 @@ pub(super) struct SkillDiscovery {
     pub plugin_roots: HashSet<PathUri>,
     pub namespace_roots: HashSet<PathUri>,
     pub warnings: Vec<String>,
+    pub has_retryable_read_failures: bool,
 }
 
 pub(super) struct DiscoveredSkill {
@@ -60,6 +61,7 @@ pub(super) async fn discover_skills(
         plugin_roots: HashSet::new(),
         namespace_roots: HashSet::new(),
         warnings: Vec::new(),
+        has_retryable_read_failures: false,
     };
     let walk = match file_system
         .walk(
@@ -89,6 +91,7 @@ pub(super) async fn discover_skills(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return empty_discovery(),
         Err(error) => {
             let mut discovery = empty_discovery();
+            discovery.has_retryable_read_failures = super::retryable_skill_io(&error);
             discovery
                 .warnings
                 .push(format!("failed to walk skills root {root}: {error:#}"));
@@ -96,7 +99,8 @@ pub(super) async fn discover_skills(
         }
     };
 
-    let inventory_complete = !walk.truncated && walk.errors.is_empty();
+    let has_retryable_read_failures = !walk.errors.is_empty();
+    let inventory_complete = !walk.truncated && !has_retryable_read_failures;
     let mut warnings = walk
         .errors
         .into_iter()
@@ -183,6 +187,7 @@ pub(super) async fn discover_skills(
         plugin_roots,
         namespace_roots: HashSet::from([root.clone()]),
         warnings,
+        has_retryable_read_failures,
     }
 }
 

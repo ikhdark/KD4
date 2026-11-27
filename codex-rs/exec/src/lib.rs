@@ -145,6 +145,7 @@ pub use exec_events::TurnStartedEvent;
 pub use exec_events::Usage;
 pub use exec_events::WebSearchItem;
 use serde_json::Value;
+use std::future::Future;
 use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
@@ -189,15 +190,32 @@ fn json_stream_opt_out_methods(json_mode: bool, json_progress: bool) -> Vec<Stri
     .to_vec()
 }
 
-fn build_exec_otel_provider(
-    config: &Config,
-) -> Result<Option<codex_otel::OtelProvider>, Box<dyn std::error::Error>> {
-    codex_core::otel_init::build_provider(
+async fn build_exec_otel_provider(config: &Config) -> Option<codex_otel::OtelProvider> {
+    let mut build = std::pin::pin!(codex_core::otel_init::build_provider_async(
         config,
         env!("CARGO_PKG_VERSION"),
         /*service_name_override*/ None,
         DEFAULT_ANALYTICS_ENABLED,
-    )
+    ));
+    // Catch panics from polling the provider, not just from creating its future.
+    let result = std::future::poll_fn(|cx| {
+        let poll = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build.as_mut().poll(cx)
+        }))?;
+        poll.map(Ok::<_, Box<dyn std::any::Any + Send>>)
+    })
+    .await;
+    match result {
+        Ok(Ok(otel)) => otel,
+        Ok(Err(e)) => {
+            eprintln!("Could not create otel exporter: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("Could not create otel exporter: panicked during initialization");
+            None
+        }
+    }
 }
 
 struct InitialOperation {
@@ -544,19 +562,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         std::process::exit(1);
     }
 
-    let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build_exec_otel_provider(&config)
-    })) {
-        Ok(Ok(otel)) => otel,
-        Ok(Err(e)) => {
-            eprintln!("Could not create otel exporter: {e}");
-            None
-        }
-        Err(_) => {
-            eprintln!("Could not create otel exporter: panicked during initialization");
-            None
-        }
-    };
+    let otel = build_exec_otel_provider(&config).await;
     codex_core::otel_init::record_process_start(otel.as_ref(), "codex_exec");
     codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), "codex_exec");
 

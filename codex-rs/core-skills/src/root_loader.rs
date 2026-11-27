@@ -1,20 +1,29 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
+use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use codex_plugin::PluginSkillRoot;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::SkillLoadOutcome;
 use crate::loader::SkillRoot;
 use crate::loader::SkillRootSnapshot;
 use crate::loader::load_skill_root;
 use crate::model::SkillFileSystemsByPath;
+use crate::service::FileSystemIdentity;
 
 static NEXT_PLUGIN_SKILL_SNAPSHOT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) type InstallationReadLease = Box<dyn Send + Sync>;
+type AcquireInstallationRead = Arc<dyn Fn() -> Option<InstallationReadLease> + Send + Sync>;
+type InstallationBindings = HashMap<AbsolutePathBuf, (String, AcquireInstallationRead)>;
+type RootSnapshots = HashMap<(PluginSkillRoot, FileSystemIdentity), Arc<SkillRootSnapshot>>;
 
 /// Parsed plugin skill-root snapshots produced by one plugin load.
 ///
@@ -23,10 +32,9 @@ static NEXT_PLUGIN_SKILL_SNAPSHOT_IDENTITY: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct PluginSkillSnapshots {
     cache_identity: u64,
-    installations: Arc<Mutex<HashMap<codex_utils_absolute_path::AbsolutePathBuf, (String, Arc<dyn Fn() -> Option<Box<dyn Send + Sync>> + Send + Sync>)>>>,
-    snapshots_by_root: Arc<
-        Mutex<HashMap<(PluginSkillRoot, crate::service::FileSystemIdentity), SkillRootSnapshot>>,
-    >,
+    installations: Arc<Mutex<InstallationBindings>>,
+    snapshots_by_root: Arc<Mutex<RootSnapshots>>,
+    preload_had_retryable_read_failures: Arc<AtomicBool>,
 }
 
 impl PluginSkillSnapshots {
@@ -36,54 +44,107 @@ impl PluginSkillSnapshots {
             cache_identity: NEXT_PLUGIN_SKILL_SNAPSHOT_IDENTITY.fetch_add(1, Ordering::Relaxed),
             installations: Arc::default(),
             snapshots_by_root: Arc::new(Mutex::new(HashMap::new())),
+            preload_had_retryable_read_failures: Arc::default(),
         }
     }
 
     /// The publication owner supplies checked read leases without coupling skills to its store.
     pub fn bind_installation(
         &self,
-        root: codex_utils_absolute_path::AbsolutePathBuf,
+        root: AbsolutePathBuf,
         plugin_id: String,
         acquire_read: Arc<dyn Fn() -> Option<Box<dyn Send + Sync>> + Send + Sync>,
     ) {
-        self.installations.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.installations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(root, (plugin_id, acquire_read));
     }
 
+    /// Synchronous publication validation for callers already on a blocking thread.
     pub fn is_current(&self) -> bool {
-        let validators = self.installations.lock()
+        self.installation_validators()
+            .into_iter()
+            .all(|acquire_read| acquire_read().is_some())
+    }
+
+    /// Check cache eligibility without running a store validator on an async worker.
+    pub(crate) async fn is_current_async(&self) -> bool {
+        let validators = self.installation_validators();
+        if validators.is_empty() {
+            return true;
+        }
+        tokio::task::spawn_blocking(move || {
+            validators
+                .into_iter()
+                .all(|acquire_read| acquire_read().is_some())
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    fn installation_validators(&self) -> Vec<AcquireInstallationRead> {
+        self.installations
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values().map(|(_, acquire_read)| Arc::clone(acquire_read)).collect::<Vec<_>>();
-        validators.into_iter().all(|acquire_read| acquire_read().is_some())
+            .values()
+            .map(|(_, acquire_read)| Arc::clone(acquire_read))
+            .collect()
     }
 
-    fn root_is_current(&self, root: &codex_utils_absolute_path::AbsolutePathBuf) -> bool {
-        let validate = self.installations.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner).get(root)
+    async fn read_guard_for_root(
+        &self,
+        root: &AbsolutePathBuf,
+    ) -> io::Result<Option<InstallationReadLease>> {
+        let acquire_read = self
+            .installations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
             .map(|(_, acquire_read)| Arc::clone(acquire_read));
-        validate.is_none_or(|acquire_read| acquire_read().is_some())
+        acquire_installation_read(acquire_read).await
     }
 
-    pub(crate) fn read_guard_for_plugin(
+    pub(crate) async fn read_guard_for_plugin(
         &self,
         plugin_id: &str,
-    ) -> std::io::Result<Option<Box<dyn Send + Sync>>> {
-        let acquire_read = self.installations.lock()
+    ) -> io::Result<Option<InstallationReadLease>> {
+        let acquire_read = self
+            .installations
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .find(|(id, _)| id == plugin_id)
             .map(|(_, acquire_read)| Arc::clone(acquire_read));
-        acquire_read.map(|acquire_read| acquire_read().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "plugin skill installation changed or is busy; reload the skills catalog",
-            )
-        })).transpose()
+        acquire_installation_read(acquire_read).await
+    }
+
+    /// Whether a load using this preload encountered an incomplete root.
+    pub fn had_retryable_read_failures(&self) -> bool {
+        self.preload_had_retryable_read_failures.load(Ordering::Relaxed)
     }
 
     pub(crate) fn cache_identity(&self) -> u64 {
         self.cache_identity
     }
+}
+
+async fn acquire_installation_read(
+    acquire_read: Option<AcquireInstallationRead>,
+) -> io::Result<Option<InstallationReadLease>> {
+    let Some(acquire_read) = acquire_read else {
+        return Ok(None);
+    };
+    tokio::task::spawn_blocking(move || acquire_read())
+        .await
+        .map_err(io::Error::other)?
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "plugin skill installation changed or is busy; reload the skills catalog",
+            )
+        })
 }
 
 impl fmt::Debug for PluginSkillSnapshots {
@@ -102,13 +163,20 @@ where
     I: IntoIterator<Item = SkillRoot>,
 {
     let mut root_snapshots = Vec::new();
+    let mut has_retryable_read_failures = false;
     for root in roots {
-        if root.plugin_root.as_ref().is_some_and(|root|
-            plugin_skill_snapshots.is_some_and(|snapshots| !snapshots.root_is_current(root)))
-        {
-            // Never reinterpret a replacement using the old plugin namespace/policy.
-            continue;
-        }
+        // Keep the exact installation leased through the cache lookup or filesystem scan.
+        // Never reinterpret a replacement using the old plugin namespace/policy.
+        let _installation_read = match (plugin_skill_snapshots, root.plugin_root.as_ref()) {
+            (Some(snapshots), Some(root)) => match snapshots.read_guard_for_root(root).await {
+                Ok(lease) => lease,
+                Err(_) => {
+                    has_retryable_read_failures = true;
+                    continue;
+                }
+            },
+            _ => None,
+        };
         let cache_key = match (
             root.plugin_id.clone(),
             root.plugin_namespace.clone(),
@@ -121,7 +189,7 @@ where
                     plugin_namespace,
                     plugin_root,
                 },
-                crate::service::FileSystemIdentity(Arc::clone(&root.file_system)),
+                FileSystemIdentity(Arc::clone(&root.file_system)),
             )),
             _ => None,
         };
@@ -138,29 +206,37 @@ where
             Some(snapshot) => snapshot,
             None => {
                 // Plugin-cached roots are never repository-scoped, so the cache stays valid.
-                let snapshot = load_skill_root(root, repository_sandbox).await;
-                if let Some(plugin_skill_snapshots) = plugin_skill_snapshots
+                let snapshot = Arc::new(load_skill_root(root, repository_sandbox).await);
+                if !snapshot.has_retryable_read_failures
+                    && let Some(plugin_skill_snapshots) = plugin_skill_snapshots
                     && let Some(cache_key) = cache_key
                 {
                     plugin_skill_snapshots
                         .snapshots_by_root
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(cache_key, snapshot.clone());
+                        .insert(cache_key, Arc::clone(&snapshot));
                 }
                 snapshot
             }
         };
+        has_retryable_read_failures |= snapshot.has_retryable_read_failures;
         root_snapshots.push(snapshot);
     }
 
     let mut outcome = merge_skill_root_snapshots(root_snapshots);
+    outcome.has_retryable_read_failures = has_retryable_read_failures;
+    if has_retryable_read_failures && let Some(snapshots) = plugin_skill_snapshots {
+        snapshots
+            .preload_had_retryable_read_failures
+            .store(true, Ordering::Relaxed);
+    }
     outcome.plugin_installations = plugin_skill_snapshots.cloned();
     outcome.repository_sandbox = repository_sandbox.cloned();
     outcome
 }
 
-fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOutcome {
+fn merge_skill_root_snapshots(snapshots: Vec<Arc<SkillRootSnapshot>>) -> SkillLoadOutcome {
     fn scope_rank(scope: codex_protocol::protocol::SkillScope) -> u8 {
         use codex_protocol::protocol::SkillScope;
 
@@ -184,7 +260,8 @@ fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOut
             skills,
             errors,
             file_system,
-        } = snapshot;
+            ..
+        } = Arc::unwrap_or_clone(snapshot);
         if !skills.is_empty() && !skill_roots.contains(&root) {
             skill_roots.push(root.clone());
         }

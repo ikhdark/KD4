@@ -16,6 +16,7 @@ use serde::Serialize;
 
 const SESSION_INDEX_FILE: &str = "session_index.jsonl";
 const SESSION_INDEX_LOCK_FILE: &str = "session_index.jsonl.lock";
+const UNPUBLISHED_ENTRY_BYTE: u8 = 0;
 const READ_CHUNK_SIZE: usize = 8192;
 const SESSION_INDEX_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -66,14 +67,22 @@ fn append_session_index_entry_blocking(
 ) -> std::io::Result<()> {
     with_session_index_lock(codex_home, || {
         let path = session_index_path(codex_home);
+        // The sidecar lock serializes appends and removals. A seekable writer
+        // lets the final one-byte overwrite publish the row after its LF exists.
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
-            .append(true)
+            .write(true)
+            .truncate(false)
             .open(&path)?;
-        let mut line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
-        line.push('\n');
-        if file.metadata()?.len() > 0 {
+        let mut line = serde_json::to_vec(entry).map_err(std::io::Error::other)?;
+        let commit_byte = line
+            .pop()
+            .ok_or_else(|| std::io::Error::other("empty session index entry"))?;
+        // Raw NUL is invalid JSON, even for readers that accept legacy rows
+        // without LF and even if a later mutation adds the missing separator.
+        line.extend_from_slice(&[UNPUBLISHED_ENTRY_BYTE, b'\n']);
+        if file.seek(SeekFrom::End(0))? > 0 {
             file.seek(SeekFrom::End(-1))?;
             let mut tail = [0];
             file.read_exact(&mut tail)?;
@@ -81,8 +90,10 @@ fn append_session_index_entry_blocking(
                 file.write_all(b"\n")?;
             }
         }
-        file.write_all(line.as_bytes())?;
-        file.flush()
+        file.write_all(&line)?;
+        file.flush()?;
+        file.seek(SeekFrom::Current(-2))?;
+        file.write_all(&[commit_byte])
     })
 }
 
@@ -356,9 +367,13 @@ fn cached_thread_names_by_ids(
     // Known negatives must not force every new page to scan to the beginning.
     // Scan only newly requested IDs, retaining the reverse reader's blank-name
     // and malformed-line behavior.
+    // On a cache miss, sample the publication byte before scanning. The
+    // final overwrite can leave both length and a coarse mtime unchanged.
+    let cacheable_tail = matches!(has_unpublished_tail(&mut file, version.length), Ok(false));
     names.extend(scan_index_from_end_by_ids_on_file(&mut file, &pending)?);
     let named_version = File::open(path).ok().and_then(|file| IndexVersion::read(&file));
-    if IndexVersion::read(&file).as_ref() == Some(&version)
+    if cacheable_tail
+        && IndexVersion::read(&file).as_ref() == Some(&version)
         && named_version.as_ref() == Some(&version)
         && thread_ids.len() <= 2048
         && names.values().map(String::len).sum::<usize>() <= 4 * 1024 * 1024
@@ -381,6 +396,16 @@ fn cached_thread_names_by_ids(
         cached.insert(path.to_path_buf(), CachedNames { version, _file: file, names: observed });
     }
     Ok(names)
+}
+
+fn has_unpublished_tail(file: &mut File, length: u64) -> std::io::Result<bool> {
+    if length < 2 {
+        return Ok(false);
+    }
+    let mut tail = [0; 2];
+    file.seek(SeekFrom::Start(length - 2))?;
+    file.read_exact(&mut tail)?;
+    Ok(tail == [UNPUBLISHED_ENTRY_BYTE, b'\n'])
 }
 
 fn scan_index_from_end_by_ids(

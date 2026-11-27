@@ -424,7 +424,7 @@ pub struct PluginsManager {
     loaded_plugins_cache: RwLock<LoadedPluginsCache>,
     loaded_plugins_load_semaphore: Semaphore,
     tool_suggest_metadata_cache: ToolSuggestMetadataCache,
-    remote_installed_plugins_cache: RwLock<Option<Vec<RemoteInstalledPlugin>>>,
+    remote_installed_plugins_cache: RwLock<Option<Arc<[RemoteInstalledPlugin]>>>,
     remote_installed_plugins_cache_generation: AtomicU64,
     remote_installed_plugins_next_fetch: AtomicU64,
     remote_installed_plugins_accepted_fetch: AtomicU64,
@@ -704,7 +704,7 @@ impl PluginsManager {
         let plugin_skill_snapshots = PluginSkillSnapshots::for_plugin_load();
         let plugins = load_plugins_from_layer_stack(
             &config.config_layer_stack,
-            self.remote_installed_plugin_configs(),
+            self.remote_installed_plugin_configs().await,
             &self.store,
             Some(&plugin_skill_snapshots),
             self.restriction_product,
@@ -836,7 +836,7 @@ impl PluginsManager {
         }
         let plugins = load_plugins_from_layer_stack(
             config_layer_stack,
-            self.remote_installed_plugin_configs(),
+            self.remote_installed_plugin_configs().await,
             &self.store,
             plugin_skill_snapshots,
             self.restriction_product,
@@ -860,7 +860,7 @@ impl PluginsManager {
         }
         load_plugin_hooks_from_layer_stack(
             config_layer_stack,
-            self.remote_installed_plugin_configs(),
+            self.remote_installed_plugin_configs().await,
             &self.store,
             self.remote_global_catalog_active(config),
         )
@@ -912,7 +912,7 @@ impl PluginsManager {
         let snapshots = PluginSkillSnapshots::for_plugin_load();
         let plugins = match load_plugins_from_layer_stack(
             config_layer_stack,
-            self.remote_installed_plugin_configs(),
+            self.remote_installed_plugin_configs().await,
             &self.store,
             Some(&snapshots),
             self.restriction_product,
@@ -1045,8 +1045,9 @@ impl PluginsManager {
             Err(err) => err.into_inner(),
         };
         if cache.generation == generation {
-            let retry_after = plugins.iter().any(|plugin| plugin.error.is_some())
-                .then(|| std::time::Instant::now() + std::time::Duration::from_secs(30));
+            let retry_after = (plugin_skill_snapshots.had_retryable_read_failures()
+                || plugins.iter().any(|plugin| plugin.error.is_some()))
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs(30));
             cache.entries.retain(|cached| cached.key != key);
             if cache.entries.len() >= 4 {
                 cache.entries.remove(0);
@@ -1062,16 +1063,41 @@ impl PluginsManager {
         }
     }
 
-    fn remote_installed_plugin_configs(&self) -> HashMap<String, PluginConfig> {
-        let cache = match self.remote_installed_plugins_cache.read() {
-            Ok(cache) => cache,
-            Err(err) => err.into_inner(),
-        };
-        let Some(plugins) = cache.as_ref() else {
-            return HashMap::new();
-        };
+    async fn remote_installed_plugin_configs(&self) -> HashMap<String, PluginConfig> {
+        loop {
+            let plugins = self
+                .remote_installed_plugins_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let Some(plugins) = plugins.filter(|plugins| !plugins.is_empty()) else {
+                return HashMap::new();
+            };
+            let snapshot = Arc::clone(&plugins);
+            let store = self.store.clone();
+            let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+            let span = tracing::Span::current();
+            let configs = tokio::task::spawn_blocking(move || {
+                tracing::dispatcher::with_default(&dispatcher, || {
+                    span.in_scope(|| remote_installed_plugins_to_config(&snapshot, &store))
+                })
+            })
+            .await
+            .expect("remote installed plugin projection task failed");
 
-        remote_installed_plugins_to_config(plugins, &self.store)
+            // A refresh or clear may win while we inspect the bundle directories.
+            // Discard a replaced snapshot without changing the cache's generation or tickets.
+            let cache = self
+                .remote_installed_plugins_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &plugins))
+            {
+                return configs;
+            }
+        }
     }
 
     fn remote_plugin_id_for(&self, plugin_id: &PluginId) -> Option<String> {
@@ -1346,8 +1372,8 @@ impl PluginsManager {
         // Even an equal observation supersedes older in-flight responses.
         self.remote_installed_plugins_accepted_fetch
             .store(ticket, Ordering::Release);
-        match cache.as_ref() {
-            Some(cache) if cache.eq(&plugins) => return Some(false),
+        match cache.as_deref() {
+            Some(cache) if cache == plugins.as_slice() => return Some(false),
             // An absent cache and an empty one yield the same effective plugin
             // set (remote_installed_plugin_configs is empty for both), so a first
             // empty fetch records the observation without invalidating loaded
@@ -1356,12 +1382,12 @@ impl PluginsManager {
             // suggestions, and the app-server installed-marketplace read that
             // fetches when the cache is absent) read this cache live on each request.
             None if plugins.is_empty() => {
-                *cache = Some(plugins);
+                *cache = Some(plugins.into());
                 return Some(false);
             }
             _ => {}
         }
-        *cache = Some(plugins);
+        *cache = Some(plugins.into());
         drop(cache);
         self.clear_loaded_plugins_cache();
         Some(true)
@@ -1408,7 +1434,7 @@ impl PluginsManager {
 
     fn clear_remote_installed_plugins_cache_locked(
         &self,
-        mut cache: std::sync::RwLockWriteGuard<'_, Option<Vec<RemoteInstalledPlugin>>>,
+        mut cache: std::sync::RwLockWriteGuard<'_, Option<Arc<[RemoteInstalledPlugin]>>>,
     ) -> bool {
         // Dropping an empty observation leaves the effective plugin set unchanged
         // (see write_remote_installed_plugins_cache_if_generation), so it only

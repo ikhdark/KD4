@@ -323,48 +323,59 @@ impl HostState {
             // Resolve before spawning: even concurrent cells see catalog
             // registrations and revocations in connection order.
             let resolved = (|| {
+                // Prepare before locking so even rejected definitions drop unlocked.
+                let tools_to_register: Option<Arc<[codex_code_mode_protocol::ToolDefinition]>> =
+                    catalog.register.then(|| {
+                        std::mem::take(&mut request.enabled_tools)
+                            .into_iter()
+                            .map(Into::into)
+                            .collect()
+                    });
                 let mut catalogs = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner);
                 self.session(session_id)?;
                 if matches!(catalogs.get(session_id), Some(None)) {
                     return Err("code-mode session is closing; no catalog registered".to_string());
                 }
-                if catalog.register {
-                    if catalogs
+                if catalog.register
+                    && catalogs
                         .get(session_id)
                         .and_then(Option::as_ref)
                         .is_some_and(|(revision, _)| catalog.revision <= *revision)
-                    {
-                        return Err("stale tool catalog registration; no cell started".to_string());
-                    }
-                    let tools: Arc<[codex_code_mode_protocol::ToolDefinition]> =
-                        std::mem::take(&mut request.enabled_tools)
-                            .into_iter()
-                            .map(Into::into)
-                            .collect();
-                    resolved_tools = Some(Arc::clone(&tools));
-                    catalogs.insert(session_id.clone(), Some((catalog.revision, tools)));
-                } else {
-                    if !request.enabled_tools.is_empty() {
-                        return Err(
-                            "catalog references cannot carry tool definitions; no cell started"
-                                .to_string(),
-                        );
-                    }
-                    let (_, tools) = catalogs
-                        .get(session_id)
-                        .and_then(Option::as_ref)
-                        .filter(|(revision, _)| *revision == catalog.revision)
-                        .ok_or_else(|| {
-                            "unknown or revoked tool catalog revision; no cell started".to_string()
-                        })?;
-                    resolved_tools = Some(Arc::clone(tools));
+                {
+                    return Err("stale tool catalog registration; no cell started".to_string());
                 }
-                Ok(())
+                if let Some(tools) = tools_to_register {
+                    let retired = catalogs.insert(
+                        session_id.clone(),
+                        Some((catalog.revision, Arc::clone(&tools))),
+                    );
+                    return Ok((tools, retired));
+                }
+                if !request.enabled_tools.is_empty() {
+                    return Err(
+                        "catalog references cannot carry tool definitions; no cell started"
+                            .to_string(),
+                    );
+                }
+                let (_, tools) = catalogs
+                    .get(session_id)
+                    .and_then(Option::as_ref)
+                    .filter(|(revision, _)| *revision == catalog.revision)
+                    .ok_or_else(|| {
+                        "unknown or revoked tool catalog revision; no cell started".to_string()
+                    })?;
+                Ok((Arc::clone(tools), None))
             })();
-            if let Err(error) = resolved {
-                self.respond(request_id, Err(error));
-                self.finish_request(request_id);
-                return Ok(());
+            match resolved {
+                Ok((tools, retired)) => {
+                    drop(retired);
+                    resolved_tools = Some(tools);
+                }
+                Err(error) => {
+                    self.respond(request_id, Err(error));
+                    self.finish_request(request_id);
+                    return Ok(());
+                }
             }
         }
         let Ok(permit) = Arc::clone(&self.request_permits).try_acquire_owned() else {

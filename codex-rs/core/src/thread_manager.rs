@@ -80,6 +80,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::sync::TryLockError;
+use std::sync::Weak;
+use std::sync::mpsc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::OwnedMutexGuard;
@@ -94,6 +99,7 @@ pub use fork_history::interrupted_fork_history_for_display;
 pub(crate) use fork_history::resumed_rollout_unfinished_turn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
+const THREAD_REGISTRY_RECLAIM_BATCH: usize = 16;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct InheritedInstructionSnapshot {
@@ -209,11 +215,102 @@ pub struct ThreadManager {
     state: Arc<ThreadManagerState>,
 }
 
+pub(crate) struct ThreadRegistryLease {
+    // Unlock before releasing the entry reference.
+    _guard: OwnedMutexGuard<()>,
+    _entry: Arc<ThreadRegistryLeaseEntry>,
+}
+
+struct ThreadRegistryLeaseEntry {
+    thread_id: ThreadId,
+    lock: Arc<AsyncMutex<()>>,
+    registry: Weak<ThreadRegistryLeases>,
+}
+
+impl Drop for ThreadRegistryLeaseEntry {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        match registry.map.try_lock() {
+            Ok(mut map) => map.remove_if_idle(self.thread_id),
+            Err(TryLockError::Poisoned(error)) => {
+                error.into_inner().remove_if_idle(self.thread_id);
+            }
+            Err(TryLockError::WouldBlock) => {
+                // A lease may be dropped on a native worker or during cancellation.
+                // Hand off reclamation rather than waiting for the registry lock.
+                let _ = registry.deferred_removals.send(self.thread_id);
+            }
+        }
+    }
+}
+
+struct ThreadRegistryLeaseMap {
+    entries: HashMap<ThreadId, Weak<ThreadRegistryLeaseEntry>>,
+    deferred_removals: mpsc::Receiver<ThreadId>,
+}
+
+impl ThreadRegistryLeaseMap {
+    fn remove_if_idle(&mut self, thread_id: ThreadId) {
+        // An acquisition may have installed a replacement since the old entry
+        // expired. Never remove an entry that still has a holder or waiter.
+        if self
+            .entries
+            .get(&thread_id)
+            .is_some_and(|entry| entry.strong_count() == 0)
+        {
+            self.entries.remove(&thread_id);
+        }
+    }
+}
+
+struct ThreadRegistryLeases {
+    map: Mutex<ThreadRegistryLeaseMap>,
+    deferred_removals: mpsc::Sender<ThreadId>,
+}
+
+impl Default for ThreadRegistryLeases {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            map: Mutex::new(ThreadRegistryLeaseMap {
+                entries: HashMap::new(),
+                deferred_removals: receiver,
+            }),
+            deferred_removals: sender,
+        }
+    }
+}
+
+impl ThreadRegistryLeases {
+    fn entry(self: &Arc<Self>, thread_id: ThreadId) -> Arc<ThreadRegistryLeaseEntry> {
+        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        for _ in 0..THREAD_REGISTRY_RECLAIM_BATCH {
+            let Ok(expired_id) = map.deferred_removals.try_recv() else {
+                break;
+            };
+            map.remove_if_idle(expired_id);
+        }
+        let slot = map.entries.entry(thread_id).or_default();
+        if let Some(entry) = slot.upgrade() {
+            return entry;
+        }
+        let entry = Arc::new(ThreadRegistryLeaseEntry {
+            thread_id,
+            lock: Arc::new(AsyncMutex::new(())),
+            registry: Arc::downgrade(self),
+        });
+        *slot = Arc::downgrade(&entry);
+        entry
+    }
+}
+
 /// Keeps the exact notified thread instance loaded while a consumer registers it.
 pub struct ThreadCreatedThreadGuard {
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
-    _thread_registry_lease: OwnedMutexGuard<()>,
+    _thread_registry_lease: ThreadRegistryLease,
 }
 
 impl ThreadCreatedThreadGuard {
@@ -292,7 +389,7 @@ pub(crate) struct ThreadManagerState {
     root_service_tiers: std::sync::Mutex<
         HashMap<codex_protocol::SessionId, std::sync::Weak<arc_swap::ArcSwapOption<String>>>,
     >,
-    thread_registry_leases: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<AsyncMutex<()>>>>,
+    thread_registry_leases: Arc<ThreadRegistryLeases>,
     removing_threads: Arc<std::sync::Mutex<HashSet<ThreadId>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_created_instances: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<CodexThread>>>,
@@ -625,7 +722,7 @@ impl ThreadManager {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 model_http_clients: Default::default(),
                 root_service_tiers: Default::default(),
-                thread_registry_leases: std::sync::Mutex::new(HashMap::new()),
+                thread_registry_leases: Default::default(),
                 thread_created_tx,
                 thread_created_instances: std::sync::Mutex::new(HashMap::new()),
                 removing_threads: Default::default(),
@@ -1962,23 +2059,14 @@ impl ThreadManagerState {
     pub(crate) async fn acquire_thread_registry_lease(
         &self,
         thread_id: ThreadId,
-    ) -> OwnedMutexGuard<()> {
-        let thread_registry_lease = {
-            let mut leases = self
-                .thread_registry_leases
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            leases.retain(|_, lease| lease.strong_count() > 0);
-            leases
-                .get(&thread_id)
-                .and_then(std::sync::Weak::upgrade)
-                .unwrap_or_else(|| {
-                    let lease = Arc::new(AsyncMutex::new(()));
-                    leases.insert(thread_id, Arc::downgrade(&lease));
-                    lease
-                })
-        };
-        thread_registry_lease.lock_owned().await
+    ) -> ThreadRegistryLease {
+        // The entry stays alive while waiting as well as while holding the lock.
+        let entry = self.thread_registry_leases.entry(thread_id);
+        let guard = Arc::clone(&entry.lock).lock_owned().await;
+        ThreadRegistryLease {
+            _guard: guard,
+            _entry: entry,
+        }
     }
 
     fn forget_thread_created_instance_if_same(

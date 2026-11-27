@@ -52,6 +52,8 @@ use codex_app_server_rpc::outgoing_message::ConnectionRequestId;
 use codex_app_server_rpc::outgoing_message::OutgoingEnvelope;
 use codex_app_server_rpc::outgoing_message::OutgoingMessage;
 use codex_app_server_rpc::outgoing_message::OutgoingMessageSender;
+use codex_app_server_rpc::outgoing_message::RESOURCE_DELIVERY_TIMEOUT;
+use codex_app_server_rpc::outgoing_message::RoutePublicationFence;
 
 const EXEC_TIMEOUT_EXIT_CODE: i32 = 124;
 const MAX_PENDING_STDIN_WRITES: usize = 32;
@@ -318,7 +320,7 @@ struct RunProcessParams {
     output_bytes_cap: Option<usize>,
     connection_cancellation: CancellationToken,
     terminal_cleanup: ProcessTerminalCleanup,
-    response_enqueued: oneshot::Receiver<()>,
+    response_publication: oneshot::Receiver<Option<RoutePublicationFence>>,
 }
 
 struct ProcessTerminalCleanup {
@@ -454,7 +456,7 @@ impl ProcessExecRequestProcessor {
 
         let response_outgoing = Arc::clone(&outgoing);
         let response_request_id = request_id.clone();
-        let (response_enqueued_tx, response_enqueued_rx) = oneshot::channel();
+        let (response_publication_tx, response_publication_rx) = oneshot::channel();
         tokio::spawn(async move {
             let _run_owner = run_owner;
             run_process(RunProcessParams {
@@ -473,15 +475,15 @@ impl ProcessExecRequestProcessor {
                     sessions,
                     process_key,
                 },
-                response_enqueued: response_enqueued_rx,
+                response_publication: response_publication_rx,
             })
             .await;
         });
 
-        response_outgoing
-            .send_response(response_request_id, ProcessSpawnResponse {})
+        let publication = response_outgoing
+            .send_response_with_publication_fence(response_request_id, ProcessSpawnResponse {})
             .await;
-        let _ = response_enqueued_tx.send(());
+        let _ = response_publication_tx.send(publication);
 
         Ok::<_, JSONRPCErrorError>(())
         });
@@ -650,10 +652,24 @@ async fn run_process(params: RunProcessParams) {
         output_bytes_cap,
         connection_cancellation,
         terminal_cleanup,
-        response_enqueued,
+        response_publication,
     } = params;
     let response_ready = CancellationToken::new();
-    let response_barrier = async { response_enqueued.await.is_ok() };
+    let response_barrier = async {
+        let Ok(Some(fence)) = response_publication.await else {
+            return false;
+        };
+        if matches!(
+            tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT, fence.wait()).await,
+            Ok(true)
+        ) {
+            return true;
+        }
+        tracing::warn!(connection_id = ?request_id.connection_id,
+            "process/spawn response did not reach the requester route");
+        outgoing.fail_connection_delivery(request_id.connection_id).await;
+        false
+    };
     tokio::pin!(response_barrier);
     let mut response_processed = false;
     let mut control_rx = control_rx;
@@ -927,7 +943,7 @@ fn collect_spawn_process_output(
                     continue;
                 },
                 // Flush a buffered prompt as soon as the spawn response is
-                // enqueued, even if the child is now waiting for stdin.
+                // routed to the requester, even if the child is now waiting for stdin.
                 _ = response_ready.cancelled(), if stream_output && !response_processed => {
                     response_processed = true;
                     continue;

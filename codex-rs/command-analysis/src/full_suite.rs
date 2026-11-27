@@ -27,6 +27,12 @@ struct CompilationChanges {
 struct CompilationInputs {
     compilation_inputs_v1: String,
     edit_revision: u64,
+    /// Latest exact edit to an input whose path cannot be a JSON string.
+    #[serde(default)]
+    non_unicode_edit_revision: u64,
+    /// Latest exact edit of a named input omitted by the fingerprint read budget or an I/O error.
+    #[serde(default, skip_serializing_if = "is_zero_revision")]
+    unfingerprinted_edit_revision: u64,
     fingerprints: BTreeMap<PathBuf, String>,
     #[serde(default)]
     closed_inputs: bool,
@@ -38,6 +44,8 @@ struct CompilationInputs {
     command: Vec<String>,
 }
 
+fn is_zero_revision(revision: &u64) -> bool { *revision == 0 }
+
 fn compilation_inputs_changed(previous: &str, current: &str) -> bool {
     let Ok(current) = serde_json::from_str::<CompilationInputs>(current) else { return false; };
     let Ok(previous) = serde_json::from_str::<CompilationInputs>(previous) else {
@@ -48,6 +56,11 @@ fn compilation_inputs_changed(previous: &str, current: &str) -> bool {
     if current.compilation_inputs_v1 == previous.compilation_inputs_v1
         && current.closed_inputs && previous.closed_inputs {
         return current.fingerprints != previous.fingerprints;
+    }
+    // Matching serializable fingerprints cannot disprove a fresh exact edit
+    // to an input whose path was omitted from the checkpoint.
+    if current.non_unicode_edit_revision.max(current.unfingerprinted_edit_revision) > previous.edit_revision {
+        return true;
     }
     if current.compilation_inputs_v1 == previous.compilation_inputs_v1
         && !current.fingerprints.is_empty() && current.fingerprints == previous.fingerprints {
@@ -165,15 +178,37 @@ impl FullSuiteBudget {
 
     pub fn compilation_revision(
         &self, scope: &str, environment: &str, relevant_inputs: &[PathBuf],
-        closed_inputs: bool, fingerprints: BTreeMap<PathBuf, String>,
+        closed_inputs: bool, mut fingerprints: BTreeMap<PathBuf, String>,
     ) -> String {
         let changes = self.2.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let edit_revision = changes.paths.iter().filter(|((owner, path), _)|
-            owner == environment && relevant_inputs.contains(path))
-            .map(|(_, revision)| *revision).max().unwrap_or(0);
+        let mut edit_revision = 0;
+        let mut non_unicode_edit_revision = 0;
+        let mut unfingerprinted_edit_revision = 0;
+        for ((owner, path), &revision) in &changes.paths {
+            if owner == environment && relevant_inputs.contains(path) {
+                edit_revision = edit_revision.max(revision);
+                if path.to_str().is_none() {
+                    non_unicode_edit_revision = non_unicode_edit_revision.max(revision);
+                } else if !fingerprints.contains_key(path) {
+                    unfingerprinted_edit_revision = unfingerprinted_edit_revision.max(revision);
+                }
+            }
+        }
+        drop(changes);
+
+        // A non-Unicode key would fail serialization of the entire checkpoint.
+        // Keep other fingerprints without replacing the key with a lossy alias.
+        let observed_count = fingerprints.len();
+        fingerprints.retain(|path, _| path.to_str().is_some());
+        let closed_inputs = closed_inputs
+            && fingerprints.len() == observed_count
+            && relevant_inputs.len() == fingerprints.len()
+            && relevant_inputs.iter().all(|path| fingerprints.contains_key(path));
         serde_json::to_string(&CompilationInputs {
             compilation_inputs_v1: scope.to_owned(), edit_revision,
-            closed_inputs: closed_inputs && relevant_inputs.len() == fingerprints.len(),
+            non_unicode_edit_revision,
+            unfingerprinted_edit_revision,
+            closed_inputs,
             fingerprints,
             reuse_context: None,
             command: Vec::new(),

@@ -1,4 +1,3 @@
-use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -46,6 +45,7 @@ use crate::unified_exec::ProcessStore;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
+use crate::unified_exec::WriteStdinObservation;
 use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::lagged_output_marker;
@@ -645,12 +645,11 @@ async fn cleanup_pending_process_registration(
             {
                 (store.remove(cleanup.process_id), false)
             }
-            (Some(_), Some(_)) => (None, true),
-            _ => {
+            (Some(_), _) => (None, true),
+            (None, _) => {
                 // Startup custody, rather than the caller future, owns this
                 // reservation until every spawned process is confirmed gone.
-                store.reserved_process_ids.remove(&cleanup.process_id);
-                store.reserved_process_slots.remove(&cleanup.process_id);
+                store.release_reservation(cleanup.process_id);
                 (None, false)
             }
         }
@@ -925,42 +924,32 @@ impl UnifiedExecProcessManager {
         build_unified_exec_environment(context).0
     }
 
-    async fn allocate_process_id_value(&self) -> u32 {
-        loop {
+    pub(crate) async fn reserve_process_id(&self) -> Result<ProcessIdReservation, UnifiedExecError> {
+        let process_id = {
             let mut store = self.process_store.lock().await;
-
-            let process_id = rand::rng().random_range(1_000..=u32::MAX);
-
-            if store.reserved_process_ids.contains(&process_id)
-                || store.used_process_ids.contains_key(&process_id)
-            {
-                continue;
-            }
-
+            let process_id = store.process_id_history.allocate().ok_or_else(|| {
+                UnifiedExecError::process_failed(
+                    "unified exec process ID space exhausted; command was not started".to_string(),
+                )
+            })?;
             store.reserved_process_ids.insert(process_id);
-            store.used_process_ids.insert(process_id, None);
-            return process_id;
-        }
-    }
-
-    pub(crate) async fn reserve_process_id(&self) -> ProcessIdReservation {
-        let process_id = self.allocate_process_id_value().await;
+            process_id
+        };
         let (transfer_sender, transfer_receiver) = tokio::sync::oneshot::channel();
         let process_store = Arc::clone(&self.process_store);
         tokio::spawn(async move {
             if transfer_receiver.await.is_err() {
                 let mut store = process_store.lock().await;
-                store.reserved_process_ids.remove(&process_id);
-                store.reserved_process_slots.remove(&process_id);
+                store.release_reservation(process_id);
             }
         });
-        ProcessIdReservation::new(process_id, transfer_sender)
+        Ok(ProcessIdReservation::new(process_id, transfer_sender))
     }
 
     pub(crate) async fn exclude_process_ids(&self, ids: impl IntoIterator<Item = u32>) {
         let mut store = self.process_store.lock().await;
         for id in ids {
-            store.used_process_ids.entry(id).or_insert(None);
+            store.process_id_history.exclude_restored(id);
         }
     }
 
@@ -1549,7 +1538,8 @@ impl UnifiedExecProcessManager {
         &self,
         request: WriteStdinRequest<'_>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        self.write_stdin_with_observation_mode(request, false, None).await
+        self.write_stdin_with_observation_mode(request, WriteStdinObservation::Poll, None)
+            .await
     }
 
     /// Report whether the backend was polled, independently of the child result.
@@ -1563,7 +1553,11 @@ impl UnifiedExecProcessManager {
             started: false,
         };
         let result = self
-            .write_stdin_with_observation_mode(request, false, Some(&mut mutation))
+            .write_stdin_with_observation_mode(
+                request,
+                WriteStdinObservation::Poll,
+                Some(&mut mutation),
+            )
             .await;
         (result, mutation.started)
     }
@@ -1572,13 +1566,14 @@ impl UnifiedExecProcessManager {
         &self,
         request: WriteStdinRequest<'_>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        self.write_stdin_with_observation_mode(request, true, None).await
+        self.write_stdin_with_observation_mode(request, WriteStdinObservation::UntilOutput, None)
+            .await
     }
 
     async fn write_stdin_with_observation_mode(
         &self,
         request: WriteStdinRequest<'_>,
-        until_output: bool,
+        observation: WriteStdinObservation,
         mutation: Option<&mut StdinMutation<'_>>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let handler_started_at = Instant::now();
@@ -1586,7 +1581,9 @@ impl UnifiedExecProcessManager {
         let poll_bound = nested_poll_bound(request.nested_deadline);
         let process = {
             let store = self.process_store.lock().await;
-            if let Some(response) = Self::finished_stdin_response(&store, &request) {
+            if observation != WriteStdinObservation::BackgroundCompletion
+                && let Some(response) = Self::finished_stdin_response(&store, &request)
+            {
                 return response;
             }
             store
@@ -1600,15 +1597,23 @@ impl UnifiedExecProcessManager {
         let started_at = Instant::now();
         let mut hard_deadline = poll_bound;
         let result = self
-            .write_stdin_inner(request, &process, until_output, mutation, &mut hard_deadline)
+            .write_stdin_inner(request, &process, observation, mutation, &mut hard_deadline)
             .await;
-        let result = finish_exited_process_result(
-            Some(&process),
-            result,
-            Instant::now().saturating_duration_since(started_at),
-            hard_deadline,
-        )
-        .await;
+        let result = if observation == WriteStdinObservation::BackgroundCompletion {
+            // The exit watcher was already settled when this poll was admitted.
+            // The inner poll finalized successful output before acknowledging it;
+            // output-bearing errors are delivered as-is by the background collector.
+            // Do not suspend between consuming output and handing it to that owner.
+            result
+        } else {
+            finish_exited_process_result(
+                Some(&process),
+                result,
+                Instant::now().saturating_duration_since(started_at),
+                hard_deadline,
+            )
+            .await
+        };
         tracing::info!(event.name = "codex.exec.handler_completed",
             operation = "write_stdin", process_id,
             handler_elapsed_ms = u64::try_from(handler_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1621,7 +1626,7 @@ impl UnifiedExecProcessManager {
         &self,
         request: WriteStdinRequest<'_>,
         locked_process: &Arc<UnifiedExecProcess>,
-        until_output: bool,
+        observation: WriteStdinObservation,
         mutation: Option<&mut StdinMutation<'_>>,
         observation_deadline: &mut Option<Instant>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
@@ -1635,6 +1640,9 @@ impl UnifiedExecProcessManager {
         {
             Ok(handles) => handles,
             Err(error) => {
+                if observation == WriteStdinObservation::BackgroundCompletion {
+                    return Err(error);
+                }
                 let store = self.process_store.lock().await;
                 return Self::finished_stdin_response(&store, &request).unwrap_or(Err(error));
             }
@@ -1715,7 +1723,14 @@ impl UnifiedExecProcessManager {
         } else {
             store.await
         };
-        if let Some(response) = Self::finished_stdin_response(&store, &request) {
+        if observation == WriteStdinObservation::BackgroundCompletion {
+            if !store.processes.get(&process_id).is_some_and(|entry| {
+                Arc::ptr_eq(&entry.process, locked_process)
+                    && Self::background_completion_ready(entry)
+            }) {
+                return Err(UnifiedExecError::UnknownProcessId { process_id });
+            }
+        } else if let Some(response) = Self::finished_stdin_response(&store, &request) {
             return response;
         }
         drop(store);
@@ -1909,7 +1924,7 @@ impl UnifiedExecProcessManager {
             // Validation polls continue through progress bursts even in
             // until-output mode, bounded by exit, handoff, or the deadline.
             (!input_operation
-                && (until_output || tty)
+                && (observation == WriteStdinObservation::UntilOutput || tty)
                 && !validation_launch
                 && process.validation().is_none())
             .then_some(INITIAL_OUTPUT_QUIET_PERIOD),
@@ -2089,7 +2104,7 @@ impl UnifiedExecProcessManager {
                 }
                 entry.clone()
             } else {
-                if store.used_process_ids.get(&process_id).copied().flatten() != Some(incarnation) {
+                if store.issued_process_incarnation(process_id) != Some(incarnation) {
                     return None;
                 }
                 let (_, response, _) = store.finished.iter().find(|(id, _, _)| *id == process_id)?;
@@ -2357,10 +2372,9 @@ impl UnifiedExecProcessManager {
             let mut store = self.process_store.lock().await;
             let reserved = store.reserved_process_slots.remove(&process_id);
             debug_assert!(reserved, "process capacity must be reserved before launch");
-            store.used_process_ids.insert(
-                process_id,
-                Some(process.session_capabilities(tty).incarnation),
-            );
+            // Private launches retain their original process identity. At the
+            // live-store boundary the manager binds the output/replay identity.
+            process.bind_managed_incarnation(store.process_id_history.incarnation(process_id));
             store.processes.insert(process_id, entry);
             process_id_reservation.transfer_to_store();
         }
@@ -2596,7 +2610,12 @@ impl UnifiedExecProcessManager {
             None
         };
         let handed_off = match speculative.as_ref() {
-            Some(launch) => self.speculative_shell.take_and_hand_off(launch).await,
+            Some(launch) => self
+                .speculative_shell
+                .take_and_hand_off(launch)
+                .await
+                // An unconfirmed commit is not a retryable process-creation error.
+                .map_err(|error| UnifiedExecError::process_failed(error.to_string()))?,
             None => None,
         };
         let spawn_result = if let Some(spawned) = handed_off {
@@ -3452,6 +3471,15 @@ impl UnifiedExecProcessManager {
         Ok(removed_entries.len())
     }
 
+    fn background_completion_ready(entry: &ProcessEntry) -> bool {
+        !entry.tty
+            && !entry.initial_exec_command_active.load(Ordering::Acquire)
+            && entry.process.has_exited()
+            && !entry.process.shutdown_is_pending()
+            && entry.process.output_is_closed()
+            && entry.process.terminal_completion_is_ready()
+    }
+
     /// Terminal results of yielded background commands that exited before the
     /// next model-visible boundary (event-driven completion delivery).
     ///
@@ -3461,25 +3489,22 @@ impl UnifiedExecProcessManager {
     /// the process retires exactly as if the model had polled it and a later
     /// poll receives the same retained finished result. Running, interactive,
     /// mid-launch, shutting-down and currently interacting processes are left
-    /// untouched for the model's own poll.
+    /// untouched for the model's own poll. The ordered commit owner supplies
+    /// the batch so cancelling this future saves the already collected prefix.
     pub(crate) async fn collect_exited_background_results(
         &self,
         truncation_policy: codex_utils_output_truncation::TruncationPolicy,
         max_output_tokens: usize,
         limit: usize,
-    ) -> Vec<(u32, ExecCommandToolOutput)> {
+        results: &mut Vec<(u32, ExecCommandToolOutput)>,
+    ) {
         let candidates = {
             let store = self.process_store.lock().await;
             let mut candidates = store
                 .processes
                 .values()
                 .filter(|entry| {
-                    !entry.tty
-                        && !entry.initial_exec_command_active.load(Ordering::Acquire)
-                        && entry.process.has_exited()
-                        && !entry.process.shutdown_is_pending()
-                        && entry.process.output_is_closed()
-                        && entry.process.terminal_completion_is_ready()
+                    Self::background_completion_ready(entry)
                         && entry.process.interaction_lock().try_lock().is_ok()
                 })
                 .map(|entry| (entry.last_used, entry.process_id))
@@ -3488,7 +3513,6 @@ impl UnifiedExecProcessManager {
             candidates.truncate(limit);
             candidates
         };
-        let mut results = Vec::with_capacity(candidates.len());
         for (_, process_id) in candidates {
             let request = WriteStdinRequest {
                 process_id,
@@ -3502,7 +3526,14 @@ impl UnifiedExecProcessManager {
             };
             // Any chunk this poll consumed must reach the model, including a
             // partial drain that still names its session for the remainder.
-            match self.write_stdin(request).await {
+            match self
+                .write_stdin_with_observation_mode(
+                    request,
+                    WriteStdinObservation::BackgroundCompletion,
+                    None,
+                )
+                .await
+            {
                 Ok(output) => results.push((process_id, output)),
                 Err(UnifiedExecError::ProcessFailedWithOutput { output, .. }) => {
                     results.push((process_id, *output));
@@ -3515,7 +3546,6 @@ impl UnifiedExecProcessManager {
                 }
             }
         }
-        results
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {
@@ -3552,7 +3582,7 @@ impl UnifiedExecProcessManager {
                     .finished
                     .iter()
                     .any(|(id, _, _)| *id == process_id)
-                    .then(|| store.used_process_ids.get(&process_id).copied().flatten())
+                    .then(|| store.issued_process_incarnation(process_id))
                     .flatten()
             })
     }

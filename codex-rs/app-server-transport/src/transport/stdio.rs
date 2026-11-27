@@ -1,5 +1,6 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
+use super::ControlReserveSender;
 use super::TransportEvent;
 use super::enqueue_incoming_message_with_admission;
 use super::next_connection_id;
@@ -78,7 +79,7 @@ pub fn note_stdio_output_retirement(connection_id: crate::outgoing_message::Conn
 /// Consume this after joining the transport owner; upstream delivery and
 /// supervisor completion are separate from this local observation.
 pub async fn start_stdio_connection(
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     stdio_handles: &mut Vec<JoinHandle<()>>,
     initialize_client_name_tx: oneshot::Sender<String>,
 ) -> IoResult<oneshot::Receiver<ConnectionId>> {
@@ -327,7 +328,7 @@ fn read_stdin_lines(
 }
 
 async fn start_stdio_connection_with_io<W>(
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     stdio_handles: &mut Vec<JoinHandle<()>>,
     initialize_client_name_tx: oneshot::Sender<String>,
     stdin_lines: StdinLines,
@@ -358,7 +359,7 @@ struct OpenStdioConnection {
 }
 
 async fn open_stdio_connection(
-    transport_event_tx: &mpsc::Sender<TransportEvent>,
+    transport_event_tx: &ControlReserveSender<TransportEvent>,
 ) -> IoResult<OpenStdioConnection> {
     let connection_id = next_connection_id();
     let state = Arc::new(StdioConnectionState::register(connection_id));
@@ -366,7 +367,7 @@ async fn open_stdio_connection(
     let (writer_tx, writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
     let writer_tx_for_reader = writer_tx.clone();
     transport_event_tx
-        .send(TransportEvent::ConnectionOpened {
+        .send_unreserved(TransportEvent::ConnectionOpened {
             connection_id,
             origin: ConnectionOrigin::Stdio,
             writer: writer_tx,
@@ -442,7 +443,7 @@ struct StdioWriterEnd<W> {
 /// server retired for output backlog is replaced on the same pipes when its
 /// client asked for that; every other end closes the transport as before.
 async fn serve_stdio_connections<W>(
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     initialize_client_name_tx: oneshot::Sender<String>,
     mut stdin_lines: StdinLines,
     mut stdout: W,
@@ -562,7 +563,7 @@ async fn write_stdio_retired_notice<W: AsyncWrite + Unpin>(
 fn spawn_stdio_reader(
     mut stdin_lines: StdinLines,
     mut initialize_client_name_tx: Option<oneshot::Sender<String>>,
-    transport_event_tx_for_reader: mpsc::Sender<TransportEvent>,
+    transport_event_tx_for_reader: ControlReserveSender<TransportEvent>,
     writer_tx_for_reader: mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: crate::outgoing_message::ConnectionId,
     cancellation_for_reader: CancellationToken,
@@ -657,7 +658,7 @@ fn spawn_stdio_reader(
 fn spawn_stdio_writer<W>(
     mut stdout: W,
     mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     connection_id: crate::outgoing_message::ConnectionId,
     cancellation_for_writer: CancellationToken,
     state: Arc<StdioConnectionState>,
@@ -918,7 +919,7 @@ async fn write_streamed_message<W: AsyncWrite + Unpin>(
 }
 
 async fn close_stdio_connection(
-    transport_event_tx: &mpsc::Sender<TransportEvent>,
+    transport_event_tx: &ControlReserveSender<TransportEvent>,
     connection_id: crate::outgoing_message::ConnectionId,
     cancellation: &CancellationToken,
     connection_closed: &AtomicBool,
@@ -926,7 +927,7 @@ async fn close_stdio_connection(
     cancellation.cancel();
     if !connection_closed.swap(true, Ordering::AcqRel) {
         let _ = transport_event_tx
-            .send(TransportEvent::ConnectionClosed { connection_id })
+            .send_unreserved(TransportEvent::ConnectionClosed { connection_id })
             .await;
     }
 }

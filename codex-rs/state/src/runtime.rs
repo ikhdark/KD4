@@ -419,6 +419,19 @@ async fn open_logs_sqlite(
     open_sqlite(path, migrator, LOGS_DB, telemetry_override).await
 }
 
+// The budget limits retry admission, not the duration of an admitted SQLite operation.
+async fn wait_for_sqlite_startup_retry(started: Instant) -> bool {
+    let deadline = started + Duration::from_secs(5);
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+
+    let retry_at = deadline.min(now + Duration::from_millis(25));
+    tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)).await;
+    Instant::now() < deadline
+}
+
 /// Connect a SQLite pool using the shared bounded retry for startup PRAGMA contention.
 pub async fn connect_sqlite_pool_with_retry(
     options: SqliteConnectOptions,
@@ -433,13 +446,14 @@ pub async fn connect_sqlite_pool_with_retry(
             .connect_with(options.clone())
             .await;
         match result {
-            Err(ref err)
-                if sqlite_error_detail_is_lock(&err.to_string())
-                    && started.elapsed() < std::time::Duration::from_secs(5) =>
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            Ok(pool) => return Ok(pool),
+            Err(error) => {
+                if !sqlite_error_detail_is_lock(&error.to_string())
+                    || !wait_for_sqlite_startup_retry(started).await
+                {
+                    return Err(error.into());
+                }
             }
-            result => break result.map_err(anyhow::Error::from),
         }
     }
 }
@@ -546,11 +560,10 @@ async fn open_runtime_sqlite_pool(path: &Path, started: Instant) -> anyhow::Resu
                 // initialization error rather than an after_connect timeout.
                 pool.close().await;
                 if !sqlite_error_detail_is_lock(&error.to_string())
-                    || started.elapsed() >= Duration::from_secs(5)
+                    || !wait_for_sqlite_startup_retry(started).await
                 {
                     return Err(error);
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
     }

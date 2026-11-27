@@ -123,6 +123,13 @@ impl LineBuffer {
 #[derive(Debug)]
 struct LineLimitExceeded;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiveState {
+    Open,
+    CleanEof,
+    Interrupted,
+}
+
 // Remote public implementation.
 
 /// A client-side rmcp transport backed by an executor-managed process.
@@ -155,10 +162,8 @@ pub(super) struct ExecutorProcessTransport {
     /// Buffered stderr bytes for diagnostic logging.
     stderr: LineBuffer,
 
-    /// Whether the executor has reported process closure or a terminal
-    /// subscription failure. Once closed, any remaining partial stdout line is
-    /// flushed once and then rmcp receives EOF.
-    closed: bool,
+    /// Only an ordered process close proves that stdout ended without loss.
+    receive_state: ReceiveState,
 
     /// Highest executor process event sequence observed by this transport.
     ///
@@ -181,7 +186,7 @@ impl ExecutorProcessTransport {
             program_name,
             stdout: LineBuffer::default(),
             stderr: LineBuffer::default(),
-            closed: false,
+            receive_state: ReceiveState::Open,
             last_seq: 0,
             exit_known: false,
         }
@@ -242,64 +247,29 @@ impl ExecutorProcessTransport {
         loop {
             // rmcp stdio framing is line-oriented JSON. We first drain any
             // complete line already buffered from an earlier process event.
-            if let Some(message) = self.take_stdout_message(/*allow_partial*/ self.closed) {
+            if let Some(message) = self.take_stdout_message() {
                 return Some(message);
             }
-            if self.closed {
+            if self.receive_state != ReceiveState::Open {
+                // Complete lines have been drained. Never decode an
+                // unterminated suffix after an interrupted stream.
+                self.stdout.clear();
                 self.flush_stderr();
                 return None;
             }
 
-            let received = match self.events.recv().await {
+            match self.events.recv().await {
                 Ok(event) => match self.recover_forward_gap(event).await {
-                    Ok(Some(event)) => Ok(event),
-                    Ok(None) => continue,
+                    Ok(Some(event)) => self.handle_process_event(event),
+                    Ok(None) => {}
                     Err(error) => {
                         warn!(
-                            "Failed to recover remote MCP initial output ({}): {error}",
+                            "Failed to recover remote MCP output sequence ({}): {error}",
                             self.program_name
                         );
-                        self.stdout.clear();
-                        self.closed = true;
-                        continue;
+                        self.receive_state = ReceiveState::Interrupted;
                     }
                 },
-                Err(error) => Err(error),
-            };
-            match received {
-                Ok(ExecProcessEvent::OutputGap { through_seq, .. }) => {
-                    // A JSON-RPC byte stream cannot safely resume through a
-                    // missing frame. Report transport loss, not process death.
-                    warn!(
-                        "Remote MCP output lost through sequence {through_seq} ({})",
-                        self.program_name
-                    );
-                    self.closed = true;
-                }
-                Ok(ExecProcessEvent::Output(chunk)) => {
-                    // The executor pushes raw process bytes. This is the only
-                    // place where those bytes are split back into the stdout
-                    // protocol stream and stderr diagnostics.
-                    self.push_process_output_if_new(chunk);
-                }
-                Ok(ExecProcessEvent::Exited { seq, .. }) => {
-                    self.note_seq(seq);
-                    self.exit_known = true;
-                    // Wait for `Closed` before ending the rmcp stream so any
-                    // output flushed during process shutdown can still be
-                    // decoded into JSON-RPC messages.
-                }
-                Ok(ExecProcessEvent::Closed { seq, .. }) => {
-                    self.note_seq(seq);
-                    self.closed = true;
-                }
-                Ok(ExecProcessEvent::Failed(message)) => {
-                    warn!(
-                        "Remote MCP server process failed ({}): {message}",
-                        self.program_name
-                    );
-                    self.closed = true;
-                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(
                         "Remote MCP server output stream lagged ({}): skipped {skipped} events",
@@ -310,12 +280,50 @@ impl ExecutorProcessTransport {
                             "Failed to recover remote MCP server output stream ({}): {error}",
                             self.program_name
                         );
-                        self.closed = true;
+                        self.receive_state = ReceiveState::Interrupted;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    self.closed = true;
+                    warn!(
+                        "Remote MCP server output receiver closed before process closure ({})",
+                        self.program_name
+                    );
+                    self.receive_state = ReceiveState::Interrupted;
                 }
+            }
+        }
+    }
+
+    fn handle_process_event(&mut self, event: ExecProcessEvent) {
+        match event {
+            ExecProcessEvent::OutputGap { through_seq, .. } => {
+                if through_seq <= self.last_seq {
+                    return;
+                }
+                // A JSON-RPC byte stream cannot safely resume through a
+                // missing frame. Report transport loss, not process death.
+                warn!(
+                    "Remote MCP output lost through sequence {through_seq} ({})",
+                    self.program_name
+                );
+                self.receive_state = ReceiveState::Interrupted;
+            }
+            ExecProcessEvent::Output(chunk) => self.push_process_output_if_new(chunk),
+            ExecProcessEvent::Exited { seq, .. } => {
+                self.note_seq(seq);
+                self.exit_known = true;
+                // Wait for `Closed` so shutdown output can still be decoded.
+            }
+            ExecProcessEvent::Closed { seq, .. } => {
+                self.note_seq(seq);
+                self.receive_state = ReceiveState::CleanEof;
+            }
+            ExecProcessEvent::Failed(message) => {
+                warn!(
+                    "Remote MCP server process failed ({}): {message}",
+                    self.program_name
+                );
+                self.receive_state = ReceiveState::Interrupted;
             }
         }
     }
@@ -333,6 +341,13 @@ impl ExecutorProcessTransport {
             ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq, .. } => {
                 Some(*seq)
             }
+            // A producer capture loss occupies one sequence. Initial
+            // subscriber history can be truncated before it, so recover any
+            // retained prefix just as for a sequenced output event.
+            ExecProcessEvent::OutputGap {
+                through_seq,
+                capture_incomplete: Some(_),
+            } => Some(*through_seq),
             _ => None,
         };
         if seq.is_some_and(|seq| seq > self.last_seq.saturating_add(1)) {
@@ -365,11 +380,9 @@ impl ExecutorProcessTransport {
             )
             .await
             .map_err(io::Error::other)?;
-        if response.output_gap.is_some() {
-            return Err(io::Error::other(
-                "remote MCP output contains an unrecoverable gap",
-            ));
-        }
+        // A retained read can include valid output before its first gap.
+        // Replay in sequence order and stop at that gap rather than dropping
+        // the entire validated prefix or interpreting a later close as EOF.
         let recovered = codex_exec_server::replay_process_events(
             self.last_seq,
             self.exit_known,
@@ -378,21 +391,8 @@ impl ExecutorProcessTransport {
         )
         .map_err(io::Error::other)?;
         for event in recovered {
-            match event {
-                ExecProcessEvent::Output(chunk) => self.push_process_output_if_new(chunk),
-                ExecProcessEvent::Exited { seq, .. } => {
-                    self.note_seq(seq);
-                    self.exit_known = true;
-                }
-                ExecProcessEvent::Closed { seq, .. } => {
-                    self.note_seq(seq);
-                    self.closed = true;
-                }
-                ExecProcessEvent::OutputGap { .. } | ExecProcessEvent::Failed(_) => {
-                    return Err(io::Error::other("remote MCP output could not be recovered"));
-                }
-            }
-            if self.closed {
+            self.handle_process_event(event);
+            if self.receive_state != ReceiveState::Open {
                 break;
             }
         }
@@ -422,8 +422,7 @@ impl ExecutorProcessTransport {
                         "Remote MCP server stdout message exceeded the {MCP_STDOUT_MAX_MESSAGE_BYTES}-byte limit ({}); closing transport",
                         self.program_name
                     );
-                    self.stdout.clear();
-                    self.closed = true;
+                    self.receive_state = ReceiveState::Interrupted;
                 }
             }
             // Stderr is intentionally out-of-band. It should help debug server
@@ -434,15 +433,16 @@ impl ExecutorProcessTransport {
         }
     }
 
-    fn take_stdout_message(&mut self, allow_partial: bool) -> Option<RxJsonRpcMessage<RoleClient>> {
+    fn take_stdout_message(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
         // A normal MCP stdio server emits one JSON-RPC message per newline.
-        // If the process has already closed, accept a final unterminated line
-        // so EOF after a complete JSON object behaves like local rmcp's
+        // At clean EOF, accept a final unterminated line like local rmcp's
         // `decode_eof` handling.
         loop {
             let line = match self.stdout.take_line() {
                 Some(line) => line,
-                None if allow_partial => self.stdout.take_remaining()?,
+                None if self.receive_state == ReceiveState::CleanEof => {
+                    self.stdout.take_remaining()?
+                }
                 None => return None,
             };
             let line = Self::trim_trailing_carriage_return(line);

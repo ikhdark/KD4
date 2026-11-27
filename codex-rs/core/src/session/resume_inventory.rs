@@ -7,6 +7,7 @@ use codex_protocol::protocol::RolloutItem;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 pub(crate) use codex_conversation::RESUME_STATE_LOCATOR as LOCATOR;
@@ -135,12 +136,28 @@ fn command_records(items: &[RolloutItem]) -> BTreeMap<String, Value> {
     records
 }
 
-/// Exact recorded arguments of one call ID (function or custom tool). Read-only; no control grant.
-fn recorded_call_arguments(items: &[RolloutItem], call_id: &str) -> Vec<Value> {
+/// Exact recorded arguments of the named call (function or custom tool). Read-only; no control grant.
+fn recorded_call_arguments(
+    items: &[RolloutItem],
+    filter: &ResumeInventoryFilter,
+    operations: &BTreeMap<String, Value>,
+    unresolved_invocations: &[Value],
+) -> Vec<Value> {
     use sha2::Digest;
+    let Some(call_id) = filter.call_id.as_deref() else {
+        return Vec::new();
+    };
     let mut found = Vec::new();
+    let mut turn_id = None;
     for (index, item) in items.iter().enumerate() {
-        let RolloutItem::ResponseItem(item) = item else { continue };
+        let item = match item {
+            RolloutItem::TurnContext(context) => {
+                turn_id = context.turn_id.as_deref();
+                continue;
+            }
+            RolloutItem::ResponseItem(item) => item,
+            _ => continue,
+        };
         let (kind, name, text) = match item {
             ResponseItem::FunctionCall { call_id: id, name, arguments, .. } if id == call_id =>
                 ("function_call", name, arguments),
@@ -148,13 +165,49 @@ fn recorded_call_arguments(items: &[RolloutItem], call_id: &str) -> Vec<Value> {
                 ("custom_tool_call", name, input),
             _ => continue,
         };
-        found.push(json!({
-            "kind": kind, "rollout_item_index": index, "call_id": call_id, "name": name,
-            "bytes": text.len(), "sha256": hex::encode(sha2::Sha256::digest(text.as_bytes())),
-            "arguments": text,
-        }));
+        found.push((index, turn_id, kind, name, text));
     }
-    found
+
+    // A bare call ID is the exact recovery path even without an inventory row.
+    // Additional selectors require a surviving operation or invocation to bind
+    // each argument occurrence, rather than revealing every reuse of the ID.
+    if filter.parent_cell_id.is_some() || filter.artifact_id.is_some() || filter.unresolved_only {
+        let rollout_index = |record: &Value| {
+            usize::try_from(record["rollout_item_index"].as_u64()?).ok()
+        };
+        let mut selected = unresolved_invocations
+            .iter()
+            .filter_map(rollout_index)
+            .collect::<BTreeSet<_>>();
+        for record in operations.values() {
+            let Some(index) = rollout_index(record) else { continue };
+            let operation_turn = match items.get(index) {
+                Some(RolloutItem::EventMsg(EventMsg::ItemStarted(event))) =>
+                    Some(event.turn_id.as_str()),
+                Some(RolloutItem::EventMsg(EventMsg::ItemCompleted(event))) =>
+                    Some(event.turn_id.as_str()),
+                // Process checkpoints lack an authoritative originating turn.
+                Some(RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_)) => None,
+                _ => continue,
+            };
+            let mut candidates = found.iter().filter(|(call_index, call_turn, ..)| {
+                *call_index < index
+                    && operation_turn.is_none_or(|turn| *call_turn == Some(turn))
+            });
+            if let Some((call_index, ..)) = candidates.next()
+                && candidates.next().is_none()
+            {
+                selected.insert(*call_index);
+            }
+        }
+        found.retain(|(index, ..)| selected.contains(index));
+    }
+
+    found.into_iter().map(|(index, _, kind, name, text)| json!({
+        "kind": kind, "rollout_item_index": index, "call_id": call_id, "name": name,
+        "bytes": text.len(), "sha256": hex::encode(sha2::Sha256::digest(text.as_bytes())),
+        "arguments": text,
+    })).collect()
 }
 
 fn reconcile(record: &mut Value, owners: &[Value]) {
@@ -318,10 +371,8 @@ impl Session {
             .await
             .map_err(|error| error.to_string())?;
         let active_turn = active_turn.to_string();
-        // S16/AT03: exact original arguments of the named call, from the durable rollout.
-        let call_arguments = filter.and_then(|filter| filter.call_id.as_deref())
-            .map(|call_id| recorded_call_arguments(&items, call_id)).unwrap_or_default();
-        let (mut records, mut unresolved_invocations) = tokio::task::spawn_blocking(move || {
+        let recover_arguments = filter.is_some_and(|filter| filter.call_id.is_some());
+        let (mut records, mut unresolved_invocations, argument_items) = tokio::task::spawn_blocking(move || {
             let records = command_records(&items);
             // In-flight calls in this turn still have their original owner.
             // Do not classify the inventory call itself as a lost result.
@@ -330,7 +381,7 @@ impl Session {
                 .unwrap_or(items.len());
             let unresolved = super::rollout_reconstruction::unsettled_tool_recovery_entries(&items[..boundary])
                 .collect::<Vec<_>>();
-            (records, unresolved)
+            (records, unresolved, recover_arguments.then_some(items))
         }).await.map_err(|error| error.to_string())?;
 
         // Release each owner before consulting the next. This is explicitly a
@@ -364,6 +415,13 @@ impl Session {
                             && record["incarnation"] == owner["incarnation"]))
             });
         }
+        // S16/AT03: recover the exact original arguments, scoped to the selected rows.
+        let call_arguments = filter
+            .zip(argument_items)
+            .map(|(filter, items)| {
+                recorded_call_arguments(&items, filter, &records, &unresolved_invocations)
+            })
+            .unwrap_or_default();
         let history = self.clone_history().await;
         let mut references = history
             .tool_history_state_ref()

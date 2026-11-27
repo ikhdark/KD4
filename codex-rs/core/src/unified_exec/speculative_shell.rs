@@ -22,8 +22,9 @@
 //! hosts are prepared in this process. It accepts only scripts that parse and admit an
 //! appended `$?` capture, dot-sources the script at global scope and leaves the exit
 //! code to the host's `-Command` rule (`$?` of the last statement, or an explicit
-//! `exit`). Any key mismatch, decline, timeout, dead host or failure falls back to
-//! the ordinary launch; an unused bootstrap is terminated before running caller code.
+//! `exit`). A key mismatch, decline, timeout, dead host or failure before commit
+//! falls back to the ordinary launch. A ready host cannot run caller code until
+//! committed; once commit is attempted, a failed handoff never retries cold.
 //!
 //! The script is written only after the pipe client is verified to be the host's
 //! own process. An accepted host is attributed to the consuming call's process
@@ -68,9 +69,9 @@ const IDLE_LIMIT: Duration = Duration::from_secs(45);
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Screened one-line bootstrap. It warms the parser, connects to the private pipe,
-/// reads `thread-id \n priority-class \n byte-length \n script`, and replies `A`
-/// (accepted, priority restored, about to run), `D` (declined, nothing run) or `P`
-/// (login launch declined because a profile is not empty, nothing run).
+/// reads `thread-id \n priority-class \n byte-length \n script`, and replies `R`
+/// (ready, priority restored), `D` (declined) or `P` (non-empty login profile).
+/// Only a ready host receiving `C` (commit) may reply `A` (accepted) and run.
 #[cfg(windows)]
 const BOOTSTRAP: &str = include_str!("speculative_shell_bootstrap.ps1");
 
@@ -209,17 +210,27 @@ pub(crate) struct SpeculativeShellSlot {
 }
 
 impl SpeculativeShellSlot {
-    /// Hands the launch's script to a matching spare. `None` means launch normally.
+    /// Hands the launch's script to a matching spare. Only `Ok(None)` permits
+    /// an ordinary launch; `Err` means the command may already have run.
     #[cfg(windows)]
     pub(crate) async fn take_and_hand_off(
         &self,
         launch: &SpeculativeLaunch<'_>,
-    ) -> Option<SpawnedProcess> {
+    ) -> std::io::Result<Option<SpawnedProcess>> {
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
+
+        enum Reply {
+            Accepted,
+            Declined,
+            DeclinedProfile,
+        }
+
         let prepared = {
             let mut pool = POOL.lock().await;
-            let index = pool.iter().position(|prepared| prepared.key == launch.key)?;
+            let Some(index) = pool.iter().position(|prepared| prepared.key == launch.key) else {
+                return Ok(None);
+            };
             pool.remove(index)
         };
         let Prepared {
@@ -232,6 +243,7 @@ impl SpeculativeShellSlot {
             ..
         } = prepared;
         let handoff_started = std::time::Instant::now();
+        let mut commit_attempted = false;
         let handoff = async {
             // A host that died during startup must not hold the launch until the
             // handoff deadline; its exit releases the ordinary fallback at once.
@@ -254,41 +266,62 @@ impl SpeculativeShellSlot {
             pipe.write_all(header.as_bytes()).await?;
             pipe.write_all(bytes).await?;
             pipe.flush().await?;
-            let mut ack = [0_u8; 1];
-            pipe.read_exact(&mut ack).await?;
-            Ok::<u8, std::io::Error>(ack[0])
+            let mut reply = [0_u8; 1];
+            pipe.read_exact(&mut reply).await?;
+            match reply[0] {
+                b'R' => {}
+                b'P' => return Ok(Reply::DeclinedProfile),
+                _ => return Ok(Reply::Declined),
+            }
+
+            // The write can reach the host even if the deadline or a later
+            // pipe failure prevents us from seeing its acknowledgement.
+            commit_attempted = true;
+            pipe.write_all(b"C").await?;
+            pipe.flush().await?;
+            pipe.read_exact(&mut reply).await?;
+            if reply[0] != b'A' {
+                return Err(std::io::Error::other("unexpected speculative shell commit reply"));
+            }
+            Ok(Reply::Accepted)
         };
         let outcome = tokio::time::timeout(HANDOFF_TIMEOUT, handoff).await;
         let handoff_ms = handoff_started.elapsed().as_secs_f64() * 1000.0;
         let lead_ms = handoff_started.duration_since(started).as_secs_f64() * 1000.0;
         let reason = match outcome {
-            Ok(Ok(b'A')) => {
+            Ok(Ok(Reply::Accepted)) => {
                 // The host now runs this call's command: record it as this call's
                 // requested root, as an ordinary launch here would be.
                 observation.adopt_into_current_scope();
                 tracing::info!(target: "codex_speculative_shell", outcome = "accepted", handoff_ms, lead_ms, "speculative shell accepted");
                 retire(pipe);
-                return Some(process);
+                return Ok(Some(process));
             }
-            Ok(Ok(b'P')) => {
+            Ok(Ok(Reply::DeclinedProfile)) => {
                 LOGIN_PROFILE_DECLINED.store(true, Ordering::Release);
                 "declined_profile".to_string()
             }
-            Ok(Ok(_)) => "declined".to_string(),
+            Ok(Ok(Reply::Declined)) => "declined".to_string(),
             Ok(Err(error)) => format!("failed: {error}"),
             Err(_) => "timeout".to_string(),
         };
-        tracing::info!(target: "codex_speculative_shell", outcome = %reason, handoff_ms, lead_ms, "speculative shell not used");
         retire((process, pipe));
-        None
+        if commit_attempted {
+            tracing::warn!(target: "codex_speculative_shell", outcome = "commit_uncertain", %reason, handoff_ms, lead_ms, "speculative shell commit unconfirmed");
+            return Err(std::io::Error::other(format!(
+                "speculative shell commit was not confirmed ({reason}); the command may have run. Inspect its effects before retrying."
+            )));
+        }
+        tracing::info!(target: "codex_speculative_shell", outcome = %reason, handoff_ms, lead_ms, "speculative shell not used");
+        Ok(None)
     }
 
     #[cfg(not(windows))]
     pub(crate) async fn take_and_hand_off(
         &self,
         _launch: &SpeculativeLaunch<'_>,
-    ) -> Option<SpawnedProcess> {
-        None
+    ) -> std::io::Result<Option<SpawnedProcess>> {
+        Ok(None)
     }
 
     /// Tops up spares for the key just launched.

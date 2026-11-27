@@ -16,18 +16,28 @@ use syn::parse_macro_input;
 #[proc_macro_derive(ExperimentalApi, attributes(experimental))]
 pub fn derive_experimental_api(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
+    expand_experimental_api(&input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn expand_experimental_api(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    // Validate type-level annotations without changing the type's expansion.
+    experimental_annotations(&input.attrs)?;
     match &input.data {
-        Data::Struct(data) => derive_for_struct(&input, data),
-        Data::Enum(data) => derive_for_enum(&input, data),
-        Data::Union(_) => {
-            syn::Error::new_spanned(&input.ident, "ExperimentalApi does not support unions")
-                .to_compile_error()
-                .into()
-        }
+        Data::Struct(data) => derive_for_struct(input, data),
+        Data::Enum(data) => derive_for_enum(input, data),
+        Data::Union(_) => Err(syn::Error::new_spanned(
+            &input.ident,
+            "ExperimentalApi does not support unions",
+        )),
     }
 }
 
-fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
+fn derive_for_struct(
+    input: &DeriveInput,
+    data: &DataStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
     let type_name_lit = LitStr::new(&name.to_string(), Span::call_site());
 
@@ -36,7 +46,8 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
             let mut checks = Vec::new();
             let mut registrations = Vec::new();
             for field in &named.named {
-                if let Some(reason) = experimental_reason(&field.attrs) {
+                let (reason, nested) = experimental_annotations(&field.attrs)?;
+                if let Some(reason) = reason {
                     let expr = experimental_presence_expr(field);
                     checks.push(quote! {
                         if #expr {
@@ -56,7 +67,7 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
                             }
                         });
                     }
-                } else if has_nested_experimental(field) {
+                } else if nested {
                     let Some(ident) = field.ident.as_ref() else {
                         continue;
                     };
@@ -75,7 +86,8 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
             let mut checks = Vec::new();
             let mut registrations = Vec::new();
             for (index, field) in unnamed.unnamed.iter().enumerate() {
-                if let Some(reason) = experimental_reason(&field.attrs) {
+                let (reason, nested) = experimental_annotations(&field.attrs)?;
+                if let Some(reason) = reason {
                     let expr = index_presence_expr(index, &field.ty);
                     checks.push(quote! {
                         if #expr {
@@ -93,7 +105,7 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
                             }
                         }
                     });
-                } else if has_nested_experimental(field) {
+                } else if nested {
                     let index = syn::Index::from(index);
                     checks.push(quote! {
                         if let Some(reason) =
@@ -127,10 +139,13 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
             }
         }
     };
-    expanded.into()
+    Ok(expanded)
 }
 
-fn derive_for_enum(input: &DeriveInput, data: &DataEnum) -> TokenStream {
+fn derive_for_enum(
+    input: &DeriveInput,
+    data: &DataEnum,
+) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
     let mut match_arms = Vec::new();
 
@@ -141,7 +156,11 @@ fn derive_for_enum(input: &DeriveInput, data: &DataEnum) -> TokenStream {
             Fields::Unnamed(_) => quote!(Self::#variant_name ( .. )),
             Fields::Unit => quote!(Self::#variant_name),
         };
-        let reason = experimental_reason(&variant.attrs);
+        let (reason, _) = experimental_annotations(&variant.attrs)?;
+        // The expansion uses only the variant's reason, not its payload fields.
+        for field in &variant.fields {
+            experimental_annotations(&field.attrs)?;
+        }
         if let Some(reason) = reason {
             match_arms.push(quote! {
                 #pattern => Some(#reason),
@@ -162,32 +181,29 @@ fn derive_for_enum(input: &DeriveInput, data: &DataEnum) -> TokenStream {
             }
         }
     };
-    expanded.into()
+    Ok(expanded)
 }
 
-fn experimental_reason(attrs: &[Attribute]) -> Option<LitStr> {
-    attrs.iter().find_map(experimental_reason_attr)
-}
-
-fn experimental_reason_attr(attr: &Attribute) -> Option<LitStr> {
-    if !attr.path().is_ident("experimental") {
-        return None;
+fn experimental_annotations(attrs: &[Attribute]) -> syn::Result<(Option<LitStr>, bool)> {
+    let mut reason = None;
+    let mut nested = false;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("experimental")) {
+        if let Ok(literal) = attr.parse_args::<LitStr>() {
+            // Preserve the first reason, but still validate later annotations.
+            reason.get_or_insert(literal);
+        } else if attr
+            .parse_args::<Ident>()
+            .is_ok_and(|ident| ident == "nested")
+        {
+            nested = true;
+        } else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected #[experimental(\"reason\")] or #[experimental(nested)]",
+            ));
+        }
     }
-
-    attr.parse_args::<LitStr>().ok()
-}
-
-fn has_nested_experimental(field: &Field) -> bool {
-    field.attrs.iter().any(experimental_nested_attr)
-}
-
-fn experimental_nested_attr(attr: &Attribute) -> bool {
-    if !attr.path().is_ident("experimental") {
-        return false;
-    }
-
-    attr.parse_args::<Ident>()
-        .is_ok_and(|ident| ident == "nested")
+    Ok((reason, nested))
 }
 
 fn field_serialized_name(field: &Field) -> Option<String> {

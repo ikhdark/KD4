@@ -49,6 +49,8 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use super::input_receipts::UserInputIdentity;
+
 pub async fn interrupt(sess: &Arc<Session>) {
     // Claim cancellation before returning to dispatch, but do not make the
     // control loop an observer of the cancellation-resistant finalizer.
@@ -414,16 +416,26 @@ pub(super) async fn user_input_or_turn_inner(
             return;
         }
     };
-    if let Some((_, admission)) = start_only_admission.as_ref()
-        && !admission.1.is_cancelled()
-        && let Err(error) = sess.accept_start_receipt(&sub_id, client_user_message_id.as_deref(), &items, &additional_context).await
+    let receipt = if start_only_admission
+        .as_ref()
+        .is_some_and(|(_, admission)| !admission.1.is_cancelled())
     {
-        if let Some((permit, admission)) = start_only_admission.take() {
-            drop(permit);
-            let _ = admission.send(Err(error));
+        match sess
+            .accept_start_receipt(&sub_id, client_user_message_id.as_deref(), &items, &additional_context)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Some((permit, admission)) = start_only_admission.take() {
+                    drop(permit);
+                    let _ = admission.send(Err(error));
+                }
+                return;
+            }
         }
-        return;
-    }
+    } else {
+        None
+    };
     let start_fence = start_only_admission.as_ref().map(|(_, admission)| super::input_queue::StartInputFence {
         turn_id: sub_id.clone(), cancellation: admission.1.clone(),
     });
@@ -431,7 +443,10 @@ pub(super) async fn user_input_or_turn_inner(
     if !items.is_empty() {
         task_input.push(TurnInput::UserInput {
             content: items,
-            client_id: client_user_message_id,
+            identity: match receipt {
+                Some(receipt) => UserInputIdentity::Receipted(receipt),
+                None => UserInputIdentity::Unreceipted(client_user_message_id),
+            },
             start_fence,
         });
     }

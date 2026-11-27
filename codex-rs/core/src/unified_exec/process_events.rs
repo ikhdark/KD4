@@ -419,11 +419,11 @@ impl UnifiedExecProcessManager {
                 }
                 Arc::clone(&entry.process)
             } else {
-                if store.used_process_ids.get(&process_id).copied().flatten() != Some(incarnation) {
+                if store.issued_process_incarnation(process_id) != Some(incarnation) {
                     return Err("stale process incarnation; no subscription created".into());
                 }
                 let Some((_, result, totals)) = store.finished.iter().find(|(id, _, _)| *id == process_id) else {
-                    // The identity tombstone outlives retention, not the output
+                    // The issued identity outlives retention, not the output
                     // or exit evidence. Preserve the cursor and expose the gap.
                     drop(store);
                     let mut matcher = Matcher::new(filter);

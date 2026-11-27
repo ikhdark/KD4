@@ -18,6 +18,7 @@ use super::internal_error;
 use super::invalid_request;
 use super::warn;
 
+use codex_feedback::MAX_FEEDBACK_EXTRA_ATTACHMENT_ATTEMPTS;
 use futures::StreamExt;
 
 const MAX_FEEDBACK_TREE_THREADS: usize = 8;
@@ -104,6 +105,7 @@ impl FeedbackRequestProcessor {
         }
         let mut snapshot = self.feedback.snapshot(conversation_id);
         let thread_id = snapshot.thread_id.clone();
+        let mut seen_attachment_paths = HashSet::new();
         let prepare_logs = async {
             let (logs_settled, feedback_thread_ids) = if include_logs {
                 // Bounded: the flush is queued behind every pending insert batch, and each
@@ -188,7 +190,6 @@ impl FeedbackRequestProcessor {
             };
             let prepare_attachments = async {
                 let mut attachment_paths = Vec::new();
-                let mut seen_attachment_paths = HashSet::new();
                 if include_logs {
                     let rollout_paths = futures::stream::iter(feedback_thread_ids.iter().copied())
                         .map(|feedback_thread_id| async move {
@@ -224,18 +225,6 @@ impl FeedbackRequestProcessor {
                         }
                     }
                 }
-                if let Some(extra_log_files) = extra_log_files {
-                    for extra_log_file in extra_log_files {
-                        if seen_attachment_paths.insert(extra_log_file.clone()) {
-                            attachment_paths.push(FeedbackAttachmentPath {
-                                path: extra_log_file,
-                                hydrate_rollout: false,
-                                attachment_filename_override: None,
-                            });
-                        }
-                    }
-                }
-
                 attachment_paths
             };
             let (attachment_paths, sqlite_feedback_logs) =
@@ -249,7 +238,7 @@ impl FeedbackRequestProcessor {
                 None
             }
         };
-        let ((attachment_paths, sqlite_feedback_logs, logs_settled), doctor_report) =
+        let ((mut attachment_paths, sqlite_feedback_logs, logs_settled), doctor_report) =
             tokio::join!(prepare_logs, prepare_doctor);
 
         // A successful query can still return old rows after a batch was lost, or when
@@ -278,20 +267,41 @@ impl FeedbackRequestProcessor {
             }
         }
 
+        // Keep generated reports and selected rollouts ahead of user-supplied paths.
+        // Count raw entries against the scan limit so duplicates cannot extend the scan.
+        let remaining_attempts = MAX_FEEDBACK_EXTRA_ATTACHMENT_ATTEMPTS
+            .saturating_sub(extra_attachments.len() + attachment_paths.len());
+        let unexamined_candidates = extra_log_files.map_or(0, |files| {
+            let unexamined = files.len().saturating_sub(remaining_attempts);
+            for path in files.into_iter().take(remaining_attempts) {
+                if seen_attachment_paths.insert(path.clone()) {
+                    attachment_paths.push(FeedbackAttachmentPath {
+                        path,
+                        hydrate_rollout: false,
+                        attachment_filename_override: None,
+                    });
+                }
+            }
+            unexamined
+        });
+
         let session_source = self.thread_manager.session_source();
 
         let upload_result = tokio::task::spawn_blocking(move || {
             let tags = (!upload_tags.is_empty()).then_some(&upload_tags);
-            snapshot.upload_feedback(FeedbackUploadOptions {
-                classification: &classification,
-                reason: reason.as_deref(),
-                tags,
-                include_logs,
-                extra_attachments: &extra_attachments,
-                extra_attachment_paths: &attachment_paths,
-                session_source: Some(session_source),
-                logs_override: sqlite_feedback_logs,
-            })
+            snapshot.upload_feedback_with_unexamined_candidates(
+                FeedbackUploadOptions {
+                    classification: &classification,
+                    reason: reason.as_deref(),
+                    tags,
+                    include_logs,
+                    extra_attachments: &extra_attachments,
+                    extra_attachment_paths: &attachment_paths,
+                    session_source: Some(session_source),
+                    logs_override: sqlite_feedback_logs,
+                },
+                unexamined_candidates,
+            )
         })
         .await;
 

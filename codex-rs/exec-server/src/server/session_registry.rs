@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::ExecServerRuntimePaths;
@@ -18,6 +20,7 @@ const DETACHED_SESSION_TTL: Duration = Duration::from_secs(30);
 
 pub(crate) struct SessionRegistry {
     sessions: Mutex<HashMap<String, Arc<SessionEntry>>>,
+    cleanup: TaskTracker,
     telemetry: ExecServerTelemetry,
 }
 
@@ -54,6 +57,7 @@ impl SessionRegistry {
     pub(crate) fn new(telemetry: ExecServerTelemetry) -> Arc<Self> {
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
+            cleanup: TaskTracker::new(),
             telemetry,
         })
     }
@@ -68,13 +72,16 @@ impl SessionRegistry {
             Attached(Arc<SessionEntry>),
             Expired {
                 session_id: String,
-                entry: Arc<SessionEntry>,
+                cleanup: JoinHandle<()>,
             },
         }
 
         let connection_id = ConnectionId(Uuid::new_v4());
         let outcome = {
             let mut sessions = self.sessions.lock().await;
+            if self.cleanup.is_closed() {
+                return Err(invalid_request("session registry is shutting down".into()));
+            }
             if let Some(session_id) = resume_session_id {
                 let entry = sessions
                     .get(&session_id)
@@ -84,7 +91,10 @@ impl SessionRegistry {
                     let entry = sessions.remove(&session_id).ok_or_else(|| {
                         invalid_request(format!("unknown session id {session_id}"))
                     })?;
-                    Ok(AttachOutcome::Expired { session_id, entry })
+                    // Publish custody under the removal lock. The initialize
+                    // waiter can disappear as soon as it next yields.
+                    let cleanup = self.track_cleanup(vec![entry]);
+                    Ok(AttachOutcome::Expired { session_id, cleanup })
                 } else if entry.has_active_connection() {
                     Err(session_already_attached(format!(
                         "session {session_id} is already attached to another connection"
@@ -107,9 +117,10 @@ impl SessionRegistry {
         };
         let entry = match outcome? {
             AttachOutcome::Attached(entry) => entry,
-            AttachOutcome::Expired { session_id, entry } => {
-                entry.cancel_expiry();
-                entry.process.shutdown().await;
+            AttachOutcome::Expired { session_id, cleanup } => {
+                if let Err(error) = cleanup.await {
+                    tracing::error!(%session_id, %error, cleanup_outcome = "shutdown_uncertain", "session cleanup task failed");
+                }
                 return Err(invalid_request(format!("unknown session id {session_id}")));
             }
         };
@@ -122,28 +133,42 @@ impl SessionRegistry {
     }
 
 
-    pub(crate) async fn shutdown(&self) {
-        let sessions = std::mem::take(&mut *self.sessions.lock().await);
-        for entry in sessions.into_values() {
+    // Register while holding the sessions lock so shutdown cannot close and
+    // drain the tracker between removing an entry and giving its cleanup away.
+    fn track_cleanup(&self, entries: Vec<Arc<SessionEntry>>) -> JoinHandle<()> {
+        for entry in &entries {
             entry.cancel_expiry();
-            entry.process.shutdown().await;
         }
+        self.cleanup.spawn(async move {
+            for entry in entries {
+                entry.process.shutdown(&entry.session_id).await;
+            }
+        })
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        {
+            let mut sessions = self.sessions.lock().await;
+            if !sessions.is_empty() {
+                drop(self.track_cleanup(sessions.drain().map(|(_, entry)| entry).collect()));
+            }
+            // No attach can add a session after this point. Any expiry task
+            // that did not claim its entry before the drain now finds none.
+            self.cleanup.close();
+        }
+        self.cleanup.wait().await;
     }
 
     async fn expire_if_detached(&self, session_id: String, connection_id: ConnectionId) {
-        let removed = {
-            let mut sessions = self.sessions.lock().await;
-            let Some(entry) = sessions.get(&session_id) else {
-                return;
-            };
-            if !entry.is_detached_connection_expired(connection_id, tokio::time::Instant::now()) {
-                return;
-            }
-            sessions.remove(&session_id)
+        let mut sessions = self.sessions.lock().await;
+        let Some(entry) = sessions.get(&session_id) else {
+            return;
         };
-
-        if let Some(entry) = removed {
-            entry.process.shutdown().await;
+        if !entry.is_detached_connection_expired(connection_id, tokio::time::Instant::now()) {
+            return;
+        }
+        if let Some(entry) = sessions.remove(&session_id) {
+            drop(self.track_cleanup(vec![entry]));
         }
     }
 }
@@ -152,6 +177,7 @@ impl Default for SessionRegistry {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            cleanup: TaskTracker::new(),
             telemetry: ExecServerTelemetry::default(),
         }
     }
@@ -265,6 +291,13 @@ impl SessionHandle {
     }
 
     pub(crate) async fn detach(&self) {
+        let sessions = self.registry.sessions.lock().await;
+        if !sessions
+            .get(self.session_id())
+            .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+        {
+            return;
+        }
         let Some(expiry_cancelled) = self.entry.detach(self.connection_id) else {
             return;
         };
@@ -278,8 +311,8 @@ impl SessionHandle {
                 _ = expiry_cancelled.cancelled() => return,
                 _ = tokio::time::sleep(DETACHED_SESSION_TTL) => {},
             }
-            // Once expiry claims the entry, native cleanup must finish even
-            // if an observer disappears. Cancel only the obsolete timer wait.
+            // The token cancels only the obsolete timer wait. Expiry transfers
+            // cleanup custody to the registry if this connection still owns it.
             registry.expire_if_detached(session_id, connection_id).await;
         });
     }

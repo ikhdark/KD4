@@ -29,6 +29,8 @@ const MAX_QUALIFIED_SKILL_NAME_CHARS: usize = 128;
 const MAX_SKILL_PACKAGE_URI_CHARS: usize = 1_024;
 const MAX_SKILL_RESOURCE_URI_CHARS: usize = 2_048;
 const MAX_SKILL_RESOURCE_CONTENT_BYTES: usize = 1024 * 1024;
+const SKIPPED_RESOURCE_WARNING_PREFIX: &str = "Skipped ";
+const SKIPPED_RESOURCE_WARNING_SUFFIX: &str = " malformed orchestrator skill resources.";
 
 /// Discovers and reads skills owned by the orchestrator.
 ///
@@ -40,6 +42,20 @@ pub struct OrchestratorSkillProvider;
 impl OrchestratorSkillProvider {
     pub fn new() -> Self {
         Self
+    }
+
+    pub(crate) fn skipped_resource_warning(count: usize) -> String {
+        format!("{SKIPPED_RESOURCE_WARNING_PREFIX}{count}{SKIPPED_RESOURCE_WARNING_SUFFIX}")
+    }
+
+    /// Identify this provider's malformed-record diagnostic in the shared warning list.
+    pub(crate) fn skipped_resource_count(warning: &str) -> Option<usize> {
+        warning
+            .strip_prefix(SKIPPED_RESOURCE_WARNING_PREFIX)?
+            .strip_suffix(SKIPPED_RESOURCE_WARNING_SUFFIX)?
+            .parse()
+            .ok()
+            .filter(|count| *count > 0)
     }
 }
 
@@ -220,9 +236,9 @@ where
         catalog.warnings.push("Orchestrator skill discovery is incomplete. Follow skills.list next_cursor to continue discovery.".to_string());
     }
     if skipped_resources > 0 {
-        catalog.warnings.push(format!(
-            "Skipped {skipped_resources} malformed orchestrator skill resources."
-        ));
+        catalog
+            .warnings
+            .push(OrchestratorSkillProvider::skipped_resource_warning(skipped_resources));
     }
 
     catalog

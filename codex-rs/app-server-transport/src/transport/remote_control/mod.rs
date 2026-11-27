@@ -32,6 +32,7 @@ use self::protocol::ServerEvent;
 use self::protocol::StreamId;
 use self::protocol::normalize_remote_control_url;
 use super::CHANNEL_CAPACITY;
+use super::ControlReserveSender;
 use super::TransportEvent;
 use super::next_connection_id;
 pub(super) use codex_api::X_CODEX_INSTALLATION_ID_HEADER as REMOTE_CONTROL_INSTALLATION_ID_HEADER;
@@ -63,9 +64,10 @@ use std::ops::DerefMut;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
-use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -252,10 +254,28 @@ enum RemoteControlEnrollmentSelection {
 struct RemoteControlEnrollmentState {
     enrollment: StdMutex<Option<RemoteControlEnrollment>>,
     lock: Semaphore,
-    lifecycle: StdMutex<CancellationToken>,
+    lifecycle: StdMutex<Arc<RemoteControlLifecycle>>,
     retry_after: StdMutex<Option<time::OffsetDateTime>>,
     request_policy: watch::Receiver<RemoteControlPolicyDecision>,
     request_auth_manager: Arc<AuthManager>,
+}
+
+struct RemoteControlLifecycle {
+    retired: AtomicBool,
+    retirement_wake: CancellationToken,
+}
+
+impl RemoteControlLifecycle {
+    fn new() -> Self {
+        Self {
+            retired: AtomicBool::new(false),
+            retirement_wake: CancellationToken::new(),
+        }
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug)]
@@ -290,7 +310,7 @@ impl RemoteControlEnrollmentState {
         Self {
             enrollment: StdMutex::new(enrollment),
             lock: Semaphore::new(1),
-            lifecycle: StdMutex::new(CancellationToken::new()),
+            lifecycle: StdMutex::new(Arc::new(RemoteControlLifecycle::new())),
             retry_after: StdMutex::new(None),
             request_policy,
             request_auth_manager,
@@ -353,14 +373,19 @@ impl RemoteControlEnrollmentState {
             .clone()
     }
 
-    fn lifecycle(&self) -> CancellationToken {
+    fn lifecycle(&self) -> Arc<RemoteControlLifecycle> {
         self.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     fn retire_lifecycle(&self) {
-        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        lifecycle.cancel();
-        *lifecycle = CancellationToken::new();
+        let retired = {
+            let mut lifecycle = self.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            lifecycle.retired.store(true, Ordering::Release);
+            std::mem::replace(&mut *lifecycle, Arc::new(RemoteControlLifecycle::new()))
+        };
+        // Cancellation can invoke wakers synchronously. The retired flag already
+        // fences old work; notify its waiters only after releasing the commit lock.
+        retired.retirement_wake.cancel();
     }
 }
 
@@ -473,15 +498,24 @@ fn policy_admits_current_identity(
 impl RemoteControlHandle {
     async fn run_with_lifecycle<T>(
         &self,
-        lifecycle: &CancellationToken,
+        lifecycle: &RemoteControlLifecycle,
         operation: impl std::future::Future<Output = io::Result<T>>,
     ) -> io::Result<T> {
+        let interrupted = || {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "remote control operation retired by disable",
+            )
+        };
+        if lifecycle.is_retired() {
+            return Err(interrupted());
+        }
         tokio::select! {
             biased;
-            _ = lifecycle.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "remote control operation retired by disable")),
+            _ = lifecycle.retirement_wake.cancelled() => Err(interrupted()),
             result = operation => {
-                if lifecycle.is_cancelled() {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "remote control operation retired by disable"));
+                if lifecycle.is_retired() {
+                    return Err(interrupted());
                 }
                 result
             }
@@ -1566,7 +1600,7 @@ pub async fn start_remote_control(
     config: RemoteControlStartConfig,
     state_db: Option<Arc<StateRuntime>>,
     auth_manager: Arc<AuthManager>,
-    transport_event_tx: mpsc::Sender<TransportEvent>,
+    transport_event_tx: ControlReserveSender<TransportEvent>,
     shutdown_token: CancellationToken,
     app_server_client_name_rx: Option<oneshot::Receiver<String>>,
     startup_mode: RemoteControlStartupMode,

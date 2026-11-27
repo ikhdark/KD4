@@ -344,7 +344,9 @@ impl ShellCommandHandler {
             crate::validation::analyze_validation_policy_with_shell(
                 &original_invocation, original_shell_type,
                 allow_native_analysis.then_some(cwd.as_path()),
-            ).await;
+            )
+            .await
+            .map_err(|error| command_not_started(format!("command policy worker failed: {error}")))?;
         if let Some(refusal) = crate::validation_task::mode_refusal(
             &turn, policy_classification, params.validation.is_some(),
         ) {
@@ -374,7 +376,9 @@ impl ShellCommandHandler {
                 crate::validation::analyze_validation_policy_with_shell(
                     &command_invocation, original_shell_type,
                     allow_native_analysis.then_some(cwd.as_path()),
-                ).await;
+                )
+                .await
+                .map_err(|error| command_not_started(format!("command policy worker failed: {error}")))?;
             if let Some(refusal) = crate::validation_task::mode_refusal(
                 &turn, policy_classification, params.validation.is_some(),
             ) {
@@ -387,7 +391,8 @@ impl ShellCommandHandler {
             allow_native_analysis.then_some(cwd.as_path()),
             params.validation.clone(),
         )
-        .await;
+        .await
+        .map_err(|error| command_not_started(format!("command validation worker failed: {error}")))?;
         let validation_launch = validation.is_some()
             || matches!(
                 classify_validation_invocations(&validation_invocations),

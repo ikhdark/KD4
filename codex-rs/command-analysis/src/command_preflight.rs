@@ -9,6 +9,7 @@ pub use full_suite::FullSuitePermit;
 #[path = "managed_cargo_lane.rs"]
 mod managed_cargo_lane;
 pub use managed_cargo_lane::CargoAdmissionError;
+pub use managed_cargo_lane::CargoCompilationSources;
 pub use managed_cargo_lane::check_managed_cargo_admission;
 pub use managed_cargo_lane::check_managed_cargo_lane;
 pub use managed_cargo_lane::compilation_sources;

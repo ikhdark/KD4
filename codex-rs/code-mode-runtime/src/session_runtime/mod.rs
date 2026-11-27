@@ -701,6 +701,49 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         Ok(None)
     }
 
+    fn enabled_tool_catalog(
+        &self,
+        definitions: &Arc<[codex_code_mode_protocol::ToolDefinition]>,
+    ) -> Result<Arc<crate::runtime::EnabledToolCatalog>, Error> {
+        let cached_for_definitions = |cached: &Option<CachedToolCatalog>| {
+            cached
+                .as_ref()
+                .filter(|(cached_definitions, _)| Arc::ptr_eq(cached_definitions, definitions))
+                .map(|(_, catalog)| Arc::clone(catalog))
+        };
+        let hit = {
+            let cached = self
+                .inner
+                .catalog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cached_for_definitions(&cached)
+        };
+        if let Some(catalog) = hit {
+            return Ok(catalog);
+        }
+
+        let candidate = Arc::new(
+            crate::runtime::EnabledToolCatalog::from_definitions(definitions)
+                .map_err(Error::Runtime)?,
+        );
+        let retired = {
+            let mut cached = self
+                .inner
+                .catalog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Another admission may have built this exact snapshot first.
+            // The guard drops before the losing candidate on this return.
+            if let Some(catalog) = cached_for_definitions(&cached) {
+                return Ok(catalog);
+            }
+            cached.replace((Arc::clone(definitions), Arc::clone(&candidate)))
+        };
+        drop(retired);
+        Ok(candidate)
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "admission excludes restore until the value snapshot and active-cell permit are acquired; it is released before native startup"
@@ -715,25 +758,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         // Yielded cells retain their permits until they finish. Waiting here can
         // prevent the caller from ever issuing the wait/terminate that frees one.
         let stored_values = self.inner.stored_values.lock().await.clone();
-        let catalog = {
-            let mut cached = self
-                .inner
-                .catalog
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((definitions, catalog)) = cached.as_ref()
-                && Arc::ptr_eq(definitions, &request.enabled_tools)
-            {
-                Arc::clone(catalog)
-            } else {
-                let catalog = Arc::new(
-                    crate::runtime::EnabledToolCatalog::from_definitions(&request.enabled_tools)
-                        .map_err(Error::Runtime)?,
-                );
-                *cached = Some((Arc::clone(&request.enabled_tools), Arc::clone(&catalog)));
-                catalog
-            }
-        };
+        let catalog = self.enabled_tool_catalog(&request.enabled_tools)?;
         let input_bytes = stored_values.values().fold(
             request.source.len().saturating_add(catalog.input_bytes()),
             |bytes, value| bytes.saturating_add(value.bytes),
@@ -769,7 +794,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         let cell_state = Arc::new(CellState::with_cancellation(self.inner.shutdown_cancellation.child(self.inner.shutdown_token.child_token())));
         // Prepare outside the registry lock: native startup can take seconds and
         // must not block observing, terminating, or closing other cells.
-        let (handle, initial_event, task) = tokio::select! {
+        let (handle, initial_event, task, start_gate) = tokio::select! {
             biased;
             _ = self.inner.shutdown_token.cancelled() => return Err(Error::ShuttingDown),
             prepared = CellActor::prepare(
@@ -793,7 +818,16 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             return Err(Error::DuplicateCell(cell_id));
         }
         cells.insert(cell_id.clone(), handle);
-        let task = self.inner.cell_tasks.spawn(task);
+        let task = self.inner.cell_tasks.track_future(task);
+        // The registry entry and tracking token must precede V8 evaluation.
+        // If the runtime is already gone, drop the unspawned actor (and its
+        // permit) so it cannot publish a terminal event for an unadmitted cell.
+        if let Err(error) = start_gate.release() {
+            cells.remove(&cell_id);
+            return Err(Error::Runtime(error));
+        }
+        // Do not suspend between releasing the gate and returning admission.
+        let task = tokio::spawn(task);
         {
             let task_failure_handler = self.inner.task_failure_handler.clone();
             let failed_cell_id = cell_id.clone();

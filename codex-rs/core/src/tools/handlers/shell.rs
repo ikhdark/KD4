@@ -296,8 +296,7 @@ impl ToolOutput for LegacyShellToolOutput {
             && !diagnostics.is_empty()
         {
             const VALIDATION_DIAGNOSTICS_ID: &str = "validation:diagnostics";
-            let (diagnostics, range) =
-                failure_diagnostic_excerpt(VALIDATION_DIAGNOSTICS_ID, diagnostics);
+            let excerpt = failure_diagnostic_excerpt(VALIDATION_DIAGNOSTICS_ID, diagnostics);
             metadata.fragments.insert(
                 1,
                 ToolOutputProjectionFragment::new(
@@ -306,11 +305,11 @@ impl ToolOutput for LegacyShellToolOutput {
                     } else {
                         ToolOutputProjectionFragmentKind::ErrorOrDiagnostic
                     },
-                    diagnostics,
+                    excerpt.text,
                 )
                 .with_id(VALIDATION_DIAGNOSTICS_ID),
             );
-            if let Some(range) = range {
+            if let Some(range) = excerpt.diagnostic_range {
                 metadata.predetermined_ranges.push(range);
             }
         }
@@ -479,9 +478,15 @@ pub(crate) fn validation_diagnostic_range(
     })
 }
 
+struct FailureDiagnosticExcerpt {
+    text: String,
+    diagnostic_range: Option<ToolOutputProjectionRange>,
+    first_omitted_line_range: Option<(usize, usize)>,
+}
+
 /// Keep the payload bounded even when a single diagnostic cannot fit as a line.
 /// Byte coordinates address the unchanged canonical log, including CRLF/Unicode.
-fn failure_diagnostic_excerpt(id: &str, text: &str) -> (String, Option<ToolOutputProjectionRange>) {
+fn failure_diagnostic_excerpt(id: &str, text: &str) -> FailureDiagnosticExcerpt {
     const MAX_BYTES: usize = 12 * 1024;
     let mut offset = 0;
     let diagnostic_start = text.split_inclusive('\n').find_map(|line| {
@@ -524,12 +529,23 @@ fn failure_diagnostic_excerpt(id: &str, text: &str) -> (String, Option<ToolOutpu
     } else {
         "bounded_tail_fallback (no diagnostic match)"
     };
-    (
-        format!(
+    let first_omitted_line_range = if start > 0 {
+        Some((1, start_line - usize::from(text[..start].ends_with('\n'))))
+    } else if end < text.len() {
+        Some((
+            end_line + usize::from(excerpt.ends_with('\n')),
+            text.lines().count(),
+        ))
+    } else {
+        None
+    };
+    FailureDiagnosticExcerpt {
+        text: format!(
             "Failure excerpt: canonical log bytes {start}..{end} (zero-based, end-exclusive); lines {start_line}..{end_line} (one-based, inclusive; boundary lines may be partial); selection={selection}\n{excerpt}"
         ),
-        range,
-    )
+        diagnostic_range: range,
+        first_omitted_line_range,
+    }
 }
 
 pub(super) async fn run_exec_like_with_exit_code(
@@ -959,7 +975,7 @@ async fn run_exec_like_with_exit_code_inner(
             let text = std::str::from_utf8(bytes)
                 .ok()
                 .filter(|text| !text.is_empty())?;
-            let (excerpt, _) = failure_diagnostic_excerpt("validation:diagnostics", text);
+            let excerpt = failure_diagnostic_excerpt("validation:diagnostics", text);
             let duration = (output.duration.as_secs_f32() * 10.0).round() / 10.0;
             let timeout = if output.timed_out {
                 format!(
@@ -969,9 +985,12 @@ async fn run_exec_like_with_exit_code_inner(
             } else {
                 String::new()
             };
-            Some(format!(
-                "Exit code: {}\nWall time: {duration} seconds{timeout}\nOutput:\n{excerpt}",
-                output.exit_code
+            Some((
+                format!(
+                    "Exit code: {}\nWall time: {duration} seconds{timeout}\nOutput:\n{}",
+                    output.exit_code, excerpt.text
+                ),
+                excerpt.first_omitted_line_range,
             ))
         });
     let quiet_success_candidate = quiet_on_success && canonical_complete
@@ -986,9 +1005,9 @@ async fn run_exec_like_with_exit_code_inner(
         // Small complete captures stay inline. A reduced display still needs a
         // recovery handle, so retain the exact original bytes on demand.
         _ if canonical_complete
-            && model_projection
-                .as_ref()
-                .is_some_and(|projection| projection.reduced || quiet_success_candidate) =>
+            && (quiet_success_candidate
+                || model_projection.as_ref().is_some_and(|projection| projection.reduced)
+                || failure_content.as_ref().is_some_and(|(_, range)| range.is_some())) =>
         {
             match canonical_output.as_deref() {
                 Some(bytes) => Some(
@@ -1004,13 +1023,24 @@ async fn run_exec_like_with_exit_code_inner(
         }
         _ => None,
     };
-    let reduction_notice = raw_output_artifact
-        .as_ref()
-        .zip(execution_output)
-        .zip(model_projection.as_ref())
-        .and_then(|((artifact, source), projection)| {
-            artifact.reduction_notice(&source.aggregated_output.text, &projection.text)
-        });
+    let reduction_notice = raw_output_artifact.as_ref().and_then(|artifact| {
+        let canonical = std::str::from_utf8(canonical_output.as_deref()?).ok()?;
+        if !canonical_complete {
+            return None;
+        }
+        let first_omitted_lines = if let Some((_, range)) = &failure_content {
+            *range
+        } else {
+            // Equal lengths alone do not identify the retained source. A
+            // reduced or decoded display may not share canonical coordinates.
+            let source = &execution_output?.aggregated_output.text;
+            if source != canonical {
+                return None;
+            }
+            model_projection.as_ref()?.first_omitted_lines
+        };
+        artifact.reduction_notice(canonical, first_omitted_lines)
+    });
     let quiet_success = quiet_success_candidate
         && raw_output_artifact.as_ref().is_some_and(
             crate::tools::command_output_artifact::RawOutputArtifact::capture_finalized_complete,
@@ -1042,7 +1072,7 @@ async fn run_exec_like_with_exit_code_inner(
             failure.details.get_or_insert_with(|| json!({}))["output_reference"] = reference;
             FunctionCallError::structured(failure)
         })?;
-    if let Some(failure_content) = failure_content {
+    if let Some((failure_content, _)) = failure_content {
         content = failure_content;
     }
     if quiet_success {
@@ -1090,7 +1120,7 @@ async fn run_exec_like_with_exit_code_inner(
             essential_inline.insert("raw_output_artifact_id".to_string(), json!(id.to_string()));
         }
         insert_metadata_before_output(&mut content, &raw_output_artifact.render_for_model());
-        if let Some(notice) = reduction_notice {
+        if !quiet_success && let Some(notice) = reduction_notice {
             content.push('\n');
             content.push_str(&notice);
         }

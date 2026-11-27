@@ -138,6 +138,7 @@ pub use mcp_edit::load_global_mcp_servers;
 pub use mcp_edit::serialize_mcp_server;
 pub use mcp_edit::serialize_mcp_server_inline;
 pub use mcp_edit::serialize_mcp_server_for_edit;
+pub use mcp_edit::validate_mcp_replacement;
 pub use mcp_requirements::McpServerCommandMatcher;
 pub use mcp_requirements::McpServerIdentity;
 pub use mcp_requirements::McpServerRequirement;

@@ -32,12 +32,23 @@ struct Snapshot<V, E = CellEvent, P = Value> {
     values: BTreeMap<String, V>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     presentations: BTreeMap<String, P>,
-    #[serde(default)]
-    completed_cells: BTreeMap<String, E>,
+    #[serde(default, deserialize_with = "deserialize_completed_cells")]
+    completed_cells: Option<BTreeMap<String, E>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     completed_cell_order: Vec<String>,
     #[serde(default)]
     next_cell_id: u64,
+}
+
+// Only a missing field should become None. Explicit null must still fail as a map.
+fn deserialize_completed_cells<'de, D, E>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, E>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    E: Deserialize<'de>,
+{
+    BTreeMap::deserialize(deserializer).map(Some)
 }
 
 /// One thread owns the snapshot for the lifetime of its runtime. A replacement
@@ -151,17 +162,6 @@ impl DurableState {
                 if !matches!(snapshot.version, 1..=7) {
                     return Err("unsupported named-state snapshot version; no cell started".into());
                 }
-                if snapshot.completed_cells.len() > super::TERMINAL_CELL_CACHE_CAPACITY
-                    || snapshot.completed_cells.iter().any(|(id, event)| {
-                        super::cell_id_sequence(id).is_none()
-                            || !matches!(
-                                event,
-                                CellEvent::Completed { .. } | CellEvent::Terminated { .. }
-                            )
-                    })
-                {
-                    return Err("invalid completed-cell snapshot; no cell started".into());
-                }
                 snapshot
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Snapshot {
@@ -170,17 +170,38 @@ impl DurableState {
                 completed_call_id: String::new(),
                 values: BTreeMap::new(),
                 presentations: BTreeMap::new(),
-                completed_cells: BTreeMap::new(),
+                completed_cells: None,
                 completed_cell_order: Vec::new(),
                 next_cell_id: 1,
             },
             Err(error) => return Err(error.to_string()),
         };
+        let completed_cells = match snapshot.completed_cells {
+            Some(cells) => cells,
+            None if snapshot.version < 7 => BTreeMap::new(),
+            None => {
+                return Err(
+                    "invalid completed-cell snapshot: missing completed_cells; no cell started"
+                        .into(),
+                );
+            }
+        };
+        if completed_cells.len() > super::TERMINAL_CELL_CACHE_CAPACITY
+            || completed_cells.iter().any(|(id, event)| {
+                super::cell_id_sequence(id).is_none()
+                    || !matches!(
+                        event,
+                        CellEvent::Completed { .. } | CellEvent::Terminated { .. }
+                    )
+            })
+        {
+            return Err("invalid completed-cell snapshot; no cell started".into());
+        }
         let mut completion_order = snapshot.completed_cell_order;
         if snapshot.version < 6 && completion_order.is_empty() {
             // Legacy snapshots did not record completion chronology. Preserve
             // their allocation-order fallback, never infer order from map keys.
-            completion_order = snapshot.completed_cells.keys().cloned().collect();
+            completion_order = completed_cells.keys().cloned().collect();
             completion_order.sort_by_key(|id| super::cell_id_sequence(id).unwrap_or(u64::MAX));
         }
         let order_len = completion_order.len();
@@ -190,8 +211,8 @@ impl DurableState {
             .map(|(index, id)| (id, index as u64))
             .collect::<BTreeMap<_, _>>();
         if order.len() != order_len
-            || order.len() != snapshot.completed_cells.len()
-            || order.keys().ne(snapshot.completed_cells.keys())
+            || order.len() != completed_cells.len()
+            || order.keys().ne(completed_cells.keys())
         {
             return Err("invalid completed-cell order; no cell started".into());
         }
@@ -211,8 +232,7 @@ impl DurableState {
         if !stored_values_with_writes_within_limits(&HashMap::new(), &values) {
             return Err("named-state snapshot exceeds the session storage limit".into());
         }
-        let first_cell_id = snapshot
-            .completed_cells
+        let first_cell_id = completed_cells
             .keys()
             .filter_map(|id| super::cell_id_sequence(id))
             .max()
@@ -231,8 +251,7 @@ impl DurableState {
             _lease: lease,
             revision: AtomicU64::new(snapshot.revision),
             completed_cells: Mutex::new(
-                snapshot
-                    .completed_cells
+                completed_cells
                     .into_iter()
                     .map(|(id, event)| {
                         CompletedSnapshotEvent::new(event, order[&id]).map(|event| (id, event))
@@ -369,10 +388,12 @@ impl DurableState {
                         .ok_or_else(|| "stored value has no serialized representation".to_string())
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()?,
-            completed_cells: completed_cells
-                .iter()
-                .map(|(id, event)| (id.clone(), Arc::clone(&event.serialized)))
-                .collect(),
+            completed_cells: Some(
+                completed_cells
+                    .iter()
+                    .map(|(id, event)| (id.clone(), Arc::clone(&event.serialized)))
+                    .collect(),
+            ),
             completed_cell_order,
             next_cell_id: self.cell_id_limit,
         };

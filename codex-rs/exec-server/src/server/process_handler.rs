@@ -137,8 +137,8 @@ impl ProcessHandler {
         }
     }
 
-    pub(crate) async fn shutdown(&self) {
-        self.process.shutdown().await;
+    pub(crate) async fn shutdown(&self, session_id: &str) {
+        self.process.shutdown(session_id).await;
     }
 
 

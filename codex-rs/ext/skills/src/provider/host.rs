@@ -2,6 +2,7 @@ use codex_core_skills::SkillLoadOutcome;
 use codex_core_skills::SkillMetadata;
 use codex_core_skills::HostSkillsSnapshot;
 use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::OnceCell;
 
 use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
@@ -18,7 +19,7 @@ use crate::provider::SkillReadRequest;
 
 const HOST_AUTHORITY_ID: &str = "host";
 
-type SnapshotCatalog = (Weak<HostSkillsSnapshot>, Arc<SkillCatalog>);
+type SnapshotCatalog = (Weak<HostSkillsSnapshot>, Arc<OnceCell<Arc<SkillCatalog>>>);
 
 /// Host-owned skill provider backed by an immutable service snapshot.
 ///
@@ -48,16 +49,34 @@ impl SkillProvider for HostSkillProvider {
                 ));
             };
 
-            let mut catalogs = self.catalogs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            catalogs.retain(|(snapshot, _)| snapshot.strong_count() != 0);
-            if let Some((_, catalog)) = catalogs.iter().find(|(snapshot, _)|
-                snapshot.upgrade().is_some_and(|snapshot| Arc::ptr_eq(&snapshot, &host_snapshot)))
-            {
-                return Ok(Arc::clone(catalog));
-            }
-            let catalog = Arc::new(catalog_from_outcome(host_snapshot.outcome()));
-            catalogs.push((Arc::downgrade(&host_snapshot), Arc::clone(&catalog)));
-            Ok(catalog)
+            let slot = {
+                let mut catalogs = self
+                    .catalogs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                catalogs.retain(|(snapshot, _)| snapshot.strong_count() != 0);
+                if let Some((_, slot)) = catalogs.iter().find(|(snapshot, _)| {
+                    snapshot
+                        .upgrade()
+                        .is_some_and(|snapshot| Arc::ptr_eq(&snapshot, &host_snapshot))
+                }) {
+                    if let Some(catalog) = slot.get() {
+                        return Ok(Arc::clone(catalog));
+                    }
+                    Arc::clone(slot)
+                } else {
+                    let slot = Arc::new(OnceCell::new());
+                    catalogs.push((Arc::downgrade(&host_snapshot), Arc::clone(&slot)));
+                    slot
+                }
+            };
+
+            // Initialize without the shared cache lock. The live snapshot keeps
+            // its slot from being pruned, and other callers for it wait asynchronously.
+            let catalog = slot
+                .get_or_init(|| async { Arc::new(catalog_from_outcome(host_snapshot.outcome())) })
+                .await;
+            Ok(Arc::clone(catalog))
         })
     }
 

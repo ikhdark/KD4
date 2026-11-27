@@ -252,6 +252,8 @@ async fn process_review_events(
     let mut prev_agent_message: Option<codex_protocol::protocol::AgentMessageEvent> = None;
     let mut mirrored_web_search_starts = HashSet::new();
     let mut mirrored_web_search_ends = HashSet::new();
+    let mut mirrored_patch_apply_begins = HashSet::new();
+    let mut mirrored_patch_apply_ends = HashSet::new();
     while let Ok(event) = receiver.recv().await {
         match event.msg {
             EventMsg::AgentMessage(message) => {
@@ -360,18 +362,30 @@ async fn process_review_events(
                 if mirrored_web_search_starts.remove(&event.call_id) => {}
             EventMsg::WebSearchEnd(event)
                 if mirrored_web_search_ends.remove(&event.call_id) => {}
+            EventMsg::PatchApplyBegin(event)
+                if mirrored_patch_apply_begins.remove(&event.call_id) => {}
+            EventMsg::PatchApplyEnd(event)
+                if mirrored_patch_apply_ends.remove(&event.call_id) => {}
             mut other => {
                 match &other {
-                    EventMsg::ItemStarted(event) => {
-                        if let TurnItem::WebSearch(item) = &event.item {
+                    EventMsg::ItemStarted(event) => match &event.item {
+                        TurnItem::WebSearch(item) => {
                             mirrored_web_search_starts.insert(item.id.clone());
                         }
-                    }
-                    EventMsg::ItemCompleted(event) => {
-                        if let TurnItem::WebSearch(item) = &event.item {
+                        TurnItem::FileChange(item) => {
+                            mirrored_patch_apply_begins.insert(item.id.clone());
+                        }
+                        _ => {}
+                    },
+                    EventMsg::ItemCompleted(event) => match &event.item {
+                        TurnItem::WebSearch(item) => {
                             mirrored_web_search_ends.insert(item.id.clone());
                         }
-                    }
+                        TurnItem::FileChange(item) if item.status.is_some() => {
+                            mirrored_patch_apply_ends.insert(item.id.clone());
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
                 reparent_review_event(&mut other, session.thread_id, &ctx.sub_id);
@@ -442,8 +456,17 @@ fn reparent_review_event(event: &mut EventMsg, thread_id: codex_protocol::Thread
             event.turn_id = turn_id.to_string();
             event.call_id = format!("review-{turn_id}:{}", event.call_id);
         }
-        EventMsg::PatchApplyBegin(event) => event.turn_id = turn_id.to_string(),
-        EventMsg::PatchApplyEnd(event) => event.turn_id = turn_id.to_string(),
+        EventMsg::PatchApplyBegin(event) => {
+            event.turn_id = turn_id.to_string();
+            event.call_id = format!("review-{turn_id}:{}", event.call_id);
+        }
+        EventMsg::PatchApplyUpdated(event) => {
+            event.call_id = format!("review-{turn_id}:{}", event.call_id);
+        }
+        EventMsg::PatchApplyEnd(event) => {
+            event.turn_id = turn_id.to_string();
+            event.call_id = format!("review-{turn_id}:{}", event.call_id);
+        }
         EventMsg::TurnPhaseChanged(event) => event.turn_id = turn_id.to_string(),
         _ => {}
     }

@@ -163,8 +163,10 @@ impl SkillsService {
         repository_sandbox: Option<&FileSystemSandboxContext>,
     ) -> HostSkillsSnapshot {
         let generation = self.cache_generation.load(Ordering::SeqCst);
-        let plugin_installations_current = input.plugin_skill_snapshots.as_ref()
-            .is_none_or(PluginSkillSnapshots::is_current);
+        let plugin_installations_current = match input.plugin_skill_snapshots.as_ref() {
+            Some(snapshots) => snapshots.is_current_async().await,
+            None => true,
+        };
         let input_cache_key = (plugin_installations_current && !self.cache_reuse_disabled.load(Ordering::Acquire))
             .then(|| SkillsInputCacheKey::new(input, fs.as_ref(), repository_sandbox, generation));
         if let Some(snapshot) = input_cache_key
@@ -296,8 +298,10 @@ impl SkillsService {
             plugin_skill_preload,
             repository_sandbox,
         } = cache_options;
-        let plugin_installations_current = input.plugin_skill_snapshots.as_ref().or(plugin_skill_preload)
-            .is_none_or(PluginSkillSnapshots::is_current);
+        let plugin_installations_current = match input.plugin_skill_snapshots.as_ref().or(plugin_skill_preload) {
+            Some(snapshots) => snapshots.is_current_async().await,
+            None => true,
+        };
         let cache_key = (plugin_installations_current && !self.cache_reuse_disabled.load(Ordering::Acquire))
             .then(|| {
                 skills_cache_key(
@@ -342,14 +346,17 @@ impl SkillsService {
             .await,
         ));
         if let Some(cache_key) = cache_key
+            && !snapshot.outcome().has_retryable_read_failures
             && !self.cache_reuse_disabled.load(Ordering::Acquire)
         {
             let mut cache = self
                 .snapshot_cache
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Disabling reuse also fences loads that were already in flight.
-            if self.cache_reuse_disabled.load(Ordering::Acquire) {
+            // In-flight loads may finish, but must not evict current entries.
+            if cache_key.generation != self.snapshot_generation()
+                || self.cache_reuse_disabled.load(Ordering::Acquire)
+            {
                 return snapshot;
             }
             if !cache.contains_key(&cache_key)
@@ -418,7 +425,7 @@ impl SkillsService {
 
     /// Reconcile a genuine observation gap without cooling unrelated catalogs.
     /// Rekey unaffected entries across the existing publication-generation fence;
-    /// old in-flight loads can only publish under the previous generation.
+    /// in-flight loads from a previous generation cannot repopulate the rekeyed caches.
     pub fn invalidate_roots(&self, roots: &[PathBuf]) {
         if roots.is_empty() {
             return;
@@ -498,14 +505,18 @@ impl SkillsService {
         snapshot: HostSkillsSnapshot,
         roots: Vec<AbsolutePathBuf>,
     ) {
-        if self.cache_reuse_disabled.load(Ordering::Acquire) {
+        if snapshot.outcome().has_retryable_read_failures
+            || self.cache_reuse_disabled.load(Ordering::Acquire)
+        {
             return;
         }
         let mut cache = self
             .input_snapshot_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.cache_reuse_disabled.load(Ordering::Acquire) {
+        if cache_key.generation != self.snapshot_generation()
+            || self.cache_reuse_disabled.load(Ordering::Acquire)
+        {
             return;
         }
         if !cache.contains_key(&cache_key)

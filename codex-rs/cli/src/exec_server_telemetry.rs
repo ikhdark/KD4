@@ -7,19 +7,20 @@ const DEFAULT_ANALYTICS_ENABLED: bool = false;
 const DEFAULT_LOG_FILTER: &str = "error,opentelemetry_sdk=off,opentelemetry_otlp=off";
 const OTEL_SERVICE_NAME: &str = "codex-exec-server";
 
-pub(crate) fn init(
+pub(crate) async fn init(
     config: Option<&codex_core::config::Config>,
 ) -> (impl Send + Sync, codex_exec_server::ExecServerTelemetry) {
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_filter(stderr_env_filter());
     let otel = match config {
-        Some(config) => codex_core::otel_init::build_provider(
+        Some(config) => codex_core::otel_init::build_provider_async(
             config,
             env!("CARGO_PKG_VERSION"),
             Some(OTEL_SERVICE_NAME),
             DEFAULT_ANALYTICS_ENABLED,
         )
+        .await
         .unwrap_or_else(|error| {
             eprintln!("Could not create otel exporter: {error}");
             None

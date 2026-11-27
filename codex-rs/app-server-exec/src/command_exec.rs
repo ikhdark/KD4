@@ -41,6 +41,7 @@ use codex_app_server_rpc::error_code::invalid_request;
 use codex_app_server_rpc::outgoing_message::ConnectionId;
 use codex_app_server_rpc::outgoing_message::ConnectionRequestId;
 use codex_app_server_rpc::outgoing_message::OutgoingMessageSender;
+use codex_app_server_rpc::outgoing_message::RESOURCE_DELIVERY_TIMEOUT;
 
 const EXEC_TIMEOUT_EXIT_CODE: i32 = 124;
 const MAX_PENDING_STDIN_WRITES: usize = 32;
@@ -174,14 +175,24 @@ impl<K: ConnectionSessionKey, V> ConnectionSessionMap<K, V> {
             None
         }
     }
+    fn connection_values_mut(&mut self, connection_id: ConnectionId) -> impl Iterator<Item = &mut V> {
+        self.connections
+            .get_mut(&connection_id)
+            .into_iter()
+            .flat_map(HashMap::values_mut)
+    }
     pub(crate) fn remove_connection(&mut self, connection_id: ConnectionId) -> Vec<V> {
         self.connections.remove(&connection_id).unwrap_or_default().into_values().collect()
     }
 }
 
+// A closed connection drops its control endpoints but keeps each reservation
+// until the owning run has settled.
+type CommandExecSessions = ConnectionSessionMap<ConnectionProcessId, Option<CommandExecSession>>;
+
 #[derive(Clone)]
 pub(crate) struct CommandExecManager {
-    sessions: Arc<Mutex<ConnectionSessionMap<ConnectionProcessId, CommandExecSession>>>,
+    sessions: Arc<Mutex<CommandExecSessions>>,
     run_tasks: tokio_util::task::TaskTracker,
     next_generated_process_id: Arc<AtomicI64>,
 }
@@ -255,12 +266,17 @@ struct RunCommandParams {
     expiration: ExecExpiration,
     output_bytes_cap: Option<usize>,
     connection_cancellation: CancellationToken,
-    terminal_cleanup: CommandTerminalCleanup,
 }
 
 struct CommandTerminalCleanup {
-    sessions: Arc<Mutex<ConnectionSessionMap<ConnectionProcessId, CommandExecSession>>>,
+    sessions: Arc<Mutex<CommandExecSessions>>,
     process_key: ConnectionProcessId,
+}
+
+impl CommandTerminalCleanup {
+    async fn release(self) {
+        self.sessions.lock().await.remove(&self.process_key);
+    }
 }
 
 struct SpawnProcessOutputParams {
@@ -286,6 +302,7 @@ struct OutputDeliveryRelay {
     byte_budget: Arc<Semaphore>,
     capacity_changed: Arc<tokio::sync::Notify>,
     settlement: watch::Sender<Option<tokio::time::Instant>>,
+    stop_admission: CancellationToken,
 }
 
 struct QueuedOutputDelivery {
@@ -414,11 +431,11 @@ impl CommandExecManager {
                     }
                     sessions.insert(
                         process_key.clone(),
-                        CommandExecSession::Active {
+                        Some(CommandExecSession::Active {
                             control_tx,
                             write_tx,
                             write_slots,
-                        },
+                        }),
                     );
                     Ok(())
                 })
@@ -426,56 +443,71 @@ impl CommandExecManager {
         }
         // Native spawn and handoff must survive cancellation of the RPC waiter.
         let spawn_owner = tokio::spawn(async move {
-        let Some((program, args)) = command.split_first() else {
-            return Err(internal_error("validated command unexpectedly empty"));
-        };
-        let spawned = if tty {
-            codex_utils_pty::spawn_pty_process(
-                program,
-                args,
-                cwd.as_path(),
-                &env,
-                &arg0,
-                size.unwrap_or_default(),
-            )
+            let terminal_cleanup = CommandTerminalCleanup {
+                sessions,
+                process_key,
+            };
+            let spawned = match command.split_first() {
+                Some((program, args)) => {
+                    let result = if tty {
+                        codex_utils_pty::spawn_pty_process(
+                            program,
+                            args,
+                            cwd.as_path(),
+                            &env,
+                            &arg0,
+                            size.unwrap_or_default(),
+                        )
+                        .await
+                    } else if stream_stdin {
+                        codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0)
+                            .await
+                    } else {
+                        codex_utils_pty::spawn_pipe_process_no_stdin(
+                            program, args, cwd.as_path(), &env, &arg0,
+                        )
+                        .await
+                    };
+                    result.map_err(|err| internal_error(format!("failed to spawn command: {err}")))
+                }
+                None => Err(internal_error("validated command unexpectedly empty")),
+            };
+            let spawned = match spawned {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    let _run_owner = run_owner;
+                    drop(control_rx);
+                    drop(write_rx);
+                    outgoing.send_error(request_id, error).await;
+                    terminal_cleanup.release().await;
+                    return;
+                }
+            };
+
+            tokio::spawn(async move {
+                let _run_owner = run_owner;
+                run_command(RunCommandParams {
+                    outgoing,
+                    request_id,
+                    process_id: notification_process_id,
+                    spawned,
+                    control_rx,
+                    write_rx,
+                    stream_stdin,
+                    stream_stdout_stderr,
+                    expiration,
+                    output_bytes_cap,
+                    connection_cancellation,
+                })
+                .await;
+                // The terminal send has settled and the run no longer owns the
+                // native process. Only now can this connection reuse the ID.
+                terminal_cleanup.release().await;
+            });
+        });
+        spawn_owner
             .await
-        } else if stream_stdin {
-            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0).await
-        } else {
-            codex_utils_pty::spawn_pipe_process_no_stdin(program, args, cwd.as_path(), &env, &arg0)
-                .await
-        };
-        let spawned = match spawned {
-            Ok(spawned) => spawned,
-            Err(err) => {
-                sessions.lock().await.remove(&process_key);
-                return Err(internal_error(format!("failed to spawn command: {err}")));
-            }
-        };
-        tokio::spawn(async move {
-            let _run_owner = run_owner;
-            run_command(RunCommandParams {
-                outgoing,
-                request_id: request_id.clone(),
-                process_id: notification_process_id,
-                spawned,
-                control_rx,
-                write_rx,
-                stream_stdin,
-                stream_stdout_stderr,
-                expiration,
-                output_bytes_cap,
-                connection_cancellation,
-                terminal_cleanup: CommandTerminalCleanup {
-                    sessions,
-                    process_key,
-                },
-            })
-            .await;
-        });
-        Ok::<_, JSONRPCErrorError>(())
-        });
-        spawn_owner.await.map_err(|err| internal_error(format!("command spawn owner failed: {err}")))?
+            .map_err(|err| internal_error(format!("command spawn owner failed: {err}")))
     }
 
 
@@ -505,6 +537,7 @@ impl CommandExecManager {
             .lock()
             .await
             .get(&target_process_id)
+            .and_then(Option::as_ref)
             .cloned()
             .ok_or_else(|| {
                 invalid_request(format!(
@@ -594,9 +627,13 @@ impl CommandExecManager {
     }
 
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
-        let controls = {
-            self.sessions.lock().await.remove_connection(connection_id)
-        };
+        let controls: Vec<_> = self
+            .sessions
+            .lock()
+            .await
+            .connection_values_mut(connection_id)
+            .filter_map(Option::take)
+            .collect();
 
         for control in controls {
             let CommandExecSession::Active { control_tx, .. } = control;
@@ -624,6 +661,7 @@ impl CommandExecManager {
                 .lock()
                 .await
                 .get(&process_id)
+                .and_then(Option::as_ref)
                 .cloned()
                 .ok_or_else(|| {
                     invalid_request(format!(
@@ -660,7 +698,6 @@ async fn run_command(params: RunCommandParams) {
         expiration,
         output_bytes_cap,
         connection_cancellation,
-        terminal_cleanup,
     } = params;
     let mut control_rx = control_rx;
     let mut control_open = true;
@@ -690,15 +727,15 @@ async fn run_command(params: RunCommandParams) {
         "stdin streaming is not enabled for this command/exec",
     );
 
-    let (delivery_relay, delivery_handle) = if stream_stdout_stderr {
-        let (relay, handle) = spawn_output_delivery_relay(
+    let (delivery_relay, delivery_handle, mut output_settled) = if stream_stdout_stderr {
+        let (relay, handle, settled) = spawn_output_delivery_relay(
             Arc::clone(&outgoing),
             request_id.connection_id,
             connection_cancellation,
         );
-        (Some(relay), Some(handle))
+        (Some(relay), Some(handle), Some(settled))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let stdout_handle = spawn_process_output(SpawnProcessOutputParams {
@@ -756,7 +793,26 @@ async fn run_command(params: RunCommandParams) {
                     "kind": "process_exit_unconfirmed", "cleanupPending": true,
                     "terminationError": retry_error.or_else(|| termination_error.take()),
                 }));
-                termination_delivery = Some(Box::pin(outgoing.send_error(request_id.clone(), error)));
+                let settled = if outgoing.has_separate_notification_lane()
+                    && let Some(relay) = &delivery_relay
+                {
+                    // The exceptional early response is terminal too. Seal
+                    // only this command's stream, while supervision continues.
+                    relay.seal();
+                    output_settled.take()
+                } else {
+                    None
+                };
+                let outgoing = Arc::clone(&outgoing);
+                let request_id = request_id.clone();
+                termination_delivery = Some(Box::pin(async move {
+                    if let Some(settled) = settled
+                        && settled.await.is_err()
+                    {
+                        outgoing.fail_connection_delivery(request_id.connection_id).await;
+                    }
+                    outgoing.send_error(request_id, error).await;
+                }));
                 termination_reported = true;
             }
             control = control_rx.recv(), if control_open => {
@@ -815,15 +871,15 @@ async fn run_command(params: RunCommandParams) {
     timeout_handle.abort();
     drop(delivery_relay);
     let undelivered = if let Some(delivery_handle) = delivery_handle {
-        delivery_handle.await
+        let result = delivery_handle.await;
+        if result.is_err() && outgoing.has_separate_notification_lane() {
+            // A lost relay can no longer prove publication of its admissions.
+            outgoing.fail_connection_delivery(request_id.connection_id).await;
+        }
+        result
     } else {
         Ok(UndeliveredOutput::default())
     };
-    terminal_cleanup
-        .sessions
-        .lock()
-        .await
-        .remove(&terminal_cleanup.process_key);
     let undelivered = match undelivered.and_then(|mut output| {
         // Relay failures precede chunks rejected by relay admission. Decode the
         // entire suffix once, including split UTF-8 codepoints.
@@ -881,48 +937,72 @@ fn spawn_output_delivery_relay(
 ) -> (
     OutputDeliveryRelay,
     tokio::task::JoinHandle<UndeliveredOutput>,
+    oneshot::Receiver<()>,
 ) {
     let (tx, mut rx) = mpsc::channel::<QueuedOutputDelivery>(OUTPUT_DELIVERY_QUEUE_ITEMS);
     let (settlement, mut settlement_rx) = watch::channel(None);
+    let (settled_tx, settled_rx) = oneshot::channel();
+    let stop_admission = CancellationToken::new();
     let capacity_changed = Arc::new(tokio::sync::Notify::new());
     let relay = OutputDeliveryRelay {
         tx,
         byte_budget: Arc::new(Semaphore::new(OUTPUT_DELIVERY_MAX_QUEUED_BYTES)),
         capacity_changed: Arc::clone(&capacity_changed),
         settlement,
+        stop_admission: stop_admission.clone(),
     };
     let handle = tokio::spawn(async move {
         let mut undelivered = UndeliveredOutput::default();
         let mut delivery_failed = false;
-        while let Some(queued) = rx.recv().await {
+        let mut last_admitted = None;
+        loop {
+            let queued = tokio::select! {
+                biased;
+                _ = stop_admission.cancelled(), if !rx.is_closed() => {
+                    rx.close();
+                    continue;
+                }
+                queued = rx.recv() => match queued {
+                    Some(queued) => queued,
+                    None => break,
+                },
+            };
             if !delivery_failed {
-                let delivery = outgoing.send_server_notification_to_connection_bounded(
+                let delivery = outgoing.send_server_notification_with_publication_fence(
                         connection_id,
                         ServerNotification::CommandExecOutputDelta(queued.notification.clone()),
                         &cancellation,
                     );
                 tokio::pin!(delivery);
-                delivery_failed = loop {
+                let admitted = loop {
                     let deadline = *settlement_rx.borrow_and_update();
                     tokio::select! {
                         biased;
+                        _ = stop_admission.cancelled(), if !rx.is_closed() => {
+                            rx.close();
+                        }
                         _ = async {
                             if let Some(deadline) = deadline {
                                 tokio::time::sleep_until(deadline).await;
                             } else {
                                 std::future::pending::<()>().await;
                             }
-                        } => break true,
-                        delivered = &mut delivery => break !delivered,
+                        } => break None,
+                        result = &mut delivery => break result,
                         changed = settlement_rx.changed(), if deadline.is_none() => {
                             if changed.is_err() {
                                 // All producers are gone; queued work still has
                                 // the ordinary per-send bound when no exit was signalled.
-                                break !delivery.await;
+                                break delivery.await;
                             }
                         }
                     }
                 };
+                if let Some(fence) = admitted {
+                    last_admitted = Some(fence);
+                } else {
+                    delivery_failed = true;
+                }
             }
             if delivery_failed {
                 // Publish terminal failure through the existing channel owner.
@@ -939,12 +1019,35 @@ fn spawn_output_delivery_relay(
             drop(queued);
             capacity_changed.notify_waiters();
         }
+        // The embedded event owner processes admissions serially. Only the
+        // newest receipt is needed, including when that notification was filtered.
+        if let Some(fence) = last_admitted {
+            let deadline = (*settlement_rx.borrow())
+                .unwrap_or_else(|| tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT);
+            let published = tokio::select! {
+                biased;
+                result = tokio::time::timeout_at(deadline, fence.wait()) => matches!(result, Ok(true)),
+                _ = cancellation.cancelled() => false,
+            };
+            if !published {
+                // Enqueued bytes may still publish; returning them as fallback
+                // or sending a terminal reply now would duplicate or reorder them.
+                tracing::warn!(?connection_id, "command/exec output publication fence failed");
+                outgoing.fail_connection_delivery(connection_id).await;
+            }
+        }
+        let _ = settled_tx.send(());
         undelivered
     });
-    (relay, handle)
+    (relay, handle, settled_rx)
 }
 
 impl OutputDeliveryRelay {
+    fn seal(&self) {
+        self.begin_settlement();
+        self.stop_admission.cancel();
+    }
+
     fn begin_settlement(&self) {
         self.settlement.send_if_modified(|deadline| {
             if deadline.is_some() { return false; }

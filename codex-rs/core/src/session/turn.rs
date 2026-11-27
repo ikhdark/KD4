@@ -2444,6 +2444,8 @@ async fn record_context_notice_if_changed(
     let Some(item) = context_notice_item_if_changed(history.raw_items(), marker, text) else {
         return Ok(false);
     };
+    // The notice is owned; don't pin the canonical history during the append.
+    drop(history);
     sess.record_conversation_items(turn, &[item]).await?;
     Ok(true)
 }
@@ -3057,11 +3059,11 @@ async fn inspect_inputs(
         }
         let hook_outcome = inspect_pending_input(sess, turn_context, input_item).await;
         if hook_outcome.should_stop {
-            if let TurnInput::UserInput { content, client_id, .. } = input_item
-                && let Some((receipt, suffix)) = sess.pending_receipt_for_input(content, client_id.as_deref()).await?
+            if let TurnInput::UserInput { identity, .. } = input_item
+                && let Some(receipt) = identity.accepted_receipt()
             {
                 // Rejection is a durable disposition, not runnable recovery.
-                sess.complete_input_receipt(&receipt, &suffix).await?;
+                sess.complete_accepted_input_receipt(receipt).await?;
             }
             blocked_input = true;
             emit_hook_stop_reason(
@@ -6264,25 +6266,53 @@ async fn drain_in_flight_with_buffer(
         // Event-driven completion delivery: after the generation's final result,
         // attach terminal results of yielded commands that already exited so
         // the next request carries them without a model-issued poll.
-        if completed.is_empty()
+        let collect_background = completed.is_empty()
             && in_flight.is_empty()
             && completion_error.is_none()
-            && required_terminal.is_none()
-        {
-            let receipts = sess
-                .services
-                .unified_exec_manager
-                .collect_exited_background_results(
-                    turn_context.model_info.truncation_policy.into(),
-                    BACKGROUND_COMPLETION_OUTPUT_TOKENS,
-                    BACKGROUND_COMPLETION_LIMIT,
-                )
-                .await;
-            response_items.extend(background_completion_receipt(&receipts));
-        }
-        let commit = sess.record_tool_completion_ordered(
-            &turn_context, &completion.call_id, &response_items, pending_continuation_ack,
-        );
+            && required_terminal.is_none();
+        let call_id = completion.call_id;
+        let commit = async {
+            if !collect_background {
+                return sess
+                    .record_tool_completion_ordered(
+                        &turn_context, &call_id, &response_items, pending_continuation_ack,
+                    )
+                    .await;
+            }
+
+            // Hand the final response and its background batch to an ordered
+            // commit owner before any poll can acknowledge output. If the turn
+            // worker is aborted, stop polling but commit the collected prefix
+            // under the same turn and call, before terminal history is flushed.
+            let stop_collection = CancellationToken::new();
+            let _stop_collection_on_drop = stop_collection.clone().drop_guard();
+            let commit_owner = sess.retain_tool_dispatch_commit();
+            let sess = Arc::clone(&sess);
+            let turn_context = Arc::clone(&turn_context);
+            let terminal_tasks = sess.terminal_tasks.clone();
+            terminal_tasks
+                .spawn(async move {
+                    let _commit_owner = commit_owner;
+                    let mut receipts = Vec::with_capacity(BACKGROUND_COMPLETION_LIMIT);
+                    tokio::select! {
+                        biased;
+                        _ = stop_collection.cancelled() => {}
+                        () = sess.services.unified_exec_manager.collect_exited_background_results(
+                            turn_context.model_info.truncation_policy.into(),
+                            BACKGROUND_COMPLETION_OUTPUT_TOKENS,
+                            BACKGROUND_COMPLETION_LIMIT,
+                            &mut receipts,
+                        ) => {}
+                    }
+                    response_items.extend(background_completion_receipt(&receipts));
+                    sess.record_tool_completion_ordered(
+                        &turn_context, &call_id, &response_items, pending_continuation_ack,
+                    )
+                    .await
+                })
+                .await
+                .map_err(std::io::Error::other)?
+        };
         tokio::pin!(commit);
         let commit_result = loop {
             tokio::select! {

@@ -22,6 +22,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -478,40 +479,38 @@ async fn build_report(
                 .cwd
                 .clone()
                 .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-            let (
-                config_check,
-                network_check,
-                terminal_check,
-                git_check,
-                state_check,
-                reachability_check,
-            ) = tokio::join!(
-                async {
-                    run_sync_check("config", progress.clone(), || {
-                        DoctorCheck::new(
-                            "config.load",
-                            "config",
-                            CheckStatus::Fail,
-                            "config could not be loaded",
-                        )
-                        .detail(err.to_string())
-                        .remediation("Fix the reported config error, then rerun codex doctor.")
-                    })
-                },
-                async { run_sync_check("network", progress.clone(), network_check) },
-                async {
-                    run_sync_check("terminal", progress.clone(), || {
-                        terminal_check(command.no_color)
-                    })
-                },
+            let config_check = run_sync_check("config", progress.clone(), || {
+                DoctorCheck::new(
+                    "config.load",
+                    "config",
+                    CheckStatus::Fail,
+                    "config could not be loaded",
+                )
+                .detail(err.to_string())
+                .remediation("Fix the reported config error, then rerun codex doctor.")
+            });
+            let blocking_progress = progress.clone();
+            let no_color = command.no_color;
+            let blocking_checks = tokio::task::spawn_blocking(move || {
+                (
+                    run_sync_check("network", blocking_progress.clone(), network_check),
+                    run_sync_check("terminal", blocking_progress.clone(), || {
+                        terminal_check(no_color)
+                    }),
+                    run_sync_check("state", blocking_progress, fallback_state_check),
+                )
+            });
+            let (blocking_checks, git_check, reachability_check) = tokio::join!(
+                blocking_checks,
                 run_async_check("git", progress.clone(), git_check(fallback_cwd.as_path())),
-                async { run_sync_check("state", progress.clone(), fallback_state_check) },
                 run_async_check(
                     "provider reachability",
                     progress.clone(),
                     provider_reachability_check(reachability_plan),
                 ),
             );
+            let (network_check, terminal_check, state_check) =
+                blocking_checks.expect("doctor fallback blocking checks task panicked");
             checks.extend([
                 config_check,
                 network_check,
@@ -873,21 +872,40 @@ fn installation_check(show_details: bool) -> DoctorCheck {
         "CODEX_MANAGED_PACKAGE_ROOT",
     );
 
-    let path_entries = codex_path_entries();
     let mut status = CheckStatus::Ok;
     let mut summary = "installation looks consistent".to_string();
     let mut remediation = None;
+    let mut path_probe_issue = None;
 
-    if path_entries.len() > 1 {
-        details.push(format!("PATH codex entries: {}", path_entries.len()));
-    }
-    if show_details || path_entries.len() > 1 {
-        details.extend(
-            path_entries
-                .iter()
-                .enumerate()
-                .map(|(index, path)| format!("PATH codex #{}: {path}", index + 1)),
-        );
+    match codex_path_entries() {
+        Ok(path_entries) => {
+            if path_entries.len() > 1 {
+                details.push(format!("PATH codex entries: {}", path_entries.len()));
+            }
+            if show_details || path_entries.len() > 1 {
+                details.extend(
+                    path_entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, path)| format!("PATH codex #{}: {path}", index + 1)),
+                );
+            }
+        }
+        Err(err) => {
+            details.push(format!("PATH codex probe: failed ({err})"));
+            // The Windows where utility is not expected on other platforms.
+            if cfg!(windows) {
+                status = CheckStatus::Warning;
+                summary = "Codex entries on PATH could not be checked".to_string();
+                path_probe_issue = Some(
+                    DoctorIssue::new(CheckStatus::Warning, "where codex probe failed")
+                        .measured(err)
+                        .expected("where codex returns matches or a no-match result")
+                        .remedy("Verify that where.exe is available and can search PATH.")
+                        .field("PATH codex probe"),
+                );
+            }
+        }
     }
 
     if doctor_managed_by_npm(current_exe.as_deref()) {
@@ -930,6 +948,9 @@ fn installation_check(show_details: bool) -> DoctorCheck {
     }
 
     let mut check = DoctorCheck::new("installation", "install", status, summary).details(details);
+    if let Some(issue) = path_probe_issue {
+        check = check.issue(issue);
+    }
     if let Some(remediation) = remediation {
         check = check.remediation(remediation);
     }
@@ -1097,16 +1118,18 @@ fn display_list<T: AsRef<str>>(items: &[T]) -> String {
     }
 }
 
-fn codex_path_entries() -> Vec<String> {
-    let result = run_command("where", ["codex"]);
-
-    result
-        .unwrap_or_default()
+fn codex_path_entries() -> Result<Vec<String>, String> {
+    let output = run_command_with_timeout("where", ["codex"], Duration::from_secs(5))?;
+    // Windows where.exe reports no matches with exit code 1.
+    if cfg!(windows) && output.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    Ok(successful_command_stdout(output)?
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
-        .collect()
+        .collect())
 }
 
 fn run_command<I, S>(program: &str, args: I) -> Result<String, String>
@@ -1114,14 +1137,30 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_command_with_timeout(program, args, Duration::from_secs(5))
+    successful_command_stdout(run_command_with_timeout(
+        program,
+        args,
+        Duration::from_secs(5),
+    )?)
+}
+
+fn successful_command_stdout(output: Output) -> Result<String, String> {
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("exited with status {}", output.status)
+        } else {
+            err
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn run_command_with_timeout<I, S>(
     program: &str,
     args: I,
     timeout: Duration,
-) -> Result<String, String>
+) -> Result<Output, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -1129,7 +1168,7 @@ where
     use std::io::Seek;
     use std::io::SeekFrom;
     const MAX_OUTPUT: u64 = 64 * 1024;
-    let run = || -> std::io::Result<Result<String, String>> {
+    let run = || -> std::io::Result<Result<Output, String>> {
         let mut stdout = tempfile::tempfile()?;
         let mut stderr = tempfile::tempfile()?;
         let mut child = Command::new(program)
@@ -1161,10 +1200,15 @@ where
         })();
         let status = match status {
             Ok(Ok(status)) => status,
-            result => {
+            Ok(Err(err)) => {
                 let _ = child.kill();
                 child.wait()?;
-                return result.map(|result| result.map(|_| String::new()));
+                return Ok(Err(err));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                child.wait()?;
+                return Err(err);
             }
         };
         stdout.seek(SeekFrom::Start(0))?;
@@ -1176,15 +1220,11 @@ where
         if out.len() as u64 > MAX_OUTPUT || err.len() as u64 > MAX_OUTPUT {
             return Ok(Err("diagnostic command output limit exceeded".to_string()));
         }
-        if !status.success() {
-            let err = String::from_utf8_lossy(&err).trim().to_string();
-            return Ok(Err(if err.is_empty() {
-                format!("exited with status {status}")
-            } else {
-                err
-            }));
-        }
-        Ok(Ok(String::from_utf8_lossy(&out).into_owned()))
+        Ok(Ok(Output {
+            status,
+            stdout: out,
+            stderr: err,
+        }))
     };
     run().map_err(|err| err.to_string())?
 }
@@ -1626,23 +1666,23 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
                     input_issues.push(format!("{name}: stdio command is empty"));
                 }
                 if server.is_local_environment() {
-                    let host_native_cwd = cwd.as_ref().map(|cwd| Path::new(cwd.as_str()));
-                    if let Some(cwd) = host_native_cwd
-                        && !cwd.exists()
-                    {
-                        has_configuration_issues = true;
-                        input_issues
-                            .push(format!("{name}: cwd does not exist ({})", cwd.display()));
-                    }
-                    if !command_is_empty
-                        && let Err(err) =
-                            stdio_command_resolves(command, host_native_cwd, env.as_ref())
-                    {
-                        has_configuration_issues = true;
-                        input_issues.push(format!(
-                            "{name}: stdio command {command:?} is not resolvable ({err})"
-                        ));
-                    }
+                    let cwd = cwd.as_ref().map(|cwd| PathBuf::from(cwd.as_str()));
+                    let command = command.clone();
+                    let env = env.clone();
+                    let issues = tokio::task::spawn_blocking(move || {
+                        local_stdio_path_issues(
+                            &command,
+                            command_is_empty,
+                            cwd.as_deref(),
+                            env.as_ref(),
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|err| {
+                        vec![format!("local stdio path inspection failed ({err})")]
+                    });
+                    has_configuration_issues |= !issues.is_empty();
+                    input_issues.extend(issues.into_iter().map(|issue| format!("{name}: {issue}")));
                 } else {
                     match cwd {
                         Some(cwd) if cwd.to_inferred_path_uri().is_none() => {
@@ -2246,7 +2286,7 @@ async fn state_check(config: &Config) -> DoctorCheck {
         ("log dir", config.log_dir.as_path()),
         ("sqlite home", config.sqlite_home.as_path()),
     ] {
-        if !path_readiness(&mut details, label, path) {
+        if !path_readiness(&mut details, label, path).await {
             failures.push(format!(
                 "{label}: path is inaccessible or is not a directory"
             ));
@@ -3065,7 +3105,9 @@ async fn mcp_http_probe_url(url: &str) -> Result<String, String> {
 }
 
 async fn mcp_http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<String, String> {
-    let client = create_client_without_request_logging()
+    let client = tokio::task::spawn_blocking(create_client_without_request_logging)
+        .await
+        .map_err(|err| format!("HTTP client build task failed for {url}: {err}"))?
         .map_err(|err| format!("failed to build HTTP client for {url}: {err}"))?;
     let mut failures = Vec::new();
     for (method, request) in [("HEAD", client.head(url)), ("GET", client.get(url))] {
@@ -3089,7 +3131,9 @@ async fn mcp_http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result
 }
 
 async fn http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<String, String> {
-    let response = create_client_without_request_logging()
+    let response = tokio::task::spawn_blocking(create_client_without_request_logging)
+        .await
+        .map_err(|err| format!("HTTP client build task failed for {url}: {err}"))?
         .map_err(|err| format!("failed to build HTTP client for {url}: {err}"))?
         .head(url)
         .timeout(timeout)
@@ -3110,7 +3154,9 @@ async fn http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<Str
 }
 
 async fn http_get_probe_status_with_timeout(url: &str, timeout: Duration) -> Result<u16, String> {
-    let response = create_client_without_request_logging()
+    let response = tokio::task::spawn_blocking(create_client_without_request_logging)
+        .await
+        .map_err(|err| format!("HTTP client build task failed for {url}: {err}"))?
         .map_err(|err| format!("failed to build HTTP client for {url}: {err}"))?
         .get(url)
         .timeout(timeout)
@@ -3128,6 +3174,24 @@ async fn http_get_probe_status_with_timeout(url: &str, timeout: Duration) -> Res
             }
         })?;
     Ok(response.status().as_u16())
+}
+
+fn local_stdio_path_issues(
+    command: &str,
+    command_is_empty: bool,
+    cwd: Option<&Path>,
+    server_env: Option<&HashMap<String, String>>,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    if let Some(cwd) = cwd
+        && !cwd.exists()
+    {
+        issues.push(format!("cwd does not exist ({})", cwd.display()));
+    }
+    if !command_is_empty && let Err(err) = stdio_command_resolves(command, cwd, server_env) {
+        issues.push(format!("stdio command {command:?} is not resolvable ({err})"));
+    }
+    issues
 }
 
 fn stdio_command_resolves(
@@ -3187,8 +3251,8 @@ fn executable_path_exists(path: &Path) -> Result<(), String> {
     }
 }
 
-fn path_readiness(details: &mut Vec<String>, label: &str, path: &Path) -> bool {
-    match std::fs::metadata(path) {
+async fn path_readiness(details: &mut Vec<String>, label: &str, path: &Path) -> bool {
+    match tokio::fs::metadata(path).await {
         Ok(metadata) => {
             let kind = if metadata.is_dir() {
                 "dir"

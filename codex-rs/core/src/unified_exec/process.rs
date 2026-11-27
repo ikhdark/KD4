@@ -299,7 +299,7 @@ pub(crate) struct UnifiedExecProcess {
     // Host-observed launch acknowledgement, before output readers or startup
     // reporting can wait. This is not an exact remote OS start timestamp.
     launch_observed_at: std::time::Instant,
-    incarnation: uuid::Uuid,
+    incarnation: std::sync::OnceLock<uuid::Uuid>,
     validation: std::sync::OnceLock<crate::validation::CommandValidation>,
     process_handle: ProcessHandle,
     termination_owner: std::sync::OnceLock<ProcessTerminationOwner>,
@@ -493,7 +493,7 @@ impl UnifiedExecProcess {
             launch_observation: codex_utils_pty::process_observation::ProcessObservationContext::current(),
             environment: std::sync::OnceLock::new(),
             validation: std::sync::OnceLock::new(),
-            incarnation: uuid::Uuid::new_v4(),
+            incarnation: std::sync::OnceLock::new(),
             process_handle,
             termination_owner: std::sync::OnceLock::new(),
             output_tx,
@@ -754,8 +754,18 @@ impl UnifiedExecProcess {
         Some([stdout, stderr])
     }
 
+    /// Bind the manager-issued identity before making the process observable as
+    /// a managed handle. An already observed identity must never change.
+    pub(super) fn bind_managed_incarnation(&self, incarnation: uuid::Uuid) {
+        assert!(
+            self.incarnation.set(incarnation).is_ok(),
+            "managed process incarnation must be bound before its first observation"
+        );
+    }
+
     pub(super) fn incarnation(&self) -> uuid::Uuid {
-        self.incarnation
+        // Unmanaged processes, including short-lived commands, retain a v4 UUID.
+        *self.incarnation.get_or_init(uuid::Uuid::new_v4)
     }
 
     /// Ready-only terminal observation for packet emission. A busy owner,
@@ -1006,7 +1016,7 @@ impl UnifiedExecProcess {
                 .map_or(silent_for_ms, |at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX))
         };
         crate::tools::context::ExecSessionCapabilities {
-            incarnation: self.incarnation,
+            incarnation: self.incarnation(),
             stdin: running && !self.shutdown_is_pending() && !self.stdin_closed.load(Ordering::Acquire),
             close_stdin: !tty,
             interrupt: running && !self.shutdown_is_pending() && interrupt,

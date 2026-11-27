@@ -1,7 +1,6 @@
 use codex_utils_absolute_path as path_utils;
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
 use std::ops::ControlFlow;
@@ -159,47 +158,31 @@ impl Cursor {
     }
 }
 
-/// Keeps track of where a paginated listing left off. As the file scan goes newest -> oldest,
-/// it ignores everything until it passes the last seen timestamp from the previous page, then
-/// starts returning results after that. This makes paging stable even if new files show up during
-/// pagination.
-struct AnchorState {
+#[derive(Clone, Copy)]
+struct ListingAnchor {
     ts: OffsetDateTime,
     id: Option<Uuid>,
-    passed: bool,
 }
 
-impl AnchorState {
-    fn new(anchor: Option<Cursor>) -> Self {
-        match anchor {
-            Some(cursor) => Self {
-                ts: cursor.ts,
-                id: cursor
-                    .id
-                    .and_then(|id| Uuid::parse_str(id.to_string().as_str()).ok()),
-                passed: false,
-            },
-            None => Self {
-                ts: OffsetDateTime::UNIX_EPOCH,
-                id: None,
-                passed: true,
-            },
+impl ListingAnchor {
+    fn from_cursor(cursor: &Cursor) -> Self {
+        Self {
+            ts: cursor.ts,
+            id: cursor
+                .id
+                .and_then(|id| Uuid::parse_str(&id.to_string()).ok()),
         }
     }
 
-    fn should_skip(&mut self, ts: OffsetDateTime, id: Uuid) -> bool {
-        if self.passed {
-            return false;
-        }
-        let passed_anchor = match self.id {
-            Some(anchor_id) => (ts, id) < (self.ts, anchor_id),
-            None => ts < self.ts,
+    fn should_skip(self, ts: OffsetDateTime, id: Uuid, ascending: bool) -> bool {
+        let ordering = match self.id {
+            Some(anchor_id) => (ts, id).cmp(&(self.ts, anchor_id)),
+            None => ts.cmp(&self.ts),
         };
-        if passed_anchor {
-            self.passed = true;
-            false
+        if ascending {
+            !ordering.is_gt()
         } else {
-            true
+            !ordering.is_lt()
         }
     }
 }
@@ -258,20 +241,25 @@ impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
     }
 }
 
-/// Collects lightweight file candidates (path + id + mtime).
-/// Sorting after mtime happens after all files are collected.
-struct FilesByUpdatedAtVisitor<'a> {
-    candidates: &'a mut Vec<ThreadCandidate>,
+/// Collect lightweight candidates for sorts that need ordering before summary reads.
+struct FilesByUpdatedAtVisitor {
+    candidates: Vec<ThreadCandidate>,
+    desc_anchor: Option<ListingAnchor>,
 }
 
-impl<'a> RolloutFileVisitor for FilesByUpdatedAtVisitor<'a> {
+impl RolloutFileVisitor for FilesByUpdatedAtVisitor {
     async fn visit(&mut self, _ts: OffsetDateTime, id: Uuid, path: PathBuf) -> ControlFlow<()> {
         let updated_at = file_modified_time(&path).await.unwrap_or(None);
-        self.candidates.push(ThreadCandidate {
-            path,
-            id,
-            updated_at,
-        });
+        if !self.desc_anchor.is_some_and(|anchor| {
+            anchor.should_skip(updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), id, false)
+        }) {
+            self.candidates.push(ThreadCandidate {
+                path,
+                id,
+                updated_at,
+                ordinal: self.candidates.len(),
+            });
+        }
         ControlFlow::Continue(())
     }
 }
@@ -508,51 +496,68 @@ async fn get_threads_in_root_by_summary(
         };
     }
     let mut scanned_files = 0usize;
-    let candidates = match config.layout {
-        ThreadListLayout::NestedByDate => {
-            collect_files_by_updated_at(&root, &mut scanned_files).await?
-        }
-        ThreadListLayout::Flat => {
-            collect_flat_files_by_updated_at(&root, &mut scanned_files).await?
-        }
+    let anchor = cursor.map(ListingAnchor::from_cursor);
+    let mut selection = SummaryPageSelection {
+        page_size,
+        sort_key,
+        ascending,
+        anchor,
+        config: &config,
+        provider_matcher: provider_matcher.as_ref(),
+        keyed_items: Vec::new(),
+        next_ordinal: 0,
     };
-    let anchor = cursor.map(|cursor| {
-        (
-            cursor.timestamp(),
-            cursor
-                .thread_id()
-                .and_then(|id| Uuid::parse_str(&id.to_string()).ok()),
-        )
-    });
-    // UpdatedAt is already known from file metadata. When every candidate has
-    // a representable timestamp, summary hydration cannot change its sort key.
-    // Preserve the full-summary fallback for missing mtimes and RecencyAt.
-    let updated_key = |candidate: &ThreadCandidate| {
-        candidate.updated_at.and_then(format_rfc3339)
-            .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
-            .map(|timestamp| (timestamp, candidate.id))
-    };
-    if sort_key == ThreadSortKey::UpdatedAt
-        && let Some(keys) = candidates.iter().map(updated_key).collect::<Option<Vec<_>>>()
+
+    // A RecencyAt scan must hydrate every candidate. If no cached summary in
+    // this root needs priority, select the page directly from the directory walk.
+    // With cached summaries, preserve the warm-before-cold order so the scan
+    // cannot evict entries it has not visited yet.
+    if sort_key == ThreadSortKey::RecencyAt
+        && !crate::metadata::cached_summary_paths(config.default_provider)
+            .iter()
+            .any(|path| path.starts_with(&root))
     {
-        let mut candidates = keys.into_iter().zip(candidates).collect::<Vec<_>>();
-        candidates.sort_by_key(|(key, _)| *key);
-        if !ascending { candidates.reverse(); }
+        walk_listing_rollout_files(&root, config.layout, &mut scanned_files, &mut selection)
+            .await?;
+        return Ok(selection.finish(scanned_files));
+    }
+
+    let mut candidates =
+        collect_updated_candidates(&root, config.layout, &mut scanned_files, None).await?;
+    // For UpdatedAt with representable mtimes the physical key cannot be changed
+    // by summary hydration. Missing/unrepresentable mtimes still use the full
+    // summary sort. The stored mtimes are UTC, so an RFC3339 round trip preserves
+    // the timestamp exactly; a second catalog of converted keys is unnecessary.
+    if sort_key == ThreadSortKey::UpdatedAt
+        && candidates
+            .iter()
+            .all(|candidate| candidate.updated_at.and_then(format_rfc3339).is_some())
+    {
+        candidates.retain(|candidate| {
+            !candidate.updated_at.is_some_and(|ts| {
+                anchor.is_some_and(|anchor| anchor.should_skip(ts, candidate.id, ascending))
+            })
+        });
+        candidates.sort_unstable_by_key(|candidate| {
+            (candidate.updated_at, candidate.id, candidate.ordinal)
+        });
+        if !ascending {
+            candidates.reverse();
+        }
         let mut items = Vec::with_capacity(page_size.min(candidates.len()));
         let mut more_matches_available = false;
-        for (key, candidate) in candidates {
-            if anchor.is_some_and(|(timestamp, id)| match id {
-                Some(id) if ascending => key <= (timestamp, id),
-                Some(id) => key >= (timestamp, id),
-                None if ascending => key.0 <= timestamp,
-                None => key.0 >= timestamp,
-            }) { continue; }
+        for candidate in candidates {
             if let Some(item) = build_thread_item(
-                candidate.path, config.allowed_sources, provider_matcher.as_ref(),
-                config.cwd_filters, candidate.updated_at.and_then(format_rfc3339),
+                candidate.path,
+                config.allowed_sources,
+                provider_matcher.as_ref(),
+                config.cwd_filters,
+                candidate.updated_at.and_then(format_rfc3339),
                 config.default_provider,
                 config.include_empty_preview,
-            ).await {
+            )
+            .await
+            {
                 // Probe the next *matching* summary so filtering/damaged files
                 // cannot manufacture a next-page cursor.
                 if items.len() == page_size {
@@ -563,97 +568,118 @@ async fn get_threads_in_root_by_summary(
             }
         }
         let next_cursor = more_matches_available
-            .then(|| build_next_cursor(&items, sort_key)).flatten();
+            .then(|| build_next_cursor(&items, sort_key))
+            .flatten();
         return Ok(ThreadsPage {
-            items, next_cursor, num_scanned_files: scanned_files, reached_scan_cap: false,
+            items,
+            next_cursor,
+            num_scanned_files: scanned_files,
+            reached_scan_cap: false,
         });
     }
-    // A full RecencyAt scan must not evict still-unvisited cached summaries.
-    // This is only a work-order hint: build_thread_item revalidates each input.
-    let hinted_paths = if sort_key == ThreadSortKey::RecencyAt {
-        crate::metadata::cached_summary_paths(config.default_provider)
-    } else {
-        HashSet::new()
-    };
-    let (preferred, deferred): (Vec<_>, Vec<_>) = candidates
-        .into_iter()
-        .enumerate()
-        .partition(|(_, candidate)| hinted_paths.contains(&candidate.path));
-    drop(hinted_paths);
-    let mut keyed_items = Vec::new();
-    for (ordinal, candidate) in preferred.into_iter().chain(deferred) {
-        let updated_at = candidate.updated_at.and_then(format_rfc3339);
+
+    if sort_key == ThreadSortKey::RecencyAt {
+        let hinted_paths = crate::metadata::cached_summary_paths(config.default_provider);
+        // Yield the preferred entries in scan order and leave the cold
+        // entries in the same allocation and relative order.
+        for candidate in candidates.extract_if(.., |candidate| hinted_paths.contains(&candidate.path))
+        {
+            selection
+                .consider(candidate.path, candidate.updated_at, candidate.ordinal)
+                .await;
+        }
+    }
+    for candidate in candidates {
+        selection
+            .consider(candidate.path, candidate.updated_at, candidate.ordinal)
+            .await;
+    }
+    Ok(selection.finish(scanned_files))
+}
+
+struct SummaryPageSelection<'a, 'config> {
+    page_size: usize,
+    sort_key: ThreadSortKey,
+    ascending: bool,
+    anchor: Option<ListingAnchor>,
+    config: &'a ThreadListConfig<'config>,
+    provider_matcher: Option<&'a ProviderMatcher<'config>>,
+    keyed_items: Vec<((OffsetDateTime, Uuid), usize, ThreadItem)>,
+    next_ordinal: usize,
+}
+
+impl SummaryPageSelection<'_, '_> {
+    async fn consider(&mut self, path: PathBuf, updated_at: Option<OffsetDateTime>, ordinal: usize) {
         let Some(item) = build_thread_item(
-            candidate.path,
-            config.allowed_sources,
-            provider_matcher.as_ref(),
-            config.cwd_filters,
-            updated_at,
-            config.default_provider,
-            config.include_empty_preview,
+            path,
+            self.config.allowed_sources,
+            self.provider_matcher,
+            self.config.cwd_filters,
+            updated_at.and_then(format_rfc3339),
+            self.config.default_provider,
+            self.config.include_empty_preview,
         )
         .await
         else {
-            continue;
+            return;
         };
-        let Some(key) = thread_item_sort_key(&item, sort_key) else {
-            continue;
+        let Some((ts, id)) = thread_item_sort_key(&item, self.sort_key) else {
+            return;
         };
-        if anchor.is_some_and(|(anchor_ts, anchor_id)| match anchor_id {
-            Some(anchor_id) => {
-                if ascending {
-                    key <= (anchor_ts, anchor_id)
-                } else {
-                    key >= (anchor_ts, anchor_id)
-                }
-            }
-            None => {
-                if ascending {
-                    key.0 <= anchor_ts
-                } else {
-                    key.0 >= anchor_ts
-                }
-            }
-        }) {
-            continue;
+        if self
+            .anchor
+            .is_some_and(|anchor| anchor.should_skip(ts, id, self.ascending))
+        {
+            return;
         }
-        keyed_items.push((key, ordinal, item));
-        // The page and its "more" probe need only the first `page_size + 1`
-        // items in final order, and `(key, ordinal)` is a strict total order
-        // (`ordinal` is unique per candidate). Periodically keep just that
-        // prefix instead of every hydrated summary; an evicted item always has
-        // at least `retain` better items still retained, so the result is exact.
-        let retain = page_size.saturating_add(1);
-        if keyed_items.len() >= retain.saturating_mul(2).max(RECENCY_COMPACTION_FLOOR) {
-            keyed_items.sort_by_key(|(key, ordinal, _)| (*key, *ordinal));
-            if !ascending {
-                keyed_items.reverse();
-            }
-            keyed_items.truncate(retain);
+
+        self.keyed_items.push(((ts, id), ordinal, item));
+        // Keep the page plus its exact "more" probe. The scan ordinal makes
+        // the sort total even when multiple copies share a timestamp and UUID.
+        let retain = self.page_size.saturating_add(1);
+        if self.keyed_items.len() >= retain.saturating_mul(2).max(RECENCY_COMPACTION_FLOOR) {
+            self.sort_items();
+            self.keyed_items.truncate(retain);
         }
     }
-    // Preserve the original stable tie order despite reordered hydration.
-    keyed_items.sort_by_key(|(key, ordinal, _)| (*key, *ordinal));
-    if !ascending {
-        keyed_items.reverse();
+
+    fn sort_items(&mut self) {
+        self.keyed_items
+            .sort_unstable_by_key(|(key, ordinal, _)| (*key, *ordinal));
+        if !self.ascending {
+            self.keyed_items.reverse();
+        }
     }
 
-    let more_matches_available = keyed_items.len() > page_size;
-    keyed_items.truncate(page_size);
-    let items = keyed_items
-        .into_iter()
-        .map(|(_, _, item)| item)
-        .collect::<Vec<_>>();
-    let next_cursor = more_matches_available
-        .then(|| build_next_cursor(&items, sort_key))
-        .flatten();
+    fn finish(mut self, scanned_files: usize) -> ThreadsPage {
+        self.sort_items();
+        let more_matches_available = self.keyed_items.len() > self.page_size;
+        self.keyed_items.truncate(self.page_size);
+        let items = self
+            .keyed_items
+            .into_iter()
+            .map(|(_, _, item)| item)
+            .collect::<Vec<_>>();
+        let next_cursor = more_matches_available
+            .then(|| build_next_cursor(&items, self.sort_key))
+            .flatten();
+        ThreadsPage {
+            items,
+            next_cursor,
+            num_scanned_files: scanned_files,
+            reached_scan_cap: false,
+        }
+    }
+}
 
-    Ok(ThreadsPage {
-        items,
-        next_cursor,
-        num_scanned_files: scanned_files,
-        reached_scan_cap: false,
-    })
+impl RolloutFileVisitor for SummaryPageSelection<'_, '_> {
+    async fn visit(&mut self, _ts: OffsetDateTime, _id: Uuid, path: PathBuf) -> ControlFlow<()> {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        let updated_at = file_modified_time(&path).await.unwrap_or(None);
+        self.consider(path, updated_at, ordinal).await;
+        ControlFlow::Continue(())
+    }
 }
 
 /// Load thread file paths from disk using directory traversal.
@@ -833,20 +859,21 @@ async fn traverse_directories_for_paths_updated(
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
-    let mut anchor_state = AnchorState::new(anchor);
     let mut more_matches_available = false;
 
-    let mut candidates = collect_files_by_updated_at(&root, &mut scanned_files).await?;
-    candidates.sort_by_key(|candidate| {
+    let mut candidates = collect_updated_candidates(
+        &root,
+        ThreadListLayout::NestedByDate,
+        &mut scanned_files,
+        anchor.as_ref().map(ListingAnchor::from_cursor),
+    )
+    .await?;
+    candidates.sort_unstable_by_key(|candidate| {
         let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        (Reverse(ts), Reverse(candidate.id))
+        (Reverse(ts), Reverse(candidate.id), candidate.ordinal)
     });
 
-    for candidate in candidates.into_iter() {
-        let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        if anchor_state.should_skip(ts, candidate.id) {
-            continue;
-        }
+    for candidate in candidates {
         if items.len() == page_size {
             more_matches_available = true;
             break;
@@ -900,14 +927,17 @@ async fn traverse_flat_paths_created(
     let mut scanned_files = 0usize;
     let mut more_matches_available = false;
 
-    let mut files = collect_flat_rollout_files(&root, &mut scanned_files).await?;
+    let mut files = FlatCreatedCandidates {
+        paths: Vec::new(),
+        anchor: anchor.as_ref().map(ListingAnchor::from_cursor),
+        ascending,
+    };
+    walk_flat_rollout_files(&root, &mut scanned_files, &mut files).await?;
+    files.paths.sort_unstable_by_key(|(key, _)| *key);
     if ascending {
-        files.reverse();
+        files.paths.reverse();
     }
-    for (ts, id, path) in files.into_iter() {
-        if skip_created_candidate(ts, id, anchor.as_ref(), ascending) {
-            continue;
-        }
+    for (_, path) in files.paths {
         if items.len() == page_size {
             more_matches_available = true;
             break;
@@ -960,20 +990,21 @@ async fn traverse_flat_paths_updated(
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
-    let mut anchor_state = AnchorState::new(anchor);
     let mut more_matches_available = false;
 
-    let mut candidates = collect_flat_files_by_updated_at(&root, &mut scanned_files).await?;
-    candidates.sort_by_key(|candidate| {
+    let mut candidates = collect_updated_candidates(
+        &root,
+        ThreadListLayout::Flat,
+        &mut scanned_files,
+        anchor.as_ref().map(ListingAnchor::from_cursor),
+    )
+    .await?;
+    candidates.sort_unstable_by_key(|candidate| {
         let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        (Reverse(ts), Reverse(candidate.id))
+        (Reverse(ts), Reverse(candidate.id), candidate.ordinal)
     });
 
-    for candidate in candidates.into_iter() {
-        let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        if anchor_state.should_skip(ts, candidate.id) {
-            continue;
-        }
+    for candidate in candidates {
         if items.len() == page_size {
             more_matches_available = true;
             break;
@@ -1262,12 +1293,35 @@ where
     Ok(collected)
 }
 
-async fn collect_flat_rollout_files(
+type FlatCreatedKey = (Reverse<OffsetDateTime>, Reverse<Uuid>, usize);
+
+struct FlatCreatedCandidates {
+    paths: Vec<(FlatCreatedKey, PathBuf)>,
+    anchor: Option<ListingAnchor>,
+    ascending: bool,
+}
+
+impl RolloutFileVisitor for FlatCreatedCandidates {
+    async fn visit(&mut self, ts: OffsetDateTime, id: Uuid, path: PathBuf) -> ControlFlow<()> {
+        if !self
+            .anchor
+            .is_some_and(|anchor| anchor.should_skip(ts, id, self.ascending))
+        {
+            // The scan ordinal preserves the old stable tie order without
+            // allocating the sort's catalog-sized scratch space.
+            self.paths
+                .push(((Reverse(ts), Reverse(id), self.paths.len()), path));
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+async fn walk_flat_rollout_files(
     root: &Path,
     scanned_files: &mut usize,
-) -> io::Result<Vec<(OffsetDateTime, Uuid, PathBuf)>> {
+    visitor: &mut impl RolloutFileVisitor,
+) -> io::Result<()> {
     let mut dir = tokio::fs::read_dir(root).await?;
-    let mut collected = Vec::new();
     while let Some(entry) = dir.next_entry().await? {
         if !entry
             .file_type()
@@ -1285,10 +1339,11 @@ async fn collect_flat_rollout_files(
             continue;
         };
         *scanned_files += 1;
-        collected.push((ts, id, rollout_file.into_path()));
+        if let ControlFlow::Break(()) = visitor.visit(ts, id, rollout_file.into_path()).await {
+            break;
+        }
     }
-    collected.sort_by_key(|(ts, sid, _path)| (Reverse(*ts), Reverse(*sid)));
-    Ok(collected)
+    Ok(())
 }
 
 async fn collect_rollout_day_files(
@@ -1334,81 +1389,35 @@ struct ThreadCandidate {
     path: PathBuf,
     id: Uuid,
     updated_at: Option<OffsetDateTime>,
+    ordinal: usize,
 }
 
-async fn collect_files_by_updated_at(
+async fn collect_updated_candidates(
     root: &Path,
+    layout: ThreadListLayout,
     scanned_files: &mut usize,
+    desc_anchor: Option<ListingAnchor>,
 ) -> io::Result<Vec<ThreadCandidate>> {
-    let mut candidates = Vec::new();
     let mut visitor = FilesByUpdatedAtVisitor {
-        candidates: &mut candidates,
+        candidates: Vec::new(),
+        desc_anchor,
     };
-    walk_rollout_files(root, scanned_files, &mut visitor, false, None).await?;
-
-    Ok(candidates)
+    walk_listing_rollout_files(root, layout, scanned_files, &mut visitor).await?;
+    Ok(visitor.candidates)
 }
 
-async fn collect_flat_files_by_updated_at(
+async fn walk_listing_rollout_files(
     root: &Path,
+    layout: ThreadListLayout,
     scanned_files: &mut usize,
-) -> io::Result<Vec<ThreadCandidate>> {
-    let mut candidates = Vec::new();
-    let mut dir = tokio::fs::read_dir(root).await?;
-    while let Some(entry) = dir.next_entry().await? {
-        if !entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_file())
-            .unwrap_or(false)
-        {
-            continue;
+    visitor: &mut impl RolloutFileVisitor,
+) -> io::Result<()> {
+    match layout {
+        ThreadListLayout::NestedByDate => {
+            walk_rollout_files(root, scanned_files, visitor, false, None).await
         }
-        let Some(rollout_file) = compression::RolloutFile::from_path(entry.path()) else {
-            continue;
-        };
-        let Some((_ts, id)) = parse_timestamp_uuid_from_filename(rollout_file.plain_file_name())
-        else {
-            continue;
-        };
-        *scanned_files += 1;
-        let updated_at = file_modified_time(rollout_file.path())
-            .await
-            .unwrap_or(None);
-        candidates.push(ThreadCandidate {
-            path: rollout_file.into_path(),
-            id,
-            updated_at,
-        });
+        ThreadListLayout::Flat => walk_flat_rollout_files(root, scanned_files, visitor).await,
     }
-
-    Ok(candidates)
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "ThreadId serializes its validated UUID, so parsing that representation cannot fail"
-)]
-fn skip_created_candidate(
-    ts: OffsetDateTime,
-    id: Uuid,
-    anchor: Option<&Cursor>,
-    ascending: bool,
-) -> bool {
-    anchor.is_some_and(|anchor| {
-        let ordering = match anchor.id {
-            Some(anchor_id) => (ts, id).cmp(&(
-                anchor.ts,
-                Uuid::parse_str(&anchor_id.to_string()).expect("thread UUID"),
-            )),
-            None => ts.cmp(&anchor.ts),
-        };
-        if ascending {
-            !ordering.is_gt()
-        } else {
-            !ordering.is_lt()
-        }
-    })
 }
 
 async fn walk_rollout_files(
@@ -1418,6 +1427,7 @@ async fn walk_rollout_files(
     ascending: bool,
     anchor: Option<&Cursor>,
 ) -> io::Result<()> {
+    let anchor = anchor.map(ListingAnchor::from_cursor);
     let mut year_dirs = collect_dirs_desc(root, |s| s.parse::<u16>().ok()).await?;
     if ascending {
         year_dirs.reverse();
@@ -1439,7 +1449,7 @@ async fn walk_rollout_files(
                     day_files.reverse();
                 }
                 for (ts, id, path) in day_files.into_iter() {
-                    if skip_created_candidate(ts, id, anchor, ascending) {
+                    if anchor.is_some_and(|anchor| anchor.should_skip(ts, id, ascending)) {
                         continue;
                     }
                     *scanned_files += 1;

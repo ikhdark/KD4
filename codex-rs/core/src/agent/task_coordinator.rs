@@ -19,6 +19,7 @@ use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::LocalAgentTaskStore;
 use codex_agent_task_store::ObservationKind;
+use codex_agent_task_store::PendingTerminalOutcome;
 use codex_agent_task_store::ReceiptDraft;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::StoreResult;
@@ -412,87 +413,108 @@ impl AgentTaskCoordinator {
         let Some(initialized) = self.store.get() else {
             return Ok(());
         };
-        for pending in initialized
-            .store
-            .pending_terminal_outcomes(&initialized.root_session_id)
-            .await?
-        {
-            let pending = match pending {
-                Ok(pending) => pending,
-                Err(error) => {
-                    tracing::warn!(%error, "invalid terminal record retained; continuing unrelated recovery");
-                    continue;
-                }
+        let Some(through_sequence) = initialized.store.terminal_outcome_high_water().await? else {
+            return Ok(());
+        };
+        // Retention inserts SQLite-generated positive sequences. Restart from
+        // the beginning each pass so rows that remain pending can be retried.
+        let mut after_sequence = 0;
+        while after_sequence < through_sequence {
+            let page = initialized
+                .store
+                .pending_terminal_outcome_page(
+                    &initialized.root_session_id,
+                    after_sequence,
+                    through_sequence,
+                )
+                .await?;
+            let Some((last_sequence, _)) = page.last() else {
+                break;
             };
-            let key = (pending.binding.attempt_id, pending.turn_id.clone());
-            if self
-                .reconciled_terminal_outcomes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&key)
-            {
-                continue;
-            }
-            let binding = pending.binding;
-            let result: StoreResult<()> = async {
-                let status: AgentStatus = serde_json::from_str(&pending.status_json)?;
-                let event: codex_protocol::protocol::EventMsg = serde_json::from_str(&pending.event_json)?;
-                let path = AgentPath::try_from(binding.agent_path.as_str())
-                    .map_err(StoreError::InvalidAssignment)?;
-                let thread = binding
-                    .thread_id
-                    .as_deref()
-                    .and_then(|id| ThreadId::from_string(id).ok())
-                    .ok_or_else(|| {
-                        StoreError::CorruptData("pending terminal has no thread".into())
-                    })?;
-                let summary = match &event {
-                    codex_protocol::protocol::EventMsg::TurnComplete(event) => {
-                        let assessment = event.timing.as_ref()
-                            .and_then(|timing| timing.completion_assessment.as_ref());
-                        self.note_terminal_assessment(binding.attempt_id, assessment);
-                        assessment
-                            .and_then(|assessment| assessment.bounded_summary(&event.turn_id))
-                            .unwrap_or_else(|| crate::agent::status::NO_COMPLETION_DIAGNOSTICS.to_string())
-                    }
-                    codex_protocol::protocol::EventMsg::TurnAborted(_) => format!(
-                        "Host terminal boundary for turn {}: turn aborted; partial effects may remain.", pending.turn_id),
-                    _ => return Err(StoreError::CorruptData("pending terminal event is not terminal".into())),
-                };
-                self.record_host_completion_and_seal(&binding, &path, thread, &pending.turn_id, summary, &status).await?;
-                self.record_host_completion_observation(&binding, thread,
-                    &format!("{}:parent-delivery", pending.turn_id),
-                    format!("Completion retained across recovery; parent delivery is unacknowledged. Read get_agent_task for assignment {} attempt {}; do not replay the child.", binding.assignment_id, binding.attempt_id), None).await?;
-                // Receipt recovery is not parent delivery. Retain the original
-                // event until the delivery owner acknowledges it explicitly.
-                Ok(())
-            }
-            .await;
-            let settled = match result {
-                Ok(()) => true,
-                // A superseded attempt can never accept this evidence.
-                Err(error @ StoreError::AttemptNotActive(_)) => {
-                    tracing::warn!(attempt_id = %binding.attempt_id, %error,
-                        "terminal outcome belongs to a superseded attempt; retained without further reconciliation");
-                    true
-                }
-                Err(error) => {
-                    tracing::warn!(attempt_id = %binding.attempt_id, %error,
-                        "terminal reconciliation remains pending; continuing unrelated recovery");
-                    false
-                }
-            };
-            if settled {
-                let mut reconciled = self
-                    .reconciled_terminal_outcomes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if reconciled.len() < MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES {
-                    reconciled.insert(key);
-                }
+            // Advance independently of decode, reconciliation or delivery.
+            after_sequence = *last_sequence;
+            for (_, pending) in page {
+                self.reconcile_terminal_outcome(pending).await;
             }
         }
         Ok(())
+    }
+
+    async fn reconcile_terminal_outcome(&self, pending: StoreResult<PendingTerminalOutcome>) {
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%error, "invalid terminal record retained; continuing unrelated recovery");
+                return;
+            }
+        };
+        let key = (pending.binding.attempt_id, pending.turn_id.clone());
+        if self
+            .reconciled_terminal_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+        {
+            return;
+        }
+        let binding = pending.binding;
+        let result: StoreResult<()> = async {
+            let status: AgentStatus = serde_json::from_str(&pending.status_json)?;
+            let event: codex_protocol::protocol::EventMsg = serde_json::from_str(&pending.event_json)?;
+            let path = AgentPath::try_from(binding.agent_path.as_str())
+                .map_err(StoreError::InvalidAssignment)?;
+            let thread = binding
+                .thread_id
+                .as_deref()
+                .and_then(|id| ThreadId::from_string(id).ok())
+                .ok_or_else(|| {
+                    StoreError::CorruptData("pending terminal has no thread".into())
+                })?;
+            let summary = match &event {
+                codex_protocol::protocol::EventMsg::TurnComplete(event) => {
+                    let assessment = event.timing.as_ref()
+                        .and_then(|timing| timing.completion_assessment.as_ref());
+                    self.note_terminal_assessment(binding.attempt_id, assessment);
+                    assessment
+                        .and_then(|assessment| assessment.bounded_summary(&event.turn_id))
+                        .unwrap_or_else(|| crate::agent::status::NO_COMPLETION_DIAGNOSTICS.to_string())
+                }
+                codex_protocol::protocol::EventMsg::TurnAborted(_) => format!(
+                    "Host terminal boundary for turn {}: turn aborted; partial effects may remain.", pending.turn_id),
+                _ => return Err(StoreError::CorruptData("pending terminal event is not terminal".into())),
+            };
+            self.record_host_completion_and_seal(&binding, &path, thread, &pending.turn_id, summary, &status).await?;
+            self.record_host_completion_observation(&binding, thread,
+                &format!("{}:parent-delivery", pending.turn_id),
+                format!("Completion retained across recovery; parent delivery is unacknowledged. Read get_agent_task for assignment {} attempt {}; do not replay the child.", binding.assignment_id, binding.attempt_id), None).await?;
+            // Receipt recovery is not parent delivery. Retain the original
+            // event until the delivery owner acknowledges it explicitly.
+            Ok(())
+        }
+        .await;
+        let settled = match result {
+            Ok(()) => true,
+            // A superseded attempt can never accept this evidence.
+            Err(error @ StoreError::AttemptNotActive(_)) => {
+                tracing::warn!(attempt_id = %binding.attempt_id, %error,
+                    "terminal outcome belongs to a superseded attempt; retained without further reconciliation");
+                true
+            }
+            Err(error) => {
+                tracing::warn!(attempt_id = %binding.attempt_id, %error,
+                    "terminal reconciliation remains pending; continuing unrelated recovery");
+                false
+            }
+        };
+        if settled {
+            let mut reconciled = self
+                .reconciled_terminal_outcomes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reconciled.len() < MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES {
+                reconciled.insert(key);
+            }
+        }
     }
 
     pub(crate) async fn retain_terminal_outcome(

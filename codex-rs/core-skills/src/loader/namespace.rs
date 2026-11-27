@@ -1,5 +1,5 @@
 use codex_exec_server::ExecutorFileSystem;
-use codex_plugin::plugin_namespace_for_root_uri;
+use codex_plugin::try_plugin_namespace_for_root_uri;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -36,6 +36,7 @@ impl SkillNamespaceResolver {
         }
     }
 
+    /// Returns best-effort namespaces and warnings that mark discovery incomplete.
     pub(crate) async fn discover(
         fs: &dyn ExecutorFileSystem,
         root: &PathUri,
@@ -43,7 +44,7 @@ impl SkillNamespaceResolver {
         plugin_roots: HashSet<PathUri>,
         namespace_roots: HashSet<PathUri>,
         sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
-    ) -> Self {
+    ) -> (Self, Vec<String>) {
         // Only probe plugin roots above loaded skills; unused siblings cannot affect names.
         let mut skill_ancestors = HashSet::new();
         for skill_path in skill_paths {
@@ -80,6 +81,7 @@ impl SkillNamespaceResolver {
         let mut direct_plugin_roots = plugin_roots.iter().cloned().collect::<HashSet<_>>();
         let mut namespaces_by_root = HashMap::new();
         let mut namespaces_by_lookup_root = HashMap::new();
+        let mut warnings = Vec::new();
         while !pending_lookups.is_empty() {
             let probe_roots = pending_lookups
                 .iter()
@@ -87,19 +89,25 @@ impl SkillNamespaceResolver {
                 .chain(direct_plugin_roots.drain())
                 .filter(|ancestor| !namespaces_by_root.contains_key(ancestor))
                 .collect::<HashSet<_>>();
-            namespaces_by_root.extend(
-                futures::stream::iter(probe_roots)
-                    .map(|manifest_root| async move {
-                        let namespace =
-                            plugin_namespace_for_root_uri(fs, &manifest_root, sandbox).await;
-                        (manifest_root, namespace)
-                    })
-                    // Roots are unique and collected by key; a slow probe must not
-                    // keep completed probes from freeing slots for remaining roots.
-                    .buffer_unordered(MAX_CONCURRENT_SKILL_LOADS)
-                    .collect::<HashMap<_, _>>()
-                    .await,
-            );
+            let mut probes = futures::stream::iter(probe_roots)
+                .map(|manifest_root| async move {
+                    let result =
+                        try_plugin_namespace_for_root_uri(fs, &manifest_root, sandbox).await;
+                    (manifest_root, result)
+                })
+                // Roots are unique and collected by key; a slow probe must not
+                // keep completed probes from freeing slots for remaining roots.
+                .buffer_unordered(MAX_CONCURRENT_SKILL_LOADS);
+            while let Some((manifest_root, result)) = probes.next().await {
+                let namespace = match result {
+                    Ok(namespace) => namespace,
+                    Err(error) => {
+                        warnings.push(error.to_string());
+                        None
+                    }
+                };
+                namespaces_by_root.insert(manifest_root, namespace);
+            }
 
             let mut next_lookups = Vec::new();
             for (lookup_root, ancestor) in pending_lookups {
@@ -145,10 +153,14 @@ impl SkillNamespaceResolver {
         });
         let nested_namespaces = namespace_lookups.chain(plugin_lookups).collect();
 
-        Self {
-            inherited_namespace,
-            nested_namespaces,
-        }
+        warnings.sort_unstable();
+        (
+            Self {
+                inherited_namespace,
+                nested_namespaces,
+            },
+            warnings,
+        )
     }
 
     pub(crate) fn for_skill(&self, root: &PathUri, path: &PathUri) -> &ResolvedSkillNamespace {

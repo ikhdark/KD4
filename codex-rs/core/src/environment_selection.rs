@@ -248,18 +248,33 @@ impl ThreadEnvironments {
             return false;
         }
         let previous = self.environments.load();
+        // Keep the first exact match and first inherited match independently,
+        // as the ordered scans did. The index never determines output order.
+        let mut previous_by_selection = HashMap::with_capacity(previous.environments.len());
+        for environment in &previous.environments {
+            let (_, inherited) = previous_by_selection
+                .entry((
+                    environment.selection.environment_id.as_str(),
+                    &environment.selection.cwd,
+                ))
+                .or_insert((environment, None));
+            if !environment.owns_resolution {
+                inherited.get_or_insert(environment);
+            }
+        }
         let mut seen_environment_ids = HashSet::with_capacity(environments.len());
         let mut next = Vec::with_capacity(environments.len());
         let mut replaced_resolution = false;
         for selected_environment in environments {
-            if !seen_environment_ids.insert(selected_environment.environment_id.as_str()) {
+            let environment_id = selected_environment.environment_id.as_str();
+            if !seen_environment_ids.insert(environment_id) {
                 continue;
             }
+            let previous_selection =
+                previous_by_selection.get(&(environment_id, &selected_environment.cwd));
             // Inherited handles are an accepted delegation lease. Keep its
             // logical session through transport recovery; never retarget it.
-            if let Some(inherited) = previous.environments.iter().find(|environment| {
-                !environment.owns_resolution && environment.selection == *selected_environment
-            }) {
+            if let Some(inherited) = previous_selection.and_then(|(_, inherited)| *inherited) {
                 let resolved = inherited.resolution.clone().now_or_never();
                 let current = self
                     .environment_manager
@@ -284,10 +299,7 @@ impl ThreadEnvironments {
                     continue;
                 }
             }
-            if let Some(environment) = previous
-                .environments
-                .iter()
-                .find(|environment| environment.selection == *selected_environment)
+            if let Some(&(environment, _)) = previous_selection
                 && self
                     .environment_manager
                     .get_environment(&selected_environment.environment_id)
@@ -323,7 +335,6 @@ impl ThreadEnvironments {
                 continue;
             }
 
-            let environment_id = &selected_environment.environment_id;
             let Some(environment) = self.environment_manager.get_environment(environment_id) else {
                 tracing::warn!("skipping unknown turn environment `{environment_id}`");
                 continue;

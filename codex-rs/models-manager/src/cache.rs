@@ -478,6 +478,11 @@ struct ModelsCacheHeader<'a> {
     previous: Vec<&'a serde_json::value::RawValue>,
 }
 
+#[derive(Deserialize)]
+struct CacheEntryIdentity {
+    provider_cache_identity: String,
+}
+
 // Keep the latest entry at the legacy top level for older readers, while newer
 // readers can select one of the bounded, most recently published identities.
 #[derive(Serialize, Deserialize)]
@@ -549,7 +554,19 @@ fn select_cache_entry<'a>(
     }
     for previous in header.previous {
         let contents = previous.get().as_bytes();
-        let header = ModelsCacheHeader::parse(contents)?;
+        let header = match ModelsCacheHeader::parse(contents) {
+            Ok(header) => header,
+            Err(err) => {
+                // Check only the named identity before attributing corruption to this lookup.
+                if contents.trim_ascii_start().starts_with(b"{")
+                    && serde_json::from_slice::<CacheEntryIdentity>(contents)
+                        .is_ok_and(|entry| entry.provider_cache_identity == expected_identity)
+                {
+                    return Ok(Some(CacheEntry { contents, header: Err(err) }));
+                }
+                continue;
+            }
+        };
         if header.provider_cache_identity.as_deref() == Some(expected_identity) {
             return Ok(Some(CacheEntry {
                 contents,

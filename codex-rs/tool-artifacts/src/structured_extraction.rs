@@ -357,15 +357,15 @@ pub(crate) fn select(
     let capacity = capacity(&widest.result(&selector, coverage_complete, Some(usize::MAX)));
     let mut page = Page::default();
     let mut entry_bytes = 0_usize;
-    for (index, row) in source.enumerate() {
+    // Stop before polling the row after the inclusive bound. A poll can read
+    // and parse a JSONL row (or fail) even when that row is not selected.
+    let input_rows = end_row.map_or(usize::MAX, |end| end - *start_row + 1);
+    for (index, row) in source.take(input_rows).enumerate() {
         let number = *start_row + index;
         if let Err(error) = &row
             && error.starts_with("row read failed:")
         {
             return invalid(error.clone());
-        }
-        if end_row.is_some_and(|end| number > end) {
-            break;
         }
         // Reserve the actual cursor before admitting a row. No row is dropped
         // when output, rather than input, reaches its existing delivery budget.

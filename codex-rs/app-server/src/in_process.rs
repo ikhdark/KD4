@@ -78,6 +78,7 @@ use codex_app_server_protocol_types::ServerNotification;
 use codex_app_server_protocol_types::ServerRequest;
 use codex_app_server_protocol_types::overloaded_error;
 use codex_app_server_protocol_types::server_notification_requires_delivery;
+use codex_app_server_transport::ControlReserveSender;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
@@ -302,7 +303,7 @@ enum ProcessorCommand {
 
 #[derive(Clone)]
 pub struct InProcessClientSender {
-    client_tx: mpsc::Sender<InProcessClientMessage>,
+    client_tx: ControlReserveSender<InProcessClientMessage>,
 }
 
 impl InProcessClientSender {
@@ -381,12 +382,10 @@ impl InProcessClientSender {
             // Client replies and lifecycle messages also need ingress progress.
             _ => true,
         };
-        match codex_app_server_transport::try_send_with_control_reserve(
-            &self.client_tx,
-            message,
-            control,
-            CONTROL_REQUEST_CAPACITY,
-        ) {
+        match self
+            .client_tx
+            .try_send_with_control_reserve(message, control, CONTROL_REQUEST_CAPACITY)
+        {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(IoError::new(
                 ErrorKind::WouldBlock,
@@ -459,7 +458,13 @@ impl InProcessClientHandle {
 
         // The public observer is bounded, but the retained owner must never
         // cancel Shutdown admission: sender clones can outlive that deadline.
-        if self.client.client_tx.send(InProcessClientMessage::Shutdown { done_tx }).await.is_ok() {
+        if self
+            .client
+            .client_tx
+            .send_unreserved(InProcessClientMessage::Shutdown { done_tx })
+            .await
+            .is_ok()
+        {
             let _ = done_rx.await;
         }
 
@@ -527,7 +532,7 @@ pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHand
 async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
     let channel_capacity = args.channel_capacity.max(1);
     let installation_id = resolve_installation_id(&args.config.codex_home).await?;
-    let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(
+    let (client_tx, mut client_rx) = ControlReserveSender::<InProcessClientMessage>::channel(
         channel_capacity.saturating_add(CONTROL_REQUEST_CAPACITY),
     );
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
@@ -668,7 +673,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                     requirements_shutdown,
                 ),
         );
-        let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(
+        let (processor_tx, mut processor_rx) = ControlReserveSender::<ProcessorCommand>::channel(
             channel_capacity.saturating_add(CONTROL_REQUEST_CAPACITY),
         );
         let processor_shutdown = tokio_util::sync::CancellationToken::new();
@@ -834,9 +839,10 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                 }
                             }
 
-                            match codex_app_server_transport::try_send_with_control_reserve(
-                                &processor_tx, ProcessorCommand::Request { request: Box::new(request), trace },
-                                control, CONTROL_REQUEST_CAPACITY,
+                            match processor_tx.try_send_with_control_reserve(
+                                ProcessorCommand::Request { request: Box::new(request), trace },
+                                control,
+                                CONTROL_REQUEST_CAPACITY,
                             ) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -864,8 +870,10 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             }
                         }
                         Some(InProcessClientMessage::Notification { notification }) => {
-                            match codex_app_server_transport::try_send_with_control_reserve(
-                                &processor_tx, ProcessorCommand::Notification(notification), false, CONTROL_REQUEST_CAPACITY,
+                            match processor_tx.try_send_with_control_reserve(
+                                ProcessorCommand::Notification(notification),
+                                false,
+                                CONTROL_REQUEST_CAPACITY,
                             ) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -905,8 +913,11 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         OutgoingMessage::Response(response) => {
                             pending_controls.remove(&response.id);
                             if let Some(response_tx) = pending_request_responses.remove(&response.id) {
+                                // Matching the request route settles publication even
+                                // when the caller dropped its waiter after dispatch.
                                 let _ = response_tx.send(Ok(response.result));
                             } else {
+                                delivered = false;
                                 warn!(
                                     request_id = ?response.id,
                                     "dropping unmatched in-process response"

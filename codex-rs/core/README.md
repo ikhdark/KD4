@@ -34,6 +34,11 @@ process boundaries, start with the [workspace map](../README.md).
 
 ## Avoid unnecessary continuations
 
+- For native `request_user_input` prompts, the app server selects the
+  `(Recommended)` options after five minutes without a reply. It only does
+  this when every question has one unambiguous recommendation and none are
+  secret. The result is marked `timed_out`, not recorded as user consent or
+  authorization to change plan scope. Approval prompts are unaffected.
 - Send `exec_command.yield_time_ms` as an integer. The [command decoder](src/tools/handlers/unified_exec.rs) also repairs a canonical decimal string in that one observation field and reports the conversion before applying the usual bounds. It does not infer other arguments, repair shell syntax, or retry a command.
 - A yielded noninteractive command that exits before the generation's last
   tool result is delivered reaches the next request without a model poll: the

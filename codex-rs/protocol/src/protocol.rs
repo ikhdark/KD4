@@ -3165,8 +3165,12 @@ pub enum TurnTimingGenerationReason {
     Initial,
     ToolContinuation,
     Compaction,
+    #[serde(alias = "completion_review")]
     Subagent,
     #[default]
+    // Do not assign a current continuation category to the retired repair
+    // reason. Its original value remains in the persisted rollout bytes.
+    #[serde(alias = "completion_repair_rereview")]
     Other,
 }
 

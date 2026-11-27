@@ -422,7 +422,14 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
         Err(err) => return Err(err),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("WARNING: could not enumerate stale arg0 directory in {temp_root:?}: {err}");
+                continue;
+            }
+        };
         let path = entry.path();
         if !path.is_dir() {
             continue;
