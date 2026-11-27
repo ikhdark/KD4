@@ -635,16 +635,16 @@ pub(super) fn trim_trailing_whitespace_in_ts_files(paths: &[PathBuf]) -> Result<
 }
 
 /// Generate an index.ts file that re-exports all generated types.
-/// This allows consumers to import all types from a single file.
-pub(super) fn generate_index_ts(out_dir: &Path) -> Result<PathBuf> {
+/// Only the root index has a child v2 namespace to enumerate.
+pub(super) fn generate_index_ts(out_dir: &Path, v2_out_dir: Option<&Path>) -> Result<PathBuf> {
+    let files = ts_files_in(out_dir)?;
+    let has_v2_ts = match v2_out_dir {
+        Some(dir) => !ts_files_in(dir)?.is_empty(),
+        None => false,
+    };
     let content = generated_index_ts_with_header(index_ts_entries(
-        &ts_files_in(out_dir)?
-            .iter()
-            .map(PathBuf::as_path)
-            .collect::<Vec<_>>(),
-        ts_files_in(&out_dir.join("v2"))
-            .map(|v| !v.is_empty())
-            .unwrap_or(false),
+        &files.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+        has_v2_ts,
     ));
 
     let index_path = out_dir.join("index.ts");

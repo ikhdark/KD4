@@ -34,7 +34,7 @@ async fn archive_thread_owned(
     {
         super::live_writer::shutdown_thread(store, thread_id).await?;
     }
-    let _lease = store.acquire_writer_lease(thread_id, false).await?;
+    let lease = store.acquire_writer_lease(thread_id, false).await?;
     let state_db_ctx = store.state_db().await;
     let moves = codex_rollout::lock_rollout_moves(&store.config.codex_home)
         .await
@@ -84,10 +84,20 @@ async fn archive_thread_owned(
         .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
     // The index can be absent or fail to settle after a successful move.
     // Record the earliest safe expiry on the stable writer lease before moving.
-    if codex_rollout::home_retention_enabled(&store.config.codex_home) {
-        _lease.set_modified(std::time::SystemTime::now()).map_err(super::delete_thread::delete_recovery_error)?;
-        _lease.sync_all().map_err(super::delete_thread::delete_recovery_error)?;
-    }
+    let home = store.config.codex_home.clone();
+    let (_lease, moves) = tokio::task::spawn_blocking(move || {
+        if codex_rollout::home_retention_enabled(&home) {
+            lease
+                .set_modified(std::time::SystemTime::now())
+                .map_err(super::delete_thread::delete_recovery_error)?;
+            lease
+                .sync_all()
+                .map_err(super::delete_thread::delete_recovery_error)?;
+        }
+        Ok::<_, ThreadStoreError>((lease, moves))
+    })
+    .await
+    .map_err(super::delete_thread::delete_recovery_error)??;
     let archived_path = codex_rollout::move_rollout_to_directory_with_owner(
         &canonical_rollout_path,
         &archive_folder,

@@ -785,7 +785,7 @@ impl OpenAiModelsManager {
     /// Seed provider-owned discovery before sharing this manager with consumers.
     pub fn with_discovered_catalog(mut self, models: Vec<ModelInfo>, remaining: Duration) -> Self {
         if self.endpoint_client.has_authoritative_catalog() {
-            let normalized = self.merged_remote_models(models);
+            let normalized = normalize_model_catalog_with_rejections(models);
             let state = self.state.get_mut();
             state.replace_catalog(normalized);
             state.fresh_until = Some(Instant::now() + remaining.min(self.cache_manager.ttl()));
@@ -913,7 +913,7 @@ impl OpenAiModelsManager {
                             self.ensure_current_cache_identity().await;
                             continue;
                         }
-                        let merged_models = self.merged_remote_models(models.clone());
+                        let merged_models = self.merged_remote_models(models.clone()).await;
                         let (should_apply, identity_is_current) = {
                             let mut model_state = self.state.write().await;
                             let refresh_state = self
@@ -1336,7 +1336,7 @@ impl OpenAiModelsManager {
         etag: Option<String>,
         expected_identity: &str,
     ) -> bool {
-        let merged_models = self.merged_remote_models(models);
+        let merged_models = self.merged_remote_models(models).await;
         let mut state = self.state.write().await;
         if state.active_cache_identity != expected_identity
             || !self.cache_manager.identity_is_current(expected_identity)
@@ -1349,14 +1349,29 @@ impl OpenAiModelsManager {
         true
     }
 
-    fn merged_remote_models(&self, models: Vec<ModelInfo>) -> NormalizedModelCatalog {
+    async fn merged_remote_models(&self, models: Vec<ModelInfo>) -> NormalizedModelCatalog {
         let normalized = normalize_model_catalog_with_rejections(models);
         if self.endpoint_client.has_authoritative_catalog() {
             return normalized;
         }
         let rejected_slugs = normalized.rejected_slugs;
         let mut models = normalized.models;
-        crate::prompt_resolver::apply_prompt_policy(&mut models);
+        if !models.is_empty() {
+            // Local policy reads the live default file. Keep the refresh transaction
+            // on the caller and pass only model data to the blocking worker.
+            let span = tracing::Span::current();
+            models = tokio::task::spawn_blocking(move || {
+                span.in_scope(|| crate::prompt_resolver::apply_prompt_policy(&mut models));
+                models
+            })
+            .await
+            .unwrap_or_else(|error| {
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+                panic!("model catalog policy worker stopped before producing a catalog: {error}");
+            });
+        }
         // Use the remote models list as the source of truth if it contains at least one
         // non-hidden model and the user is using ChatGPT auth.
         let should_use_remote_models_only = !models.is_empty()

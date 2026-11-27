@@ -40,12 +40,11 @@ mod delegate;
 mod peer;
 
 const MAX_ACTIVE_CELLS: usize = 128;
-// Frames the host can owe the client for work it has admitted: a response and
-// an initial response per request, a request and its cancellation per pending
-// delegate call, and a closure per cell. A full queue fails every session on
-// the connection, so it must not fill below that bound.
+// Reserve a cancellation per pending delegate and a start receipt and closure
+// per admitted cell, independently of the ordinary response/data slots. A full
+// queue fails every session on the connection.
 const OUTGOING_FRAME_CAPACITY: usize =
-    2 * MAX_IN_FLIGHT_REQUESTS + 2 * MAX_PENDING_DELEGATE_REQUESTS + MAX_ACTIVE_CELLS;
+    2 * MAX_IN_FLIGHT_REQUESTS + 2 * MAX_PENDING_DELEGATE_REQUESTS + 2 * MAX_ACTIVE_CELLS;
 // Bound retained session storage independently of transient request/cell
 // permits: 256 sessions can retain up to 2 GiB of serialized stored values.
 // Every loaded Code Mode thread of the owning process holds one session, and a
@@ -476,13 +475,6 @@ impl HostState {
                 };
                 match result {
                     Ok(started) => {
-                        let cell_id = started.cell_id.clone();
-                        self.respond(
-                            request_id,
-                            Ok(HostResponse::ExecutionStarted {
-                                cell_id: cell_id.into(),
-                            }),
-                        );
                         let initial_response_sent = self.peer.start_cell(
                             session_id,
                             request_id,

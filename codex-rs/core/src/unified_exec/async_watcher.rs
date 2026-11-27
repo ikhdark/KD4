@@ -20,7 +20,7 @@ use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
 use crate::exec::OutputDeltaDecision;
 use crate::exec::OutputDeltaLimiter;
 use crate::session::session::Session;
-use crate::session::turn::reconcile_turn_progress_event;
+use crate::session::turn::reconcile_turn_progress_event_async;
 use crate::session::turn_context::TurnContext;
 use crate::tools::command_execution::CommandExecutionId;
 use crate::tools::command_execution::CommandExecutionLedger;
@@ -427,7 +427,11 @@ pub(crate) fn spawn_exit_watcher(
             });
             turn_ref
                 .turn_timing_state
-                .record_background_tool_process_exit(&call_id, timing.snapshot(exit_observed_at));
+                .record_background_tool_process_exit_async(
+                    &call_id,
+                    timing.snapshot(exit_observed_at),
+                )
+                .await;
         }
         let failure_message = process.failure_message();
         let exit_code = process.exit_code();
@@ -517,7 +521,12 @@ pub(crate) fn spawn_exit_watcher(
             .command_execution
             .retire_completed_process(command_execution_id, &parent_tool_execution_id)
             .await;
-        reconcile_turn_progress_event(&turn_ref.turn_timing_state, 0, "background process cleanup");
+        reconcile_turn_progress_event_async(
+            &turn_ref.turn_timing_state,
+            0,
+            "background process cleanup",
+        )
+        .await;
         if tracked
             && !matches!(
                 finalization,

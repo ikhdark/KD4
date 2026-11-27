@@ -1892,7 +1892,8 @@ impl RolloutRecordDecoder {
                 Ok(Some(item))
             }
             Err(e) => {
-                if !secondary_metadata && e.to_string().contains("unknown variant") {
+                // Match the Serde diagnostic itself, not quoted record data inside it.
+                if !secondary_metadata && e.to_string().starts_with("unknown variant `") {
                     return Err(IoError::new(
                         ErrorKind::Unsupported,
                         format!("unsupported rollout representation at record {record_number}: {e}"),

@@ -357,6 +357,8 @@ impl WriteStdinHandler {
         );
         let passive_wait_started = std::time::Instant::now();
         let mut observed_wall_time = std::time::Duration::ZERO;
+        let input_operation = !args.chars.is_empty() || args.close_stdin;
+        let mut input_dispatched = false;
         let response = loop {
             let request = WriteStdinRequest {
                 process_id: args.session_id,
@@ -385,6 +387,12 @@ impl WriteStdinHandler {
                             args.session_id, incarnation,
                         ).await),
                 }
+            } else if input_operation {
+                let (response, dispatched) = manager
+                    .write_stdin_interaction(request, &cancellation_token)
+                    .await;
+                input_dispatched = dispatched;
+                response
             } else {
                 manager.write_stdin(request).await
             };
@@ -410,6 +418,7 @@ impl WriteStdinHandler {
             event_call_id: Some(call_id),
             ..
         }) = &response
+            && input_dispatched
             && !args.chars.is_empty()
         {
             session
@@ -538,11 +547,12 @@ impl WriteStdinHandler {
             }
         }
 
-        // Empty stdin is a background poll, so emit it only while there is
-        // still a live process for the UI to wait on. Non-empty stdin is a real
-        // terminal interaction and should remain visible even if it completes
-        // the process before the response returns.
-        if !args.chars.is_empty() || response.process_id.is_some() {
+        // A passive poll remains visible while the process has a live handle.
+        // An attempted input stays visible even if the child exits, but a
+        // recovery-only receipt must not echo an interaction that never ran.
+        if (!input_operation || input_dispatched)
+            && (!args.chars.is_empty() || response.process_id.is_some())
+        {
             let process_id = response.process_id.unwrap_or(args.session_id);
             let interaction = TerminalInteractionEvent {
                 call_id: response.event_call_id.clone(),

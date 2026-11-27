@@ -2061,7 +2061,7 @@ mod html_text {
             if lower[start..].starts_with("<!--") {
                 match lower[start + 4..].find("-->") {
                     Some(end) => position = start + 4 + end + 3,
-                    None => break,
+                    None => return out.finish(),
                 }
                 continue;
             }
@@ -2095,6 +2095,7 @@ mod html_text {
                 {
                     match closing_tag_end(&lower, position, name) {
                         Some(end) => position = end,
+                        None if matches!(name, "script" | "style") => return out.finish(),
                         None => unclosed.push(name),
                     }
                 }

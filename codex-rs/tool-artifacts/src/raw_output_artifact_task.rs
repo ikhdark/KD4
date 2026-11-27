@@ -265,7 +265,12 @@ impl RawOutputArtifactTask {
         if len == 0 { return false; }
         match &self.writer {
             None => self.failure.is_none(),
-            Some(writer) => writer.buffer().len().saturating_add(len) > writer.capacity(),
+            Some(writer) => {
+                // BufWriter writes directly when a chunk is at least its
+                // capacity, including an exact fit into an empty buffer.
+                len >= writer.capacity()
+                    || len > writer.capacity().saturating_sub(writer.buffer().len())
+            }
         }
     }
 

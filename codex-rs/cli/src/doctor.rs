@@ -800,6 +800,7 @@ where
     let start = Instant::now();
     tokio::pin!(future);
     let mut progress_interval = tokio::time::interval(SLOW_CHECK_PROGRESS_INTERVAL);
+    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             mut check = &mut future => {
@@ -3218,14 +3219,21 @@ fn standalone_release_cache_details(details: &mut Vec<String>) {
     let Some(releases_dir) = release_dir.parent() else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(&releases_dir) else {
-        return;
+    let count = match std::fs::read_dir(releases_dir) {
+        Ok(mut entries) => entries.try_fold(0usize, |count, entry| entry.map(|_| count + 1)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => Err(err),
     };
-    let release_count = entries.filter_map(Result::ok).count();
-    details.push(format!(
-        "standalone release cache: {release_count} entries in {}",
-        releases_dir.display()
-    ));
+    match count {
+        Ok(count) => details.push(format!(
+            "standalone release cache: {count} entries in {}",
+            releases_dir.display()
+        )),
+        Err(err) => details.push(format!(
+            "standalone release cache: incomplete scan of {} ({err})",
+            releases_dir.display()
+        )),
+    }
 }
 
 fn push_path_detail(details: &mut Vec<String>, label: &str, path: Option<&Path>) {

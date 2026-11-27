@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -33,11 +34,12 @@ struct SearchDiagnosticBudget {
 }
 
 impl SearchDiagnosticBudget {
+    fn has_capacity(&self) -> bool {
+        self.remaining > 0 && !self.cancellation.is_cancelled() && Instant::now() < self.deadline
+    }
+
     fn check(&mut self) -> io::Result<()> {
-        if self.remaining == 0
-            || Instant::now() >= self.deadline
-            || self.cancellation.is_cancelled()
-        {
+        if !self.has_capacity() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "search diagnostic budget exhausted",
@@ -282,66 +284,72 @@ fn missing_rg_path_advisory_with_budget(
 ) -> Option<String> {
     #[expect(
         clippy::expect_used,
-        reason = "the fixed missing-path regex is valid and exercised by advisory tests"
+        reason = "the fixed regex recognizes rg missing-path and Windows invalid-name errors"
     )]
-    static MISSING_PATH: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-        regex_lite::Regex::new(r"(?m)^rg: (.+?): [^\r\n]*\(os error [23]\)\r?$")
-            .expect("valid rg missing-path regex")
-    });
-    #[expect(
-        clippy::expect_used,
-        reason = "the fixed wildcard-path regex is valid and mirrors the missing-path regex"
-    )]
-    static WILDCARD_PATH: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-        regex_lite::Regex::new(r"(?m)^rg: (.+?): [^\r\n]*\(os error 123\)\r?$")
-            .expect("valid rg wildcard-path regex")
+    static PATH_ERROR: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(r"^rg: (.+?): [^\r\n]*\(os error ([23]|123)\)\r?$")
+            .expect("valid rg path-error regex")
     });
     let mut reported = Vec::<&str>::new();
-    for capture in MISSING_PATH.captures_iter(output) {
+    let mut seen = HashSet::new();
+    let mut wildcards = Vec::<&str>::new();
+    let mut lines = output.lines();
+    // Check between lines so even a long stretch without a match can be cancelled.
+    // Collect both error kinds before directory probes can use up the shared budget.
+    while budget.has_capacity() {
+        let Some(line) = lines.next() else { break };
+        if !line.starts_with("rg: ") {
+            continue;
+        }
         if budget.check().is_err() {
             break;
         }
+        let Some(capture) = PATH_ERROR.captures(line) else {
+            continue;
+        };
         let path = capture.get(1).map_or("", |path| path.as_str()).trim();
-        if !path.is_empty() && !reported.contains(&path) {
+        if capture.get(2).is_some_and(|code| code.as_str() == "123") {
+            // Windows reports a literal wildcard path as an invalid name.
+            if wildcards.len() < MAX_MISSING_PATH_NOTES
+                && path.contains(['*', '?'])
+                && !wildcards.contains(&path)
+            {
+                wildcards.push(path);
+            }
+        } else if !path.is_empty() && seen.insert(path) {
             reported.push(path);
         }
     }
-    let notes = reported
-        .into_iter()
-        .filter_map(|reported| {
-            let missing = cwd.join(reported);
-            // A script can search from another directory; never contradict it.
-            if missing.exists() {
-                return None;
-            }
-            let suggestions = nearest_existing_paths_with_budget(&missing, cwd, budget);
-            (!suggestions.is_empty()).then(|| {
-                let suggestions = suggestions
-                    .iter()
-                    .map(|path| format!("`{}`", display_suggestion(path, cwd)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("`{reported}` -> {suggestions}")
-            })
-        })
-        .take(MAX_MISSING_PATH_NOTES)
-        .collect::<Vec<_>>();
+    let mut notes = Vec::new();
+    for reported in reported {
+        if budget.check().is_err() {
+            break;
+        }
+        let missing = cwd.join(reported);
+        // A script can search from another directory; never contradict it.
+        if missing.exists() {
+            continue;
+        }
+        let suggestions = nearest_existing_paths_with_budget(&missing, cwd, budget);
+        if suggestions.is_empty() {
+            continue;
+        }
+        let suggestions = suggestions
+            .iter()
+            .map(|path| format!("`{}`", display_suggestion(path, cwd)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        notes.push(format!("`{reported}` -> {suggestions}"));
+        if notes.len() == MAX_MISSING_PATH_NOTES {
+            break;
+        }
+    }
     let missing_hint = (!notes.is_empty()).then(|| {
         format!(
             "Hint: `rg` could not open these search paths; possible existing paths (not verified replacements) are {}. The other paths still ran, and a path error is not evidence of no matches.",
             notes.join("; ")
         )
     });
-    // Windows reports a literal wildcard path operand as an invalid name
-    // (os error 123) rather than a missing path, so it needs its own hint.
-    let mut wildcards = Vec::<&str>::new();
-    for capture in WILDCARD_PATH.captures_iter(output) {
-        let path = capture.get(1).map_or("", |path| path.as_str()).trim();
-        if path.contains(['*', '?']) && !wildcards.contains(&path) {
-            wildcards.push(path);
-        }
-    }
-    wildcards.truncate(MAX_MISSING_PATH_NOTES);
     let wildcard_hint = (!wildcards.is_empty()).then(|| {
         format!(
             "Hint: `rg` does not expand wildcard path operands, and PowerShell or cmd leave them literal for a native command, so {} reached it as a literal path (os error 123). Search the parent directory and pass the wildcard through `--glob`, for example `rg PATTERN src --glob \"gate*\"`. The other paths still ran, and a path error is not evidence of no matches.",

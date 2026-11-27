@@ -27,16 +27,20 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
     loop {
         match file.try_lock() {
             Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "installation ID lock contention exceeded 10 seconds",
-                    ));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        }
+        let now = tokio::time::Instant::now();
+        if now < deadline {
+            let retry_at = now + std::time::Duration::from_millis(50);
+            tokio::time::sleep_until(retry_at.min(deadline)).await;
+        }
+        // A scheduled wake can arrive after the deadline. Check before retrying.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "installation ID lock contention exceeded 10 seconds",
+            ));
         }
     }
     tokio::task::spawn_blocking(move || {

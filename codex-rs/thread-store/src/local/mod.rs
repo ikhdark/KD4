@@ -172,21 +172,39 @@ impl LocalThreadStore {
 
     /// Bound to a private opt-in marker, not enabled for other Codex homes.
     pub async fn run_archive_retention(&self) -> ThreadStoreResult<()> {
-        if codex_rollout::home_retention_enabled(&self.config.codex_home) {
-            let tmp = self.config.codex_home.join(".tmp");
-            tokio::fs::create_dir_all(&tmp).await.map_err(delete_thread::delete_recovery_error)?;
-            let guard = std::fs::File::options().read(true).write(true).create(true).truncate(false)
-                .open(tmp.join("archive-retention.worker.lock")).map_err(delete_thread::delete_recovery_error)?;
-            match guard.try_lock() {
-                Ok(()) => (),
-                Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
-                Err(err) => return Err(delete_thread::delete_recovery_error(err)),
+        let home = self.config.codex_home.clone();
+        let guard = tokio::task::spawn_blocking(move || {
+            if !codex_rollout::home_retention_enabled(&home) {
+                return Ok(None);
             }
-            let maintenance = Self::new(self.config.clone(), self.state_db.clone());
-            delete_thread::expire_archives(&maintenance, chrono::Utc::now().timestamp()-7*86400).await?;
-            codex_rollout::collect_home_payloads(&self.config.codex_home).await
-                .map_err(|err| ThreadStoreError::Internal { message: err.to_string() })?;
-        }
+            let tmp = home.join(".tmp");
+            std::fs::create_dir_all(&tmp)?;
+            let guard = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(tmp.join("archive-retention.worker.lock"))?;
+            match guard.try_lock() {
+                Ok(()) => Ok(Some(guard)),
+                Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+                Err(err) => Err(std::io::Error::from(err)),
+            }
+        })
+        .await
+        .map_err(delete_thread::delete_recovery_error)?
+        .map_err(delete_thread::delete_recovery_error)?;
+        let Some(_guard) = guard else {
+            return Ok(());
+        };
+        let maintenance = Self::new(self.config.clone(), self.state_db.clone());
+        delete_thread::expire_archives(&maintenance, chrono::Utc::now().timestamp() - 7 * 86400)
+            .await?;
+        codex_rollout::collect_home_payloads(&self.config.codex_home)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: err.to_string(),
+            })?;
         Ok(())
     }
 

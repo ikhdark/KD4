@@ -3444,24 +3444,46 @@ impl TurnTimingState {
         call_id: &str,
         timing: ToolDispatchTimingSnapshot,
     ) {
+        detail_archive::write(self.reserve_background_tool_process_exit(call_id, timing));
+    }
+
+    /// Record the exit at the observation site, then await any overflow archive write
+    /// without blocking the async process watcher.
+    pub async fn record_background_tool_process_exit_async(
+        &self,
+        call_id: &str,
+        timing: ToolDispatchTimingSnapshot,
+    ) {
+        if let Some(record) = self.reserve_background_tool_process_exit(call_id, timing)
+            && let Err(error) = tokio::task::spawn_blocking(move || record.write()).await
+        {
+            tracing::warn!(%error, "background process exit timing archive worker failed");
+        }
+    }
+
+    fn reserve_background_tool_process_exit(
+        &self,
+        call_id: &str,
+        timing: ToolDispatchTimingSnapshot,
+    ) -> Option<detail_archive::PendingRecord> {
         if timing.exec_spawn_to_exit_ms.is_none()
             && lifecycle_boundary_at(&timing.lifecycle_events, ToolLifecycleBoundary::ProcessExit)
                 .is_none()
         {
-            return;
+            return None;
         }
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         if state.completed_snapshot.is_some() {
             state.invalid_transition();
-            return;
+            return None;
         }
         if let Some(tool_call) = state.tool_calls.iter_mut().find(|tool_call| {
             tool_call.call_id == call_id && tool_call.execution_id == timing.execution_id
         }) {
             record_tool_process_exit(tool_call, &timing);
-            return;
+            return None;
         }
         let force = state.background_tool_process_exits.len() >= MAX_TOOL_CALL_TIMINGS;
         let record = state.archive_record(serde_json::json!({
@@ -3474,8 +3496,7 @@ impl TurnTimingState {
                 .background_tool_process_exits
                 .insert((call_id.to_string(), timing.execution_id.clone()), timing);
         }
-        drop(state);
-        detail_archive::write(record);
+        record
     }
 
     pub fn record_initial_plan_generation(&self) {

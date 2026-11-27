@@ -103,6 +103,10 @@ const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_SERVER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_GRACEFUL_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+// Match the server transport's queue depth, and leave room for one notification
+// at the largest existing per-message limit (64 MiB for WebSocket, 32 MiB for stdio).
+const MAX_PENDING_NOTIFICATIONS: usize = 128;
+const MAX_PENDING_NOTIFICATION_WIRE_BYTES: usize = 64 << 20;
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 const OTEL_SERVICE_NAME: &str = "codex-app-server-test-client";
 const TRACE_DISABLED_MESSAGE: &str =
@@ -1218,7 +1222,8 @@ struct CodexClient {
     shutdown_grace: Duration,
     operation_deadline: Option<Instant>,
     wire_dump: bool,
-    pending_notifications: VecDeque<JSONRPCNotification>,
+    pending_notifications: VecDeque<(JSONRPCNotification, usize)>,
+    pending_notification_wire_bytes: usize,
     command_approval_count: usize,
 }
 
@@ -1288,6 +1293,7 @@ impl CodexClient {
             operation_deadline: None,
             wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
             pending_notifications: VecDeque::new(),
+            pending_notification_wire_bytes: 0,
             command_approval_count: 0,
         }
     }
@@ -1711,7 +1717,7 @@ impl CodexClient {
         T: DeserializeOwned,
     {
         loop {
-            let message = self.read_jsonrpc_message()?;
+            let (message, wire_bytes) = self.read_jsonrpc_message()?;
 
             match message {
                 JSONRPCMessage::Response(JSONRPCResponse { id, result }) => {
@@ -1726,7 +1732,21 @@ impl CodexClient {
                     }
                 }
                 JSONRPCMessage::Notification(notification) => {
-                    self.pending_notifications.push_back(notification);
+                    if self.pending_notifications.len() >= MAX_PENDING_NOTIFICATIONS {
+                        bail!(
+                            "{method}: pending notification limit of {MAX_PENDING_NOTIFICATIONS} messages exceeded"
+                        );
+                    }
+                    if wire_bytes
+                        > MAX_PENDING_NOTIFICATION_WIRE_BYTES - self.pending_notification_wire_bytes
+                    {
+                        bail!(
+                            "{method}: pending notification limit of {MAX_PENDING_NOTIFICATION_WIRE_BYTES} wire bytes exceeded"
+                        );
+                    }
+                    self.pending_notifications
+                        .push_back((notification, wire_bytes));
+                    self.pending_notification_wire_bytes += wire_bytes;
                 }
                 JSONRPCMessage::Request(request) => {
                     self.handle_server_request(request)?;
@@ -1737,12 +1757,13 @@ impl CodexClient {
 
     fn next_notification(&mut self) -> Result<JSONRPCNotification> {
         self.check_operation_deadline()?;
-        if let Some(notification) = self.pending_notifications.pop_front() {
+        if let Some((notification, wire_bytes)) = self.pending_notifications.pop_front() {
+            self.pending_notification_wire_bytes -= wire_bytes;
             return Ok(notification);
         }
 
         loop {
-            let message = self.read_jsonrpc_message()?;
+            let (message, _) = self.read_jsonrpc_message()?;
 
             match message {
                 JSONRPCMessage::Notification(notification) => return Ok(notification),
@@ -1757,7 +1778,7 @@ impl CodexClient {
         }
     }
 
-    fn read_jsonrpc_message(&mut self) -> Result<JSONRPCMessage> {
+    fn read_jsonrpc_message(&mut self) -> Result<(JSONRPCMessage, usize)> {
         loop {
             let raw = self.read_payload()?;
             let trimmed = raw.trim();
@@ -1772,7 +1793,7 @@ impl CodexClient {
             }
             let message: JSONRPCMessage = serde_json::from_value(parsed)
                 .context("response was not a valid JSON-RPC message")?;
-            return Ok(message);
+            return Ok((message, trimmed.len()));
         }
     }
 

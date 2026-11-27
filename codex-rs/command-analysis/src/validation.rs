@@ -243,8 +243,20 @@ fn parse_repository_runners(bytes: &[u8]) -> Runners {
 }
 
 fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<CachedRepositoryRunners> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    load_repository_runner_batch(root, oid, deadline, true)
+}
+
+fn load_repository_runner_batch(
+    root: &std::path::Path,
+    oid: &str,
+    deadline: std::time::Instant,
+    read_justfile_body: bool,
+) -> Option<CachedRepositoryRunners> {
     // Batch mode distinguishes immutable absence (a successful "missing"
-    // response) from execution failures, without a second Git invocation.
+    // response) from execution failures, without a second Git invocation on
+    // the ordinary path.
+    let justfile_command = if read_justfile_body { "contents" } else { "info" };
     let object = format!("{oid}:.codex/test-runners.json");
     let justfile_object = format!("{oid}:justfile");
     let mut command = std::process::Command::new(codex_git_utils::git_executable());
@@ -255,11 +267,14 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<CachedRe
         .args(["cat-file", "--batch-command"])
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0");
-    let (success, bytes) = bounded_runner_lookup(
+    let (bytes, truncated) = match bounded_runner_lookup(
         command,
-        format!("info {oid}\ncontents {object}\ncontents {justfile_object}\n").as_bytes(),
-        std::time::Duration::from_secs(5),
-    )?;
+        format!("info {oid}\ncontents {object}\n{justfile_command} {justfile_object}\n").as_bytes(),
+        deadline,
+    )? {
+        RunnerLookupOutput::Complete(bytes) => (bytes, false),
+        RunnerLookupOutput::Truncated(bytes) => (bytes, true),
+    };
     // First prove the commit exists. A missing/corrupt commit object is a
     // retryable lookup failure, not proof that its optional declaration is absent.
     let newline = bytes.iter().position(|byte| *byte == b'\n')?;
@@ -275,7 +290,7 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<CachedRe
     let newline = bytes.iter().position(|byte| *byte == b'\n')?;
     let header = std::str::from_utf8(&bytes[..newline]).ok()?;
     if header == format!("{object} missing") {
-        return success.then(CachedRepositoryRunners::default);
+        return (!truncated).then(CachedRepositoryRunners::default);
     }
     let fields = header.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 3 || !fields[0].bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -287,8 +302,14 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<CachedRe
     if size > MAX_RUNNER_DECLARATION_BYTES {
         return Some(CachedRepositoryRunners::default());
     }
-    if !success {
-        return None;
+    if truncated {
+        // A capped read cannot authenticate a runner declaration. Re-read it
+        // from the same commit, asking Git for only the Justfile header.
+        return if read_justfile_body {
+            load_repository_runner_batch(root, oid, deadline, false)
+        } else {
+            None
+        };
     }
     if fields[1] != "blob" {
         return Some(CachedRepositoryRunners::default());
@@ -307,12 +328,24 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<CachedRe
         let fields = header.split_whitespace().collect::<Vec<_>>();
         if fields.len() != 3 || fields[1] != "blob" { return None; }
         let size = fields[2].parse::<usize>().ok()?;
-        if size > MAX_RUNNER_DECLARATION_BYTES { return Some(CachedRepositoryRunners { runners, justfile: None }); }
         let body = bytes.get(newline + 1..)?;
-        if body.len() != size + 1 || body.last() != Some(&b'\n') { return None; }
+        if !read_justfile_body && !body.is_empty() {
+            return None;
+        }
+        if size > MAX_RUNNER_DECLARATION_BYTES {
+            return Some(CachedRepositoryRunners { runners, justfile: None });
+        }
+        if !read_justfile_body || body.len() != size + 1 || body.last() != Some(&b'\n') {
+            return None;
+        }
         std::str::from_utf8(&body[..size]).ok().map(std::sync::Arc::from)
     };
     Some(CachedRepositoryRunners { runners, justfile })
+}
+
+enum RunnerLookupOutput {
+    Complete(Vec<u8>),
+    Truncated(Vec<u8>),
 }
 
 /// Runs only Git plumbing (no hooks, filters or shell). The owning blocking
@@ -320,8 +353,8 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<CachedRe
 fn bounded_runner_lookup(
     mut command: std::process::Command,
     input: &[u8],
-    timeout: std::time::Duration,
-) -> Option<(bool, Vec<u8>)> {
+    deadline: std::time::Instant,
+) -> Option<RunnerLookupOutput> {
     use std::io::Read;
     use std::io::Write;
     use std::process::Stdio;
@@ -332,8 +365,10 @@ fn bounded_runner_lookup(
             let _ = self.0.wait();
         }
     }
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
     std::thread::scope(|scope| {
-        let deadline = std::time::Instant::now() + timeout;
         let mut child = ChildGuard(
             command
                 .stdin(Stdio::piped())
@@ -360,11 +395,11 @@ fn bounded_runner_lookup(
             .ok()?
             .ok()?;
         if bytes.len() > limit {
-            return Some((false, bytes));
+            return Some(RunnerLookupOutput::Truncated(bytes));
         }
         loop {
             if let Some(status) = child.0.try_wait().ok()? {
-                return Some((status.success(), bytes));
+                return status.success().then_some(RunnerLookupOutput::Complete(bytes));
             }
             if std::time::Instant::now() >= deadline {
                 return None;
@@ -408,11 +443,11 @@ fn repository_head_oid(root: &std::path::Path) -> Option<String> {
             .arg("-C")
             .arg(root.as_path())
             .args(["rev-parse", "--verify", "HEAD"]);
-        let (success, bytes) =
-            bounded_runner_lookup(command, &[], std::time::Duration::from_secs(5))?;
-        if !success {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let RunnerLookupOutput::Complete(bytes) = bounded_runner_lookup(command, &[], deadline)?
+        else {
             return None;
-        }
+        };
         value = String::from_utf8(bytes).ok()?;
     }
     None

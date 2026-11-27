@@ -5,7 +5,6 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -377,6 +376,8 @@ enum ClientOperationError {
 
 /// Upper bound for the liveness ping that gates a call after a timeout.
 const LIVENESS_PROBE_MAX: Duration = Duration::from_secs(10);
+// The low bit records suspicion; the other bits track the timeout generation.
+const LIVENESS_SUSPECT: u64 = 1;
 
 #[derive(Debug, thiserror::Error)]
 #[error("timed out handshaking with MCP server after {duration:?}")]
@@ -664,7 +665,7 @@ pub struct RmcpClient {
     session_recovery: StdMutex<Option<RecoveryObservation>>,
     session_generation: AtomicU64,
     elicitation_pause_state: ElicitationPauseRegistry,
-    liveness_suspect: AtomicBool,
+    liveness_state: AtomicU64,
 }
 
 impl RmcpClient {
@@ -699,7 +700,7 @@ impl RmcpClient {
             session_recovery: StdMutex::new(None),
             session_generation: AtomicU64::new(0),
             elicitation_pause_state: ElicitationPauseRegistry::default(),
-            liveness_suspect: AtomicBool::new(false),
+            liveness_state: AtomicU64::new(0),
         })
     }
 
@@ -742,7 +743,7 @@ impl RmcpClient {
             session_recovery: StdMutex::new(None),
             session_generation: AtomicU64::new(0),
             elicitation_pause_state: ElicitationPauseRegistry::default(),
-            liveness_suspect: AtomicBool::new(false),
+            liveness_state: AtomicU64::new(0),
         })
     }
 
@@ -1153,7 +1154,8 @@ impl RmcpClient {
     /// sent. A server still busy past the probe is refused too; the caller
     /// may retry once it answers.
     async fn confirm_liveness_after_timeout(&self, call_timeout: Option<Duration>) -> Result<()> {
-        if !self.liveness_suspect.load(Ordering::Acquire) {
+        let probed_state = self.liveness_state.load(Ordering::Acquire);
+        if probed_state & LIVENESS_SUSPECT == 0 {
             return Ok(());
         }
         let probe = call_timeout.map_or(LIVENESS_PROBE_MAX, |timeout| {
@@ -1181,7 +1183,14 @@ impl RmcpClient {
                 Err(ClientOperationError::Unresponsive { probe }.into())
             }
             _ => {
-                self.liveness_suspect.store(false, Ordering::Release);
+                // A later timeout must still gate the next call, even if
+                // this probe got an answer for the current caller.
+                let _ = self.liveness_state.compare_exchange(
+                    probed_state,
+                    probed_state & !LIVENESS_SUSPECT,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                );
                 Ok(())
             }
         }
@@ -1738,7 +1747,11 @@ impl RmcpClient {
             {
                 Ok(result) => result,
                 Err(()) => {
-                    self.liveness_suspect.store(true, Ordering::Release);
+                    let _ = self.liveness_state.try_update(
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                        |state| Some(state.wrapping_add(2) | LIVENESS_SUSPECT),
+                    );
                     let tracker = tracker.clone();
                     tokio::spawn(async move {
                         tracker.cancel_current("request timeout").await;

@@ -4216,9 +4216,8 @@ impl Session {
     }
 
 
-    /// Match and order native input before waking its consumer. The existing
-    /// history gate orders it against steering, compaction, rollback and plan
-    /// publication; the in-flight owner survives cancellation of the notifier.
+    /// Match native input before returning to control dispatch. Its ordered
+    /// append and delivery belong to a retained owner, not to the dispatcher.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -4229,77 +4228,106 @@ impl Session {
         call_id: Option<&str>,
         response: RequestUserInputResponse,
     ) {
-        let session = Arc::clone(self);
-        let sub_id = sub_id.to_owned();
-        let call_id = call_id.map(str::to_owned);
-        let in_flight = self.retain_tool_dispatch_commit();
-        let result = tokio::spawn(async move {
-            let _in_flight = in_flight;
-            let _commit = session.durable_history_commit_gate.acquire().await
-                .map_err(|_| std::io::Error::other("history commit gate is closed"))?;
-            let entry = {
-                let active = session.active_turn.lock().await;
-                match active.as_ref() {
-                    Some(at) => {
-                        let active_id = at.terminal.as_ref().map(|terminal| terminal.turn_id())
-                            .or_else(|| at.task.as_ref().map(|task| task.turn_context.sub_id.as_str()));
-                        if active_id != Some(sub_id.as_str())
-                            || at.terminal.as_ref().is_some_and(|terminal|
-                                terminal.interrupt_pending() || terminal.interaction_released())
-                            || at.task.as_ref().is_some_and(|task| task.cancellation_token.is_cancelled())
-                        {
-                            return Ok(());
-                        }
-                        let mut ts = at.turn_state.lock().await;
-                        ts.remove_matching_user_input(&sub_id, call_id.as_deref())
-                            .map(|pending| (pending, at.terminal.clone(),
-                                at.task.as_ref().map(|task| Arc::clone(&task.turn_context))))
-                    }
-                    None => None,
-                }
-            };
-            let Some(((call_id, args, tx_response), terminal, turn_context)) = entry else {
+        let ((call_id, args, tx_response), terminal, turn_context, in_flight) = {
+            let active = self.active_turn.lock().await;
+            let Some(at) = active.as_ref() else {
                 warn!("No pending user input found for sub_id: {sub_id}");
-                return Ok(());
+                return;
             };
-            if tx_response.is_closed() {
-                return Ok(());
+            // Terminalization takes the task under this same lock. A newly
+            // admitted answer must enter its owned commit prefix before then.
+            let Some(task) = at.task.as_ref() else {
+                return;
+            };
+            let active_id = at.terminal.as_ref().map_or(
+                task.turn_context.sub_id.as_str(),
+                |terminal| terminal.turn_id(),
+            );
+            if active_id != sub_id
+                || at.terminal.as_ref().is_some_and(|terminal| {
+                    terminal.interrupt_pending() || terminal.interaction_released()
+                })
+                || task.cancellation_token.is_cancelled()
+            {
+                return;
             }
-            if response.interrupted {
-                // Sampling admission must never be acquired while holding the
-                // history gate: a sampling owner can itself be recording input.
-                drop(_commit);
+            let mut ts = at.turn_state.lock().await;
+            let Some(pending) = ts.remove_matching_user_input(sub_id, call_id) else {
+                warn!("No pending user input found for sub_id: {sub_id}");
+                return;
+            };
+            if pending.2.is_closed() {
+                return;
+            }
+            (
+                pending,
+                at.terminal.clone(),
+                Arc::clone(&task.turn_context),
+                self.retain_tool_dispatch_commit(),
+            )
+        };
+        if response.interrupted {
+            // The interrupted reply adds no native decision. Preserve the
+            // retained, sampling-fenced delivery without taking the history gate.
+            let delivery = tokio::spawn(async move {
+                let _in_flight = in_flight;
                 if let Some(terminal) = terminal {
-                    terminal.mark_interrupt_pending_if(|| tx_response.send(response).is_ok()).await;
+                    terminal
+                        .mark_interrupt_pending_if(|| tx_response.send(response).is_ok())
+                        .await;
                 } else {
                     tx_response.send(response).ok();
                 }
-                return Ok(());
+            });
+            if let Err(error) = delivery.await {
+                warn!("Interrupted user input delivery owner failed: {error}");
             }
-            if let Some(item) = user_decision::AcceptedUserDecision::snapshot(
-                &sub_id, &call_id, &args, &response,
-            ).map_err(std::io::Error::other)? {
-                let turn_context = turn_context.ok_or_else(||
-                    std::io::Error::other("native decision has no originating turn context"))?;
-                // Input was admitted with a live matched waiter. Later cancellation
-                // does not erase that accepted user decision, just as with chat input.
-                session.persist_rollout_items_ordered(&[RolloutItem::ResponseItem(item.clone())]).await?;
-                session.state.lock().await.record_items(
-                    std::iter::once(&item), turn_context.model_info.truncation_policy.into(),
-                );
-                // As with chat input, canonical append acceptance is sufficient
-                // for live delivery. The existing terminal barrier owns artifact,
-                // rollout and metadata durability; do not make an accepted answer
-                // depend on another flush of unrelated pending tool artifacts.
-            }
-            tx_response.send(response).ok();
-            Ok::<(), std::io::Error>(())
-        }).await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!("Could not persist native user decision: {error}"),
-            Err(error) => warn!("Native user decision owner failed: {error}"),
+            return;
         }
+
+        let session = Arc::clone(self);
+        let sub_id = sub_id.to_owned();
+        let (queued, admission) = oneshot::channel();
+        tokio::spawn(async move {
+            let _in_flight = in_flight;
+            let result = async {
+                let mut gate = std::pin::pin!(session.durable_history_commit_gate.acquire());
+                let first_poll = futures::poll!(gate.as_mut());
+                // Register in semaphore order before a later submission can
+                // start a history operation. Do not wait for the permit or I/O
+                // on the submission loop.
+                let _ = queued.send(());
+                let _commit = match first_poll {
+                    std::task::Poll::Ready(result) => result,
+                    std::task::Poll::Pending => gate.await,
+                }
+                .map_err(|_| std::io::Error::other("history commit gate is closed"))?;
+                if let Some(item) = user_decision::AcceptedUserDecision::snapshot(
+                    &sub_id, &call_id, &args, &response,
+                )
+                .map_err(std::io::Error::other)?
+                {
+                    // Later cancellation does not erase this accepted input.
+                    session
+                        .persist_rollout_items_ordered(&[RolloutItem::ResponseItem(item.clone())])
+                        .await?;
+                    session.state.lock().await.record_items(
+                        std::iter::once(&item),
+                        turn_context.model_info.truncation_policy.into(),
+                    );
+                    // The terminal barrier still owns stable-storage durability.
+                }
+                Ok::<(), std::io::Error>(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    tx_response.send(response).ok();
+                }
+                Err(error) => warn!("Could not persist native user decision: {error}"),
+            }
+        });
+        let _ = admission.await;
     }
 
     #[expect(
@@ -5113,19 +5141,36 @@ impl Session {
             .await
             .map_err(std::io::Error::other)?;
 
+        // Normalization can synthesize an output for any search with an ID.
+        // Only a client-owned search can have an unavailable local delivery.
+        let client_search_ids = current_turn_items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::ToolSearchCall {
+                    call_id: Some(call_id),
+                    execution,
+                    ..
+                } if execution == "client" => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
         // A synthetic terminal output satisfies provider call/output pairing,
-        // not result availability. Reuse the host receipt recognized on resume,
-        // adjacent to each output in the same durable ordered batch; never infer
-        // unknown effects from tool text or synthetic response-item IDs.
+        // not result availability. Reuse the host receipt recognized on resume
+        // in the same durable ordered batch; never infer unknown effects from
+        // tool text or synthetic response-item IDs.
         let mut missing_items = Vec::with_capacity(output_count * 2);
         for output in missing_outputs {
             let receipt = match &output {
                 ResponseItem::FunctionCallOutput { call_id, .. }
-                | ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                    Some(crate::tools::registry::model_delivery_unavailable_receipt(call_id))
-                }
+                | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id),
+                ResponseItem::ToolSearchOutput {
+                    call_id: Some(call_id),
+                    ..
+                } if client_search_ids.contains(call_id.as_str()) => Some(call_id),
                 _ => None,
-            };
+            }
+            .map(|call_id| crate::tools::registry::model_delivery_unavailable_receipt(call_id));
             missing_items.push(output);
             missing_items.extend(receipt);
         }

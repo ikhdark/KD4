@@ -51,15 +51,51 @@ pub(super) fn record_origins<T: Clone>(
 }
 
 pub fn version_for_toml(value: &TomlValue) -> String {
-    let json = serde_json::to_value(value).unwrap_or(JsonValue::Null);
-    version_for_json(&json)
+    let mut json = serde_json::to_value(value).unwrap_or(JsonValue::Null);
+    let mut has_non_finite = false;
+    encode_non_finite_floats(value, &mut json, &mut has_non_finite);
+    let domain: &[u8] = if has_non_finite {
+        b"\0toml-nonfinite-v1\0"
+    } else {
+        b""
+    };
+    version_for_json_in_domain(&json, domain)
+}
+
+fn encode_non_finite_floats(toml: &TomlValue, json: &mut JsonValue, found: &mut bool) {
+    match (toml, json) {
+        (TomlValue::Float(value), json) if !value.is_finite() => {
+            // TOML has no null, so this tag cannot appear in ordinary TOML.
+            // Keep the bits to distinguish infinities and signed NaNs.
+            *json = JsonValue::Array(vec![JsonValue::Null, value.to_bits().into()]);
+            *found = true;
+        }
+        (TomlValue::Array(values), JsonValue::Array(items)) => {
+            for (value, item) in values.iter().zip(items) {
+                encode_non_finite_floats(value, item, found);
+            }
+        }
+        (TomlValue::Table(table), JsonValue::Object(object)) => {
+            for (key, value) in table {
+                if let Some(item) = object.get_mut(key) {
+                    encode_non_finite_floats(value, item, found);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Canonical content identity for JSON inputs, including null and nested objects.
 pub fn version_for_json(value: &JsonValue) -> String {
+    version_for_json_in_domain(value, b"")
+}
+
+fn version_for_json_in_domain(value: &JsonValue, domain: &[u8]) -> String {
     let canonical = canonicalize(value);
     let serialized = serde_json::to_vec(&canonical).unwrap_or_default();
     let mut hasher = Sha256::new();
+    hasher.update(domain);
     hasher.update(serialized);
     let hash = hex::encode(hasher.finalize());
     format!("sha256:{hash}")

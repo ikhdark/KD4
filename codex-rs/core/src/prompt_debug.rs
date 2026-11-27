@@ -41,7 +41,13 @@ pub async fn build_prompt_input(
     let local_runtime_paths =
         ExecServerRuntimePaths::from_optional_path(config.codex_self_exe.clone())?;
 
-    let thread_store = thread_store_from_config(&config, state_db.clone());
+    // The synchronous constructor reads the local retention policy.
+    let (config, state_db, thread_store) = tokio::task::spawn_blocking(move || {
+        let thread_store = thread_store_from_config(&config, state_db.clone());
+        (config, state_db, thread_store)
+    })
+    .await
+    .map_err(|err| CodexErr::Fatal(format!("prompt debug store construction failed: {err}")))?;
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let environment_manager = Arc::new(
         EnvironmentManager::from_codex_home_with_http_client_factory(config.codex_home.clone(), Some(local_runtime_paths), config.http_client_factory())

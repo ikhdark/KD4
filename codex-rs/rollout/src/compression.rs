@@ -995,21 +995,15 @@ pub(crate) fn decode_rollout_line(mut line: Vec<u8>) -> String {
 
 /// Blocking counterpart of [`existing_rollout_path`] for scans already off the executor.
 pub(crate) fn existing_rollout_path_blocking(path: &Path) -> Option<PathBuf> {
-    let plain_path = path::plain_rollout_path(path);
-    if std::fs::metadata(&plain_path).is_ok_and(|metadata| metadata.is_file()) {
-        return Some(plain_path);
-    }
-    let compressed_path = path::compressed_rollout_path(&plain_path);
-    std::fs::metadata(&compressed_path)
-        .is_ok_and(|metadata| metadata.is_file())
-        .then_some(compressed_path)
+    path::try_existing_rollout_path_blocking(path).ok().flatten()
 }
 
 /// Blocking open with the same bounded representation-transition retry as
 /// [`open_rollout_line_reader`].
 pub(crate) fn open_rollout_file_with_retry(path: &Path) -> io::Result<(PathBuf, File)> {
     let open_once = || {
-        let physical = existing_rollout_path_blocking(path).unwrap_or_else(|| path.to_path_buf());
+        let physical = path::try_existing_rollout_path_blocking(path)?
+            .unwrap_or_else(|| path.to_path_buf());
         File::open(&physical).map(|file| (physical, file))
     };
     for _ in 0..MAX_OPEN_RETRIES {
@@ -1886,19 +1880,42 @@ mod path {
 
     pub(super) async fn try_existing_rollout_path(path: &Path) -> io::Result<Option<PathBuf>> {
         let plain_path = plain_rollout_path(path);
-        let plain_error = match tokio::fs::metadata(&plain_path).await {
-            Ok(metadata) if metadata.is_file() => return Ok(Some(plain_path)),
-            Ok(_) => None,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => Some(error),
+        let plain_error = match probe_file(tokio::fs::metadata(&plain_path).await) {
+            Ok(true) => return Ok(Some(plain_path)),
+            result => result.err(),
         };
         let compressed_path = compressed_rollout_path(&plain_path);
-        match tokio::fs::metadata(&compressed_path).await {
-            Ok(metadata) if metadata.is_file() => Ok(Some(compressed_path)),
-            Ok(_) => plain_error.map_or(Ok(None), Err),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                plain_error.map_or(Ok(None), Err)
-            }
+        let compressed_probe = probe_file(tokio::fs::metadata(&compressed_path).await);
+        select_compressed_path(compressed_path, compressed_probe, plain_error)
+    }
+
+    pub(super) fn try_existing_rollout_path_blocking(path: &Path) -> io::Result<Option<PathBuf>> {
+        let plain_path = plain_rollout_path(path);
+        let plain_error = match probe_file(std::fs::metadata(&plain_path)) {
+            Ok(true) => return Ok(Some(plain_path)),
+            result => result.err(),
+        };
+        let compressed_path = compressed_rollout_path(&plain_path);
+        let compressed_probe = probe_file(std::fs::metadata(&compressed_path));
+        select_compressed_path(compressed_path, compressed_probe, plain_error)
+    }
+
+    fn probe_file(metadata: io::Result<std::fs::Metadata>) -> io::Result<bool> {
+        match metadata {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn select_compressed_path(
+        compressed_path: PathBuf,
+        compressed_probe: io::Result<bool>,
+        plain_error: Option<io::Error>,
+    ) -> io::Result<Option<PathBuf>> {
+        match compressed_probe {
+            Ok(true) => Ok(Some(compressed_path)),
+            Ok(false) => plain_error.map_or(Ok(None), Err),
             Err(error) => Err(plain_error.unwrap_or(error)),
         }
     }
@@ -1932,8 +1949,8 @@ mod reader {
     use super::path;
 
     pub(super) async fn open_once(path: &Path) -> io::Result<RolloutLineReader> {
-        let path = path::existing_rollout_path(path)
-            .await
+        let path = path::try_existing_rollout_path(path)
+            .await?
             .unwrap_or_else(|| path.to_path_buf());
         let source_path = path.clone();
         if path::is_compressed_rollout_path(path.as_path()) {

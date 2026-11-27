@@ -12,7 +12,11 @@ pub fn home_retention_enabled(home: &Path) -> bool {
 }
 
 pub async fn collect_home_payloads(home: &Path) -> io::Result<usize> {
-    if !home_retention_enabled(home) {
+    let policy_home = home.to_path_buf();
+    if !tokio::task::spawn_blocking(move || home_retention_enabled(&policy_home))
+        .await
+        .map_err(io::Error::other)?
+    {
         return Ok(0);
     }
     let Some(moves) = crate::try_lock_rollout_moves(home).await? else {
@@ -21,9 +25,10 @@ pub async fn collect_home_payloads(home: &Path) -> io::Result<usize> {
     if crate::has_recoverable_delete_staging(home).await? {
         return Ok(0);
     }
-    let home = fs::canonicalize(home)?;
+    let home = home.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let _moves = moves;
+        let home = fs::canonicalize(home)?;
         let dir = home.join(super::PAYLOAD_DIRECTORY);
         if !dir.try_exists()? {
             return Ok(0);

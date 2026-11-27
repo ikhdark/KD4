@@ -139,8 +139,8 @@ pub fn generate_ts_with_options(
     }
 
     if options.generate_indices {
-        generate_index_ts(out_dir)?;
-        generate_index_ts(&v2_out_dir)?;
+        generate_index_ts(out_dir, Some(&v2_out_dir))?;
+        generate_index_ts(&v2_out_dir, None)?;
     }
 
     // Ensure our header is present on all TS files (root + subdirs like v2/).

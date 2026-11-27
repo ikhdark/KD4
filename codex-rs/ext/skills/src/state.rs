@@ -199,15 +199,11 @@ impl SkillsThreadState {
     ) -> Arc<SkillCatalog> {
         let cache = self.orchestrator_cache(query.mcp_resources.as_deref());
         let mut continued = cache.continued_catalog.lock().await;
-        let catalog = continued.get_or_insert_with(|| {
-            shared_catalog_or_warning(
-                cache
-                    .catalog
-                    .get()
-                    .cloned()
-                    .unwrap_or_else(|| Ok(Arc::new(SkillCatalog::default()))),
-            )
-        });
+        let Some(base) = cache.catalog.get() else {
+            // A continuation cannot initialize discovery for a new generation.
+            return Arc::new(SkillCatalog::default());
+        };
+        let catalog = continued.get_or_insert_with(|| shared_catalog_or_warning(base.clone()));
         if catalog.entries.len() != expected_len {
             return catalog.clone();
         }

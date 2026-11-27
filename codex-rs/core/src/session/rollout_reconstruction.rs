@@ -68,6 +68,14 @@ pub(super) fn unsettled_tool_recovery_entries(
 ) -> impl ExactSizeIterator<Item = serde_json::Value> + '_ {
     use sha2::Digest;
     use std::collections::BTreeMap;
+
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+    enum CallKind {
+        Function,
+        Custom,
+        ClientSearch,
+    }
+
     let mut pending = BTreeMap::new();
     let mut unmatched = std::collections::HashMap::new();
     let mut turn = "";
@@ -99,64 +107,90 @@ pub(super) fn unsettled_tool_recovery_entries(
             RolloutItem::ResponseItem(response) => response,
             _ => continue,
         };
-        match response {
-            ResponseItem::FunctionCall { call_id, .. }
-            | ResponseItem::CustomToolCall { call_id, .. } => {
-                // Match borrowed invocation identities first. Settled calls
-                // never pay argument decoding, hashing or redaction costs.
-                let kind = matches!(response, ResponseItem::CustomToolCall { .. });
-                pending.insert(index, (turn, call_id.as_str(), cwd, response));
-                // Legacy raw IDs can recur within one turn. Only a unique
-                // unmatched preceding invocation can own a later result.
-                unmatched
-                    .entry((turn, kind, call_id.as_str()))
-                    .and_modify(|prior| *prior = None)
-                    .or_insert(Some(index));
+        let (kind, call_id, is_call, output) = match response {
+            ResponseItem::FunctionCall { call_id, .. } => {
+                (CallKind::Function, call_id, true, None)
             }
+            ResponseItem::CustomToolCall { call_id, .. } => {
+                (CallKind::Custom, call_id, true, None)
+            }
+            ResponseItem::ToolSearchCall {
+                call_id: Some(call_id),
+                execution,
+                ..
+            } if execution == "client" => (CallKind::ClientSearch, call_id, true, None),
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
-            }
-            | ResponseItem::CustomToolCallOutput {
+            } => (CallKind::Function, call_id, false, Some(output)),
+            ResponseItem::CustomToolCallOutput {
                 call_id, output, ..
-            } => {
-                // Only the registry's complete delivery-loss placeholder is a
-                // recovery signal; quoted source/log text is still a result.
-                let unavailable = items.get(index + 1).is_some_and(|next|
-                    matches!(next, RolloutItem::ResponseItem(item)
-                        if crate::tools::registry::is_model_delivery_unavailable_receipt(item, call_id)))
-                    // Conservative compatibility with legacy host placeholders.
-                    || output.body.to_text().is_some_and(|text|
-                    text == "Tool execution completed, but its full result could not be preserved for model delivery.");
-                let kind = matches!(response, ResponseItem::CustomToolCallOutput { .. });
-                if let Some(Some(source)) = unmatched.remove(&(turn, kind, call_id.as_str()))
-                    && !unavailable
-                {
-                    pending.remove(&source);
-                }
+            } => (CallKind::Custom, call_id, false, Some(output)),
+            ResponseItem::ToolSearchOutput {
+                call_id: Some(call_id),
+                execution,
+                ..
+            } if execution == "client" => (CallKind::ClientSearch, call_id, false, None),
+            _ => continue,
+        };
+        let call_id = call_id.as_str();
+        let key = (turn, kind, call_id);
+        if is_call {
+            // Match borrowed invocation identities first. Settled calls
+            // never pay argument decoding, hashing or redaction costs.
+            pending.insert(index, (turn, call_id, cwd, response));
+            // Legacy raw IDs can recur within one turn. Only a unique
+            // unmatched preceding invocation can own a later result.
+            unmatched
+                .entry(key)
+                .and_modify(|prior| *prior = None)
+                .or_insert(Some(index));
+        } else if let Some(Some(source)) = unmatched.remove(&key) {
+            // An incomplete search output can be a real result. Only an
+            // adjacent host receipt proves a search result was unavailable.
+            let unavailable = items.get(index + 1).is_some_and(|next|
+                matches!(next, RolloutItem::ResponseItem(item)
+                    if crate::tools::registry::is_model_delivery_unavailable_receipt(item, call_id)))
+                // Conservative compatibility with legacy function/custom placeholders.
+                || output.and_then(|output| output.body.to_text()).is_some_and(|text|
+                text == "Tool execution completed, but its full result could not be preserved for model delivery.");
+            if !unavailable {
+                pending.remove(&source);
             }
-            _ => {}
         }
     }
     let mut pending = pending.into_iter().collect::<Vec<_>>();
     pending.sort_unstable_by_key(|(index, _)| std::cmp::Reverse(*index));
     pending.into_iter().map(move |(index, (turn, call_id, cwd, response))| {
-        let (name, namespace, arguments) = match response {
+        let (tool, argument_digest, args) = match response {
             ResponseItem::FunctionCall { name, namespace, arguments, .. }
-            | ResponseItem::CustomToolCall { name, namespace, input: arguments, .. } => (name, namespace, arguments),
+            | ResponseItem::CustomToolCall { name, namespace, input: arguments, .. } => {
+                let tool = namespace.as_ref()
+                    .map(|namespace| format!("{namespace}.{name}"))
+                    .unwrap_or_else(|| name.clone());
+                let args = (arguments.len() <= 16 * 1024)
+                    .then(|| serde_json::from_str::<serde_json::Value>(arguments).ok())
+                    .flatten();
+                (tool, sha2::Sha256::digest(arguments.as_bytes()), args)
+            }
+            ResponseItem::ToolSearchCall { arguments, .. } => (
+                "tool_search".to_owned(),
+                sha2::Sha256::digest(arguments.to_string().as_bytes()),
+                None,
+            ),
             _ => unreachable!("only invocations enter pending"),
         };
-        let args = (arguments.len() <= 16 * 1024)
-            .then(|| serde_json::from_str::<serde_json::Value>(arguments).ok()).flatten()
-            .unwrap_or(serde_json::Value::Null);
-        let field = |keys: &[&str]| keys.iter().find_map(|key| args.get(*key).and_then(serde_json::Value::as_str));
+        let field = |keys: &[&str]| {
+            let args = args.as_ref()?;
+            keys.iter().find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
+        };
         let cwd = cwd.map(|path| path.to_string_lossy()).unwrap_or_default();
         serde_json::json!({
             "turn_id": bounded(turn), "call_id": bounded(call_id), "rollout_item_index": index,
-            "tool": bounded(&namespace.as_ref().map(|namespace| format!("{namespace}.{name}")).unwrap_or_else(|| name.clone())),
+            "tool": bounded(&tool),
             "environment": field(&["environment_id"]).map(bounded),
             "cwd": redacted_path(field(&["workdir", "cwd"]).unwrap_or(&cwd)),
             "target": field(&["path", "file_path", "target"]).map(redacted_path),
-            "invocation_sha256": hex::encode(sha2::Sha256::digest(arguments.as_bytes())),
+            "invocation_sha256": hex::encode(argument_digest),
             "status": "result_not_durably_available_effects_unknown",
         })
     })

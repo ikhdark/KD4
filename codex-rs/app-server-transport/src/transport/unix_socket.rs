@@ -225,21 +225,32 @@ pub async fn acquire_app_server_startup_lock(
     .await
     .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))??;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut retrying = false;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(AppServerStartupLock { _file: file }),
+            Ok(()) if !retrying || tokio::time::Instant::now() < deadline => {
+                return Ok(AppServerStartupLock { _file: file });
+            }
+            // If the retry itself crossed the deadline, drop the acquired file.
+            Ok(()) => break,
             Err(std::fs::TryLockError::WouldBlock) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        ErrorKind::TimedOut,
-                        "app-server startup lock contention exceeded 10 seconds",
-                    ));
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                retrying = true;
+                tokio::time::sleep_until((now + Duration::from_millis(50)).min(deadline)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
             }
             Err(std::fs::TryLockError::Error(err)) => return Err(err),
         }
     }
+    Err(std::io::Error::new(
+        ErrorKind::TimedOut,
+        "app-server startup lock contention exceeded 10 seconds",
+    ))
 }
 
 struct ControlSocketFileGuard {

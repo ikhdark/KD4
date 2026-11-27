@@ -46,8 +46,6 @@ const JSONRPC_PAYLOAD_RESERVE_LEN: usize = 1024 * 1024;
 /// whole connection; file operations check this bound so they fail on their own.
 pub(crate) const MAX_FILE_PAYLOAD_BYTES: usize =
     (MAX_JSONRPC_MESSAGE_LEN - JSONRPC_PAYLOAD_RESERVE_LEN) / 4 * 3;
-const STDIO_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(2);
-const STDIO_FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const STDIO_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(70);
 pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -101,7 +99,7 @@ impl JsonRpcTransport {
 
     fn from_managed_child_process(
         child_process: Child,
-        managed_root: Arc<ManagedRootProcess>,
+        managed_root: ManagedRootProcess,
     ) -> Self {
         Self::Stdio {
             transport: StdioTransport::spawn(child_process, managed_root),
@@ -137,7 +135,7 @@ struct StdioTransportHandle {
 }
 
 impl StdioTransport {
-    fn spawn(child_process: Child, managed_root: Arc<ManagedRootProcess>) -> Self {
+    fn spawn(child_process: Child, managed_root: ManagedRootProcess) -> Self {
         let (terminate_tx, terminate_rx) = watch::channel(false);
         let (terminated_tx, terminated_rx) = watch::channel(false);
         let handle = Arc::new(StdioTransportHandle {
@@ -161,7 +159,7 @@ impl StdioTransport {
     async fn terminate_and_wait_with_timeout(&self, wait_timeout: Duration) -> bool {
         self.terminate();
         let mut terminated_rx = self.handle.terminated_rx.clone();
-        let completed = timeout(wait_timeout, async {
+        match timeout(wait_timeout, async {
             loop {
                 if *terminated_rx.borrow() {
                     return true;
@@ -172,11 +170,13 @@ impl StdioTransport {
             }
         })
         .await
-        .unwrap_or(false);
-        if !completed {
-            warn!("exec-server stdio child supervisor exceeded its termination deadline");
+        {
+            Ok(confirmed) => confirmed,
+            Err(_) => {
+                warn!("exec-server stdio child supervisor exceeded its termination deadline");
+                false
+            }
         }
-        completed
     }
 
 }
@@ -197,33 +197,29 @@ impl Drop for StdioTransportHandle {
 
 fn spawn_stdio_child_supervisor(
     mut child_process: Child,
-    managed_root: Arc<ManagedRootProcess>,
+    managed_root: ManagedRootProcess,
     mut terminate_rx: watch::Receiver<bool>,
     terminated_tx: watch::Sender<bool>,
 ) {
     tokio::spawn(async move {
         tokio::select! {
             result = child_process.wait() => {
-                match result {
-                    Ok(_) => {
-                        // wait() released the root handle: its numeric PID is no
-                        // longer a safe cleanup identity. The Job still owns descendants.
-                        if let Err(err) = terminate_managed_root(&managed_root).await {
-                            debug!("failed to terminate exec-server stdio descendants: {err}");
-                        }
-                    }
-                    Err(err) => {
-                        debug!("failed to wait for exec-server stdio child: {err}");
-                        terminate_stdio_child(&mut child_process, &managed_root).await;
-                    }
+                if let Err(err) = result {
+                    debug!("failed to wait for exec-server stdio child: {err}");
                 }
             }
-            () = wait_for_stdio_termination(&mut terminate_rx) => {
-                terminate_stdio_child(&mut child_process, &managed_root).await;
-            }
+            () = wait_for_stdio_termination(&mut terminate_rx) => {}
         }
-        drop(managed_root);
-        terminated_tx.send_replace(true);
+
+        // A successful root wait is cached by Child and does not settle the
+        // Job. The shared cleanup owner retains admission while waiting and
+        // retains the Job for reconciliation if tree termination fails.
+        match managed_root.terminate_and_reap(child_process).await {
+            Ok(()) => {
+                terminated_tx.send_replace(true);
+            }
+            Err(err) => warn!("exec-server stdio shutdown remains unconfirmed: {err}"),
+        }
     });
 }
 
@@ -235,48 +231,6 @@ async fn wait_for_stdio_termination(terminate_rx: &mut watch::Receiver<bool>) {
         if terminate_rx.changed().await.is_err() {
             return;
         }
-    }
-}
-
-/// Job termination waits (up to seconds) for the tree to empty; run it on the
-/// blocking pool so the supervisor never stalls a shared runtime worker.
-async fn terminate_managed_root(managed_root: &Arc<ManagedRootProcess>) -> std::io::Result<()> {
-    let owner = Arc::clone(managed_root);
-    codex_utils_pty::run_windows_process_operation(
-        codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT,
-        move || owner.terminate(),
-    )
-    .await
-}
-
-async fn terminate_stdio_child(
-    child_process: &mut Child,
-    managed_root: &Arc<ManagedRootProcess>,
-) {
-    let mut wait_timeout = STDIO_TERMINATION_GRACE_PERIOD;
-    loop {
-        if let Err(err) = terminate_managed_root(managed_root).await {
-            debug!("failed to terminate managed exec-server stdio process tree: {err}");
-            kill_direct_child(child_process, "kill");
-        }
-        match timeout(wait_timeout, child_process.wait()).await {
-            Ok(Ok(_)) => return,
-            Ok(Err(err)) => {
-                debug!("failed to wait for exec-server stdio child; retaining admission: {err}");
-                if matches!(child_process.try_wait(), Ok(Some(_))) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(_) => warn!("exec-server stdio child exit remains unconfirmed; retaining admission"),
-        }
-        wait_timeout = STDIO_FORCE_REAP_TIMEOUT;
-    }
-}
-
-fn kill_direct_child(child_process: &mut Child, action: &str) {
-    if let Err(err) = child_process.start_kill() {
-        debug!("failed to {action} exec-server stdio child: {err}");
     }
 }
 
@@ -581,7 +535,7 @@ impl JsonRpcConnection {
     pub(crate) fn with_managed_child_process(
         mut self,
         child_process: Child,
-        managed_root: Arc<ManagedRootProcess>,
+        managed_root: ManagedRootProcess,
     ) -> Self {
         self.transport = JsonRpcTransport::from_managed_child_process(child_process, managed_root);
         self

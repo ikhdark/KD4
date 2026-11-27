@@ -473,7 +473,7 @@ fn save_oauth_tokens_with_keyring<K: KeyringStore + Clone + 'static>(
 ) -> Result<()> {
     match keyring_backend_kind {
         AuthKeyringBackendKind::Direct => {
-            save_oauth_tokens_to_direct_keyring(keyring_store, codex_home, server_name, tokens)
+            save_oauth_tokens_to_direct_keyring(keyring_store, server_name, tokens)
         }
         AuthKeyringBackendKind::Secrets => {
             save_oauth_tokens_to_secrets_keyring(keyring_store, codex_home, server_name, tokens)
@@ -483,7 +483,6 @@ fn save_oauth_tokens_with_keyring<K: KeyringStore + Clone + 'static>(
 
 fn save_oauth_tokens_to_direct_keyring<K: KeyringStore>(
     keyring_store: &K,
-    codex_home: &Path,
     server_name: &str,
     tokens: &StoredOAuthTokens,
 ) -> Result<()> {
@@ -491,10 +490,7 @@ fn save_oauth_tokens_to_direct_keyring<K: KeyringStore>(
 
     let key = compute_store_key(server_name, &tokens.url)?;
     match keyring_store.save(KEYRING_SERVICE, &key, &serialized) {
-        Ok(()) => {
-            cleanup_plaintext_after_secure_save(codex_home, &key);
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(error) => {
             let message = format!(
                 "failed to write OAuth tokens to keyring: {}",
@@ -507,8 +503,6 @@ fn save_oauth_tokens_to_direct_keyring<K: KeyringStore>(
 }
 
 /// Saves one credential while holding the Secrets aggregate-store lock across the mutation.
-///
-/// The Secrets lock is released before fallback File cleanup to preserve aggregate-lock ordering.
 fn save_oauth_tokens_to_secrets_keyring<K: KeyringStore + Clone + 'static>(
     keyring_store: &K,
     codex_home: &Path,
@@ -516,25 +510,19 @@ fn save_oauth_tokens_to_secrets_keyring<K: KeyringStore + Clone + 'static>(
     tokens: &StoredOAuthTokens,
 ) -> Result<()> {
     let serialized = serde_json::to_string(tokens).context("failed to serialize OAuth tokens")?;
-    {
-        let _store_lock = OAuthStoreLock::acquire(codex_home, OAuthStore::Secrets)?;
-        save_oauth_tokens_to_secrets_keyring_with_lock_held(
-            keyring_store,
-            codex_home,
-            server_name,
-            tokens,
-            &serialized,
-        )?;
-    }
-
-    let key = compute_store_key(server_name, &tokens.url)?;
-    cleanup_plaintext_after_secure_save(codex_home, &key);
-    Ok(())
+    let _store_lock = OAuthStoreLock::acquire(codex_home, OAuthStore::Secrets)?;
+    save_oauth_tokens_to_secrets_keyring_with_lock_held(
+        keyring_store,
+        codex_home,
+        server_name,
+        tokens,
+        &serialized,
+    )
 }
 
 fn cleanup_plaintext_after_secure_save(codex_home: &Path, key: &str) {
     if let Err(error) = delete_oauth_tokens_from_file(codex_home, key) {
-        warn!("secure OAuth credentials were saved but plaintext fallback cleanup failed: {error}");
+        warn!("secure OAuth credentials were committed but plaintext fallback cleanup failed: {error}");
     }
 }
 
@@ -575,42 +563,65 @@ fn save_oauth_tokens_coordinated<K: KeyringStore + Clone + 'static>(
     let mut tokens = tokens.clone();
     tokens.expires_at = tokens.expires_at.or_else(|| compute_expires_at_millis(&tokens.token_response.0));
     let tokens = &tokens;
-    let backend = if matches!(mode, OAuthCredentialsStoreMode::File) {
-        save_oauth_tokens_to_file(codex_home, tokens)?;
-        CredentialBackend::File
-    } else { match save_oauth_tokens_with_keyring(
-        keyring_store,
-        codex_home,
-        keyring_backend_kind,
-        server_name,
-        tokens,
-    ) {
-        Ok(()) => match keyring_backend_kind { AuthKeyringBackendKind::Direct => CredentialBackend::Direct, AuthKeyringBackendKind::Secrets => CredentialBackend::Secrets },
-        // As on load, a store lock failure is a coordination failure rather than evidence that
-        // the keyring backend is unavailable. Falling back could leave a newer File token hidden
-        // behind a stale Secrets entry.
-        Err(error)
-            if error.downcast_ref::<OAuthStoreLockFailure>().is_some()
-                || error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
-        {
-            return Err(error);
+    let fingerprint = credential_fingerprint(tokens)?;
+    let (backend, fallback_message) = if matches!(mode, OAuthCredentialsStoreMode::File) {
+        (CredentialBackend::File, None)
+    } else {
+        match save_oauth_tokens_with_keyring(
+            keyring_store,
+            codex_home,
+            keyring_backend_kind,
+            server_name,
+            tokens,
+        ) {
+            Ok(()) => (
+                match keyring_backend_kind {
+                    AuthKeyringBackendKind::Direct => CredentialBackend::Direct,
+                    AuthKeyringBackendKind::Secrets => CredentialBackend::Secrets,
+                },
+                None,
+            ),
+            // As on load, a store lock failure is a coordination failure rather than evidence
+            // that the keyring backend is unavailable. A fallback could hide the new File
+            // credential behind a stale Secrets entry.
+            Err(error)
+                if error.downcast_ref::<OAuthStoreLockFailure>().is_some()
+                    || error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                return Err(error);
+            }
+            Err(error) => {
+                if matches!(mode, OAuthCredentialsStoreMode::Keyring) {
+                    return Err(error);
+                }
+                let message = error.to_string();
+                warn!("falling back to file storage for OAuth tokens: {message}");
+                (CredentialBackend::File, Some(message))
+            }
         }
-        Err(error) => {
-            if matches!(mode, OAuthCredentialsStoreMode::Keyring) { return Err(error); }
-            let message = error.to_string();
-            warn!("falling back to file storage for OAuth tokens: {message}");
-            save_oauth_tokens_to_file(codex_home, tokens)
-                .with_context(|| format!("failed to write OAuth tokens to keyring: {message}"))?;
-            CredentialBackend::File
-        }
-    }};
-    let authority = CredentialAuthority { backend: Some(backend), fingerprint: Some(credential_fingerprint(tokens)?), revision };
-    state.entries.insert(key, authority.clone());
-    // Publication failures are not secure-store failures and must never trigger
-    // a retry to plaintext. Cleanup above is serialized with every logical save.
-    commit_credential_authority(codex_home, &state)?;
+    };
+    let authority = CredentialAuthority {
+        backend: Some(backend),
+        fingerprint: Some(fingerprint),
+        revision,
+    };
+    state.entries.insert(key.clone(), authority.clone());
+    let publish_authority = || commit_credential_authority(codex_home, &state);
+    if backend == CredentialBackend::File {
+        save_oauth_tokens_to_file(
+            codex_home,
+            tokens,
+            fallback_message.as_deref(),
+            publish_authority,
+        )?;
+    } else {
+        // A secure write is not committed until authority is published. On publication
+        // failure, retain the previous plaintext fallback and never retry into File.
+        publish_authority()?;
+        cleanup_plaintext_after_secure_save(codex_home, &key);
+    }
     if let Some(expected) = expected {
         expected.accept_with_lock_held(authority);
     }
@@ -1191,20 +1202,55 @@ fn load_oauth_tokens_from_file(
     Ok(None)
 }
 
-/// Saves one credential while holding the File aggregate-store lock across the full
-/// read-modify-write operation.
-fn save_oauth_tokens_to_file(codex_home: &Path, tokens: &StoredOAuthTokens) -> Result<()> {
-    let _store_lock = OAuthStoreLock::acquire(codex_home, OAuthStore::File)?;
-    save_oauth_tokens_to_file_with_lock_held(codex_home, tokens)
+/// Holds the File lock from the snapshot through publication or rollback.
+fn save_oauth_tokens_to_file(
+    codex_home: &Path,
+    tokens: &StoredOAuthTokens,
+    fallback_message: Option<&str>,
+    publish_authority: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let update = || -> Result<_> {
+        let store_lock = OAuthStoreLock::acquire(codex_home, OAuthStore::File)?;
+        let previous = read_fallback_file_contents_unlocked(codex_home)?;
+        save_oauth_tokens_to_file_with_lock_held(codex_home, tokens, previous.as_deref())?;
+        Ok((store_lock, previous))
+    };
+    let (_store_lock, previous) = update().map_err(|error| match fallback_message {
+        Some(message) => error.context(format!("failed to write OAuth tokens to keyring: {message}")),
+        None => error,
+    })?;
+
+    if let Err(error) = publish_authority() {
+        // Restore the exact old contents, including unrelated entries and legacy aliases.
+        let path = fallback_file_path(codex_home);
+        let rollback = match previous {
+            Some(contents) => replace_fallback_file_contents(&path, contents.as_bytes()),
+            None => match fs::remove_file(&path) {
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                result => result.map_err(Error::from),
+            },
+        };
+        return match rollback {
+            Ok(()) => Err(error).context("failed to publish OAuth credential authority"),
+            Err(rollback_error) => Err(error).context(format!(
+                "failed to publish OAuth credential authority and restore the previous fallback file: {rollback_error}"
+            )),
+        };
+    }
+    Ok(())
 }
 
-/// Updates the fallback File. The caller must hold the File aggregate-store lock.
+/// Updates the fallback File from a snapshot taken under the same File lock.
 fn save_oauth_tokens_to_file_with_lock_held(
     codex_home: &Path,
     tokens: &StoredOAuthTokens,
+    previous: Option<&str>,
 ) -> Result<()> {
     let key = compute_store_key(&tokens.server_name, &tokens.url)?;
-    let mut store = read_fallback_file_unlocked(codex_home)?.unwrap_or_default();
+    let mut store = previous
+        .map(|contents| parse_fallback_file(codex_home, contents))
+        .transpose()?
+        .unwrap_or_default();
 
     let token_response = &tokens.token_response.0;
     let expires_at = tokens
@@ -1343,25 +1389,29 @@ fn fallback_file_path(codex_home: &Path) -> PathBuf {
 }
 
 fn read_fallback_file_unlocked(codex_home: &Path) -> Result<Option<FallbackFile>> {
-    let path = fallback_file_path(codex_home);
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).context(format!(
-                "failed to read credentials file at {}",
-                path.display()
-            ));
-        }
-    };
+    read_fallback_file_contents_unlocked(codex_home)?
+        .map(|contents| parse_fallback_file(codex_home, &contents))
+        .transpose()
+}
 
-    match serde_json::from_str::<FallbackFile>(&contents) {
-        Ok(store) => Ok(Some(store)),
-        Err(e) => Err(e).context(format!(
-            "failed to parse credentials file at {}",
-            path.display()
-        )),
+fn read_fallback_file_contents_unlocked(codex_home: &Path) -> Result<Option<String>> {
+    let path = fallback_file_path(codex_home);
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!("failed to read credentials file at {}", path.display())
+        }),
     }
+}
+
+fn parse_fallback_file(codex_home: &Path, contents: &str) -> Result<FallbackFile> {
+    serde_json::from_str(contents).with_context(|| {
+        format!(
+            "failed to parse credentials file at {}",
+            fallback_file_path(codex_home).display()
+        )
+    })
 }
 
 fn write_fallback_file(codex_home: &Path, store: &FallbackFile) -> Result<()> {
@@ -1379,15 +1429,19 @@ fn write_fallback_file(codex_home: &Path, store: &FallbackFile) -> Result<()> {
     }
 
     let serialized = serde_json::to_string(store)?;
+    replace_fallback_file_contents(&path, serialized.as_bytes())
+}
+
+fn replace_fallback_file_contents(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("credentials path has no parent: {}", path.display()))?;
     let mut temporary = NamedTempFile::new_in(parent)?;
 
-    temporary.write_all(serialized.as_bytes())?;
+    temporary.write_all(contents)?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
-    temporary.persist(&path).map_err(|error| error.error)?;
+    temporary.persist(path).map_err(|error| error.error)?;
 
     Ok(())
 }

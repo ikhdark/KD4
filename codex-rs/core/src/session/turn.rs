@@ -6290,6 +6290,21 @@ pub(crate) fn reconcile_turn_progress_event(
     )
 }
 
+pub(crate) async fn reconcile_turn_progress_event_async(
+    turn_timing_state: &TurnTimingState,
+    pending_tool_count: usize,
+    event: &'static str,
+) {
+    let mut active_without_pending_passes = 0;
+    record_reconciliation_async(
+        turn_timing_state,
+        pending_tool_count,
+        &mut active_without_pending_passes,
+        event,
+    )
+    .await;
+}
+
 fn record_reconciliation(
     turn_timing_state: &TurnTimingState,
     pending_tool_count: usize,

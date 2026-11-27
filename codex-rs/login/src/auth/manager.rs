@@ -2076,7 +2076,7 @@ impl UnauthorizedRecovery {
     }
 
     pub async fn next(&mut self) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenError> {
-        let revision = *self.manager.auth_change_tx.borrow();
+        let revision = *self.manager.state.auth_change_tx.borrow();
         self.next_with_rejected_revision(Some(revision), None).await
     }
 
@@ -2242,6 +2242,11 @@ struct AuthLoadFailure {
 /// read or parse keeps the cached identity for at most `AUTH_LOAD_ANCHOR_GRACE`
 /// while `check_auth_load()` fails closed; a policy denial logs out immediately.
 pub struct AuthManager {
+    // Gives an admitted refresh commit an owner independent of its caller.
+    state: Arc<AuthManagerState>,
+}
+
+struct AuthManagerState {
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
     auth_change_tx: watch::Sender<u64>,
@@ -2252,7 +2257,7 @@ pub struct AuthManager {
     managed_auth_policy: ManagedAuthPolicy,
     chatgpt_base_url: Option<String>,
     agent_identity_authapi_base_url: Option<String>,
-    refresh_lock: Semaphore,
+    refresh_lock: Arc<Semaphore>,
     proactive_refresh_generation: AtomicU64,
     pending_rotation: Mutex<Option<(ChatgptAuth, AuthDotJson, RefreshResponse)>>,
     agent_identity_lock: Arc<Semaphore>,
@@ -2296,18 +2301,18 @@ pub trait AuthManagerConfig {
 impl Debug for AuthManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthManager")
-            .field("codex_home", &self.codex_home)
-            .field("inner", &self.inner)
-            .field("enable_codex_api_key_env", &self.enable_codex_api_key_env)
+            .field("codex_home", &self.state.codex_home)
+            .field("inner", &self.state.inner)
+            .field("enable_codex_api_key_env", &self.state.enable_codex_api_key_env)
             .field(
                 "auth_credentials_store_mode",
-                &self.auth_credentials_store_mode,
+                &self.state.auth_credentials_store_mode,
             )
-            .field("keyring_backend_kind", &self.keyring_backend_kind)
-            .field("forced_login_restrictions", &self.forced_login_restrictions)
-            .field("managed_auth_policy", &self.managed_auth_policy)
-            .field("chatgpt_base_url", &self.chatgpt_base_url)
-            .field("auth_route_config", &self.auth_route_config)
+            .field("keyring_backend_kind", &self.state.keyring_backend_kind)
+            .field("forced_login_restrictions", &self.state.forced_login_restrictions)
+            .field("managed_auth_policy", &self.state.managed_auth_policy)
+            .field("chatgpt_base_url", &self.state.chatgpt_base_url)
+            .field("auth_route_config", &self.state.auth_route_config)
             .field("has_external_auth", &self.has_external_auth())
             .finish_non_exhaustive()
     }
@@ -2374,35 +2379,37 @@ impl AuthManager {
             agent_identity_authapi_base_url(chatgpt_base_url.as_deref()).ok();
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
         Self {
-            codex_home,
-            inner: RwLock::new(CachedAuth {
-                auth: managed_auth,
-                load_error,
-                load_publications: 0,
-                last_load_retirement: 0,
-                retired_managed_lifecycles: Vec::new(),
-                policy_epoch: 0,
-                identity_epoch: 0,
-                permanent_refresh_failure: None,
+            state: Arc::new(AuthManagerState {
+                codex_home,
+                inner: RwLock::new(CachedAuth {
+                    auth: managed_auth,
+                    load_error,
+                    load_publications: 0,
+                    last_load_retirement: 0,
+                    retired_managed_lifecycles: Vec::new(),
+                    policy_epoch: 0,
+                    identity_epoch: 0,
+                    permanent_refresh_failure: None,
+                }),
+                auth_change_tx,
+                enable_codex_api_key_env,
+                auth_credentials_store_mode,
+                keyring_backend_kind,
+                forced_login_restrictions: RwLock::new((
+                    forced_login_method,
+                    forced_chatgpt_workspace_id,
+                )),
+                managed_auth_policy,
+                chatgpt_base_url,
+                agent_identity_authapi_base_url,
+                refresh_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
+                proactive_refresh_generation: AtomicU64::new(0),
+                pending_rotation: Mutex::new(None),
+                agent_identity_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
+                agent_identity_bootstrap_cooldown: Mutex::default(),
+                external_auth: RwLock::new(ExternalAuthState::default()),
+                auth_route_config,
             }),
-            auth_change_tx,
-            enable_codex_api_key_env,
-            auth_credentials_store_mode,
-            keyring_backend_kind,
-            forced_login_restrictions: RwLock::new((
-                forced_login_method,
-                forced_chatgpt_workspace_id,
-            )),
-            managed_auth_policy,
-            chatgpt_base_url,
-            agent_identity_authapi_base_url,
-            refresh_lock: Semaphore::new(/*permits*/ 1),
-            proactive_refresh_generation: AtomicU64::new(0),
-            pending_rotation: Mutex::new(None),
-            agent_identity_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
-            agent_identity_bootstrap_cooldown: Mutex::default(),
-            external_auth: RwLock::new(ExternalAuthState::default()),
-            auth_route_config,
         }
     }
 
@@ -2412,45 +2419,47 @@ impl AuthManager {
     pub fn external_bearer_only(config: ModelProviderAuthInfo) -> Arc<Self> {
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
         Arc::new(Self {
-            codex_home: PathBuf::from("non-existent"),
-            inner: RwLock::new(CachedAuth {
-                auth: None,
-                load_error: None,
-                load_publications: 0,
-                last_load_retirement: 0,
-                retired_managed_lifecycles: Vec::new(),
-                policy_epoch: 0,
-                identity_epoch: 0,
-                permanent_refresh_failure: None,
+            state: Arc::new(AuthManagerState {
+                codex_home: PathBuf::from("non-existent"),
+                inner: RwLock::new(CachedAuth {
+                    auth: None,
+                    load_error: None,
+                    load_publications: 0,
+                    last_load_retirement: 0,
+                    retired_managed_lifecycles: Vec::new(),
+                    policy_epoch: 0,
+                    identity_epoch: 0,
+                    permanent_refresh_failure: None,
+                }),
+                auth_change_tx,
+                enable_codex_api_key_env: false,
+                auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+                keyring_backend_kind: AuthKeyringBackendKind::default(),
+                forced_login_restrictions: RwLock::new((None, None)),
+                managed_auth_policy: ManagedAuthPolicy::default(),
+                chatgpt_base_url: None,
+                agent_identity_authapi_base_url: default_agent_identity_authapi_base_url(),
+                refresh_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
+                proactive_refresh_generation: AtomicU64::new(0),
+                pending_rotation: Mutex::new(None),
+                agent_identity_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
+                agent_identity_bootstrap_cooldown: Mutex::default(),
+                external_auth: RwLock::new(ExternalAuthState {
+                    source: Some(ExternalAuthSource::Runtime(Arc::new(BearerTokenRefresher::new(config)))),
+                    generation: Arc::new(()),
+                }),
+                // External bearer auth refreshes by running the provider's command and never makes
+                // auth-owned HTTP requests, so this route is intentionally inert.
+                auth_route_config: AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
+                    OutboundProxyPolicy::ReqwestDefault,
+                )),
             }),
-            auth_change_tx,
-            enable_codex_api_key_env: false,
-            auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-            keyring_backend_kind: AuthKeyringBackendKind::default(),
-            forced_login_restrictions: RwLock::new((None, None)),
-            managed_auth_policy: ManagedAuthPolicy::default(),
-            chatgpt_base_url: None,
-            agent_identity_authapi_base_url: default_agent_identity_authapi_base_url(),
-            refresh_lock: Semaphore::new(/*permits*/ 1),
-            proactive_refresh_generation: AtomicU64::new(0),
-            pending_rotation: Mutex::new(None),
-            agent_identity_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
-            agent_identity_bootstrap_cooldown: Mutex::default(),
-            external_auth: RwLock::new(ExternalAuthState {
-                source: Some(ExternalAuthSource::Runtime(Arc::new(BearerTokenRefresher::new(config)))),
-                generation: Arc::new(()),
-            }),
-            // External bearer auth refreshes by running the provider's command and never makes
-            // auth-owned HTTP requests, so this route is intentionally inert.
-            auth_route_config: AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
-                OutboundProxyPolicy::ReqwestDefault,
-            )),
         })
     }
 
     /// Current cached auth (clone) without attempting a refresh.
     pub fn auth_cached(&self) -> Option<CodexAuth> {
-        self.inner
+        self.state.inner
             .read()
             .ok()
             .and_then(|cached| cached.auth.clone())
@@ -2458,7 +2467,7 @@ impl AuthManager {
 
     /// Identity/eligibility generation, independent of same-identity token rotation.
     pub fn policy_auth_snapshot(&self) -> std::io::Result<(u64, Option<CodexAuth>)> {
-        let cached = self
+        let cached = self.state
             .inner
             .read()
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
@@ -2468,15 +2477,15 @@ impl AuthManager {
     /// Request credential revision, or None when this snapshot is already stale.
     /// Read the revision while holding the cache lock that publishes it.
     pub fn auth_revision_for_snapshot(&self, auth: &CodexAuth) -> Option<u64> {
-        let cached = self.inner.read().ok()?;
+        let cached = self.state.inner.read().ok()?;
         Self::auths_equal_for_refresh(Some(auth), cached.auth.as_ref())
-            .then(|| *self.auth_change_tx.borrow())
+            .then(|| *self.state.auth_change_tx.borrow())
     }
 
     fn recovery_auth_snapshot(&self) -> std::io::Result<(u64, u64, Option<CodexAuth>)> {
-        let cached = self.inner.read()
+        let cached = self.state.inner.read()
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
-        Ok((cached.policy_epoch, *self.auth_change_tx.borrow(), cached.auth.clone()))
+        Ok((cached.policy_epoch, *self.state.auth_change_tx.borrow(), cached.auth.clone()))
     }
 
     /// Linearize a synchronous policy publication against identity transitions.
@@ -2486,7 +2495,7 @@ impl AuthManager {
         epoch: u64,
         publish: impl FnOnce() -> T,
     ) -> std::io::Result<T> {
-        let cached = self
+        let cached = self.state
             .inner
             .read()
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
@@ -2506,7 +2515,7 @@ impl AuthManager {
         epoch: u64,
         use_auth: impl FnOnce(&CodexAuth, u64, bool) -> T,
     ) -> std::io::Result<T> {
-        let cached = self.inner.read()
+        let cached = self.state.inner.read()
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
         if cached.policy_epoch != epoch {
             return Err(std::io::Error::new(
@@ -2518,7 +2527,7 @@ impl AuthManager {
         let auth = cached.auth.as_ref().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "no credentials are available")
         })?;
-        let revision = *self.auth_change_tx.borrow();
+        let revision = *self.state.auth_change_tx.borrow();
         let refresh_failed = cached.permanent_refresh_failure.is_some();
         Ok(use_auth(auth, revision, refresh_failed))
     }
@@ -2529,7 +2538,7 @@ impl AuthManager {
         &self,
         publish: impl FnOnce(PolicyIdentity) -> T,
     ) -> std::io::Result<T> {
-        let cached = self
+        let cached = self.state
             .inner
             .read()
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
@@ -2541,11 +2550,11 @@ impl AuthManager {
 
     /// Subscribes to cached auth changes that can affect request recovery.
     pub fn auth_change_receiver(&self) -> watch::Receiver<u64> {
-        self.auth_change_tx.subscribe()
+        self.state.auth_change_tx.subscribe()
     }
 
     pub fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFailedError> {
-        self.inner.read().ok().and_then(|cached| {
+        self.state.inner.read().ok().and_then(|cached| {
             cached
                 .permanent_refresh_failure
                 .as_ref()
@@ -2575,7 +2584,7 @@ impl AuthManager {
             };
         }
 
-        let retry_load = self
+        let retry_load = self.state
             .inner
             .read()
             .ok()
@@ -2586,7 +2595,7 @@ impl AuthManager {
             })
             .unwrap_or(false);
         if retry_load {
-            let admitted = self.inner.write().ok().is_some_and(|mut cached| {
+            let admitted = self.state.inner.write().ok().is_some_and(|mut cached| {
                 if let Some(failure) = cached.load_error.as_mut()
                     && failure.attempted_at.elapsed() >= Duration::from_secs(1)
                 {
@@ -2633,7 +2642,7 @@ impl AuthManager {
         };
         if policy == AgentIdentityAuthPolicy::ChatGptAuth && matches!(auth, CodexAuth::Chatgpt(_)) {
             let bootstrap_permit = Arc::new(
-                Arc::clone(&self.agent_identity_lock)
+                Arc::clone(&self.state.agent_identity_lock)
                     .acquire_owned()
                     .await
                     .map_err(std::io::Error::other)?,
@@ -2644,12 +2653,12 @@ impl AuthManager {
                 effective_chatgpt_workspaces.clone(),
             )
             .and_then(|binding| {
-                self.agent_identity_authapi_base_url
+                self.state.agent_identity_authapi_base_url
                     .as_ref()
                     .map(|base_url| (binding.account_id, base_url.clone()))
             });
             let cooldown_error = cooldown_key.as_ref().and_then(|(account_id, authapi_base_url)| {
-                self.agent_identity_bootstrap_cooldown.lock().ok().and_then(|mut cooldown| {
+                self.state.agent_identity_bootstrap_cooldown.lock().ok().and_then(|mut cooldown| {
                     cooldown.error_for(account_id, authapi_base_url, Instant::now())
                 })
             });
@@ -2661,14 +2670,14 @@ impl AuthManager {
             let result = auth
                 .agent_identity_auth(
                     policy,
-                    self.agent_identity_authapi_base_url.as_deref(),
+                    self.state.agent_identity_authapi_base_url.as_deref(),
                     effective_chatgpt_workspaces,
-                    &self.auth_route_config,
+                    &self.state.auth_route_config,
                     session_source,
                     Some(&bootstrap_permit),
                 )
                 .await;
-            if let Ok(mut cooldown) = self.agent_identity_bootstrap_cooldown.lock() {
+            if let Ok(mut cooldown) = self.state.agent_identity_bootstrap_cooldown.lock() {
                 if let (Err(err), Some((account_id, authapi_base_url))) = (&result, cooldown_key)
                     && let Some(error) = AgentIdentityAuthError::bootstrap_unavailable(err).cloned()
                 {
@@ -2681,9 +2690,9 @@ impl AuthManager {
         }
         auth.agent_identity_auth(
             policy,
-            self.agent_identity_authapi_base_url.as_deref(),
+            self.state.agent_identity_authapi_base_url.as_deref(),
             self.effective_chatgpt_workspaces(),
-            &self.auth_route_config,
+            &self.state.auth_route_config,
             session_source,
             None,
         )
@@ -2759,7 +2768,7 @@ impl AuthManager {
 
     /// Distinguishes missing credentials from an unavailable or malformed store.
     pub fn check_auth_load(&self) -> std::io::Result<()> {
-        let cached = self.inner.read()
+        let cached = self.state.inner.read()
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
         Self::check_cached_auth_load(&cached)
     }
@@ -2775,7 +2784,7 @@ impl AuthManager {
     }
 
     fn load_publication_revision(&self) -> std::io::Result<u64> {
-        self.inner
+        self.state.inner
             .read()
             .map(|cached| cached.load_publications)
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))
@@ -2788,7 +2797,7 @@ impl AuthManager {
         // The explicit transition already replaced or retired the store's old
         // identity. Fence reloads that read that predecessor before this point.
         self.with_current_external_auth(generation, || {
-            let mut cached = self.inner.write()
+            let mut cached = self.state.inner.write()
                 .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
             Self::advance_load_retirement(&mut cached);
             cached.load_error = Some(AuthLoadFailure {
@@ -2815,7 +2824,7 @@ impl AuthManager {
         auth: Option<CodexAuth>,
         started: u64,
     ) -> std::io::Result<(bool, bool)> {
-        let mut cached = self.inner.write()
+        let mut cached = self.state.inner.write()
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
         Self::check_load_publication(&cached, started)?;
         if auth.as_ref().and_then(CodexAuth::lifecycle_id).is_some_and(|lifecycle| {
@@ -2864,7 +2873,7 @@ impl AuthManager {
     fn record_load_failure(&self, err: &std::io::Error, started: u64, keep_anchor: bool) -> bool {
         let policy_denied = is_auth_policy_denial(err);
         let busy = err.kind() == std::io::ErrorKind::WouldBlock;
-        let Ok(mut cached) = self.inner.write() else {
+        let Ok(mut cached) = self.state.inner.write() else {
             return false;
         };
         if started < cached.last_load_retirement
@@ -2990,7 +2999,7 @@ impl AuthManager {
         attempted_auth: &CodexAuth,
         error: &RefreshTokenFailedError,
     ) {
-        if let Ok(mut guard) = self.inner.write() {
+        if let Ok(mut guard) = self.state.inner.write() {
             let current_auth_matches =
                 Self::auths_equal_for_refresh(Some(attempted_auth), guard.auth.as_ref());
             if current_auth_matches {
@@ -3037,15 +3046,15 @@ impl AuthManager {
         let allowed_login_methods = self.allowed_login_methods();
         let effective_chatgpt_workspaces = self.effective_chatgpt_workspaces();
         load_auth(
-            &self.codex_home,
-            self.enable_codex_api_key_env,
-            self.auth_credentials_store_mode,
+            &self.state.codex_home,
+            self.state.enable_codex_api_key_env,
+            self.state.auth_credentials_store_mode,
             Some(&allowed_login_methods),
             effective_chatgpt_workspaces.as_deref(),
-            self.chatgpt_base_url.as_deref(),
-            self.keyring_backend_kind,
-            self.agent_identity_authapi_base_url.as_deref(),
-            &self.auth_route_config,
+            self.state.chatgpt_base_url.as_deref(),
+            self.state.keyring_backend_kind,
+            self.state.agent_identity_authapi_base_url.as_deref(),
+            &self.state.auth_route_config,
         )
         .await
         .map(|auth| {
@@ -3061,7 +3070,7 @@ impl AuthManager {
     }
 
     fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool {
-        let result = self.inner
+        let result = self.state.inner
             .write()
             .ok()
             .map(|mut cached| self.publish_auth_locked(&mut cached, new_auth).0);
@@ -3142,7 +3151,7 @@ impl AuthManager {
         }
         guard.auth = new_auth;
         if auth_changed_for_refresh || policy_changed {
-            self.auth_change_tx.send_modify(|revision| *revision += 1);
+            self.state.auth_change_tx.send_modify(|revision| *revision += 1);
         }
         (changed, auth_changed_for_refresh)
     }
@@ -3159,7 +3168,7 @@ impl AuthManager {
         let external_auth_source = ExternalAuthSource::Runtime(external_auth);
         let auth = self.resolve_external_auth(&external_auth_source).await?;
         let mirror_key = self.prepare_external_auth_mirror_key(&external_auth_source, &auth).await?;
-        let mut source_slot = self.external_auth.write().map_err(|_| {
+        let mut source_slot = self.state.external_auth.write().map_err(|_| {
             RefreshTokenError::Transient(std::io::Error::other("external auth lock is poisoned"))
         })?;
         if matches!(
@@ -3195,7 +3204,7 @@ impl AuthManager {
         }
         let external_auth_source = ExternalAuthSource::Configured(external_auth);
         let auth = self.resolve_external_auth(&external_auth_source).await?;
-        let mut source = self
+        let mut source = self.state
             .external_auth
             .write()
             .map_err(|_| permanent_external_auth_error("external auth lock is poisoned"))?;
@@ -3214,7 +3223,7 @@ impl AuthManager {
 
     /// Clears only auth installed through the runtime API. Configured auth is immutable.
     pub fn clear_external_auth(&self) {
-        if let Ok(mut external_auth) = self.external_auth.write()
+        if let Ok(mut external_auth) = self.state.external_auth.write()
             && matches!(external_auth.source.as_ref(), Some(ExternalAuthSource::Runtime(_)))
         {
             external_auth.source.take();
@@ -3224,7 +3233,7 @@ impl AuthManager {
     }
 
     pub fn set_forced_chatgpt_workspace_id(&self, workspace_id: Option<Vec<String>>) {
-        if let Ok(mut guard) = self.forced_login_restrictions.write()
+        if let Ok(mut guard) = self.state.forced_login_restrictions.write()
             && guard.1 != workspace_id
         {
             guard.1 = workspace_id;
@@ -3237,9 +3246,9 @@ impl AuthManager {
         &self,
         config: &impl AuthManagerConfig,
     ) -> std::io::Result<()> {
-        if self.codex_home != config.codex_home()
-            || self.auth_credentials_store_mode != config.cli_auth_credentials_store_mode()
-            || self.keyring_backend_kind != config.auth_keyring_backend_kind()
+        if self.state.codex_home != config.codex_home()
+            || self.state.auth_credentials_store_mode != config.cli_auth_credentials_store_mode()
+            || self.state.keyring_backend_kind != config.auth_keyring_backend_kind()
         {
             return Err(std::io::Error::other(
                 "credential-store configuration changed; restart the app server before account operations",
@@ -3256,14 +3265,14 @@ impl AuthManager {
         method: Option<ForcedLoginMethod>,
         workspaces: Option<Vec<String>>,
     ) -> std::io::Result<bool> {
-        let mut source = self.external_auth.write()
+        let mut source = self.state.external_auth.write()
             .map_err(|_| std::io::Error::other("external auth lock is poisoned"))?;
-        let mut restrictions = self.forced_login_restrictions.write()
+        let mut restrictions = self.state.forced_login_restrictions.write()
             .map_err(|_| std::io::Error::other("login restrictions lock is poisoned"))?;
         if restrictions.0 == method && restrictions.1 == workspaces {
             return Ok(false);
         }
-        let mut cached = self.inner.write()
+        let mut cached = self.state.inner.write()
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
         *restrictions = (method, workspaces);
         source.generation = Arc::new(());
@@ -3273,26 +3282,26 @@ impl AuthManager {
         cached.permanent_refresh_failure = None;
         cached.policy_epoch += 1;
         cached.identity_epoch = cached.policy_epoch;
-        self.auth_change_tx.send_modify(|revision| *revision += 1);
+        self.state.auth_change_tx.send_modify(|revision| *revision += 1);
         Ok(true)
     }
 
     pub fn forced_chatgpt_workspace_id(&self) -> Option<Vec<String>> {
-        self.forced_login_restrictions
+        self.state.forced_login_restrictions
             .read()
             .ok()
             .and_then(|guard| guard.1.clone())
     }
 
     pub fn effective_chatgpt_workspaces(&self) -> Option<Vec<String>> {
-        self.managed_auth_policy
+        self.state.managed_auth_policy
             .effective_chatgpt_workspaces(self.forced_chatgpt_workspace_id().as_deref())
     }
 
     pub fn is_login_method_allowed(&self, method: ForcedLoginMethod) -> bool {
-        let restrictions = self.forced_login_restrictions.read()
+        let restrictions = self.state.forced_login_restrictions.read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.managed_auth_policy.allows_login_method(
+        self.state.managed_auth_policy.allows_login_method(
             method,
             restrictions.0,
             restrictions.1.as_deref(),
@@ -3300,9 +3309,9 @@ impl AuthManager {
     }
 
     fn allowed_login_methods(&self) -> Vec<ForcedLoginMethod> {
-        let restrictions = self.forced_login_restrictions.read()
+        let restrictions = self.state.forced_login_restrictions.read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.managed_auth_policy.allowed_login_methods(
+        self.state.managed_auth_policy.allowed_login_methods(
             restrictions.0,
             restrictions.1.as_deref(),
         )
@@ -3313,7 +3322,7 @@ impl AuthManager {
     }
 
     pub fn has_configured_external_auth(&self) -> bool {
-        self.external_auth.read().ok().is_some_and(|source| {
+        self.state.external_auth.read().ok().is_some_and(|source| {
             matches!(source.source.as_ref(), Some(ExternalAuthSource::Configured(_)))
         })
     }
@@ -3325,7 +3334,7 @@ impl AuthManager {
     }
 
     pub fn codex_api_key_env_enabled(&self) -> bool {
-        self.enable_codex_api_key_env
+        self.state.enable_codex_api_key_env
     }
 
     /// Convenience constructor returning an `Arc` wrapper.
@@ -3381,7 +3390,7 @@ impl AuthManager {
     }
 
     fn external_auth_snapshot(&self) -> Option<(Arc<()>, Option<ExternalAuthSource>)> {
-        self.external_auth
+        self.state.external_auth
             .read()
             .ok()
             .map(|state| (Arc::clone(&state.generation), state.source.clone()))
@@ -3393,7 +3402,7 @@ impl AuthManager {
         generation: &Arc<()>,
         action: impl FnOnce() -> T,
     ) -> std::io::Result<T> {
-        let state = self.external_auth.read()
+        let state = self.state.external_auth.read()
             .map_err(|_| std::io::Error::other("external auth lock is poisoned"))?;
         if !Arc::ptr_eq(&state.generation, generation) {
             return Err(std::io::Error::new(
@@ -3434,22 +3443,26 @@ impl AuthManager {
     }
 
     async fn refresh_token_internal(&self, proactive: bool) -> Result<(), RefreshTokenError> {
-        let generation = self.proactive_refresh_generation.load(Ordering::Acquire);
-        let auth_revision = *self.auth_change_tx.borrow();
-        let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
-            RefreshTokenError::Permanent(RefreshTokenFailedError::new(
-                RefreshTokenFailedReason::Other,
-                REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
-            ))
-        })?;
-        if self.commit_pending_rotation()? {
-            self.reload().await;
+        let generation = self.state.proactive_refresh_generation.load(Ordering::Acquire);
+        let auth_revision = *self.state.auth_change_tx.borrow();
+        let refresh_permit = Arc::new(
+            Arc::clone(&self.state.refresh_lock)
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                        RefreshTokenFailedReason::Other,
+                        REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
+                    ))
+                })?,
+        );
+        if self.commit_pending_rotation(&refresh_permit).await? {
             return Ok(());
         }
         let auth_before_reload = self.auth_cached();
         if proactive
-            && self.proactive_refresh_generation.load(Ordering::Acquire) != generation
-            && *self.auth_change_tx.borrow() == auth_revision
+            && self.state.proactive_refresh_generation.load(Ordering::Acquire) != generation
+            && *self.state.auth_change_tx.borrow() == auth_revision
             && auth_before_reload
                 .as_ref()
                 .and_then(CodexAuth::get_current_auth_json)
@@ -3491,7 +3504,9 @@ impl AuthManager {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
                 Ok(())
             }
-            ReloadOutcome::ReloadedNoChange => self.refresh_token_from_authority_impl().await,
+            ReloadOutcome::ReloadedNoChange => {
+                self.refresh_token_from_authority_impl(&refresh_permit).await
+            }
             ReloadOutcome::Skipped => Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
                 REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
@@ -3499,9 +3514,9 @@ impl AuthManager {
         };
         if proactive
             && matches!(&result, Err(RefreshTokenError::Transient(_)))
-            && *self.auth_change_tx.borrow() == auth_revision
+            && *self.state.auth_change_tx.borrow() == auth_revision
         {
-            self.proactive_refresh_generation
+            self.state.proactive_refresh_generation
                 .fetch_add(1, Ordering::Release);
         }
         result
@@ -3514,21 +3529,30 @@ impl AuthManager {
         // Several sessions can reject the same credentials at once. Serialize
         // refreshes, but do not rotate credentials that a preceding waiter has
         // already replaced. A later, non-overlapping explicit refresh still runs.
-        let auth_revision = *self.auth_change_tx.borrow();
-        let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
-            RefreshTokenError::Permanent(RefreshTokenFailedError::new(
-                RefreshTokenFailedReason::Other,
-                REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
-            ))
-        })?;
-        if *self.auth_change_tx.borrow() != auth_revision {
+        let auth_revision = *self.state.auth_change_tx.borrow();
+        let refresh_permit = Arc::new(
+            Arc::clone(&self.state.refresh_lock)
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                        RefreshTokenFailedReason::Other,
+                        REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
+                    ))
+                })?,
+        );
+        if *self.state.auth_change_tx.borrow() != auth_revision {
             return Ok(());
         }
-        self.refresh_token_from_authority_impl().await
+        self.refresh_token_from_authority_impl(&refresh_permit).await
     }
 
-    async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError> {
-        self.refresh_token_from_snapshot(self.auth_cached()).await
+    async fn refresh_token_from_authority_impl(
+        &self,
+        refresh_permit: &Arc<OwnedSemaphorePermit>,
+    ) -> Result<(), RefreshTokenError> {
+        self.refresh_token_from_snapshot(self.auth_cached(), refresh_permit)
+            .await
     }
 
     async fn refresh_token_for_recovery(
@@ -3537,11 +3561,12 @@ impl AuthManager {
         account: Option<&str>,
         rejected_revision: Option<u64>,
     ) -> Result<bool, RefreshTokenError> {
-        let _guard = self
-            .refresh_lock
-            .acquire()
-            .await
-            .map_err(|_| std::io::Error::other("auth refresh lock closed"))?;
+        let refresh_permit = Arc::new(
+            Arc::clone(&self.state.refresh_lock)
+                .acquire_owned()
+                .await
+                .map_err(|_| std::io::Error::other("auth refresh lock closed"))?,
+        );
         let (current_epoch, current_revision, auth) = self.recovery_auth_snapshot()?;
         if current_epoch != epoch
             || auth.as_ref().and_then(CodexAuth::get_account_id).as_deref() != account
@@ -3556,16 +3581,17 @@ impl AuthManager {
             // Identity/eligibility checks above must still run on this path.
             return Ok(false);
         }
-        self.refresh_token_from_snapshot(auth).await?;
+        self.refresh_token_from_snapshot(auth, &refresh_permit)
+            .await?;
         Ok(true)
     }
 
     async fn refresh_token_from_snapshot(
         &self,
         snapshot: Option<CodexAuth>,
+        refresh_permit: &Arc<OwnedSemaphorePermit>,
     ) -> Result<(), RefreshTokenError> {
-        if self.commit_pending_rotation()? {
-            self.reload().await;
+        if self.commit_pending_rotation(refresh_permit).await? {
             return Ok(());
         }
         tracing::info!("Refreshing token");
@@ -3590,8 +3616,12 @@ impl AuthManager {
                             "Token data is not available.",
                         ))
                     })?;
-                    self.refresh_and_persist_chatgpt_token(&chatgpt_auth, token_data)
-                        .await
+                    self.refresh_and_persist_chatgpt_token(
+                        &chatgpt_auth,
+                        token_data,
+                        refresh_permit,
+                    )
+                    .await
                 }
                 CodexAuth::ApiKey(_)
                 | CodexAuth::ChatgptAuthTokens(_)
@@ -3616,22 +3646,22 @@ impl AuthManager {
         // Do not hold auth or process-local storage locks during filesystem/keyring operations.
         // A managed-store failure leaves the active provider and cache unchanged.
         let removed_managed = logout(
-            &self.codex_home,
-            self.auth_credentials_store_mode,
-            self.keyring_backend_kind,
+            &self.state.codex_home,
+            self.state.auth_credentials_store_mode,
+            self.state.keyring_backend_kind,
         )?;
         let removed_ephemeral_store =
-            if self.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+            if self.state.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
                 false
             } else {
                 logout(
-                    &self.codex_home,
+                    &self.state.codex_home,
                     AuthCredentialsStoreMode::Ephemeral,
-                    self.keyring_backend_kind,
+                    self.state.keyring_backend_kind,
                 )?
             };
-        let removed_ephemeral = with_ephemeral_auth_entry(&self.codex_home, |entry| {
-            let mut state = self
+        let removed_ephemeral = with_ephemeral_auth_entry(&self.state.codex_home, |entry| {
+            let mut state = self.state
                 .external_auth
                 .write()
                 .map_err(|_| std::io::Error::other("external auth lock is poisoned"))?;
@@ -3662,16 +3692,16 @@ impl AuthManager {
     pub async fn logout_with_revoke(&self) -> std::io::Result<bool> {
         self.ensure_logout_allowed()?;
         let snapshot = PreparedAuthLogout::capture(
-            &self.codex_home,
-            self.auth_credentials_store_mode,
-            self.keyring_backend_kind,
+            &self.state.codex_home,
+            self.state.auth_credentials_store_mode,
+            self.state.keyring_backend_kind,
         )?;
         let (generation, source) = self
             .external_auth_snapshot()
             .ok_or_else(|| std::io::Error::other("external auth lock is poisoned"))?;
         let retiring_lifecycle = snapshot.managed_lifecycle();
         if source.is_none()
-            && let Err(err) = revoke_auth_tokens(snapshot.managed_auth(), &self.auth_route_config).await
+            && let Err(err) = revoke_auth_tokens(snapshot.managed_auth(), &self.state.auth_route_config).await
         {
             tracing::warn!("failed to revoke auth tokens during logout: {err}");
         }
@@ -3688,8 +3718,8 @@ impl AuthManager {
                 return Err(err);
             }
         };
-        let removed_external = with_ephemeral_auth_entry(&self.codex_home, |entry| {
-            let mut state = self
+        let removed_external = with_ephemeral_auth_entry(&self.state.codex_home, |entry| {
+            let mut state = self.state
                 .external_auth
                 .write()
                 .map_err(|_| std::io::Error::other("external auth lock is poisoned"))?;
@@ -3723,7 +3753,7 @@ impl AuthManager {
     }
 
     fn fence_failed_retirement(&self, lifecycles: [Option<String>; 2]) {
-        let Ok(mut cached) = self.inner.write() else {
+        let Ok(mut cached) = self.state.inner.write() else {
             return;
         };
         let current = cached.auth.as_ref().and_then(CodexAuth::lifecycle_id);
@@ -3808,7 +3838,7 @@ impl AuthManager {
         };
         let external_auth = source.provider();
         let (started, previous_account_id) = {
-            let cached = self.inner.read().map_err(|_| {
+            let cached = self.state.inner.read().map_err(|_| {
                 RefreshTokenError::Transient(std::io::Error::other("auth lock is poisoned"))
             })?;
             (cached.load_publications, cached.auth.as_ref().and_then(CodexAuth::get_account_id))
@@ -3843,7 +3873,7 @@ impl AuthManager {
         if !source.is_runtime() || !auth.is_external_chatgpt_tokens() {
             return Ok(None);
         }
-        let home = self.codex_home.clone();
+        let home = self.state.codex_home.clone();
         tokio::task::spawn_blocking(move || ephemeral_auth_entry_key(&home))
             .await
             .map_err(std::io::Error::other)?
@@ -3889,7 +3919,7 @@ impl AuthManager {
         publish_mirror: impl FnOnce(),
     ) -> std::io::Result<bool> {
         self.with_current_external_auth(generation, || {
-            let mut cached = self.inner.write()
+            let mut cached = self.state.inner.write()
                 .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
             if let Some(started) = started {
                 Self::check_load_publication(&cached, started)?;
@@ -3929,33 +3959,36 @@ impl AuthManager {
         &self,
         auth: &ChatgptAuth,
         expected_tokens: TokenData,
+        refresh_permit: &Arc<OwnedSemaphorePermit>,
     ) -> Result<(), RefreshTokenError> {
         let expected = auth
             .current_auth_json()
             .ok_or_else(|| std::io::Error::other("Token data is not available."))?;
         let refresh_response = request_chatgpt_token_refresh(
             expected_tokens.refresh_token.clone(),
-            &self.auth_route_config,
+            &self.state.auth_route_config,
             expected.oauth_context.as_ref(),
             CHATGPT_TOKEN_REFRESH_TIMEOUT,
         )
         .await?;
 
-        *self
+        *self.state
             .pending_rotation
             .lock()
             .map_err(|_| std::io::Error::other("pending rotation lock poisoned"))? =
             Some((auth.clone(), expected, refresh_response));
-        self.commit_pending_rotation()?;
-        self.reload().await;
+        self.commit_pending_rotation(refresh_permit).await?;
 
         Ok(())
     }
 
     // Keep an issuer's successful single-use rotation until it is committed or
     // explicitly fenced by a newer lifecycle. Never rotate its predecessor twice.
-    fn commit_pending_rotation(&self) -> Result<bool, RefreshTokenError> {
-        let pending = self
+    async fn commit_pending_rotation(
+        &self,
+        refresh_permit: &Arc<OwnedSemaphorePermit>,
+    ) -> Result<bool, RefreshTokenError> {
+        let pending = self.state
             .pending_rotation
             .lock()
             .map_err(|_| std::io::Error::other("pending rotation lock poisoned"))?
@@ -3963,33 +3996,55 @@ impl AuthManager {
         let Some((auth, expected, response)) = pending else {
             return Ok(false);
         };
-        let result = persist_tokens(
-            auth.storage(),
-            &expected,
-            response.id_token,
-            response.access_token,
-            response.refresh_token,
-        );
-        if result.is_ok()
-            || result
-                .as_ref()
-                .is_err_and(crate::auth::storage::is_auth_changed)
-        {
-            self.pending_rotation
-                .lock()
-                .map_err(|_| std::io::Error::other("pending rotation lock poisoned"))?
-                .take();
-        }
-        result.map_err(|err| {
-            if crate::auth::storage::is_auth_changed(&err) {
-                return err;
+        let manager = Self {
+            state: Arc::clone(&self.state),
+        };
+        let refresh_permit = Arc::clone(refresh_permit);
+        // Dropping the caller detaches this task. Keep issuer serialization
+        // through the conditional save and the ordinary fenced cache reload.
+        tokio::spawn(async move {
+            let storage_permit = Arc::clone(&refresh_permit);
+            let result = tokio::task::spawn_blocking(move || {
+                // A blocking job can outlive even its async coordinator.
+                let _storage_permit = storage_permit;
+                persist_tokens(
+                    auth.storage(),
+                    &expected,
+                    response.id_token,
+                    response.access_token,
+                    response.refresh_token,
+                )
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+
+            if result.is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(crate::auth::storage::is_auth_changed)
+            {
+                manager
+                    .state
+                    .pending_rotation
+                    .lock()
+                    .map_err(|_| std::io::Error::other("pending rotation lock poisoned"))?
+                    .take();
             }
-            std::io::Error::new(
-                err.kind(),
-                format!("token rotation succeeded; local credential commit is pending: {err}"),
-            )
-        })?;
-        Ok(true)
+            result.map_err(|err| {
+                if crate::auth::storage::is_auth_changed(&err) {
+                    return err;
+                }
+                std::io::Error::new(
+                    err.kind(),
+                    format!("token rotation succeeded; local credential commit is pending: {err}"),
+                )
+            })?;
+            manager.reload().await;
+            drop(refresh_permit);
+            Ok(true)
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 }
 

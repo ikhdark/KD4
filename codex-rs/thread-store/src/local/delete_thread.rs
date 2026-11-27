@@ -707,14 +707,29 @@ async fn stage_thread_deletes_inner<'a>(
                 delete_recovery_error(error)
             }
         })?;
-    if let Some(cutoff) = archive_cutoff {
-        for lease in &writer_leases {
-            let modified: chrono::DateTime<chrono::Utc> = lease.metadata().and_then(|m|m.modified()).map_err(delete_recovery_error)?.into();
-            if modified.timestamp() > cutoff {
-                return Err(ThreadStoreError::Conflict {message: "recent archive or newly observed writer lease".into()});
+    let (moves, recorder_pauses, writer_leases) = if let Some(cutoff) = archive_cutoff {
+        // Keep the move fence, writer pauses and leases until the age check settles.
+        let owners = (moves, recorder_pauses, writer_leases);
+        tokio::task::spawn_blocking(move || {
+            for lease in &owners.2 {
+                let modified: chrono::DateTime<chrono::Utc> = lease
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .map_err(delete_recovery_error)?
+                    .into();
+                if modified.timestamp() > cutoff {
+                    return Err(ThreadStoreError::Conflict {
+                        message: "recent archive or newly observed writer lease".into(),
+                    });
+                }
             }
-        }
-    }
+            Ok(owners)
+        })
+        .await
+        .map_err(delete_recovery_error)??
+    } else {
+        (moves, recorder_pauses, writer_leases)
+    };
     let mut found_thread_ids = Vec::new();
     let mut candidates = Vec::new();
     let mut auxiliary_threads = Vec::new();

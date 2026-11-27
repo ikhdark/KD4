@@ -5,6 +5,8 @@ use std::time::Duration;
 use codex_http_client::HttpClientFactory;
 use codex_utils_pty::ManagedRootProcess;
 use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
+use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
+use codex_utils_pty::run_windows_process_operation;
 use codex_websocket_client::WebSocketConnector;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -316,36 +318,8 @@ impl ExecServerClient {
     pub(crate) async fn connect_stdio_command(
         args: StdioExecServerConnectArgs,
     ) -> Result<Self, ExecServerError> {
-        let (mut child, managed_root) = spawn_stdio_command(&args.command).await?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            ExecServerError::Protocol("spawned exec-server command has no stdin".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ExecServerError::Protocol("spawned exec-server command has no stdout".to_string())
-        })?;
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => debug!("exec-server stdio stderr: {line}"),
-                        Ok(None) => break,
-                        Err(err) => {
-                            warn!("failed to read exec-server stdio stderr: {err}");
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
-        Self::connect(
-            JsonRpcConnection::from_stdio(stdout, stdin, "exec-server stdio command".to_string())
-                .with_managed_child_process(child, managed_root),
-            args.into(),
-        )
-        .await
+        let connection = spawn_stdio_command(&args.command).await?;
+        Self::connect(connection, args.into()).await
     }
 }
 
@@ -384,30 +358,77 @@ fn stdio_command_process(stdio_command: &StdioExecServerCommand) -> Command {
 
 async fn spawn_stdio_command(
     stdio_command: &StdioExecServerCommand,
-) -> Result<(tokio::process::Child, Arc<ManagedRootProcess>), ExecServerError> {
+) -> Result<JsonRpcConnection, ExecServerError> {
     let managed_root = ManagedRootProcess::reserve_with_reclaim()
         .await
         .map_err(ExecServerError::Spawn)?;
-    let mut child = stdio_command_process(stdio_command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ExecServerError::Spawn)?;
-    let Some(process_id) = child.id() else {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        return Err(ExecServerError::Spawn(std::io::Error::other(
-            "spawned exec-server command has no process id",
-        )));
-    };
-    if let Err(error) = managed_root.attach_and_resume(process_id) {
-        if let Err(cleanup_error) = managed_root.cleanup_after_failed_attach(child).await {
-            tracing::warn!(%cleanup_error, "exec-server attachment cleanup still unsettled");
-        }
-        return Err(ExecServerError::Spawn(error));
-    }
+    let mut command = stdio_command_process(stdio_command);
+    let runtime = tokio::runtime::Handle::current();
 
-    Ok((child, Arc::new(managed_root)))
+    // Install the supervisor before returning from the blocking operation. If
+    // the caller times out or is cancelled, dropping the undelivered connection
+    // then requests cleanup instead of dropping a bare child and its admission.
+    run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        Ok(runtime.block_on(finish_stdio_command_setup(child, managed_root)))
+    })
+    .await
+    .map_err(ExecServerError::Spawn)?
+}
+
+async fn finish_stdio_command_setup(
+    mut child: tokio::process::Child,
+    managed_root: ManagedRootProcess,
+) -> Result<JsonRpcConnection, ExecServerError> {
+    let setup = (|| {
+        let process_id = child.id().ok_or_else(|| {
+            ExecServerError::Spawn(std::io::Error::other(
+                "spawned exec-server command has no process id",
+            ))
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ExecServerError::Protocol("spawned exec-server command has no stdin".to_string())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ExecServerError::Protocol("spawned exec-server command has no stdout".to_string())
+        })?;
+        managed_root
+            .attach_and_resume(process_id)
+            .map_err(ExecServerError::Spawn)?;
+        Ok((stdin, stdout))
+    })();
+    let (stdin, stdout) = match setup {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            if let Err(cleanup_error) = managed_root.cleanup_after_failed_attach(child).await {
+                warn!(%cleanup_error, "exec-server attachment cleanup still unsettled");
+            }
+            return Err(error);
+        }
+    };
+
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => debug!("exec-server stdio stderr: {line}"),
+                    Ok(None) => break,
+                    Err(err) => {
+                        warn!("failed to read exec-server stdio stderr: {err}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    Ok(
+        JsonRpcConnection::from_stdio(stdout, stdin, "exec-server stdio command".to_string())
+            .with_managed_child_process(child, managed_root),
+    )
 }
 

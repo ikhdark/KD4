@@ -4,6 +4,8 @@ use std::time::Duration;
 
 impl LocalThreadStore {
     /// Last-store drop cancels future passes; a committed deletion finishes.
+    ///
+    /// Call from a blocking context: startup reads the retention policy synchronously.
     pub fn with_archive_retention(mut self) -> Self {
         if !codex_rollout::home_retention_enabled(&self.config.codex_home) {
             return self;

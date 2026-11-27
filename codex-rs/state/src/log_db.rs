@@ -27,6 +27,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::Event;
@@ -160,23 +161,31 @@ impl LogDbLayer {
         self.has_write_failure.load(Ordering::Relaxed) || self.sender.is_closed()
     }
 
-    /// Wait for queued inserts and report any insertion failure since the last flush.
+    /// Wait for queued inserts and report a pending insertion failure, unless another flush
+    /// has already claimed it.
     pub async fn flush(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(LogDbCommand::Flush(tx))
             .await
             .map_err(|_| anyhow::anyhow!("log inserter is closed"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("log inserter stopped before acknowledging flush"))?
+        let failure = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("log inserter stopped before acknowledging flush"))?;
+        let Some(failure) = failure else {
+            return Ok(());
+        };
+        // Claim in the same poll that returns the error. Dropping an unread
+        // reply (or cancelling while waiting for the lock) does not consume it.
+        failure.lock().await.take().map_or(Ok(()), Err)
     }
 
     /// Like [`Self::flush`], but gives up after `timeout` (including time spent waiting for queue
     /// admission). The Flush command is serialized behind every queued insert batch, and each batch
     /// can wait the SQLite busy timeout when the log database is locked, so an unbounded flush lets a
     /// stalled log database stall callers that only need the buffered entries to settle on a
-    /// best-effort basis. Giving up abandons only the wait: the command stays queued, its reply is
-    /// dropped without effect, and a later flush still reports any pending insertion failure.
+    /// best-effort basis. If the command was admitted, giving up only abandons the wait;
+    /// the command still runs and leaves any unclaimed insertion failure available to later flushes.
     pub async fn flush_within(&self, timeout: Duration) -> anyhow::Result<()> {
         tokio::time::timeout(timeout, self.flush())
             .await
@@ -298,9 +307,13 @@ where
     }
 }
 
+// Flush replies share a claim on the error at their queue barrier, not on
+// whatever error the inserter might record next.
+type InsertErrorClaim = Arc<Mutex<Option<anyhow::Error>>>;
+
 enum LogDbCommand {
     Entry(Box<LogEntry>),
-    Flush(oneshot::Sender<anyhow::Result<()>>),
+    Flush(oneshot::Sender<Option<InsertErrorClaim>>),
 }
 
 #[derive(Debug)]
@@ -491,11 +504,7 @@ async fn run_inserter(
                             &mut pending_retention,
                             flush(&state_db, &mut buffer, &mut insert_error, &has_write_failure).await,
                         );
-                        if let Err(Err(error)) = reply.send(insert_error.take().map_or(Ok(()), Err)) {
-                            // Cancellation must not acknowledge an error that
-                            // no live flush receiver was able to observe.
-                            insert_error = Some(error);
-                        }
+                        let _ = reply.send(insert_error.clone());
                     }
                     None => {
                         merge_pending_retention(
@@ -612,7 +621,7 @@ fn start_retention_maintenance(
 async fn flush(
     state_db: &StateRuntime,
     buffer: &mut Vec<LogEntry>,
-    insert_error: &mut Option<anyhow::Error>,
+    insert_error: &mut Option<InsertErrorClaim>,
     has_write_failure: &AtomicBool,
 ) -> Option<LogRetentionScope> {
     if buffer.is_empty() {
@@ -628,8 +637,14 @@ async fn flush(
         Ok(scope) => Some(scope),
         Err(error) => {
             has_write_failure.store(true, Ordering::Relaxed);
-            if insert_error.is_none() {
-                *insert_error = Some(error);
+            if let Some(claim) = insert_error.as_mut().and_then(Arc::get_mut) {
+                // With no outstanding replies, coalesce failures as before,
+                // or reuse the empty slot if its previous error was claimed.
+                claim.get_mut().get_or_insert(error);
+            } else {
+                // An older reply cannot claim an error after its own barrier.
+                // Keep that reply's slot intact and publish a new one.
+                *insert_error = Some(Arc::new(Mutex::new(Some(error))));
             }
             None
         }

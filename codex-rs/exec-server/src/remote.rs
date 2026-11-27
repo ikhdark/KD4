@@ -220,25 +220,32 @@ impl EnvironmentRegistryClient {
 
         let status = response.status();
         let mut body = Vec::new();
-        while let Ok(Some(chunk)) = response.chunk().await {
+        let body_complete = loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break true,
+                Err(_) => break false,
+            };
             let remaining = (ERROR_BODY_PREVIEW_BYTES + 1).saturating_sub(body.len());
             body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
             if body.len() > ERROR_BODY_PREVIEW_BYTES {
-                break;
+                break false;
             }
-        }
+        };
         let body = String::from_utf8_lossy(&body);
-        // An incomplete body must not be interpreted as a complete registry error.
-        let body = if body.len() > ERROR_BODY_PREVIEW_BYTES {
-            preview_error_body(&body).unwrap_or_default()
+        // Partial bodies are suitable only for display, not retry classification.
+        let error = if body_complete {
+            serde_json::from_str::<RegistryErrorBody>(&body)
+                .ok()
+                .and_then(|body| body.error)
         } else {
-            body.into_owned()
+            None
         };
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-            return Err(environment_registry_auth_error(status, &body));
+            return Err(environment_registry_auth_error(status, &body, error));
         }
 
-        Err(environment_registry_http_error(status, &body))
+        Err(environment_registry_http_error(status, &body, error))
     }
 }
 
@@ -753,17 +760,27 @@ fn endpoint_url(
     Ok(url.into())
 }
 
-fn environment_registry_auth_error(status: StatusCode, body: &str) -> ExecServerError {
-    let message = registry_error_message(body).unwrap_or_else(|| "empty error body".to_string());
+fn environment_registry_auth_error(
+    status: StatusCode,
+    body: &str,
+    error: Option<RegistryError>,
+) -> ExecServerError {
+    let message = error
+        .and_then(|error| error.message)
+        .and_then(|message| preview_error_body(&message))
+        .or_else(|| preview_error_body(body))
+        .unwrap_or_else(|| "empty error body".to_string());
     ExecServerError::EnvironmentRegistryAuth(format!(
         "environment registry authentication failed ({status}): {message}"
     ))
 }
 
-fn environment_registry_http_error(status: StatusCode, body: &str) -> ExecServerError {
-    let parsed = serde_json::from_str::<RegistryErrorBody>(body).ok();
-    let (code, message) = parsed
-        .and_then(|body| body.error)
+fn environment_registry_http_error(
+    status: StatusCode,
+    body: &str,
+    error: Option<RegistryError>,
+) -> ExecServerError {
+    let (code, message) = error
         .map(|error| {
             (
                 error.code.and_then(|code| preview_error_body(&code)),
@@ -787,15 +804,6 @@ fn environment_registry_http_error(status: StatusCode, body: &str) -> ExecServer
         code,
         message,
     }
-}
-
-fn registry_error_message(body: &str) -> Option<String> {
-    serde_json::from_str::<RegistryErrorBody>(body)
-        .ok()
-        .and_then(|body| body.error)
-        .and_then(|error| error.message)
-        .and_then(|message| preview_error_body(&message))
-        .or_else(|| preview_error_body(body))
 }
 
 fn preview_error_body(body: &str) -> Option<String> {

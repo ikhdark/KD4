@@ -156,7 +156,8 @@ pub async fn observe_working_tree(
                 // unchanged state from an old baseline.
                 observed = capture(root.clone(), paths.clone(), max_files).await?;
                 observed.change_detected = observed.state_sha256 != baseline;
-                observed.timed_out = !observed.change_detected;
+                observed.rescan_required = observed.watch_routes != routes;
+                observed.timed_out = !observed.change_detected && !observed.rescan_required;
                 return Ok(observed);
             }
         };

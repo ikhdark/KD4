@@ -113,6 +113,11 @@ struct CreateFileResponse {
 }
 
 #[derive(Deserialize)]
+struct CreatedFileId {
+    file_id: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct DownloadLinkResponse {
     status: String,
@@ -289,11 +294,25 @@ async fn upload_openai_file_contents_with_pool(
         });
     }
     let create_body = create_body.map_err(|source| request_error(&create_url, source.into()))?;
-    let create_payload: CreateFileResponse =
-        serde_json::from_str(&create_body).map_err(|source| OpenAiFileError::Decode {
-            url: create_url.clone(),
-            source,
-        })?;
+    let create_payload: CreateFileResponse = match serde_json::from_str(&create_body) {
+        Ok(payload) => payload,
+        Err(source) => {
+            let error = OpenAiFileError::Decode {
+                url: create_url,
+                source,
+            };
+            // Only recover an ID from a JSON object with an unambiguous file_id field.
+            // The full decode is still required before attempting the blob upload.
+            if create_body.trim_start().starts_with('{')
+                && let Ok(CreatedFileId { file_id }) = serde_json::from_str(&create_body)
+                && !file_id.trim().is_empty()
+                && !matches!(file_id.as_str(), "." | "..")
+            {
+                return Err(rollback_openai_file(base_url, auth, http_clients, file_id, error).await);
+            }
+            return Err(error);
+        }
+    };
     let file_id = create_payload.file_id.clone();
     let upload_result: Result<UploadedOpenAiFile, OpenAiFileError> = async {
         let upload_timeout = openai_file_upload_timeout(file_size_bytes);
@@ -453,15 +472,25 @@ async fn upload_openai_file_contents_with_pool(
     match upload_result {
         Ok(uploaded) => Ok(uploaded),
         Err(source) => {
-            match delete_openai_file_with_pool(base_url, auth, http_clients, &file_id).await {
-                Ok(()) => Err(source),
-                Err(rollback) => Err(OpenAiFileError::RollbackFailed {
-                    file_id,
-                    source: Box::new(source),
-                    rollback: Box::new(rollback),
-                }),
-            }
+            Err(rollback_openai_file(base_url, auth, http_clients, file_id, source).await)
         }
+    }
+}
+
+async fn rollback_openai_file(
+    base_url: &str,
+    auth: &dyn AuthProvider,
+    http_clients: &RouteAwareClientPool,
+    file_id: String,
+    source: OpenAiFileError,
+) -> OpenAiFileError {
+    match delete_openai_file_with_pool(base_url, auth, http_clients, &file_id).await {
+        Ok(()) => source,
+        Err(rollback) => OpenAiFileError::RollbackFailed {
+            file_id,
+            source: Box::new(source),
+            rollback: Box::new(rollback),
+        },
     }
 }
 

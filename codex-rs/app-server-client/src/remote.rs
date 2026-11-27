@@ -107,8 +107,7 @@ impl PendingRemoteEvents {
     fn pop_front(&mut self) -> Option<BudgetedRemoteEvent> { self.events.pop_front() }
 
     fn acquire_wire(&self, bytes: usize) -> IoResult<tokio::sync::OwnedSemaphorePermit> {
-        let charge = bytes.saturating_mul(8).saturating_add(std::mem::size_of::<AppServerEvent>());
-        let charge = u32::try_from(charge).map_err(IoError::other)?;
+        let charge = remote_event_wire_charge(bytes)?;
         self.budget.clone().try_acquire_many_owned(charge).map_err(|_| IoError::new(
             ErrorKind::OutOfMemory, "remote app-server aggregate decoded/queued/retained event byte budget exceeded; connection retired",
         ))
@@ -122,6 +121,12 @@ impl PendingRemoteEvents {
         Ok(())
     }
 }
+
+fn remote_event_wire_charge(bytes: usize) -> IoResult<u32> {
+    let charge = bytes.saturating_mul(8).saturating_add(std::mem::size_of::<AppServerEvent>());
+    u32::try_from(charge).map_err(IoError::other)
+}
+
 // Tungstenite still needs an HTTP request URI for the WebSocket handshake;
 // the bytes travel over the Unix socket, not TCP.
 const UDS_WEBSOCKET_HANDSHAKE_URL: &str = "ws://localhost/rpc";
@@ -848,9 +853,13 @@ impl RemoteAppServerClient {
                 let _ = writer_handle.await;
             }
             drop(stream);
-            let disconnect_message = worker_exit_error
-                .as_ref()
-                .map(|(_, message)| message.clone());
+            let disconnect_message = worker_exit_error.as_ref().map(|(_, message)| {
+                // Bound only the queued diagnostic, leaving RPC and worker errors intact.
+                // This is the largest message the existing ownership budget can admit.
+                let max_bytes =
+                    (MAX_REMOTE_EVENT_OWNERSHIP_BYTES - std::mem::size_of::<AppServerEvent>()) / 8;
+                message[..message.floor_char_boundary(max_bytes)].to_owned()
+            });
             let (err_kind, err_message) = worker_exit_error.unwrap_or_else(|| {
                 (
                     ErrorKind::BrokenPipe,
@@ -862,11 +871,11 @@ impl RemoteAppServerClient {
                 let _ = response_tx.send(Err(IoError::new(err_kind, err_message.clone())));
             }
             if let Some(message) = disconnect_message {
-                let _ = deliver_event(
+                let _ = deliver_disconnect(
                     &event_tx,
                     &mut pending_delivery,
                     &mut skipped_events,
-                    AppServerEvent::Disconnected { message },
+                    message,
                 )
                 .await;
             }
@@ -1466,11 +1475,11 @@ fn forward_remote_event(
     }
 }
 
-async fn deliver_event(
+async fn deliver_disconnect(
     event_tx: &mpsc::Sender<BudgetedRemoteEvent>,
     pending_delivery: &mut PendingRemoteEvents,
     skipped_events: &mut usize,
-    event: AppServerEvent,
+    message: String,
 ) -> IoResult<()> {
     // This terminal path runs only after RPCs and the socket are retired. Drain
     // the bounded queue before sending disconnect, even when it was saturated.
@@ -1491,10 +1500,18 @@ async fn deliver_event(
             .map_err(|_| IoError::new(ErrorKind::BrokenPipe, "event consumer closed"))?;
         *skipped_events = 0;
     }
-    let bytes = match &event { AppServerEvent::Disconnected { message } => message.len(), _ => 0 };
-    let credit = pending_delivery.acquire_wire(bytes)?;
+    // Moving an event to the channel does not release its byte credit. Wait
+    // for the consumer to release enough credit, or stop if it has gone away.
+    let charge = remote_event_wire_charge(message.len())?;
+    let credit = tokio::select! {
+        _ = event_tx.closed() => return Err(IoError::new(ErrorKind::BrokenPipe, "event consumer closed")),
+        credit = pending_delivery.budget.clone().acquire_many_owned(charge) => credit.map_err(IoError::other)?,
+    };
     event_tx
-        .send(BudgetedRemoteEvent { event, _credit: Some(credit) })
+        .send(BudgetedRemoteEvent {
+            event: AppServerEvent::Disconnected { message },
+            _credit: Some(credit),
+        })
         .await
         .map_err(|_| IoError::new(ErrorKind::BrokenPipe, "event consumer closed"))?;
     Ok(())

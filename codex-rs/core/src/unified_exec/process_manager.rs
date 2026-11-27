@@ -124,6 +124,45 @@ pub(crate) fn nested_poll_bound(nested_deadline: Option<std::time::Instant>) -> 
     )
 }
 
+struct StdinMutation<'a> {
+    cancellation: &'a CancellationToken,
+    started: bool,
+}
+
+/// Tokio's timeout polls its inner future first. Keep its timer wakeup, but
+/// check the absolute bound before each poll of an effect-bearing operation.
+async fn poll_stdin_before<F: std::future::Future>(
+    deadline: Option<Instant>,
+    cancellation: Option<&CancellationToken>,
+    operation: F,
+) -> Option<F::Output> {
+    let mut operation = std::pin::pin!(operation);
+    let guarded = std::future::poll_fn(|cx| {
+        if deadline.is_some_and(|bound| Instant::now() >= bound)
+            || cancellation.is_some_and(CancellationToken::is_cancelled)
+        {
+            std::task::Poll::Ready(None)
+        } else {
+            operation.as_mut().poll(cx).map(Some)
+        }
+    });
+    let wait = async {
+        match deadline {
+            Some(bound) => tokio::time::timeout_at(bound, guarded).await.ok().flatten(),
+            None => guarded.await,
+        }
+    };
+    if let Some(cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            result = wait => result,
+        }
+    } else {
+        wait.await
+    }
+}
+
 struct CollectedOutput {
     bytes: Vec<u8>,
     stream_ranges: Option<[std::ops::Range<u64>; 2]>,
@@ -1510,26 +1549,44 @@ impl UnifiedExecProcessManager {
         &self,
         request: WriteStdinRequest<'_>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        self.write_stdin_with_observation_mode(request, false).await
+        self.write_stdin_with_observation_mode(request, false, None).await
+    }
+
+    /// Report whether the backend was polled, independently of the child result.
+    pub(crate) async fn write_stdin_interaction(
+        &self,
+        request: WriteStdinRequest<'_>,
+        cancellation: &CancellationToken,
+    ) -> (Result<ExecCommandToolOutput, UnifiedExecError>, bool) {
+        let mut mutation = StdinMutation {
+            cancellation,
+            started: false,
+        };
+        let result = self
+            .write_stdin_with_observation_mode(request, false, Some(&mut mutation))
+            .await;
+        (result, mutation.started)
     }
 
     pub(crate) async fn write_stdin_until_output(
         &self,
         request: WriteStdinRequest<'_>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        self.write_stdin_with_observation_mode(request, true).await
+        self.write_stdin_with_observation_mode(request, true, None).await
     }
 
     async fn write_stdin_with_observation_mode(
         &self,
         request: WriteStdinRequest<'_>,
         until_output: bool,
+        mutation: Option<&mut StdinMutation<'_>>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let handler_started_at = Instant::now();
         let process_id = request.process_id;
+        let poll_bound = nested_poll_bound(request.nested_deadline);
         let process = {
             let store = self.process_store.lock().await;
-            if let Some(response) = store.finished_response(&request) {
+            if let Some(response) = Self::finished_stdin_response(&store, &request) {
                 return response;
             }
             store
@@ -1541,9 +1598,9 @@ impl UnifiedExecProcessManager {
                 })?
         };
         let started_at = Instant::now();
-        let mut hard_deadline = nested_poll_bound(request.nested_deadline);
+        let mut hard_deadline = poll_bound;
         let result = self
-            .write_stdin_inner(request, &process, until_output, &mut hard_deadline)
+            .write_stdin_inner(request, &process, until_output, mutation, &mut hard_deadline)
             .await;
         let result = finish_exited_process_result(
             Some(&process),
@@ -1565,6 +1622,7 @@ impl UnifiedExecProcessManager {
         request: WriteStdinRequest<'_>,
         locked_process: &Arc<UnifiedExecProcess>,
         until_output: bool,
+        mutation: Option<&mut StdinMutation<'_>>,
         observation_deadline: &mut Option<Instant>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process_id = request.process_id;
@@ -1577,12 +1635,8 @@ impl UnifiedExecProcessManager {
         {
             Ok(handles) => handles,
             Err(error) => {
-                return self
-                    .process_store
-                    .lock()
-                    .await
-                    .finished_response(&request)
-                    .unwrap_or(Err(error));
+                let store = self.process_store.lock().await;
+                return Self::finished_stdin_response(&store, &request).unwrap_or(Err(error));
             }
         };
 
@@ -1601,7 +1655,12 @@ impl UnifiedExecProcessManager {
         // budget like every other pre-observation stage, so a call that waits
         // out its budget here still reports a live process instead of being
         // cancelled at the wrapper's hard deadline.
-        let poll_bound = nested_poll_bound(request.nested_deadline);
+        let poll_bound = if input_operation {
+            *observation_deadline
+        } else {
+            nested_poll_bound(request.nested_deadline)
+        };
+        let cancellation = mutation.as_ref().map(|mutation| mutation.cancellation);
         let lock = locked_process.interaction_lock().lock_owned();
         tokio::pin!(lock);
         let guard = async {
@@ -1617,34 +1676,49 @@ impl UnifiedExecProcessManager {
                 }
             }
         };
-        let _interaction_guard = match poll_bound {
-            Some(bound) => match tokio::time::timeout_at(bound, guard).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    tracing::debug!(
-                        process_id,
-                        interaction_queue_wait_ms = queue_started_at.elapsed().as_millis(),
-                        "unified exec interaction still queued at the nested budget"
-                    );
-                    return Ok(Self::still_queued_result(
-                        &prepared_handles,
-                        &request,
-                        queue_started_at.elapsed(),
-                    ));
-                }
-            },
-            None => guard.await,
+        let guard = if input_operation {
+            poll_stdin_before(poll_bound, cancellation, guard).await
+        } else {
+            match poll_bound {
+                Some(bound) => tokio::time::timeout_at(bound, guard).await.ok(),
+                None => Some(guard.await),
+            }
+        };
+        let not_admitted = || {
+            Self::unadmitted_interaction_result(
+                &prepared_handles,
+                &request,
+                queue_started_at.elapsed(),
+            )
+        };
+        let Some(_interaction_guard) = guard else {
+            tracing::debug!(
+                process_id,
+                interaction_queue_wait_ms = queue_started_at.elapsed().as_millis(),
+                "unified exec interaction not admitted within the owner budget"
+            );
+            return Ok(not_admitted());
         };
         tracing::debug!(
             process_id,
             interaction_queue_wait_ms = queue_started_at.elapsed().as_millis(),
-            "unified exec interaction admitted"
+            "unified exec interaction lock acquired"
         );
 
         // A preceding poll may have retired this process while we queued.
-        if let Some(response) = self.process_store.lock().await.finished_response(&request) {
+        let store = self.process_store.lock();
+        let store = if input_operation {
+            let Some(store) = poll_stdin_before(poll_bound, cancellation, store).await else {
+                return Ok(not_admitted());
+            };
+            store
+        } else {
+            store.await
+        };
+        if let Some(response) = Self::finished_stdin_response(&store, &request) {
             return response;
         }
+        drop(store);
         if request.acknowledge_only && prepared_handles.tty {
             return Err(UnifiedExecError::process_failed(
                 "acknowledge_only requires piped stdin, not a terminal; input was not delivered".into(),
@@ -1661,23 +1735,6 @@ impl UnifiedExecProcessManager {
             )));
         }
 
-        let PreparedProcessHandles {
-            process,
-            output_buffer,
-            output_notify,
-            output_closed,
-            output_closed_notify,
-            cancellation_token,
-            pause_state,
-            call_id,
-            hook_command,
-            hook_cwd,
-            process_id,
-            search_exit_one_is_no_match,
-            tty,
-            validation_launch,
-            ..
-        } = prepared_handles;
         let mut status_after_write = None;
         let mut input_error = None;
         let yield_time_ms = {
@@ -1685,8 +1742,10 @@ impl UnifiedExecProcessManager {
             // writes keep a fixed max cap so interactive stdin remains responsive.
             // Only undelivered output justifies a sub-five-second empty poll.
             // The interaction guard serializes this check with acknowledgement.
-            let new_output = {
-                let output = output_buffer.lock().await;
+            let new_output = if input_operation {
+                false
+            } else {
+                let output = prepared_handles.output_buffer.lock().await;
                 output.has_uncollected_output()
                     || output
                         .pending_output()
@@ -1728,29 +1787,48 @@ impl UnifiedExecProcessManager {
             sequence: 0,
         });
 
-        if request.close_stdin {
-            tokio::time::timeout_at(deadline, process.close_stdin()).await
-                .map_err(|_| UnifiedExecError::CloseStdin {
+        if input_operation {
+            let process = &prepared_handles.process;
+            let interrupt = !prepared_handles.tty && request.input == INTERRUPT;
+            // The token prevents first dispatch; once polled, use the existing
+            // bounded delivery/cleanup path rather than abandoning remote effects.
+            let mut started = false;
+            let write = poll_stdin_before(Some(deadline), None, async {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return None;
+                }
+                started = true;
+                Some(if request.close_stdin {
+                    process.close_stdin().await
+                } else if interrupt {
+                    process.interrupt().await
+                } else {
+                    process.write(request.input.as_bytes()).await
+                })
+            })
+            .await
+            .flatten();
+            if !started {
+                return Ok(not_admitted());
+            }
+            if let Some(mutation) = mutation {
+                mutation.started = true;
+            }
+            if request.close_stdin {
+                write.ok_or_else(|| UnifiedExecError::CloseStdin {
                     message: "close requested but pipe drain exceeded the yield deadline; the process remains available".into(),
                 })??;
-        }
-        if !request.input.is_empty() {
-            if !tty && request.input == INTERRUPT {
-                tokio::time::timeout_at(deadline, process.interrupt())
-                    .await
-                    .map_err(|_| UnifiedExecError::process_failed(
-                        "interrupt delivery was not confirmed before the yield deadline; the signal was not retried and the session remains available".to_string(),
-                    ))??;
+            } else if interrupt {
+                write.ok_or_else(|| UnifiedExecError::process_failed(
+                    "interrupt delivery was not confirmed before the yield deadline; the signal was not retried and the session remains available".to_string(),
+                ))??;
             } else {
-                let write =
-                    tokio::time::timeout_at(deadline, process.write(request.input.as_bytes()))
-                        .await;
                 let write = match write {
-                    Ok(write) => write,
+                    Some(write) => write,
                     // The backend guarantees the abandoned write queued nothing, so the
                     // process keeps running. Input carrying Ctrl-C still ends it below,
                     // because the interrupt it asked for was not delivered.
-                    Err(_)
+                    None
                         if process.cancelled_write_is_unsent()
                             && !request.input.contains(INTERRUPT) =>
                     {
@@ -1758,14 +1836,14 @@ impl UnifiedExecProcessManager {
                             "stdin was not written before the yield deadline; nothing was queued, so retrying is safe and the session remains available".to_string(),
                         ));
                     }
-                    Err(_) => {
+                    None => {
                         // Delivery may have reached the executor before its acknowledgement.
                         // Do not replay uncertain bytes. Confirm termination with its separate
                         // cleanup bound, retaining custody if confirmation fails.
                         return Err(self
                             .fail_process_with_message(
                                 process_id,
-                                &process,
+                                process,
                                 "stdin delivery was not confirmed before the yield deadline; the write was not retried".to_string(),
                             )
                             .await);
@@ -1774,7 +1852,7 @@ impl UnifiedExecProcessManager {
                 match write {
                     Ok(()) => {}
                     Err(err) => {
-                        let status = self.refresh_process_state(process_id, &process).await;
+                        let status = self.refresh_process_state(process_id, process).await;
                         if matches!(status, ProcessStatus::Exited { .. }) {
                             input_error = Some(match err {
                                 UnifiedExecError::StdinClosed => "Input was not delivered because stdin closed. The process exit does not acknowledge this interaction.".to_string(),
@@ -1783,7 +1861,7 @@ impl UnifiedExecProcessManager {
                             status_after_write = Some(status);
                         } else if let UnifiedExecError::ProcessFailed { message } = err {
                             return Err(self
-                                .fail_process_with_message(process_id, &process, message)
+                                .fail_process_with_message(process_id, process, message)
                                 .await);
                         } else {
                             return Err(err);
@@ -1792,6 +1870,24 @@ impl UnifiedExecProcessManager {
                 }
             }
         }
+
+        let PreparedProcessHandles {
+            process,
+            output_buffer,
+            output_notify,
+            output_closed,
+            output_closed_notify,
+            cancellation_token,
+            pause_state,
+            call_id,
+            hook_command,
+            hook_cwd,
+            process_id,
+            search_exit_one_is_no_match,
+            tty,
+            validation_launch,
+            ..
+        } = prepared_handles;
 
         // The write still used the full bounded delivery deadline. Do not
         // wait for a response after delivery when the caller will send EOF.
@@ -2089,17 +2185,23 @@ impl UnifiedExecProcessManager {
         }
     }
 
-    /// A yielded result for a call whose nested budget expired while it was
-    /// still queued behind another interaction.
-    ///
-    /// Nothing was written and no output was observed, so this is a resumable
-    /// handle, not a failure: the process is untouched and the caller can poll
-    /// again. Reporting it as an error would strand a live process behind a
-    /// cancelled call.
-    fn still_queued_result(
+    fn finished_stdin_response(
+        store: &ProcessStore,
+        request: &WriteStdinRequest<'_>,
+    ) -> Option<Result<ExecCommandToolOutput, UnifiedExecError>> {
+        let mut response = store.finished_response(request)?;
+        if request.close_stdin && let Ok(output) = &mut response {
+            output.error = Some("EOF was not sent because the process already exited.".into());
+        }
+        Some(response)
+    }
+
+    /// Recovery-only receipt: the backend was not invoked and no output was
+    /// consumed. Passive polls may yield successfully; mutations did not run.
+    fn unadmitted_interaction_result(
         handles: &PreparedProcessHandles,
         request: &WriteStdinRequest<'_>,
-        queue_time: Duration,
+        wait_time: Duration,
     ) -> ExecCommandToolOutput {
         let process_exited = handles.process.has_exited();
         let exit_code = handles.process.exit_code();
@@ -2108,26 +2210,35 @@ impl UnifiedExecProcessManager {
         } else {
             "Process was still running at observation."
         };
-        let input = if request.input.is_empty() {
-            "No input was requested. Poll the retained session; do not restart the command."
+        let error = if request.close_stdin {
+            Some("EOF was not sent; the close was not dispatched.".to_string())
+        } else if !request.input.is_empty() {
+            Some("Input was not delivered; the interaction was not dispatched.".to_string())
         } else {
-            "Input was not delivered and was not retried."
+            None
         };
-        let notice = format!(
-            "Interaction deadline expired after {:.3}s queued. {state} {input}",
-            queue_time.as_secs_f64()
-        );
+        let notice = if error.is_some() {
+            format!(
+                "Interaction admission ended after {:.3}s (deadline or cancellation). {state} Poll the retained session; do not restart the command.",
+                wait_time.as_secs_f64()
+            )
+        } else {
+            format!(
+                "Interaction deadline expired after {:.3}s queued. {state} No input was requested. Poll the retained session; do not restart the command.",
+                wait_time.as_secs_f64()
+            )
+        };
         ExecCommandToolOutput {
             stream_chunks: None,
             stream_ranges: None,
             output_ranges: None,
             process_output: None,
             environment_receipt: handles.process.environment_receipt(),
-            error: request.acknowledge_only.then(|| "stdin was not written before the interaction deadline".into()),
+            error,
             validation: handles.process.validation(),
             event_call_id: handles.call_id.clone(),
             chunk_id: generate_chunk_id(),
-            wall_time: queue_time,
+            wall_time: wait_time,
             raw_output: Vec::new(),
             truncation_policy: request.truncation_policy,
             max_output_tokens: request.max_output_tokens,

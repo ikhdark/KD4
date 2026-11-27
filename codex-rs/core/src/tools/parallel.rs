@@ -2751,11 +2751,12 @@ impl ToolCallRuntime {
                 timing.mark_parallel_gate_admitted();
                 turn.turn_timing_state
                     .record_tool_gate_admitted(dispatch_tool_name.as_str());
-                crate::session::turn::reconcile_turn_progress_event(
+                crate::session::turn::reconcile_turn_progress_event_async(
                     &turn.turn_timing_state,
                     1,
                     "tool request admitted",
-                );
+                )
+                .await;
                 let _model_tool_gate_timing_guard =
                     ModelToolGateTimingGuard::admitted(&turn.turn_timing_state, model_issued);
                 let _active_tool_guard = LifecycleCounterGuard::increment(

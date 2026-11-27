@@ -13,6 +13,7 @@ use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
 use codex_code_mode_protocol::host::DelegateResponse;
 use codex_code_mode_protocol::host::EncodedFrame;
+use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_REQUESTS;
 use codex_code_mode_protocol::host::RequestId;
@@ -29,6 +30,9 @@ const CELL_MESSAGE_CAPACITY: usize = 128;
 const OUTGOING_DATA_BYTES: usize = 128 * 1024 * 1024 + 1024;
 const OUTGOING_FAILURE_BYTES: usize = 1024 * 1024;
 const OUTGOING_CONTROL_BYTES: usize = 1024 * 1024;
+// The receipt contains only a request ID and a runtime-generated cell ID
+// (UUID and counter). Allow a 256-byte encode buffer, charged at twice capacity.
+const OUTGOING_START_BYTES: usize = super::MAX_ACTIVE_CELLS * 512;
 
 pub(super) struct OutgoingFrame {
     pub(super) frame: EncodedFrame,
@@ -42,6 +46,7 @@ pub(super) struct HostPeer {
     outgoing_bytes: Arc<Semaphore>,
     failure_bytes: Arc<Semaphore>,
     control_bytes: Arc<Semaphore>,
+    start_bytes: Arc<Semaphore>,
     outgoing_slots: Arc<Semaphore>,
     pending: StdMutex<HashMap<DelegateRequestId, PendingDelegate>>,
     delegate_permits: Arc<Semaphore>,
@@ -128,10 +133,11 @@ impl HostPeer {
             outgoing_bytes: Arc::new(Semaphore::new(OUTGOING_DATA_BYTES)),
             failure_bytes: Arc::new(Semaphore::new(OUTGOING_FAILURE_BYTES)),
             control_bytes: Arc::new(Semaphore::new(OUTGOING_CONTROL_BYTES)),
+            start_bytes: Arc::new(Semaphore::new(OUTGOING_START_BYTES)),
             outgoing_slots: Arc::new(Semaphore::new(
                 super::OUTGOING_FRAME_CAPACITY
                     - MAX_PENDING_DELEGATE_REQUESTS
-                    - super::MAX_ACTIVE_CELLS,
+                    - 2 * super::MAX_ACTIVE_CELLS,
             )),
             pending: StdMutex::new(HashMap::new()),
             delegate_permits: Arc::new(Semaphore::new(MAX_PENDING_DELEGATE_REQUESTS)),
@@ -175,11 +181,8 @@ impl HostPeer {
                 ..
             }
         );
-        // Capacity is admitted during a single serialization, before every
-        // allocation. Charge twice the capacity to cover both buffers during
-        // reallocation, and hold it through delivery of a stalled current frame.
         // Overload receipts have a separate small byte budget, but still use
-        // ordinary frame slots. They cannot exhaust cancellation/closure room.
+        // ordinary frame slots. They cannot exhaust reserved delivery room.
         let budget = if control {
             &self.control_bytes
         } else if failure {
@@ -187,12 +190,21 @@ impl HostPeer {
         } else {
             &self.outgoing_bytes
         };
+        self.prepare_frame_with_budget(message, budget, !control)
+    }
+
+    fn prepare_frame_with_budget(
+        &self,
+        message: &HostToClient,
+        budget: &Arc<Semaphore>,
+        uses_data_slot: bool,
+    ) -> Result<OutgoingFrame, PeerSendError> {
+        // Admit capacity before every allocation. Charge twice the capacity
+        // during reallocation and hold it through delivery of the frame.
         let mut permit = Arc::clone(budget)
             .try_acquire_many_owned(0)
             .map_err(|err| PeerSendError::Payload(err.to_string()))?;
-        let slot = if control {
-            None
-        } else {
+        let slot = if uses_data_slot {
             Some(
                 Arc::clone(&self.outgoing_slots)
                     .try_acquire_owned()
@@ -200,6 +212,8 @@ impl HostPeer {
                         PeerSendError::Payload("outgoing IPC data slots exhausted".into())
                     })?,
             )
+        } else {
+            None
         };
         let frame = EncodedFrame::encode_with_admission(message, |capacity| {
             let additional = capacity
@@ -399,6 +413,27 @@ impl HostPeer {
         started: StartedCell,
         active_cell_permit: OwnedSemaphorePermit,
     ) -> oneshot::Receiver<()> {
+        // The cell is already admitted. A response error would tell the client
+        // it never started, so failure to enqueue the receipt is connection loss.
+        // Queue it before activating the route: the same active-cell permit is
+        // held through delivery of CellClosed, which follows this start receipt.
+        let message = HostToClient::Response {
+            id: request_id,
+            result: WireResult::Ok {
+                value: HostResponse::ExecutionStarted {
+                    cell_id: (&started.cell_id).into(),
+                },
+            },
+        };
+        let frame =
+            self.prepare_frame_with_budget(&message, &self.start_bytes, /*uses_data_slot*/ false);
+        match frame {
+            Ok(frame) => {
+                // Full or closed queues already transition to connection loss.
+                let _ = self.send_frame(frame);
+            }
+            Err(error) => self.fail(format!("cannot deliver code-mode execution start: {error}")),
+        }
         let (initial_response_sent_tx, initial_response_sent_rx) = oneshot::channel();
         let key = (session_id, started.cell_id.clone());
         let messages_rx = Arc::new(CellQueue::default());

@@ -160,10 +160,18 @@ impl TerminalCellCache {
         self.events.get(cell_id).map(|(event, _)| Arc::clone(event))
     }
 
-    fn insert_cached(&mut self, cell_id: CellId, (event, bytes): (Arc<CachedCellEvent>, usize)) {
+    // Move spilled files out of the cache so their final drop cannot unlink
+    // while the caller holds the cache or cell-registry lock.
+    fn insert_cached(
+        &mut self,
+        cell_id: CellId,
+        (event, bytes): (Arc<CachedCellEvent>, usize),
+        retired_spills: &mut Vec<Arc<CachedCellEvent>>,
+    ) {
         self.expired.retain(|(id, _)| id != &cell_id);
-        if let Some((_, replaced)) = self.events.insert(cell_id.clone(), (event, bytes)) {
+        if let Some((event, replaced)) = self.events.insert(cell_id.clone(), (event, bytes)) {
             self.retained_bytes = self.retained_bytes.saturating_sub(replaced);
+            retire_spill(event, retired_spills);
         } else {
             self.order.push_back(cell_id);
         }
@@ -189,8 +197,15 @@ impl TerminalCellCache {
                 while self.expired.len() > TERMINAL_CELL_CACHE_CAPACITY {
                     self.expired.pop_front();
                 }
+                retire_spill(event, retired_spills);
             }
         }
+    }
+}
+
+fn retire_spill(event: Arc<CachedCellEvent>, retired_spills: &mut Vec<Arc<CachedCellEvent>>) {
+    if matches!(event.as_ref(), CachedCellEvent::Spilled(..)) {
+        retired_spills.push(event);
     }
 }
 
@@ -556,14 +571,17 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             let initial_values = self.inner.stored_values.lock().await.clone();
             let minimum_cell_id = self.inner.next_cell_id.load(Ordering::Acquire);
             let owned_admission = admission.take();
-            let (state, restored, completed, returned_admission) = self.inner.spawn_observed_storage(move || {
+            let storage_tasks = self.inner.storage_tasks.clone();
+            let (state, restored, completed, returned_admission, _storage_owner) = self.inner.spawn_observed_storage(move || {
                 // Keep admission through blocking publication even if the caller cancels.
                 let admission = owned_admission;
+                // Keep the restore tracked through cache installation and cleanup registration.
+                let storage_owner = storage_tasks.token();
                 let (state, restored) = snapshot::DurableState::open_with_values(selected_path, initial_values, minimum_cell_id)?;
                 let completed = state.completed_cells_for_replay().into_iter().map(|(id, event, bytes)| {
                     (id, (Arc::new(CachedCellEvent::Durable(event)), bytes))
                 }).collect::<Vec<_>>();
-                Ok::<_, String>((state, restored, completed, admission))
+                Ok::<_, String>((state, restored, completed, admission, storage_owner))
             })?.await.map_err(|error| Error::Runtime(error.to_string()))?
                 .map_err(Error::Runtime)?;
             // Keep exclusion until OnceCell has published the installed state.
@@ -588,11 +606,16 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             *self.inner.restored_cell_ids.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = completed.iter()
                 .map(|(id, _)| CellId::new(id.clone())).collect();
+            let mut retired_spills = Vec::new();
             for (id, event) in completed {
-                terminal.insert_cached(CellId::new(id), event);
+                terminal.insert_cached(CellId::new(id), event, &mut retired_spills);
             }
             self.inner.next_cell_id.fetch_max(next_id, Ordering::AcqRel);
             *values = restored;
+            drop(terminal);
+            drop(values);
+            // Do not await between installing the values and publishing the OnceCell.
+            drop(self.inner.spawn_spill_cleanup(retired_spills));
             Ok(Arc::new(state))
         }).await?;
         if &state.path != path {
@@ -761,6 +784,16 @@ struct RuntimeCellHost<D: SessionRuntimeDelegate> {
 }
 
 impl<D: SessionRuntimeDelegate> Inner<D> {
+    fn spawn_spill_cleanup(
+        &self,
+        retired_spills: Vec<Arc<CachedCellEvent>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        // Only producers already owned by the actor or storage tracker may
+        // register cleanup; shutdown drains both before relinquishing storage.
+        (!retired_spills.is_empty())
+            .then(|| self.storage_tasks.spawn_blocking(move || drop(retired_spills)))
+    }
+
     fn spawn_observed_storage<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> T + Send + 'static,
@@ -974,15 +1007,38 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                     );
                 }
             };
-            stored_values = self.inner.stored_values.lock().await;
+            let values = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => None,
+                _ = tokio::time::sleep_until(deadline) => None,
+                values = self.inner.stored_values.lock() => Some(values),
+            };
+            let Some(values) = values else {
+                self.inner
+                    .storage_tasks
+                    .spawn_blocking(move || drop((gate, staged, storage_owner)));
+                return cell_state.commit_completion_with_event(
+                    event,
+                    pending_initial_yield_items,
+                    snapshot_precommit_timeout,
+                );
+            };
+            stored_values = values;
             Some((gate, staged, storage_owner))
         } else {
             drop(gate);
             None
         };
         let completed = staged.as_ref().map(|_| event.clone());
+        let mut publication_admitted = false;
         let commit =
             cell_state.commit_completion_with_event(event, pending_initial_yield_items, |event| {
+                // Check inside the phase barrier: staging and lock readiness
+                // do not authorize a durable commit after its deadline.
+                if staged.is_some() && tokio::time::Instant::now() >= deadline {
+                    return snapshot_precommit_timeout(event);
+                }
+                publication_admitted = staged.is_some();
                 if writes_fit && !conflicting_write && !conflicting_read {
                     crate::runtime::apply_stored_value_writes(
                         &mut stored_values,
@@ -1004,8 +1060,9 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         if let (Some(durable), Some((gate, staged, storage_owner)), Some(completed)) =
             (durable, staged, completed)
         {
-            if matches!(commit, CompletionCommit::Rejected(_)) {
-                // Temporary-file cleanup is I/O too, and never publishes.
+            if !publication_admitted {
+                // Cancellation or expiry before the decision cannot publish.
+                // Temporary-file cleanup is I/O too.
                 self.inner
                     .storage_tasks
                     .spawn_blocking(move || drop((gate, staged, storage_owner)));
@@ -1017,7 +1074,6 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             let cell_id = self.cell_id.clone();
             let publication = self.inner.storage_tasks.spawn_blocking(move || {
                 let _storage_owner = storage_owner;
-                let _gate = gate;
                 let result = durable.publish(staged);
                 let event = match &result {
                     Ok(()) => completed,
@@ -1027,15 +1083,22 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                 // Settlement owns refinement, even after the observation deadline.
                 // No timed-out waiter may subsequently overwrite this receipt.
                 cell_state.update_unclaimed_completion(event);
+                let mut retired_spills = Vec::new();
                 if result.is_ok()
                     && let Some((event, bytes)) = durable.completed_cell_for_replay(cell_id.as_str())
                 {
                     let mut cache = inner.terminal_cells.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if cache.entry(&cell_id).is_some() {
-                        cache.insert_cached(cell_id, (Arc::new(CachedCellEvent::Durable(event)), bytes));
+                        cache.insert_cached(
+                            cell_id,
+                            (Arc::new(CachedCellEvent::Durable(event)), bytes),
+                            &mut retired_spills,
+                        );
                     }
                 }
+                drop(gate);
+                drop(retired_spills);
                 result
             });
             // Timeout leaves the already-published unknown receipt in place;
@@ -1052,29 +1115,36 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             && let Some(durable) = self.inner.durable_state.get().cloned()
         {
             let deadline = tokio::time::Instant::now() + TERMINAL_SPILL_TIMEOUT;
-            // Queued publishers remain actor-owned and expire before spawning.
-            // Only a job holding the shared commit gate may outlive observation.
-            let result = match tokio::time::timeout_at(
-                deadline,
-                Arc::clone(&self.inner.commit_gate).lock_owned(),
-            )
-            .await
-            {
-                Ok(gate) => {
-                    let values = self.inner.stored_values.lock().await.clone();
+            let admission = async {
+                let gate = Arc::clone(&self.inner.commit_gate).lock_owned().await;
+                let values = self.inner.stored_values.lock().await.clone();
+                (gate, values)
+            };
+            let result = match tokio::time::timeout_at(deadline, admission).await {
+                Ok((gate, values)) if tokio::time::Instant::now() < deadline => {
                     let call_id = self.parent_tool_call_id.clone();
                     let cell_id = self.cell_id.to_string();
                     let terminal = terminal.clone();
                     let publication = self.inner.storage_tasks.spawn_blocking(move || {
                         let _gate = gate;
-                        durable.publish(durable.stage(call_id, values, cell_id, terminal)?)
+                        let expired = || "snapshot publication deadline expired before commit".into();
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(expired());
+                        }
+                        let staged = durable.stage(call_id, values, cell_id, terminal)?;
+                        // Gate custody permits staging, not publication. Once
+                        // this decision passes, the blocking owner must settle.
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(expired());
+                        }
+                        durable.publish(staged)
                     });
                     match tokio::time::timeout_at(deadline, publication).await {
                         Ok(Ok(result)) => result,
                         result => Err(format!("{result:?}")),
                     }
                 }
-                Err(_) => Err(
+                _ => Err(
                     "snapshot publication admission expired; no publisher was started".to_string(),
                 ),
             };
@@ -1096,6 +1166,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             (Arc::new(CachedCellEvent::Inline(event.clone())), bytes)
         });
         let mut cached = None;
+        let mut retired_spills = Vec::new();
         {
             let mut cells = self.inner.cells.lock().await;
             let removed = cells.remove(&self.cell_id);
@@ -1124,9 +1195,12 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                     cached = inline_candidate;
                 }
                 if let Some(cached) = &cached {
-                    terminal.insert_cached(self.cell_id.clone(), cached.clone());
+                    terminal.insert_cached(self.cell_id.clone(), cached.clone(), &mut retired_spills);
                 }
             }
+        }
+        if let Some(cleanup) = self.inner.spawn_spill_cleanup(retired_spills) {
+            let _ = cleanup.await;
         }
         self.cell_permit.lock().await.take();
         self.inner.delegate.cell_closed(&self.cell_id);
@@ -1145,31 +1219,48 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         {
             let source = Arc::clone(&inline);
             let spill = self.inner.storage_tasks.spawn_blocking(move || {
-                let _admission = (job, admitted_bytes);
+                let admission = (job, admitted_bytes);
                 let CachedCellEvent::Inline(event) = source.as_ref() else {
                     unreachable!()
                 };
-                CachedCellEvent::new(event.clone())
+                (CachedCellEvent::new(event.clone()), admission)
             });
-            if let Ok(Ok(spilled)) = tokio::time::timeout(TERMINAL_SPILL_TIMEOUT, spill).await {
-                let mut cache = self
-                    .inner
-                    .terminal_cells
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Eviction or replacement while spilling must not resurrect an
-                // old receipt. Timeout leaves inline evidence and owns no write
-                // to the cache; the blocking task drops its temporary file.
-                if cache
-                    .entry(&self.cell_id)
-                    .is_some_and(|entry| Arc::ptr_eq(&entry, &inline))
+            if let Ok(Ok((spilled, _admission))) =
+                tokio::time::timeout(TERMINAL_SPILL_TIMEOUT, spill).await
+            {
+                let mut retired_spills = Vec::new();
                 {
-                    cache.insert_cached(self.cell_id.clone(), spilled);
+                    let mut cache = self
+                        .inner
+                        .terminal_cells
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Eviction or replacement while spilling must not resurrect an
+                    // old receipt. Timeout leaves inline evidence and owns no write
+                    // to the cache; the blocking task drops its temporary file.
+                    if cache
+                        .entry(&self.cell_id)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry, &inline))
+                    {
+                        cache.insert_cached(self.cell_id.clone(), spilled, &mut retired_spills);
+                    } else {
+                        retire_spill(spilled.0, &mut retired_spills);
+                    }
+                }
+                if let Some(cleanup) = self.inner.spawn_spill_cleanup(retired_spills) {
+                    let _ = cleanup.await;
                 }
             }
         }
         event
     }
+}
+
+fn snapshot_precommit_timeout(event: CellEvent) -> CellEvent {
+    storage_failure_event(
+        event,
+        "snapshot commit deadline expired; no values committed".into(),
+    )
 }
 
 fn storage_rejected_event(event: CellEvent) -> CellEvent {

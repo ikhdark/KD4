@@ -91,15 +91,41 @@ fn log_command_exec_request(params: &CommandExecParams) {
     );
 }
 
-fn legacy_command_exec_config(
-    base_config: &Config,
+async fn legacy_command_exec_config(
+    mut config: Config,
     cwd: &AbsolutePathBuf,
     sandbox_policy: codex_protocol::protocol::SandboxPolicy,
-) -> codex_core::config::ConstraintResult<Config> {
-    let mut config = base_config.clone();
+) -> Result<Config, JSONRPCErrorError> {
     config.cwd = cwd.clone();
-    config.set_legacy_sandbox_policy(sandbox_policy)?;
-    Ok(config)
+    let workspace_write = matches!(
+        sandbox_policy,
+        codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
+    );
+    let apply_policy = move || {
+        config.set_legacy_sandbox_policy(sandbox_policy)?;
+        Ok(config)
+    };
+
+    // Workspace-write conversion probes protected metadata and can read a worktree's .git file.
+    // Await the conversion before handing the command to the execution manager.
+    let result: codex_core::config::ConstraintResult<Config> = if workspace_write {
+        let span = tracing::Span::current();
+        let conversion = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| {
+                tracing::trace_span!("legacy_workspace_write_policy_conversion")
+                    .in_scope(apply_policy)
+            })
+        });
+        // If the request is dropped, abort queued work; a running probe only owns the snapshot.
+        tokio_util::task::AbortOnDropHandle::new(conversion)
+            .await
+            .map_err(|err| {
+                internal_error(format!("sandbox policy conversion worker failed: {err}"))
+            })?
+    } else {
+        apply_policy()
+    };
+    result.map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))
 }
 
 /// Loads the config a `permissionProfile` request runs under.
@@ -311,8 +337,7 @@ impl CommandExecRequestProcessor {
                     internal_error(format!("failed to load command configuration: {err}"))
                 })?;
             if let Some(policy) = sandbox_policy.map(|policy| policy.to_core()) {
-                legacy_command_exec_config(&config, &cwd, policy)
-                    .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?
+                legacy_command_exec_config(config, &cwd, policy).await?
             } else {
                 config
             }

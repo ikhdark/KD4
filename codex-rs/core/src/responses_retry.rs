@@ -247,9 +247,17 @@ pub(crate) async fn handle_retryable_response_stream_error(
             record_decision(&err, RetryAction::FallbackHttp,
                 Some(retry_after.map_or(Duration::ZERO, |advice| advice.remaining_delay())));
             turn_context.turn_timing_state.record_model_fallback();
-            sess.send_event(turn_context, EventMsg::Warning(WarningEvent {
-                message: "Falling back from WebSockets to HTTPS transport after an early message-size rejection.".into(),
-            })).await;
+            send_retry_notice_until(
+                sess.send_event(
+                    turn_context,
+                    EventMsg::Warning(WarningEvent {
+                        message: "Falling back from WebSockets to HTTPS transport after an early message-size rejection.".into(),
+                    }),
+                ),
+                wait_deadline,
+                cancellation_token,
+            )
+            .await?;
         } else {
             if retry_state.repaired_explicit_rejection {
                 return Err(err);
@@ -272,7 +280,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
             )
             .await?;
         }
-        return Ok(());
+        return retry_state.check_retry_budget(cancellation_token);
     }
 
     // A server that closed mid-response with "connect again" is not a reason to
@@ -315,13 +323,17 @@ pub(crate) async fn handle_retryable_response_stream_error(
                 )
                 .await;
         }
-        sess.notify_stream_error(
-            turn_context,
-            format!("Reconnecting... the server closed the stream (next retry in {delay:.1?}){}",
-                retry_state.visible_budget(turn_context)),
-            err,
+        send_retry_notice_until(
+            sess.notify_stream_error(
+                turn_context,
+                format!("Reconnecting... the server closed the stream (next retry in {delay:.1?}){}",
+                    retry_state.visible_budget(turn_context)),
+                err,
+            ),
+            wait_deadline,
+            cancellation_token,
         )
-        .await;
+        .await?;
         wait_for_response_retry_deadline(
             retry_at,
             wait_deadline,
@@ -366,13 +378,17 @@ pub(crate) async fn handle_retryable_response_stream_error(
         record_decision(&err, RetryAction::FallbackHttp,
             Some(retry_after.map_or(Duration::ZERO, |advice| advice.remaining_delay())));
         turn_context.turn_timing_state.record_model_fallback();
-        sess.send_event(
-            turn_context,
-            EventMsg::Warning(WarningEvent {
-                message: format!("Falling back from WebSockets to HTTPS transport. Retry trigger: {:?}.", retry_trigger(&err)),
-            }),
+        send_retry_notice_until(
+            sess.send_event(
+                turn_context,
+                EventMsg::Warning(WarningEvent {
+                    message: format!("Falling back from WebSockets to HTTPS transport. Retry trigger: {:?}.", retry_trigger(&err)),
+                }),
+            ),
+            wait_deadline,
+            cancellation_token,
         )
-        .await;
+        .await?;
         // A post-dispatch HTTPS replay spends the same budget as a reconnect.
         // Proven pre-dispatch connection recovery does not spend that budget.
         if !pre_dispatch_failure {
@@ -390,7 +406,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
             )
             .await?;
         }
-        return Ok(());
+        return retry_state.check_retry_budget(cancellation_token);
     }
 
     if wait_for_connection_recovery {
@@ -410,16 +426,20 @@ pub(crate) async fn handle_retryable_response_stream_error(
         );
         // A lost connection does not burn the provider attempt count, but the shared
         // interactive deadline prevents an outage from keeping this request alive forever.
-        sess.notify_stream_error(
-            turn_context,
-            format!(
-                "Reconnecting... waiting for network (attempt {}, next retry in {retry_delay:.1?}){}",
-                retry_state.connection_retries,
-                retry_state.visible_budget(turn_context),
+        send_retry_notice_until(
+            sess.notify_stream_error(
+                turn_context,
+                format!(
+                    "Reconnecting... waiting for network (attempt {}, next retry in {retry_delay:.1?}){}",
+                    retry_state.connection_retries,
+                    retry_state.visible_budget(turn_context),
+                ),
+                err,
             ),
-            err,
+            wait_deadline,
+            cancellation_token,
         )
-        .await;
+        .await?;
         wait_for_response_retry_deadline(
             tokio::time::Instant::now() + retry_delay,
             wait_deadline,
@@ -461,13 +481,17 @@ pub(crate) async fn handle_retryable_response_stream_error(
         } else {
             "Reconnecting"
         };
-        sess.notify_stream_error(
-            turn_context,
-            format!("{status}... {retry_count}/{max_retries} (next retry in {delay:.1?}){}",
-                retry_state.visible_budget(turn_context)),
-            err,
+        send_retry_notice_until(
+            sess.notify_stream_error(
+                turn_context,
+                format!("{status}... {retry_count}/{max_retries} (next retry in {delay:.1?}){}",
+                    retry_state.visible_budget(turn_context)),
+                err,
+            ),
+            wait_deadline,
+            cancellation_token,
         )
-        .await;
+        .await?;
         wait_for_response_retry_deadline(
             retry_at,
             wait_deadline,
@@ -657,59 +681,63 @@ pub(crate) async fn wait_for_account_change(
     let message = format!("{message}{} Account wait remaining: {} ms.",
         retry_state.visible_budget(turn_context), remaining.as_millis());
     warn!(turn_id = %turn_context.sub_id, "{message}");
-    sess.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
-        .await;
+    let notice = sess.send_event(turn_context, EventMsg::Warning(WarningEvent { message }));
     let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-    let mut reload = tokio::time::interval_at(
-        now + ACCOUNT_CHANGE_RELOAD_INTERVAL,
-        ACCOUNT_CHANGE_RELOAD_INTERVAL,
-    );
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-            changed = auth_changes.changed() => {
-                if changed.is_err() { return Ok(false); }
-                if !turn_context.provider.missing_required_credentials()
-                    && (matches!(reason, AccountChangeWait::MissingCredentials)
-                        || current_account().is_some_and(|account| Some(account) != failed_account))
-                {
-                    return Ok(true);
+    let wait_for_account = async {
+        let mut reload = tokio::time::interval_at(
+            now + ACCOUNT_CHANGE_RELOAD_INTERVAL,
+            ACCOUNT_CHANGE_RELOAD_INTERVAL,
+        );
+        // A late reload already reads current credentials; do not replay missed polls.
+        reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+                changed = auth_changes.changed() => {
+                    if changed.is_err() { return Ok(false); }
+                    if !turn_context.provider.missing_required_credentials()
+                        && (matches!(reason, AccountChangeWait::MissingCredentials)
+                            || current_account().is_some_and(|account| Some(account) != failed_account))
+                    {
+                        return Ok(true);
+                    }
                 }
-            }
-            _ = tokio::time::sleep_until(reset_at.unwrap_or(deadline)) => {
-                retry_state.check_retry_budget(cancellation_token)?;
-                return Ok(reset_at.is_some());
-            }
-            _ = reload.tick() => {
-                // The source owner enforces external TTL and generation checks.
-                // Keep one refresh alive without masking cancellation, reset or
-                // an account switch published while metadata resolution stalls.
-                let refresh = auth_manager.reload();
-                tokio::pin!(refresh);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-                        _ = tokio::time::sleep_until(reset_at.unwrap_or(deadline)) => {
-                            retry_state.check_retry_budget(cancellation_token)?;
-                            return Ok(reset_at.is_some());
-                        }
-                        changed = auth_changes.changed() => {
-                            if changed.is_err() { return Ok(false); }
-                            if !turn_context.provider.missing_required_credentials()
-                                && (matches!(reason, AccountChangeWait::MissingCredentials)
-                                    || current_account().is_some_and(|account| Some(account) != failed_account))
-                            {
-                                return Ok(true);
+                _ = tokio::time::sleep_until(reset_at.unwrap_or(deadline)) => {
+                    retry_state.check_retry_budget(cancellation_token)?;
+                    return Ok(reset_at.is_some());
+                }
+                _ = reload.tick() => {
+                    // The source owner enforces external TTL and generation checks.
+                    // Keep one refresh alive without masking cancellation, reset or
+                    // an account switch published while metadata resolution stalls.
+                    let refresh = auth_manager.reload();
+                    tokio::pin!(refresh);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+                            _ = tokio::time::sleep_until(reset_at.unwrap_or(deadline)) => {
+                                retry_state.check_retry_budget(cancellation_token)?;
+                                return Ok(reset_at.is_some());
                             }
+                            changed = auth_changes.changed() => {
+                                if changed.is_err() { return Ok(false); }
+                                if !turn_context.provider.missing_required_credentials()
+                                    && (matches!(reason, AccountChangeWait::MissingCredentials)
+                                        || current_account().is_some_and(|account| Some(account) != failed_account))
+                                {
+                                    return Ok(true);
+                                }
+                            }
+                            _ = &mut refresh => break,
                         }
-                        _ = &mut refresh => break,
                     }
                 }
             }
         }
-    }
+    };
+    wait_with_retry_notice(wait_for_account, notice).await
 }
 
 fn is_interactive_recovery(session_source: &SessionSource) -> bool {
@@ -804,28 +832,65 @@ async fn wait_for_response_retry_deadline(
     }
     check_retry_wait_budget(retry_at, wait_deadline, provider_directed)?;
     let delay = retry_at.saturating_duration_since(tokio::time::Instant::now());
+    let deadline = wait_deadline.map_or(retry_at, |limit| retry_at.min(limit));
     if provider_directed && delay > MAX_CONNECTION_RETRY_DELAY {
         let seconds = delay.as_millis().div_ceil(1000);
-        tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-            _ = sess.send_event(
+        send_retry_notice_until(
+            sess.send_event(
                 turn_context,
                 EventMsg::Warning(WarningEvent {
                     message: format!(
                         "Provider-directed retry wait: {seconds} seconds before retrying the current model. Cancel the turn to stop waiting; to use another model, cancel and select it manually. The harness will not switch models automatically."
                     ),
                 }),
-            ) => {}
-        }
+            ),
+            Some(deadline),
+            cancellation_token,
+        )
+        .await?;
     }
     let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-    let deadline = wait_deadline.map_or(retry_at, |limit| retry_at.min(limit));
     wait_for_retry_deadline(deadline, cancellation_token).await?;
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
     check_retry_wait_budget(tokio::time::Instant::now(), wait_deadline, false)
+}
+
+/// Retry notices use the normal event path until recovery must move on.
+async fn send_retry_notice_until(
+    notice: impl std::future::Future<Output = ()>,
+    cutoff: Option<tokio::time::Instant>,
+    cancellation_token: &CancellationToken,
+) -> Result<(), CodexErr> {
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
+        // The enclosing retry path still decides what an elapsed cutoff means.
+        _ = async {
+            match cutoff {
+                Some(cutoff) if cutoff > tokio::time::Instant::now() => {
+                    tokio::time::sleep_until(cutoff).await;
+                }
+                Some(_) => {}
+                None => std::future::pending().await,
+            }
+        } => Ok(()),
+        () = notice => Ok(()),
+    }
+}
+
+/// An account switch or reset can make the notice obsolete before delivery.
+async fn wait_with_retry_notice<T>(
+    recovery: impl std::future::Future<Output = T>,
+    notice: impl std::future::Future<Output = ()>,
+) -> T {
+    tokio::pin!(recovery);
+    tokio::select! {
+        biased;
+        result = &mut recovery => result,
+        () = notice => recovery.await,
+    }
 }
 
 async fn wait_for_retry_deadline(

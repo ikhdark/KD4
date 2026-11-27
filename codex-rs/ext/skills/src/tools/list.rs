@@ -109,8 +109,8 @@ impl ToolExecutor<ToolCall> for ListTool {
             let authority = args.authority.into_authority();
             let mut catalog = self.context.catalog(&call.turn_id, args.authority).await;
             let mut skills = matching_entries(&catalog, &args, query.as_deref(), &authority);
-            let start = match args.cursor.as_deref() {
-                None => 0,
+            let cursor = match args.cursor.as_deref() {
+                None => None,
                 Some(cursor) => {
                     let (hash, offset) = cursor.split_once(':').ok_or_else(invalid_cursor)?;
                     let offset = offset
@@ -118,16 +118,14 @@ impl ToolExecutor<ToolCall> for ListTool {
                         .ok()
                         .filter(|offset| *offset <= skills.len())
                         .ok_or_else(invalid_cursor)?;
-                    if u64::from_str_radix(hash, 16).ok()
-                        != Some(list_fingerprint(&skills[..offset], &args))
-                    {
-                        return Err(FunctionCallError::RespondToModel(
-                            "skills.list cursor is stale; restart from the first page".to_string(),
-                        ));
+                    let hash = u64::from_str_radix(hash, 16).map_err(|_| stale_cursor())?;
+                    if !cursor_matches(&skills, &args, hash, offset) {
+                        return Err(stale_cursor());
                     }
-                    offset
+                    Some((hash, offset))
                 }
             };
+            let start = cursor.map_or(0, |(_, offset)| offset);
             if catalog.continuation.is_some()
                 && (start == skills.len() || (!search && args.cursor.is_none()))
             {
@@ -137,6 +135,11 @@ impl ToolExecutor<ToolCall> for ListTool {
                     .continue_catalog(&call.turn_id, catalog.entries.len())
                     .await;
                 skills = matching_entries(&catalog, &args, query.as_deref(), &authority);
+                if let Some((hash, offset)) = cursor
+                    && !cursor_matches(&skills, &args, hash, offset)
+                {
+                    return Err(stale_cursor());
+                }
             }
             let incomplete = catalog.continuation.is_some();
             // Warnings can represent failed provider discovery; never turn
@@ -168,6 +171,18 @@ impl ToolExecutor<ToolCall> for ListTool {
 
 fn invalid_cursor() -> FunctionCallError {
     FunctionCallError::RespondToModel("skills.list cursor is invalid".to_string())
+}
+
+fn stale_cursor() -> FunctionCallError {
+    FunctionCallError::RespondToModel(
+        "skills.list cursor is stale; restart from the first page".to_string(),
+    )
+}
+
+fn cursor_matches(skills: &[&SkillCatalogEntry], args: &ListArgs, hash: u64, offset: usize) -> bool {
+    skills
+        .get(..offset)
+        .is_some_and(|prefix| list_fingerprint(prefix, args) == hash)
 }
 
 fn matching_entries<'a>(
