@@ -35,7 +35,10 @@ fn config_layer_source_to_api(source: ConfigLayerSource) -> ApiConfigLayerSource
     match source {
         ConfigLayerSource::Mdm { domain, key } => ApiConfigLayerSource::Mdm { domain, key },
         ConfigLayerSource::System { file } => ApiConfigLayerSource::System { file },
-        ConfigLayerSource::EnterpriseManaged { id, name } => {
+        // Cloud tiers are distinct internally; the public API keeps its existing tag.
+        ConfigLayerSource::CloudBaseline { id, name }
+        | ConfigLayerSource::EnterpriseManaged { id, name }
+        | ConfigLayerSource::CloudSystemOverlay { id, name } => {
             ApiConfigLayerSource::EnterpriseManaged { id, name }
         }
         ConfigLayerSource::User { file, profile } => ApiConfigLayerSource::User { file, profile },

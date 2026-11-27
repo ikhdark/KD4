@@ -26,11 +26,13 @@ pub(crate) use self::types::CellError;
 pub(crate) use self::types::CellEventFuture;
 pub(crate) use self::types::CellHandle;
 pub(crate) use self::types::CellHost;
+use self::types::CellResponse;
 pub(crate) use self::types::CellState;
 pub(crate) use self::types::CellToolCall;
 pub(crate) use self::types::CompletionCommit;
 use self::types::CompletionDelivery;
 use self::types::ObservationDelivery;
+use self::types::ObservationSender;
 pub(crate) use self::types::prepend_initial_yield;
 use crate::TaskFailureHandler;
 use crate::runtime::MAX_BUFFERED_OUTPUT_BYTES;
@@ -100,8 +102,12 @@ impl CellActor {
             },
             task_failure_handler,
         );
-        let initial_response =
-            Box::pin(async move { initial_response_rx.await.unwrap_or(Err(CellError::Closed)) });
+        let initial_response = Box::pin(async move {
+            initial_response_rx
+                .await
+                .unwrap_or(Err(CellError::Closed))
+                .map(CellResponse::into_event)
+        });
         Ok((handle, initial_response, task))
     }
 }
@@ -115,7 +121,7 @@ struct CellContext {
 
 struct Observer {
     mode: ObserveMode,
-    response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
+    response_tx: ObservationSender,
 }
 
 async fn run_cell<H: CellHost>(
@@ -191,7 +197,7 @@ async fn run_cell<H: CellHost>(
                 if response_tx.is_closed() {
                     continue;
                 }
-                let response_tx = match cell_state.route_observation(mode, response_tx) {
+                let response_tx = match cell_state.route_observation(response_tx) {
                     ObservationDelivery::Running(response_tx) => response_tx,
                     ObservationDelivery::Delivered => break,
                     ObservationDelivery::Buffered | ObservationDelivery::Closed => continue,
@@ -533,13 +539,13 @@ fn send_observer_event(observer: Option<Observer>, event: CellEvent) -> Result<(
 }
 
 fn send_cell_event(
-    response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
+    response_tx: ObservationSender,
     event: CellEvent,
 ) -> Result<(), CellEvent> {
-    match response_tx.send(Ok(event)) {
+    match response_tx.send(Ok(CellResponse::Yield(event))) {
         Ok(()) => Ok(()),
-        Err(Ok(event)) => Err(event),
-        Err(Err(error)) => panic!("cell event delivery returned an actor error: {error:?}"),
+        Err(Ok(CellResponse::Yield(event))) => Err(event),
+        Err(_) => unreachable!("only the sent yield can be returned"),
     }
 }
 
@@ -576,7 +582,7 @@ fn rejected_completion_content(event: Option<CellEvent>) -> Vec<OutputItem> {
 
 fn finish_termination(
     cell_state: &CellState,
-    observer_tx: Option<oneshot::Sender<Result<CellEvent, CellError>>>,
+    observer_tx: Option<ObservationSender>,
     event: CellEvent,
 ) {
     if let Some(event) = cell_state.finish_termination(event)

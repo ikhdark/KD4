@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -24,6 +25,8 @@ use codex_extension_api::ToolName;
 use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
+use codex_extension_api::TurnItemEmissionFuture;
+use codex_extension_api::TurnItemEmitter;
 use codex_extension_api::parse_tool_input_schema;
 use codex_extension_items::ExtensionItem;
 use codex_extension_items::image_generation::ImageGenerationItem;
@@ -61,6 +64,7 @@ const MAX_EDIT_IMAGES: usize = 5;
 const IMAGEGEN_DESCRIPTION: &str = include_str!("../imagegen_description.md");
 const IMAGE_GENERATION_CANCELLED_MESSAGE: &str = "image generation cancelled";
 const IMAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DROPPED_IMAGE_COMPLETION_PUBLICATION_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct ImageGenerationTool {
@@ -108,6 +112,50 @@ fn extension_turn_item(item: ImageGenerationItem, legacy_event: EventMsg) -> Ext
         item: ExtensionItem::ImageGeneration(item),
         legacy_events: vec![legacy_event],
     }
+}
+
+struct ImageCompletionPublication {
+    call_id: String,
+    pending: Option<TurnItemEmissionFuture<'static>>,
+}
+
+impl Drop for ImageCompletionPublication {
+    fn drop(&mut self) {
+        let Some(publication) = self.pending.take() else {
+            return;
+        };
+        // An emitter that panicked cannot be resumed.
+        if std::thread::panicking() {
+            return;
+        }
+        // Core can abort dispatch after its cancellation cleanup deadline while
+        // the emitter is still publishing. That future may already have written
+        // the canonical item; move it, rather than emitting a second completion.
+        let call_id = std::mem::take(&mut self.call_id);
+        tokio::spawn(async move {
+            if tokio::time::timeout(DROPPED_IMAGE_COMPLETION_PUBLICATION_GRACE, publication)
+                .await
+                .is_err()
+            {
+                tracing::warn!(%call_id, "image completion publication did not settle after dispatch was dropped");
+            }
+        });
+    }
+}
+
+async fn publish_image_completion(emitter: &Arc<dyn TurnItemEmitter>, item: ImageGenerationItem) {
+    let call_id = item.id.clone();
+    let legacy_event = legacy_end_event(&item);
+    let item = extension_turn_item(item, legacy_event);
+    let emitter = Arc::clone(emitter);
+    let mut publication = ImageCompletionPublication {
+        call_id,
+        pending: Some(Box::pin(async move { emitter.emit_completed(item).await })),
+    };
+    if let Some(pending) = publication.pending.as_mut() {
+        pending.await;
+    }
+    publication.pending = None;
 }
 
 impl ToolExecutor<ToolCall> for ImageGenerationTool {
@@ -212,7 +260,7 @@ impl ImageGenerationTool {
         let Some(data) = response.data.into_iter().next() else {
             emit_failed_result(
                 &call.call_id,
-                call.turn_item_emitter.as_ref(),
+                &call.turn_item_emitter,
                 &args.prompt,
                 Some(usage),
             )
@@ -223,7 +271,7 @@ impl ImageGenerationTool {
         };
         complete_image_generation(
             &call.call_id,
-            call.turn_item_emitter.as_ref(),
+            &call.turn_item_emitter,
             args.prompt,
             data.b64_json,
             self.save_root.as_ref(),
@@ -236,7 +284,7 @@ impl ImageGenerationTool {
 
 async fn complete_image_generation(
     call_id: &str,
-    emitter: &dyn codex_extension_api::TurnItemEmitter,
+    emitter: &Arc<dyn TurnItemEmitter>,
     prompt: String,
     result: String,
     save_root: Option<&AbsolutePathBuf>,
@@ -267,10 +315,7 @@ async fn complete_image_generation(
         saved_path: saved_path.clone(),
         provider_usage,
     };
-    let legacy_event = legacy_end_event(&item);
-    emitter
-        .emit_completed(extension_turn_item(item, legacy_event))
-        .await;
+    publish_image_completion(emitter, item).await;
     let saved_hint = saved_path.as_ref().and_then(|output_path| {
         let output_dir = output_path.parent()?;
         extension_image_generation_output_hint(output_dir.display(), output_path.display())
@@ -335,12 +380,12 @@ fn image_history_requirement(payload: &ToolPayload) -> ConversationHistoryRequir
 }
 
 async fn emit_failed_item(call: &ToolCall, prompt: &str) {
-    emit_failed_result(&call.call_id, call.turn_item_emitter.as_ref(), prompt, None).await;
+    emit_failed_result(&call.call_id, &call.turn_item_emitter, prompt, None).await;
 }
 
 async fn emit_failed_result(
     call_id: &str,
-    emitter: &dyn codex_extension_api::TurnItemEmitter,
+    emitter: &Arc<dyn TurnItemEmitter>,
     prompt: &str,
     provider_usage: Option<ImageGenerationUsage>,
 ) {
@@ -353,10 +398,7 @@ async fn emit_failed_result(
         saved_path: None,
         provider_usage,
     };
-    let legacy_event = legacy_end_event(&item);
-    emitter
-        .emit_completed(extension_turn_item(item, legacy_event))
-        .await;
+    publish_image_completion(emitter, item).await;
 }
 
 async fn persist_generated_image(

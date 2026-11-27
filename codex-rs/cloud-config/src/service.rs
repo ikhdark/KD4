@@ -169,8 +169,12 @@ impl CloudConfigBundleService {
             Some(bundle) => {
                 tracing::info!(
                     elapsed_ms = started_at.elapsed().as_millis(),
-                    config_fragments = bundle.config_toml.enterprise_managed.len(),
-                    requirements_fragments = bundle.requirements_toml.enterprise_managed.len(),
+                    config_fragments = bundle.config_toml.baseline.len()
+                        + bundle.config_toml.enterprise_managed.len()
+                        + bundle.config_toml.system_overlay.len(),
+                    requirements_fragments = bundle.requirements_toml.baseline.len()
+                        + bundle.requirements_toml.enterprise_managed.len()
+                        + bundle.requirements_toml.system_overlay.len(),
                     "Cloud config bundle downloaded; effective validation pending"
                 );
                 emit_load_metric("startup", "candidate", Some(bundle));

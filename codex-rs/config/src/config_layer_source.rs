@@ -8,8 +8,12 @@ pub enum ConfigLayerSource {
     Mdm { domain: String, key: String },
     /// Host-wide configuration loaded from a file.
     System { file: AbsolutePathBuf },
-    /// Configuration delivered by an enterprise cloud bundle.
+    /// Configuration from the cloud bundle's baseline tier.
+    CloudBaseline { id: String, name: String },
+    /// Configuration from the cloud bundle's legacy enterprise tier.
     EnterpriseManaged { id: String, name: String },
+    /// Configuration from the cloud bundle's system overlay tier.
+    CloudSystemOverlay { id: String, name: String },
     /// User configuration, optionally augmented by a selected profile.
     User {
         file: AbsolutePathBuf,
@@ -31,8 +35,10 @@ impl ConfigLayerSource {
     pub fn precedence(&self) -> i16 {
         match self {
             ConfigLayerSource::Mdm { .. } => 0,
+            ConfigLayerSource::CloudBaseline { .. } => 5,
             ConfigLayerSource::System { .. } => 10,
             ConfigLayerSource::EnterpriseManaged { .. } => 15,
+            ConfigLayerSource::CloudSystemOverlay { .. } => 16,
             ConfigLayerSource::User { profile, .. } => {
                 if profile.is_some() {
                     21
@@ -80,8 +86,14 @@ pub fn format_config_layer_source(source: &ConfigLayerSource, config_toml_file: 
         ConfigLayerSource::System { file } => {
             format!("system ({})", file.as_path().display())
         }
+        ConfigLayerSource::CloudBaseline { id, name } => {
+            format!("cloud baseline ({name}, {id})")
+        }
         ConfigLayerSource::EnterpriseManaged { id, name } => {
             format!("enterprise-managed ({name}, {id})")
+        }
+        ConfigLayerSource::CloudSystemOverlay { id, name } => {
+            format!("cloud system overlay ({name}, {id})")
         }
         ConfigLayerSource::User { file, .. } => {
             format!("user ({})", file.as_path().display())

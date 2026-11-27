@@ -43,6 +43,7 @@ use crate::transport::ConnectionState;
 use crate::transport::OutboundConnectionState;
 use crate::transport::RemoteControlPolicy;
 use crate::transport::RemoteControlStartConfig;
+use crate::transport::StdioOutboundDrain;
 use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
 use crate::transport::app_server_startup_lock_path;
@@ -191,12 +192,21 @@ enum OutboundControlEvent {
     DisconnectAll,
 }
 
+enum NormalDrain {
+    Restart,
+    Stdio(ConnectionId),
+}
+
 fn apply_outbound_control(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
+    stdio_drain: &mut Option<StdioOutboundDrain>,
     event: OutboundControlEvent,
 ) {
     match event {
         OutboundControlEvent::Opened { connection_id, state } => {
+            if stdio_drain.is_none() {
+                *stdio_drain = state.stdio_drain().cloned();
+            }
             connections.insert(connection_id, state);
         }
         OutboundControlEvent::Closed { connection_id } => {
@@ -229,7 +239,7 @@ fn prepare_connection(
         transport_shutdown,
     );
     let state = if matches!(origin, ConnectionOrigin::Stdio) {
-        state.with_stdio_delivery()
+        state.with_stdio_delivery(connection_id)
     } else if matches!(origin, ConnectionOrigin::RemoteControl) {
         state.with_remote_preview()
     } else {
@@ -536,13 +546,19 @@ pub async fn run_main(
     // processor/transport cleanup without a shutdown owner.
     let caller_cancelled = CancellationToken::new();
     let _cancel_on_drop = caller_cancelled.clone().drop_guard();
-    tokio::spawn(run_main_owned(
+    let normal_drain = tokio::spawn(run_main_owned(
         arg0_paths, cli_config_overrides, loader_overrides, strict_config,
         default_analytics_enabled, transport, session_source, auth,
         runtime_options, caller_cancelled,
     ))
     .await
-    .map_err(|error| std::io::Error::other(format!("app-server supervisor failed: {error}")))?
+    .map_err(|error| std::io::Error::other(format!("app-server supervisor failed: {error}")))??;
+    if normal_drain {
+        // Both executable entry points await run_main on the arg0-owned main
+        // thread, not the spawned async supervisor.
+        codex_protocol::timing::client_probe::seal_after_normal_drain();
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -557,7 +573,7 @@ async fn run_main_owned(
     auth: AppServerWebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
     caller_cancelled: CancellationToken,
-) -> IoResult<()> {
+) -> IoResult<bool> {
     let loader_overrides = loader_overrides_with_test_user_config_file(
         loader_overrides,
         test_user_config_file_from_env(),
@@ -876,6 +892,8 @@ async fn run_main_owned(
     let shutdown_timed_out = Arc::new(AtomicBool::new(false));
     let (shutdown_observation_tx, shutdown_observation_rx) =
         oneshot::channel::<futures::future::BoxFuture<'static, bool>>();
+    let (normal_drain_tx, normal_drain_rx) = oneshot::channel();
+    let (stdio_outbound_drain_tx, stdio_outbound_drain_rx) = oneshot::channel();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
@@ -884,17 +902,20 @@ async fn run_main_owned(
     // steady state instead of leaving Tokio's process-wide listener unserviced.
     let graceful_signal_restart_enabled = runtime_options.install_shutdown_signal_handler;
     let mut app_server_client_name_rx = None;
+    let mut stdio_transport_drain_rx = None;
 
     match &transport {
         AppServerTransport::Stdio => {
             let (stdio_client_name_tx, stdio_client_name_rx) = oneshot::channel::<String>();
             app_server_client_name_rx = Some(stdio_client_name_rx);
-            start_stdio_connection(
-                transport_event_tx.clone(),
-                &mut transport_accept_handles,
-                stdio_client_name_tx,
-            )
-            .await?;
+            stdio_transport_drain_rx = Some(
+                start_stdio_connection(
+                    transport_event_tx.clone(),
+                    &mut transport_accept_handles,
+                    stdio_client_name_tx,
+                )
+                .await?,
+            );
         }
         AppServerTransport::UnixSocket { socket_path } => {
             let accept = start_control_socket_acceptor(
@@ -1022,6 +1043,7 @@ async fn run_main_owned(
 
     let outbound_handle = tokio::spawn(async move {
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
+        let mut stdio_drain = None;
         let mut delivery_tasks = tokio::task::JoinSet::new();
         let mut controls_open = true;
         let mut output_open = true;
@@ -1030,7 +1052,7 @@ async fn run_main_owned(
             tokio::select! {
                 event = outbound_control_rx.recv(), if controls_open => {
                     match event {
-                        Some(event) => apply_outbound_control(&mut outbound_connections, event),
+                        Some(event) => apply_outbound_control(&mut outbound_connections, &mut stdio_drain, event),
                         None => controls_open = false,
                     }
                 }
@@ -1043,13 +1065,16 @@ async fn run_main_owned(
                     // bound control work so churn cannot starve existing clients.
                     for _ in 0..CHANNEL_CAPACITY {
                         match outbound_control_rx.try_recv() {
-                            Ok(event) => apply_outbound_control(&mut outbound_connections, event),
+                            Ok(event) => apply_outbound_control(&mut outbound_connections, &mut stdio_drain, event),
                             Err(mpsc::error::TryRecvError::Empty) => break,
                             Err(mpsc::error::TryRecvError::Disconnected) => {
                                 controls_open = false;
                                 break;
                             }
                         }
+                    }
+                    if let Some(drain) = &stdio_drain {
+                        drain.observe_retired_output(&outbound_connections, &envelope);
                     }
                     route_outgoing_envelope(&mut outbound_connections, envelope, &mut delivery_tasks).await;
                 }
@@ -1071,6 +1096,9 @@ async fn run_main_owned(
             }
         }
         outbound_connections.clear();
+        if let Some(connection_id) = stdio_drain.and_then(|drain| drain.completed_connection()) {
+            let _ = stdio_outbound_drain_tx.send(connection_id);
+        }
         info!("outbound router task exited (channels drained)");
     });
 
@@ -1155,6 +1183,7 @@ async fn run_main_owned(
             // Keep the registered listener across unrelated select branches so a pending
             // SIGTERM is not lost when transport traffic wins the race.
             let mut shutdown_signal_wait = Box::pin(shutdown_signal());
+            let mut last_connection_cleanup = None;
             let exit_reason = loop {
                 connection_cleanup_tasks.reap_ready();
                 let running_turn_count = {
@@ -1319,15 +1348,24 @@ async fn run_main_owned(
                                     OutboundControlEvent::Closed { connection_id },
                                 ), Err(mpsc::error::TrySendError::Closed(_)));
                                 let processor = Arc::clone(&processor);
+                                let is_last_connection = shutdown_when_no_connections && connections.is_empty();
+                                let cleanup_complete = is_last_connection.then(|| {
+                                    let (tx, rx) = oneshot::channel();
+                                    last_connection_cleanup = Some((connection_id, rx));
+                                    tx
+                                });
                                 connection_cleanup_tasks.spawn(async move {
                                     processor
                                         .connection_closed(connection_id, &connection_state.session)
                                         .await;
+                                    if let Some(tx) = cleanup_complete {
+                                        let _ = tx.send(());
+                                    }
                                 });
                                 if !outbound_closed {
                                     break "outbound_router_closed";
                                 }
-                                if shutdown_when_no_connections && connections.is_empty() {
+                                if is_last_connection {
                                     break "last_connection_closed";
                                 }
                             }
@@ -1428,6 +1466,7 @@ async fn run_main_owned(
             processor.clear_runtime_references().await;
             thread_attachment_tasks.shutdown().await;
             let disconnect_all = shutdown_state.requested();
+            let mut stdio_producers_drained = false;
             shutdown_state
                 .finish_cleanup(
                     async {
@@ -1440,7 +1479,12 @@ async fn run_main_owned(
                         .await;
                         connection_cleanup_tasks.drain().await;
                         processor.drain_background_tasks().await;
-                        processor.shutdown_threads().await;
+                        let threads_drained = if single_client_mode {
+                            processor.shutdown_threads_with_result().await.is_ok()
+                        } else {
+                            processor.shutdown_threads().await;
+                            false
+                        };
                         processor.wait_for_background_tasks().await;
                         // Hand back an active rollout-index claim so the next process resumes
                         // from its checkpoint instead of waiting out the lease, as exec does.
@@ -1448,6 +1492,7 @@ async fn run_main_owned(
                             state_db.stop_backfill_worker().await;
                         }
                         processor.finish_shutdown_delivery().await;
+                        stdio_producers_drained = threads_drained;
                         if disconnect_all {
                             let _ = outbound_control_tx
                                 .send(OutboundControlEvent::DisconnectAll)
@@ -1476,6 +1521,26 @@ async fn run_main_owned(
                 shutdown_forced = shutdown_state.forced(),
                 "processor task exited"
             );
+            let normal_drain = if shutdown_state.forced() {
+                None
+            } else if single_client_mode
+                && exit_reason == "last_connection_closed"
+                && stdio_producers_drained
+            {
+                // ConnectionCleanupTasks logs child errors. The particular
+                // producer close must have run to completion, not just joined.
+                last_connection_cleanup.and_then(|(connection_id, mut cleanup)| {
+                    cleanup
+                        .try_recv()
+                        .ok()
+                        .map(|()| NormalDrain::Stdio(connection_id))
+                })
+            } else if !single_client_mode && exit_reason == "shutdown_requested" {
+                Some(NormalDrain::Restart)
+            } else {
+                None
+            };
+            let _ = normal_drain_tx.send(normal_drain);
             // Transfer the same listener and remaining budget, rather than
             // ending supervision while outbound/transport owners still drain.
             let _ = shutdown_observation_tx.send(Box::pin(async move {
@@ -1516,7 +1581,21 @@ async fn run_main_owned(
         otel.shutdown();
     }
 
-    task_result
+    task_result?;
+    Ok(match normal_drain_rx.await.ok().flatten() {
+        Some(NormalDrain::Restart) => true,
+        Some(NormalDrain::Stdio(connection_id)) => {
+            // The owners have joined, so these positive-only receipts cannot
+            // wait for another producer. Match this runtime's native generation.
+            if let Some(transport_drain) = stdio_transport_drain_rx {
+                transport_drain.await.ok() == Some(connection_id)
+                    && stdio_outbound_drain_rx.await.ok() == Some(connection_id)
+            } else {
+                false
+            }
+        }
+        None => false,
+    })
 }
 
 async fn finish_runtime_task_groups(

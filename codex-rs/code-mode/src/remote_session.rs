@@ -194,8 +194,10 @@ impl OwnedProcessHost {
         match spawned {
             Ok(connection) => {
                 let connection = Arc::new(connection);
-                state.connection = Some(Arc::clone(&connection));
+                let displaced = state.connection.replace(Arc::clone(&connection));
                 state.last_spawn_error = None;
+                drop(state);
+                drop(displaced);
                 Ok(connection)
             }
             Err(error) => {
@@ -668,7 +670,7 @@ impl SessionInner {
     }
 
     async fn drive_shutdown(self: &Arc<Self>) -> Result<(), String> {
-        loop {
+        let result = loop {
             let action = {
                 let mut state = self
                     .state
@@ -683,9 +685,14 @@ impl SessionInner {
                         ShutdownAction::WaitForOpen(result_rx.clone())
                     }
                     SessionState::Open(binding) if !binding.connection.is_alive() => {
-                        let cleanup = binding.cleanup.clone();
+                        // Another session can replace the shared connection while
+                        // this binding's accepted stdout is still draining.
+                        let action = ShutdownAction::WaitForSessionCleanup {
+                            cleanup: binding.cleanup.clone(),
+                            connection: Arc::clone(&binding.connection),
+                        };
                         *state = SessionState::Closing;
-                        ShutdownAction::WaitForSessionCleanup(cleanup)
+                        action
                     }
                     SessionState::Open(binding) => {
                         let binding = binding.clone();
@@ -699,16 +706,32 @@ impl SessionInner {
                 }
             };
             match action {
-                ShutdownAction::WaitForOpen(result_rx) => {
-                    let _ = wait_for_watch(result_rx).await;
+                ShutdownAction::WaitForOpen(mut result_rx) => {
+                    if result_rx.wait_for(Option::is_some).await.is_err() {
+                        let mut state = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        // The opener publishes state before its result. Only
+                        // claim the opening whose sender closed without a result.
+                        if matches!(&*state, SessionState::Opening { result_rx: current, .. }
+                            if current.same_channel(&result_rx))
+                        {
+                            *state = SessionState::Closing;
+                            break Err(
+                                "code-mode session opening stopped before publishing a result"
+                                    .to_string(),
+                            );
+                        }
+                    }
                 }
-                ShutdownAction::Finish => {
-                    self.wait_for_retired_cleanups().await;
-                    self.transition_to_closed();
-                    return Ok(());
-                }
-                ShutdownAction::WaitForSessionCleanup(cleanup) => {
+                ShutdownAction::Finish => break Ok(()),
+                ShutdownAction::WaitForSessionCleanup {
+                    cleanup,
+                    connection,
+                } => {
                     cleanup.wait().await;
+                    drop(connection);
                     self.wait_for_retired_cleanups().await;
                     self.transition_to_closed();
                     return Ok(());
@@ -743,7 +766,10 @@ impl SessionInner {
                     return result;
                 }
             }
-        }
+        };
+        self.wait_for_retired_cleanups().await;
+        self.transition_to_closed();
+        result
     }
 
     fn transition_to_closed(&self) {
@@ -787,7 +813,10 @@ impl SessionInner {
 enum ShutdownAction {
     WaitForOpen(watch::Receiver<Option<Result<SessionBinding, String>>>),
     Finish,
-    WaitForSessionCleanup(SessionCleanup),
+    WaitForSessionCleanup {
+        cleanup: SessionCleanup,
+        connection: Arc<Connection>,
+    },
     Close(SessionBinding),
 }
 

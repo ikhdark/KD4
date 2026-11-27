@@ -153,11 +153,9 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     v8::Script::compile(scope, graph_source, None)
         .and_then(|script| script.run(scope))
         .ok_or_else(|| "failed to install dependency graph helper".to_string())?;
-    // A separate private closure capability for owned mechanical helpers.
-    set_global(scope, global, "__codex_helper_observation", observe_graph.into())?;
     // Keep helper registration capabilities private to the owned closures.
     let helpers = format!(
-        "((registerSearchProjection, registerCommandEvidence) => {{\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n}})",
+        "((registerSearchProjection, registerCommandEvidence, observeHelper, readFileFullSnapshot) => {{\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n}})",
         include_str!("search_pagination.js"),
         include_str!("orchestration.js"),
         include_str!("source_retrieval.js"),
@@ -183,7 +181,8 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
         .ok_or_else(|| "output projector unavailable".to_string())?;
     let register_command = projector.call(scope, receiver, &[])
         .ok_or_else(|| "failed to initialize command evidence registration".to_string())?;
-    factory.call(scope, receiver, &[register.into(), register_command])
+    let read_file_full_snapshot = v8::Boolean::new(scope, enabled_tools.read_file_full_snapshot);
+    factory.call(scope, receiver, &[register.into(), register_command, observe_graph.into(), read_file_full_snapshot.into()])
         .ok_or_else(|| "failed to initialize orchestration helpers".to_string())?;
     Ok(())
 }

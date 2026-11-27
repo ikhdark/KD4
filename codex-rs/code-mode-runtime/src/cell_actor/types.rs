@@ -20,6 +20,48 @@ use crate::session_runtime::ToolName;
 
 pub(crate) type CellEventFuture =
     Pin<Box<dyn Future<Output = Result<CellEvent, CellError>> + Send + 'static>>;
+type TerminationFuture =
+    Pin<Box<dyn Future<Output = Result<TerminalReceipt, CellError>> + Send + 'static>>;
+
+pub(super) type ObservationSender = oneshot::Sender<Result<CellResponse, CellError>>;
+
+pub(super) enum CellResponse {
+    Yield(CellEvent),
+    Terminal(TerminalReceipt),
+}
+
+impl CellResponse {
+    pub(super) fn into_event(self) -> CellEvent {
+        match self {
+            Self::Yield(event) => event,
+            Self::Terminal(receipt) => receipt.into_event(),
+        }
+    }
+}
+
+/// An immutable live receipt version. A claimed completion folds in any
+/// unobserved initial yield, without copying or joining payloads under a lock.
+#[derive(Clone)]
+pub(super) struct TerminalReceipt {
+    event: Arc<CellEvent>,
+    pending_initial_yield_items: Option<Arc<Vec<OutputItem>>>,
+}
+
+impl TerminalReceipt {
+    fn new(event: Arc<CellEvent>, pending_initial_yield_items: Option<Vec<OutputItem>>) -> Self {
+        Self {
+            event,
+            pending_initial_yield_items: pending_initial_yield_items.map(Arc::new),
+        }
+    }
+
+    fn into_event(self) -> CellEvent {
+        prepend_initial_yield(
+            Arc::unwrap_or_clone(self.event),
+            self.pending_initial_yield_items.map(Arc::unwrap_or_clone),
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CellError {
@@ -142,11 +184,11 @@ impl CellHandle {
                     event = &mut response_rx => event.unwrap_or(Err(CellError::Closed)),
                 }
             } else {
-                response_event(response_rx).await
+                response_rx.await.unwrap_or(Err(CellError::Closed))
             };
             match event {
                 Err(CellError::Closed) => state.terminal_event().ok_or(CellError::Closed),
-                result => result,
+                result => result.map(CellResponse::into_event),
             }
         })
     }
@@ -164,11 +206,12 @@ impl CellHandle {
             {
                 return Err(CellError::CleanupFailed);
             }
-            Ok(if matches!(event, CellEvent::Terminated { .. }) {
-                state.terminal_event().unwrap_or(event)
-            } else {
-                event
-            })
+            if matches!(event.event.as_ref(), CellEvent::Terminated { .. })
+                && let Some(finalized) = state.terminal_event()
+            {
+                return Ok(finalized);
+            }
+            Ok(event.into_event())
         })
     }
 }
@@ -184,7 +227,7 @@ impl CellHandle {
 /// while it is held.
 pub(crate) struct CellState {
     phase: Mutex<CellPhase>,
-    terminal_event: Mutex<Option<CellEvent>>,
+    terminal_event: Mutex<Option<TerminalReceipt>>,
     cancellation_token: CancellationToken,
     tool_cancellation: NestedCancellation,
     closed: CancellationToken,
@@ -194,21 +237,21 @@ pub(crate) struct CellState {
 enum CellPhase {
     Running,
     Terminating {
-        response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
+        response_tx: oneshot::Sender<TerminalReceipt>,
     },
     Completed {
         // Set only when `yield_control()` races the create-to-first-observe handoff.
         pending_initial_yield_items: Option<Vec<OutputItem>>,
-        event: CellEvent,
+        event: Arc<CellEvent>,
     },
-    CompletionClaimed(CellEvent),
+    CompletionClaimed(TerminalReceipt),
     Tombstone,
 }
 
-pub(crate) enum CompletionDelivery {
+pub(super) enum CompletionDelivery {
     Delivered,
     Buffered,
-    Rejected(Option<oneshot::Sender<Result<CellEvent, CellError>>>),
+    Rejected(Option<ObservationSender>),
 }
 
 /// Result of atomically publishing a completed cell and its session side effects.
@@ -218,8 +261,8 @@ pub(crate) enum CompletionCommit {
     Rejected(CellEvent),
 }
 
-pub(crate) enum ObservationDelivery {
-    Running(oneshot::Sender<Result<CellEvent, CellError>>),
+pub(super) enum ObservationDelivery {
+    Running(ObservationSender),
     Delivered,
     Buffered,
     Closed,
@@ -249,7 +292,7 @@ impl CellState {
         accepting_phase && !self.cancellation_token.is_cancelled()
     }
 
-    pub(crate) fn request_termination(&self, cause: CancellationCause) -> CellEventFuture {
+    fn request_termination(&self, cause: CancellationCause) -> TerminationFuture {
         let mut phase = self
             .phase
             .lock()
@@ -261,7 +304,7 @@ impl CellState {
                 // Record the winning origin before waking callbacks. An earlier
                 // call-local deadline remains authoritative in its child token.
                 self.tool_cancellation.cancel_with(cause);
-                response_event(response_rx)
+                Box::pin(async move { response_rx.await.map_err(|_| CellError::Closed) })
             }
             CellPhase::Terminating { response_tx } => {
                 *phase = CellPhase::Terminating { response_tx };
@@ -271,16 +314,16 @@ impl CellState {
                 pending_initial_yield_items,
                 event,
             } => {
-                let event = prepend_initial_yield(event, pending_initial_yield_items);
-                *phase = CellPhase::CompletionClaimed(event.clone());
+                let receipt = TerminalReceipt::new(event, pending_initial_yield_items);
+                *phase = CellPhase::CompletionClaimed(receipt.clone());
                 self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
-                ready_event(event)
+                Box::pin(async move { Ok(receipt) })
             }
             CellPhase::CompletionClaimed(event) => {
                 *phase = CellPhase::CompletionClaimed(event);
                 Box::pin(async { Err(CellError::AlreadyTerminating) })
             }
-            CellPhase::Tombstone => closed_event(),
+            CellPhase::Tombstone => Box::pin(async { Err(CellError::Closed) }),
         }
     }
 
@@ -297,7 +340,7 @@ impl CellState {
         if !matches!(*phase, CellPhase::Running) || self.cancellation_token.is_cancelled() {
             return CompletionCommit::Rejected(event);
         }
-        let event = commit(event);
+        let event = Arc::new(commit(event));
         *phase = CellPhase::Completed {
             pending_initial_yield_items,
             event,
@@ -305,9 +348,9 @@ impl CellState {
         CompletionCommit::Committed
     }
 
-    pub(crate) fn deliver_completion(
+    pub(super) fn deliver_completion(
         &self,
-        response_tx: Option<oneshot::Sender<Result<CellEvent, CellError>>>,
+        response_tx: Option<ObservationSender>,
     ) -> CompletionDelivery {
         let mut phase = self
             .phase
@@ -331,43 +374,59 @@ impl CellState {
             };
             return CompletionDelivery::Buffered;
         };
-        let terminal_event = event.clone();
-        match response_tx.send(Ok(event)) {
+        match self.send_completion(response_tx, event) {
             Ok(()) => {
-                self.record_terminal_event(|| terminal_event);
-                self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
+                drop(phase);
+                drop(pending_initial_yield_items);
                 CompletionDelivery::Delivered
             }
-            Err(Ok(event)) => {
+            Err(event) => {
                 *phase = CellPhase::Completed {
                     pending_initial_yield_items,
                     event,
                 };
                 CompletionDelivery::Buffered
             }
-            Err(Err(error)) => {
-                panic!("completion delivery unexpectedly carried an actor error: {error:?}")
-            }
         }
+    }
+
+    // Keep the phase barrier through the send and terminal publication: a
+    // closed receiver leaves the same completion available for the next claim.
+    fn send_completion(
+        &self,
+        response_tx: ObservationSender,
+        event: Arc<CellEvent>,
+    ) -> Result<(), Arc<CellEvent>> {
+        let receipt = TerminalReceipt::new(event, None);
+        if response_tx
+            .send(Ok(CellResponse::Terminal(receipt.clone())))
+            .is_err()
+        {
+            return Err(receipt.event);
+        }
+        self.record_terminal_event(&receipt);
+        self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
+        Ok(())
     }
 
     /// Refine a receipt after owned I/O, but never rewrite a terminal outcome
     /// already claimed by termination or delivered to an observer.
     pub(crate) fn update_unclaimed_completion(&self, completed: CellEvent) {
-        let mut phase = self
-            .phase
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let CellPhase::Completed { event, .. } = &mut *phase {
-            *event = completed;
-        }
+        let completed = Arc::new(completed);
+        let retired = {
+            let mut phase = self
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &mut *phase {
+                CellPhase::Completed { event, .. } => Some(std::mem::replace(event, completed)),
+                _ => None,
+            }
+        };
+        drop(retired);
     }
 
-    pub(crate) fn route_observation(
-        &self,
-        mode: ObserveMode,
-        response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
-    ) -> ObservationDelivery {
+    pub(super) fn route_observation(&self, response_tx: ObservationSender) -> ObservationDelivery {
         let mut phase = self
             .phase
             .lock()
@@ -380,12 +439,12 @@ impl CellState {
             CellPhase::Completed {
                 pending_initial_yield_items: Some(content_items),
                 event,
-            } if matches!(
-                mode,
-                ObserveMode::YieldAfter(_) | ObserveMode::StateChange | ObserveMode::Decision
-            ) =>
-            {
-                match response_tx.send(Ok(CellEvent::ExplicitYield { content_items })) {
+            } => {
+                // The pending explicit yield precedes completion for every
+                // observation mode; a failed send leaves it pending.
+                match response_tx.send(Ok(CellResponse::Yield(CellEvent::ExplicitYield {
+                    content_items,
+                }))) {
                     Ok(()) => {
                         *phase = CellPhase::Completed {
                             pending_initial_yield_items: None,
@@ -393,46 +452,29 @@ impl CellState {
                         };
                         ObservationDelivery::Buffered
                     }
-                    Err(Ok(CellEvent::ExplicitYield { content_items })) => {
+                    Err(Ok(CellResponse::Yield(CellEvent::ExplicitYield { content_items }))) => {
                         *phase = CellPhase::Completed {
                             pending_initial_yield_items: Some(content_items),
                             event,
                         };
                         ObservationDelivery::Buffered
                     }
-                    Err(Ok(event)) => {
-                        panic!("initial yield delivery returned an unexpected event: {event:?}")
-                    }
-                    Err(Err(error)) => {
-                        panic!("initial yield delivery returned an actor error: {error:?}")
-                    }
+                    Err(_) => unreachable!("only the sent initial yield can be returned"),
                 }
             }
             CellPhase::Completed {
-                pending_initial_yield_items,
+                pending_initial_yield_items: None,
                 event,
-            } => {
-                let delivered_event =
-                    prepend_initial_yield(event.clone(), pending_initial_yield_items.clone());
-                let terminal_event = delivered_event.clone();
-                match response_tx.send(Ok(delivered_event)) {
-                    Ok(()) => {
-                        self.record_terminal_event(|| terminal_event);
-                        self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
-                        ObservationDelivery::Delivered
-                    }
-                    Err(Ok(_)) => {
-                        *phase = CellPhase::Completed {
-                            pending_initial_yield_items,
-                            event,
-                        };
-                        ObservationDelivery::Buffered
-                    }
-                    Err(Err(error)) => {
-                        panic!("completion delivery unexpectedly carried an actor error: {error:?}")
-                    }
+            } => match self.send_completion(response_tx, event) {
+                Ok(()) => ObservationDelivery::Delivered,
+                Err(event) => {
+                    *phase = CellPhase::Completed {
+                        pending_initial_yield_items: None,
+                        event,
+                    };
+                    ObservationDelivery::Buffered
                 }
-            }
+            },
             CellPhase::Terminating {
                 response_tx: termination_tx,
             } => {
@@ -454,7 +496,8 @@ impl CellState {
         }
     }
 
-    pub(crate) fn finish_termination(&self, event: CellEvent) -> Option<CellEvent> {
+    pub(super) fn finish_termination(&self, event: CellEvent) -> Option<CellResponse> {
+        let event = TerminalReceipt::new(Arc::new(event), None);
         let mut phase = self
             .phase
             .lock()
@@ -462,47 +505,54 @@ impl CellState {
         let observer_event = match std::mem::replace(&mut *phase, CellPhase::Tombstone) {
             CellPhase::Running => Some(event),
             CellPhase::Terminating { response_tx } => {
-                let _ = response_tx.send(Ok(event.clone()));
+                let _ = response_tx.send(event.clone());
                 Some(event)
             }
             CellPhase::Completed {
                 pending_initial_yield_items,
                 event,
-            } => Some(prepend_initial_yield(event, pending_initial_yield_items)),
+            } => Some(TerminalReceipt::new(event, pending_initial_yield_items)),
             CellPhase::CompletionClaimed(completed_event) => Some(completed_event),
             CellPhase::Tombstone => None,
         };
-        if let Some(event) = observer_event.as_ref() {
-            self.record_terminal_event(|| event.clone());
+        if let Some(receipt) = observer_event.as_ref() {
+            self.record_terminal_event(receipt);
         }
         self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
-        observer_event
+        drop(phase);
+        observer_event.map(CellResponse::Terminal)
     }
 
-    pub(crate) fn terminal_event(&self) -> Option<CellEvent> {
-        self.terminal_event
+    pub(super) fn terminal_event(&self) -> Option<CellEvent> {
+        // A late reader keeps the exact version it acquired, including when
+        // close replaces a preliminary termination receipt during conversion.
+        let receipt = self
+            .terminal_event
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone();
+        receipt.map(TerminalReceipt::into_event)
     }
 
-    // Move owned delivery copies, but clone borrowed termination evidence only
-    // if this is the first retained outcome, under the existing terminal lock.
-    fn record_terminal_event(&self, event: impl FnOnce() -> CellEvent) {
+    fn record_terminal_event(&self, receipt: &TerminalReceipt) {
         let mut terminal_event = self
             .terminal_event
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if terminal_event.is_none() {
-            *terminal_event = Some(event());
+            *terminal_event = Some(receipt.clone());
         }
     }
 
     pub(crate) fn tombstone(&self) {
-        *self
-            .phase
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = CellPhase::Tombstone;
+        let retired = {
+            let mut phase = self
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *phase, CellPhase::Tombstone)
+        };
+        drop(retired);
         self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
     }
 
@@ -530,12 +580,15 @@ impl CellState {
         self.closed.cancel();
     }
 
-    pub(crate) fn finalize_termination_receipt(&self, event: Option<CellEvent>) {
+    pub(super) fn finalize_termination_receipt(&self, event: Option<CellEvent>) {
         if let Some(event @ CellEvent::Terminated { .. }) = event {
-            *self
+            let receipt = TerminalReceipt::new(Arc::new(event), None);
+            let retired = self
                 .terminal_event
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .replace(receipt);
+            drop(retired);
         }
     }
 }
@@ -584,12 +637,8 @@ pub(crate) fn prepend_initial_yield(
 pub(super) enum CellCommand {
     Observe {
         mode: ObserveMode,
-        response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
+        response_tx: ObservationSender,
     },
-}
-
-fn response_event(response_rx: oneshot::Receiver<Result<CellEvent, CellError>>) -> CellEventFuture {
-    Box::pin(async move { response_rx.await.unwrap_or(Err(CellError::Closed)) })
 }
 
 fn ready_event(event: CellEvent) -> CellEventFuture {

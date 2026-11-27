@@ -686,6 +686,7 @@ impl CodeModeExecuteHandler {
             .await;
         let (mut output, delivered_call_ids, delivery) =
             handle_runtime_response(&exec, response, max_output_tokens, context_token_limit, started_at)
+                .await
                 .map_err(FunctionCallError::RespondToModel)?;
         if !retention_settled {
             super::attach_pending_retention(&mut output, &cell_id, &call_id);

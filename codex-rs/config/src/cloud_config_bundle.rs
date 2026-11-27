@@ -9,8 +9,8 @@ use crate::ConfigLayerEntry;
 use crate::RequirementSource;
 use crate::RequirementsLayerEntry;
 use crate::cloud_config_layers::CloudConfigLayerError;
-use crate::cloud_config_layers::cloud_config_layers_from_fragments_strict;
-use crate::cloud_config_layers_from_fragments;
+use crate::cloud_config_layers::CloudConfigTier;
+use crate::cloud_config_layers::cloud_config_layers_from_fragments_for_tier;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
@@ -29,29 +29,42 @@ pub struct CloudConfigBundle {
 
 impl CloudConfigBundle {
     pub fn is_empty(&self) -> bool {
-        let CloudConfigBundle {
-            config_toml,
-            requirements_toml,
-        } = self;
         let CloudConfigTomlBundle {
+            baseline: config_baseline,
             enterprise_managed: config_enterprise_managed,
-        } = config_toml;
+            system_overlay: config_system_overlay,
+        } = &self.config_toml;
         let CloudRequirementsTomlBundle {
+            baseline: requirements_baseline,
             enterprise_managed: requirements_enterprise_managed,
-        } = requirements_toml;
+            system_overlay: requirements_system_overlay,
+        } = &self.requirements_toml;
 
-        config_enterprise_managed.is_empty() && requirements_enterprise_managed.is_empty()
+        config_baseline.is_empty()
+            && config_enterprise_managed.is_empty()
+            && config_system_overlay.is_empty()
+            && requirements_baseline.is_empty()
+            && requirements_enterprise_managed.is_empty()
+            && requirements_system_overlay.is_empty()
     }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CloudConfigTomlBundle {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baseline: Vec<CloudConfigFragment>,
     pub enterprise_managed: Vec<CloudConfigFragment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_overlay: Vec<CloudConfigFragment>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CloudRequirementsTomlBundle {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baseline: Vec<CloudRequirementsFragment>,
     pub enterprise_managed: Vec<CloudRequirementsFragment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_overlay: Vec<CloudRequirementsFragment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,12 +78,16 @@ pub struct CloudRequirementsFragment {
 ///
 /// This is not a final config stack. Callers still decide where each bucket is
 /// inserted relative to local/system/user layers.
-#[derive(Clone, Debug)]
+///
+/// Each bucket is in ascending precedence order within its own tier.
+#[derive(Clone, Debug, Default)]
 pub struct CloudConfigBundleLayers {
-    /// Enterprise-managed config layers in `ConfigLayerStack` order.
+    pub baseline_config: Vec<ConfigLayerEntry>,
     pub enterprise_managed_config: Vec<ConfigLayerEntry>,
-    /// Enterprise-managed requirements layers in requirements layer merge order.
+    pub system_overlay_config: Vec<ConfigLayerEntry>,
+    pub baseline_requirements: Vec<RequirementsLayerEntry>,
     pub enterprise_managed_requirements: Vec<RequirementsLayerEntry>,
+    pub system_overlay_requirements: Vec<RequirementsLayerEntry>,
 }
 
 impl CloudConfigBundleLayers {
@@ -93,47 +110,75 @@ impl CloudConfigBundleLayers {
         base_dir: &AbsolutePathBuf,
         strict_config: bool,
     ) -> Result<Self, CloudConfigLayerError> {
-        // Keep this destructuring exhaustive so adding a new bundle bucket forces
-        // an explicit choice about how it becomes layer data.
+        // Keep these destructurings exhaustive so new buckets have explicit placement.
         let CloudConfigBundle {
             config_toml:
                 CloudConfigTomlBundle {
+                    baseline: config_baseline,
                     enterprise_managed: config_enterprise_managed,
+                    system_overlay: config_system_overlay,
                 },
             requirements_toml:
                 CloudRequirementsTomlBundle {
+                    baseline: requirements_baseline,
                     enterprise_managed: requirements_enterprise_managed,
+                    system_overlay: requirements_system_overlay,
                 },
         } = bundle;
 
-        let enterprise_managed_config = if strict_config {
-            cloud_config_layers_from_fragments_strict(config_enterprise_managed, base_dir)?
-        } else {
-            cloud_config_layers_from_fragments(config_enterprise_managed, base_dir)?
+        let config_layers = |fragments, tier| {
+            cloud_config_layers_from_fragments_for_tier(fragments, base_dir, tier, strict_config)
         };
 
-        let mut enterprise_managed_requirements = requirements_enterprise_managed
-            .into_iter()
-            .map(|fragment| {
-                RequirementsLayerEntry::from_toml(
-                    RequirementSource::EnterpriseManaged {
-                        id: fragment.id,
-                        name: fragment.name,
-                    },
-                    fragment.contents,
-                )
-                .with_base_dir(base_dir.clone())
-            })
-            .collect::<Vec<_>>();
-        // Bundle fragments arrive highest-priority first, while requirements
-        // layers are merged lowest-priority to highest-priority.
-        enterprise_managed_requirements.reverse();
-
         Ok(Self {
-            enterprise_managed_config,
-            enterprise_managed_requirements,
+            baseline_config: config_layers(config_baseline, CloudConfigTier::Baseline)?,
+            enterprise_managed_config: config_layers(
+                config_enterprise_managed,
+                CloudConfigTier::EnterpriseManaged,
+            )?,
+            system_overlay_config: config_layers(
+                config_system_overlay,
+                CloudConfigTier::SystemOverlay,
+            )?,
+            baseline_requirements: requirements_layers_from_fragments(
+                requirements_baseline,
+                base_dir,
+                CloudConfigTier::Baseline,
+            ),
+            enterprise_managed_requirements: requirements_layers_from_fragments(
+                requirements_enterprise_managed,
+                base_dir,
+                CloudConfigTier::EnterpriseManaged,
+            ),
+            system_overlay_requirements: requirements_layers_from_fragments(
+                requirements_system_overlay,
+                base_dir,
+                CloudConfigTier::SystemOverlay,
+            ),
         })
     }
+}
+
+fn requirements_layers_from_fragments(
+    fragments: Vec<CloudRequirementsFragment>,
+    base_dir: &AbsolutePathBuf,
+    tier: CloudConfigTier,
+) -> Vec<RequirementsLayerEntry> {
+    // Bundle fragments arrive highest-priority first; composition folds low to high.
+    fragments
+        .into_iter()
+        .rev()
+        .map(|CloudRequirementsFragment { id, name, contents }| {
+            let source = match tier {
+                CloudConfigTier::Baseline => RequirementSource::CloudBaseline { id, name },
+                CloudConfigTier::EnterpriseManaged => {
+                    RequirementSource::EnterpriseManaged { id, name }
+                }
+                CloudConfigTier::SystemOverlay => RequirementSource::CloudSystemOverlay { id, name },
+            };
+            RequirementsLayerEntry::from_toml(source, contents).with_base_dir(base_dir.clone())
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -58,7 +58,7 @@ fn config_error_from_ignored_toml_value_fields_for_source<T: DeserializeOwned>(
     let unknown_flattened_path = unknown_flattened_toml_value_path::<T>(&value);
     let mut first_ignored_path = None;
     let mut ignored_callback = |ignored_path: serde_ignored::Path<'_>| {
-        record_first_ignored_path(&mut first_ignored_path, &ignored_path);
+        record_first_ignored_path(&mut first_ignored_path, &ignored_path, &|_| true);
     };
     let deserializer = serde_ignored::Deserializer::new(value, &mut ignored_callback);
     let result: Result<T, _> = serde_path_to_error::deserialize(deserializer);
@@ -83,20 +83,24 @@ fn config_error_from_ignored_toml_value_fields_for_source<T: DeserializeOwned>(
     }
 }
 
-pub(crate) fn ignored_toml_value_field<T: DeserializeOwned>(value: TomlValue) -> Option<String> {
-    let flattened_path = unknown_flattened_toml_value_path::<T>(&value);
-    first_ignored_toml_value_path::<T>(value)
-        .ok()?
-        .or(flattened_path)
-        .map(|path| path.join("."))
+/// Returns `Err` if a type error prevented a complete ignored-field scan.
+pub(crate) fn ignored_config_toml_value_field(
+    value: TomlValue,
+    matches: impl Fn(&[String]) -> bool,
+) -> Result<Option<String>, ()> {
+    let flattened_path = unknown_flattened_config_path(&value, &matches);
+    let ignored_path =
+        first_ignored_toml_value_path::<crate::config_toml::ConfigToml>(value, &matches)?;
+    Ok(ignored_path.or(flattened_path).map(|path| path.join(".")))
 }
 
 fn first_ignored_toml_value_path<T: DeserializeOwned>(
     value: TomlValue,
+    matches: &impl Fn(&[String]) -> bool,
 ) -> Result<Option<Vec<String>>, ()> {
     let mut first_ignored_path = None;
     let result: Result<T, _> = serde_ignored::deserialize(value, |ignored_path| {
-        record_first_ignored_path(&mut first_ignored_path, &ignored_path);
+        record_first_ignored_path(&mut first_ignored_path, &ignored_path, matches);
     });
     if result.is_err() {
         return Err(());
@@ -117,42 +121,47 @@ fn unknown_flattened_toml_value_path<T>(value: &TomlValue) -> Option<Vec<String>
         else if owner == std::any::type_name::<crate::types::AppConfig>() { &["apps", "_strict"] }
         else if owner == std::any::type_name::<crate::types::AppToolsConfig>() { &["apps", "_strict", "tools"] }
         else if owner == std::any::type_name::<crate::types::Tui>() { &["tui"] }
-        else { return unknown_flattened_config_path(value); };
+        else { return unknown_flattened_config_path(value, &|_| true); };
     let mut wrapped = value.clone();
     for component in prefix.iter().rev() {
         wrapped = TomlValue::Table(toml::map::Map::from_iter([(component.to_string(), wrapped)]));
     }
-    unknown_flattened_config_path(&wrapped).map(|path| path.into_iter().skip(prefix.len()).collect())
+    unknown_flattened_config_path(&wrapped, &|_| true)
+        .map(|path| path.into_iter().skip(prefix.len()).collect())
 }
 
-fn unknown_flattened_config_path(value: &TomlValue) -> Option<Vec<String>> {
+fn unknown_flattened_config_path(
+    value: &TomlValue,
+    matches: &impl Fn(&[String]) -> bool,
+) -> Option<Vec<String>> {
+    fn ignored_under<T: DeserializeOwned>(
+        value: &TomlValue,
+        prefix: &[String],
+        matches: &impl Fn(&[String]) -> bool,
+    ) -> Option<Vec<String>> {
+        let qualify = |path: &[String]| [prefix, path].concat();
+        first_ignored_toml_value_path::<T>(value.clone(), &|path| matches(&qualify(path)))
+            .ok()
+            .flatten()
+            .map(|path| qualify(&path))
+    }
+
     if let Some(apps) = value.get("apps").and_then(TomlValue::as_table) {
         for (app_id, app) in apps {
             if app_id == "_default" {
                 continue;
             }
-            if let Ok(Some(path)) =
-                first_ignored_toml_value_path::<crate::types::AppConfig>(app.clone())
-            {
-                return Some([vec!["apps".to_string(), app_id.clone()], path].concat());
+            let prefix = ["apps".to_string(), app_id.clone()];
+            if let Some(path) = ignored_under::<crate::types::AppConfig>(app, &prefix, matches) {
+                return Some(path);
             }
             if let Some(tools) = app.get("tools").and_then(TomlValue::as_table) {
                 for (tool_name, tool) in tools {
-                    if let Ok(Some(path)) =
-                        first_ignored_toml_value_path::<crate::types::AppToolConfig>(tool.clone())
+                    let prefix = [&prefix[..], &["tools".to_string(), tool_name.clone()]].concat();
+                    if let Some(path) =
+                        ignored_under::<crate::types::AppToolConfig>(tool, &prefix, matches)
                     {
-                        return Some(
-                            [
-                                vec![
-                                    "apps".to_string(),
-                                    app_id.clone(),
-                                    "tools".to_string(),
-                                    tool_name.clone(),
-                                ],
-                                path,
-                            ]
-                            .concat(),
-                        );
+                        return Some(path);
                     }
                 }
             }
@@ -163,9 +172,11 @@ fn unknown_flattened_config_path(value: &TomlValue) -> Option<Vec<String>> {
         // and optional fields, so this stays aligned with its public contract.
         let known = serde_json::to_value(crate::types::Tui::default()).ok()?;
         let known = known.as_object()?;
-        if let Some(key) = tui.keys().find(|key| !known.contains_key(*key)) {
-            return Some(vec!["tui".to_string(), key.clone()]);
-        }
+        return tui
+            .keys()
+            .filter(|key| !known.contains_key(*key))
+            .map(|key| vec!["tui".to_string(), key.clone()])
+            .find(|path| matches(path));
     }
     None
 }
@@ -174,10 +185,14 @@ pub(crate) fn unknown_feature_toml_value_field(value: &TomlValue) -> Option<Stri
     unknown_feature_toml_value_path(value).map(|path_segments| path_segments.join("."))
 }
 
-fn record_first_ignored_path(first: &mut Option<Vec<String>>, path: &serde_ignored::Path<'_>) {
+fn record_first_ignored_path(
+    first: &mut Option<Vec<String>>,
+    path: &serde_ignored::Path<'_>,
+    matches: &impl Fn(&[String]) -> bool,
+) {
     if first.is_none() {
         let segments = ignored_path_segments(path);
-        if !segments.is_empty() {
+        if !segments.is_empty() && matches(&segments) {
             *first = Some(segments);
         }
     }

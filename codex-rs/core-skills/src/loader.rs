@@ -417,7 +417,9 @@ fn skill_roots_from_layer_stack_inner(
                 });
             }
             ConfigLayerSource::Mdm { .. }
+            | ConfigLayerSource::CloudBaseline { .. }
             | ConfigLayerSource::EnterpriseManaged { .. }
+            | ConfigLayerSource::CloudSystemOverlay { .. }
             | ConfigLayerSource::SessionFlags
             | ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. }
             | ConfigLayerSource::LegacyManagedConfigTomlFromMdm => {}

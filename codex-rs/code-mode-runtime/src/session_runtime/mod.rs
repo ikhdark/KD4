@@ -20,6 +20,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 
 pub(crate) use self::types::CellEvent;
 pub(crate) use self::types::CellId;
@@ -83,7 +84,38 @@ enum CachedCellEvent {
     Inline(CellEvent),
     Durable(Arc<snapshot::CompletedSnapshotEvent>),
     // Lifecycle survives payload eviction without reopening the spill under a lock.
-    Spilled(tempfile::NamedTempFile, usize, Option<bool>),
+    Spilled(Option<TerminalSpill>, usize, Option<bool>),
+}
+
+struct TerminalSpill {
+    owned: Option<OwnedTerminalSpill>,
+    runtime: tokio::runtime::Handle,
+}
+
+struct OwnedTerminalSpill {
+    // Drop the file before releasing the tracker token.
+    file: tempfile::NamedTempFile,
+    _storage_owner: TaskTrackerToken,
+}
+
+impl TerminalSpill {
+    fn file(&self) -> &tempfile::NamedTempFile {
+        &self.owned.as_ref().expect("live spill owns its file").file
+    }
+
+    fn runtime_handle(&self) -> tokio::runtime::Handle {
+        tokio::runtime::Handle::try_current().unwrap_or_else(|_| self.runtime.clone())
+    }
+}
+
+impl Drop for TerminalSpill {
+    fn drop(&mut self) {
+        // An observation cancelled before blocking admission can hold the last
+        // alias. Keep the storage token until the private file has been dropped.
+        if let Some(owned) = self.owned.take() {
+            drop(self.runtime_handle().spawn_blocking(move || drop(owned)));
+        }
+    }
 }
 
 // serde_json emits many small writes. Flush explicitly so an I/O error cannot
@@ -96,7 +128,7 @@ fn write_buffered_json(writer: impl Write, value: &impl serde::Serialize) -> Res
 
 impl CachedCellEvent {
     // Called off the async runtime and outside the cell registry/cache locks.
-    fn new(event: CellEvent) -> (Arc<Self>, usize) {
+    fn new(event: CellEvent, storage_tasks: &TaskTracker) -> (Arc<Self>, usize) {
         let bytes = cell_event_bytes(&event);
         if bytes > TERMINAL_CELL_CACHE_MAX_BYTES {
             let spilled = (|| -> Result<tempfile::NamedTempFile, String> {
@@ -106,8 +138,15 @@ impl CachedCellEvent {
             })();
             match spilled {
                 Ok(file) => {
+                    let spill = TerminalSpill {
+                        owned: Some(OwnedTerminalSpill {
+                            file,
+                            _storage_owner: storage_tasks.token(),
+                        }),
+                        runtime: tokio::runtime::Handle::current(),
+                    };
                     return (
-                        Arc::new(Self::Spilled(file, bytes, terminal_completion(&event))),
+                        Arc::new(Self::Spilled(Some(spill), bytes, terminal_completion(&event))),
                         0,
                     );
                 }
@@ -125,13 +164,14 @@ impl CachedCellEvent {
         match self {
             Self::Inline(event) => Ok(event.clone()),
             Self::Durable(event) => Ok(event.read()),
-            Self::Spilled(file, _, _) => file.reopen()
+            Self::Spilled(Some(spill), ..) => spill.file().reopen()
                 .map_err(|error| Error::Runtime(format!(
                     "terminal cell result is unavailable: {error}; the cell completed; do not replay its effects"
                 )))
                 .and_then(|file| serde_json::from_reader(BufReader::new(file)).map_err(|error| Error::Runtime(
                     format!("terminal cell result cannot be decoded: {error}; do not replay its effects")
                 ))),
+            Self::Spilled(None, ..) => Err(Error::ShuttingDown),
         }
     }
 }
@@ -158,6 +198,18 @@ impl TerminalCellCache {
 
     fn entry(&self, cell_id: &CellId) -> Option<Arc<CachedCellEvent>> {
         self.events.get(cell_id).map(|(event, _)| Arc::clone(event))
+    }
+
+    fn take_spills(&mut self) -> Vec<Arc<CachedCellEvent>> {
+        let mut retired = Vec::new();
+        for (event, _) in self.events.values_mut() {
+            if let CachedCellEvent::Spilled(Some(_), bytes, completed) = event.as_ref() {
+                // Keep the shutdown lookup and lifecycle result for this ID.
+                let marker = Arc::new(CachedCellEvent::Spilled(None, *bytes, *completed));
+                retired.push(std::mem::replace(event, marker));
+            }
+        }
+        retired
     }
 
     // Move spilled files out of the cache so their final drop cannot unlink
@@ -204,8 +256,14 @@ impl TerminalCellCache {
 }
 
 fn retire_spill(event: Arc<CachedCellEvent>, retired_spills: &mut Vec<Arc<CachedCellEvent>>) {
-    if matches!(event.as_ref(), CachedCellEvent::Spilled(..)) {
+    if matches!(event.as_ref(), CachedCellEvent::Spilled(Some(_), ..)) {
         retired_spills.push(event);
+    }
+}
+
+fn drop_cached_on_blocking_thread(event: Arc<CachedCellEvent>) {
+    if let Some(CachedCellEvent::Spilled(Some(mut spill), ..)) = Arc::into_inner(event) {
+        drop(spill.owned.take());
     }
 }
 
@@ -421,8 +479,21 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 .storage_admission
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *admission = false;
-            self.inner.storage_tasks.close();
+            if *admission {
+                *admission = false;
+                // The actors are done creating spills; already-admitted
+                // restore/publication can still install durable entries only.
+                // The storage token on each spill also covers surviving replay
+                // aliases and spill results whose observers timed out.
+                let retired_spills = self
+                    .inner
+                    .terminal_cells
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take_spills();
+                drop(self.inner.spawn_spill_cleanup(retired_spills));
+                self.inner.storage_tasks.close();
+            }
         }
         tokio::time::timeout(SNAPSHOT_COMMIT_TIMEOUT, self.inner.storage_tasks.wait())
             .await.map_err(|_| Error::Runtime(
@@ -489,7 +560,11 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             (event.read(), permit)
         } else {
             self.inner
-                .spawn_observed_storage(move || (event.read(), permit))?
+                .spawn_observed_storage(move || {
+                    let result = event.read();
+                    drop_cached_on_blocking_thread(event);
+                    (result, permit)
+                })?
                 .await
                 .map_err(|error| {
                     Error::Runtime(format!(
@@ -783,15 +858,32 @@ struct RuntimeCellHost<D: SessionRuntimeDelegate> {
     cell_permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
+impl<D: SessionRuntimeDelegate> Drop for Inner<D> {
+    fn drop(&mut self) {
+        // A disconnect deadline can drop the session without completing the
+        // orderly drain. The final owner still retires the cache as one batch.
+        let retired_spills = self
+            .terminal_cells
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_spills();
+        drop(self.spawn_spill_cleanup(retired_spills));
+    }
+}
+
 impl<D: SessionRuntimeDelegate> Inner<D> {
     fn spawn_spill_cleanup(
         &self,
         retired_spills: Vec<Arc<CachedCellEvent>>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        // Only producers already owned by the actor or storage tracker may
-        // register cleanup; shutdown drains both before relinquishing storage.
-        (!retired_spills.is_empty())
-            .then(|| self.storage_tasks.spawn_blocking(move || drop(retired_spills)))
+        let CachedCellEvent::Spilled(Some(spill), ..) = retired_spills.first()?.as_ref() else {
+            unreachable!("only live spills are retired");
+        };
+        let runtime = spill.runtime_handle();
+        Some(self.storage_tasks.spawn_blocking_on(
+            move || retired_spills.into_iter().for_each(drop_cached_on_blocking_thread),
+            &runtime,
+        ))
     }
 
     fn spawn_observed_storage<T: Send + 'static>(
@@ -1098,7 +1190,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                     }
                 }
                 drop(gate);
-                drop(retired_spills);
+                retired_spills.into_iter().for_each(drop_cached_on_blocking_thread);
                 result
             });
             // Timeout leaves the already-published unknown receipt in place;
@@ -1218,12 +1310,13 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                 Arc::clone(&self.inner.spill_bytes).try_acquire_many_owned(weight)
         {
             let source = Arc::clone(&inline);
+            let storage_tasks = self.inner.storage_tasks.clone();
             let spill = self.inner.storage_tasks.spawn_blocking(move || {
                 let admission = (job, admitted_bytes);
                 let CachedCellEvent::Inline(event) = source.as_ref() else {
                     unreachable!()
                 };
-                (CachedCellEvent::new(event.clone()), admission)
+                (CachedCellEvent::new(event.clone(), &storage_tasks), admission)
             });
             if let Ok(Ok((spilled, _admission))) =
                 tokio::time::timeout(TERMINAL_SPILL_TIMEOUT, spill).await

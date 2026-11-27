@@ -35,8 +35,10 @@ Precedence is **top overrides bottom**:
 3. `Project` config (`.codex/config.toml`)
 4. `User` profile config, when present
 5. `User` config (`config.toml`)
-6. `EnterpriseManaged` cloud-managed config bundle layers
-7. `System` config (`%ProgramData%\OpenAI\Codex\config.toml`)
+6. `CloudSystemOverlay` config bundle layers
+7. `EnterpriseManaged` legacy cloud-managed config bundle layers
+8. `System` config (`%ProgramData%\OpenAI\Codex\config.toml`)
+9. `CloudBaseline` config bundle layers
 
 `ConfigLayerStack` stores layers in the opposite order internally: lowest
 precedence first, highest precedence last, so later layers override earlier

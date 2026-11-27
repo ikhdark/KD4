@@ -183,6 +183,18 @@ silently invalidate historical comparisons.
   repair; continue independent work, including separable correctness fixes.
 - For executable-obligation changes, exercise the real stopping decision; see
   the [workload guidance](../KDR/benchmarks/README.md#executable-obligation-comparisons).
+- **Execution efficiency:** Use the lowest-cost valid path to satisfy each
+  required outcome. Extract relevant evidence first, reconcile existing fixes,
+  and reuse compatible evidence and binaries. Before expensive execution,
+  resolve required artifacts, interpreter, runner compatibility, baseline,
+  storage and isolation requirements. Build only necessary targets; select
+  compatible lanes by expected completion time, including queue and cold-build
+  costs. Prefer focused, decisive verification over broader execution. Recheck
+  transient dependencies before reconstructing alternatives. Do not retry
+  unchanged blockers or continue optional verification without concrete value.
+  Preserve required coverage, correctness, safeguards and concurrent execution.
+  Integrate these decisions into existing workflows rather than adding mandatory
+  stages or bookkeeping.
 - Reuse source-matched analysis and hashes. Before counting a prior run, cite
   a direct retained observation per criterion and match source
   or binary, inputs, settings and exercised path. Similar requests and summaries

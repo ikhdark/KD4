@@ -171,6 +171,7 @@ struct ReadFileArgs {
     if_file_revision: Option<String>,
     encoding: Option<ranges::ByteEncoding>,
     selectors: Option<Vec<FileSelector>>,
+    full_snapshot: bool,
     resume_filter: Option<crate::session::resume_inventory::ResumeInventoryFilter>,
 }
 
@@ -185,6 +186,8 @@ struct RawReadFileArgs {
     if_file_revision: Option<String>,
     encoding: Option<ranges::ByteEncoding>,
     selectors: Option<Vec<FileSelector>>,
+    #[serde(default)]
+    full_snapshot: bool,
     resume_filter: Option<crate::session::resume_inventory::ResumeInventoryFilter>,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -239,6 +242,9 @@ impl TryFrom<RawReadFileArgs> for ReadFileArgs {
         } else {
             raw.selectors
         };
+        if raw.full_snapshot && selectors.is_some() {
+            return Err("full_snapshot cannot be combined with selectors or offset/limit".into());
+        }
         if raw.encoding.is_some()
             && (raw.revision.is_some() || if_source_hash.is_some()
                 || raw.path.starts_with("skill:") || raw.path.starts_with("context:")
@@ -268,6 +274,7 @@ impl TryFrom<RawReadFileArgs> for ReadFileArgs {
             encoding: raw.encoding,
             resume_filter: raw.resume_filter,
             selectors,
+            full_snapshot: raw.full_snapshot,
         })
     }
 }
@@ -421,6 +428,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             }
         }
         output["properties"]["file_bytes"] = json!({"type":"integer", "minimum":0});
+        output["properties"]["snapshot_original_utf8"] = json!({"const":true, "description":"The Code Mode full_snapshot represents original filesystem UTF-8 bytes, not decoded or rendered text. Does not certify whole-file delivery; check file_complete or finish immutable recovery."});
         output["properties"]["readback_sha256"] = json!({"type":"string", "pattern":"^[0-9a-f]{64}$", "description":"Digest of original bytes delivered by a single complete byte range from zero through EOF. Omitted for partial, decoded, rendered, or non-byte selections. The digest alone is not a retention receipt."});
         output["properties"]["classification_scope"] = json!({"enum":["complete_file","prefix"], "description":"Bytes inspected for a non-display classification, not a format guarantee. Per-result live-page classification covers only canonical_range."});
         output["properties"]["inspected_bytes"] = json!({"type":"integer", "minimum":0});
@@ -567,6 +575,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ("if_file_revision".to_string(), JsonSchema::string(Some("Opaque file_revision from a large-file byte read. Requires filesystem bytes-only selectors; refuses a changed object/metadata revision, even if the file shrank below 8 MiB. Not a hash, snapshot, or if_source_hash freshness shortcut. Cannot combine with revision or if_source_hash.".into()))),
                 ("if_source_hash".to_string(), JsonSchema::string(Some("Optional source_sha256 from a previous read, whole or its first 12 characters: on a match returns unchanged:true without content or retention. Reacquire current contents through the same authorized owner and compare the whole selected representation, not just requested ranges. On a match and complete selector resolution, return unchanged:true without content or retention; invalid, missing or partial selections keep their normal results. Omit when you need content (including a new selection); a match is not evidence that you previously acquired these selectors. Default rendered HTML and explicit exact markup have different identities.".to_string()))),
                 ("force_fresh".to_string(), JsonSchema::boolean(Some("Legacy compatibility option; every call reads current contents.".to_string()))),
+                ("full_snapshot".to_string(), JsonSchema::boolean(Some("Code Mode only, without selectors: use the bounded script payload for the first page of the default snapshot, with immutable continuation if needed. Prefer read_files(paths, {full:true}) to consume all pages.".into()))),
                 ("resume_filter".to_string(), JsonSchema::object(BTreeMap::from([
                     ("parent_cell_id".into(), JsonSchema::string(Some("Exact originating Code Mode cell identity.".into()))),
                     ("call_id".into(), JsonSchema::string(Some("Exact call or parent call identity, including retired output pins.".into()))),
@@ -592,6 +601,13 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ));
             };
             let mut args = parse_read_file_arguments(arguments)?;
+            let script_consumer = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
+            let full_snapshot = args.full_snapshot;
+            if full_snapshot && !script_consumer {
+                return Err(FunctionCallError::RespondToModel(
+                    "full_snapshot is only supported inside Code Mode".into(),
+                ));
+            }
             if args.selectors.as_ref().is_some_and(|selectors| {
                 selectors.is_empty() || selectors.len() > READ_TOOL_OUTPUT_MAX_SELECTORS
             }) {
@@ -819,7 +835,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 && git_source.is_none()
                 && source_inspection.is_none()
                 && html_outside_workspace(&invocation, &environment_id, &resolved_path);
-            let script_consumer = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
             // Display-sized continuations remain useful for direct model reads.
             // Script selection itself uses a fixed byte cap, not this budget.
             let output_budget = match &invocation.source {
@@ -897,7 +912,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 }
                 let (selectors, selector_errors, selector_bindings) =
                     structure::resolve_batch(&structure_path, &mut canonical, args.selectors);
-                let selection = if script_consumer && !default_preview {
+                let selection = if script_consumer && (full_snapshot || !default_preview) {
                     select_file_snapshot_for_script(&canonical, selectors)
                 } else {
                     select_file_snapshot_with_ceiling(&canonical, selectors, selection_ceiling)
@@ -1090,12 +1105,16 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             output["source_sha256"] = json!(canonical.sha256);
             encoding::annotate(&mut output, decoded_source.as_ref());
             output["file_complete"] = json!(file_complete);
+            let original_utf8 = git_source.is_none()
+                && decoded_source.is_none() && rendered_from.is_none()
+                && !environment_id.starts_with("host-");
+            if full_snapshot && original_utf8 {
+                output["snapshot_original_utf8"] = json!(true);
+            }
             // A complete original UTF-8 byte selection already computed this
             // digest. Expose the same readback contract as the encoded route
             // without forcing a second read or hashing the source again.
-            if file_complete && git_source.is_none()
-                && decoded_source.is_none() && rendered_from.is_none()
-                && !environment_id.starts_with("host-")
+            if file_complete && original_utf8
                 && matches!(output["results"].as_array().map(Vec::as_slice), Some([row])
                     if row["selector"]["kind"] == "bytes" && row["text"].is_string()
                     && row["complete"] == true && row["canonical_range"]["start"] == 0

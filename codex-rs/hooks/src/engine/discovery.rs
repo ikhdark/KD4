@@ -349,12 +349,14 @@ fn fallback_managed_hooks_source_path(
         Some(RequirementSource::Composite { .. }) => {
             synthetic_layer_path("<requirements-composition>/requirements.toml")
         }
+        Some(RequirementSource::CloudBaseline { id, name }) => {
+            cloud_requirements_hook_path("cloud-baseline", id, name)
+        }
         Some(RequirementSource::EnterpriseManaged { id, name }) => {
-            let name = escape_xml_text(name);
-            let id = escape_xml_text(id);
-            synthetic_layer_path(&format!(
-                "<enterprise-managed:{name}:{id}>/requirements.toml"
-            ))
+            cloud_requirements_hook_path("enterprise-managed", id, name)
+        }
+        Some(RequirementSource::CloudSystemOverlay { id, name }) => {
+            cloud_requirements_hook_path("cloud-system-overlay", id, name)
         }
         Some(RequirementSource::LegacyManagedConfigTomlFromMdm) => {
             synthetic_layer_path("<legacy-managed-config.toml-mdm>/managed_config.toml")
@@ -363,6 +365,12 @@ fn fallback_managed_hooks_source_path(
             synthetic_layer_path("<managed-requirements>/requirements.toml")
         }
     }
+}
+
+fn cloud_requirements_hook_path(tier: &str, id: &str, name: &str) -> AbsolutePathBuf {
+    let name = escape_xml_text(name);
+    let id = escape_xml_text(id);
+    synthetic_layer_path(&format!("<{tier}:{name}:{id}>/requirements.toml"))
 }
 
 fn load_hooks_json(
@@ -440,8 +448,14 @@ fn config_toml_source_path(layer: &ConfigLayerEntry) -> AbsolutePathBuf {
         ConfigLayerSource::Mdm { domain, key } => {
             synthetic_layer_path(&format!("<mdm:{domain}:{key}>/{CONFIG_TOML_FILE}"))
         }
+        ConfigLayerSource::CloudBaseline { id, name } => {
+            synthetic_layer_path(&format!("<cloud-baseline:{name}:{id}>/{CONFIG_TOML_FILE}"))
+        }
         ConfigLayerSource::EnterpriseManaged { id, name } => synthetic_layer_path(&format!(
             "<enterprise-managed:{name}:{id}>/{CONFIG_TOML_FILE}"
+        )),
+        ConfigLayerSource::CloudSystemOverlay { id, name } => synthetic_layer_path(&format!(
+            "<cloud-system-overlay:{name}:{id}>/{CONFIG_TOML_FILE}"
         )),
         ConfigLayerSource::LegacyManagedConfigTomlFromMdm => {
             synthetic_layer_path("<legacy-managed-config.toml-mdm>/managed_config.toml")
@@ -813,7 +827,9 @@ pub(crate) fn hook_metadata_for_config_layer_source(source: &ConfigLayerSource) 
         ConfigLayerSource::User { .. } => (HookSource::User, false),
         ConfigLayerSource::Project { .. } => (HookSource::Project, false),
         ConfigLayerSource::Mdm { .. } => (HookSource::Mdm, true),
-        ConfigLayerSource::EnterpriseManaged { .. } => (HookSource::CloudManagedConfig, true),
+        ConfigLayerSource::CloudBaseline { .. }
+        | ConfigLayerSource::EnterpriseManaged { .. }
+        | ConfigLayerSource::CloudSystemOverlay { .. } => (HookSource::CloudManagedConfig, true),
         ConfigLayerSource::SessionFlags => (HookSource::SessionFlags, false),
         ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. } => {
             (HookSource::LegacyManagedConfigFile, true)
@@ -841,7 +857,11 @@ fn hook_source_for_requirement_source(source: Option<&RequirementSource>) -> Hoo
             // available coarse attribution.
             hook_source_for_requirement_source(sources.first())
         }
-        Some(RequirementSource::EnterpriseManaged { .. }) => HookSource::CloudRequirements,
+        Some(
+            RequirementSource::CloudBaseline { .. }
+            | RequirementSource::EnterpriseManaged { .. }
+            | RequirementSource::CloudSystemOverlay { .. },
+        ) => HookSource::CloudRequirements,
         Some(RequirementSource::Unknown) | None => HookSource::Unknown,
     }
 }

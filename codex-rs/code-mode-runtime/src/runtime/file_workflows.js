@@ -1,5 +1,19 @@
 (() => {
   // Bounded workflows over the existing admitted dispatch and delivery paths.
+  const owned = (implementation, name) => Object.defineProperty({
+    [name](...args) {
+      const helper = observeHelper?.("helper");
+      const result = implementation(helper, ...args);
+      observeHelper?.("helper_bind", helper, result);
+      return result;
+    },
+  }[name], "length", {value: implementation.length - 1});
+  const nativeCall = (helper, branch, action) => {
+    if (helper === undefined) return action();
+    const previous = observeHelper("helper_enter", helper, branch);
+    try { return action(); }
+    finally { observeHelper("helper_leave", helper, previous); }
+  };
   const jsonPointer = (value) => typeof value === "string" &&
     (value === "" || value.startsWith("/")) && !/~(?:[^01]|$)/.test(value);
   const jsonScalar = (value) => value === null || typeof value === "string" ||
@@ -111,19 +125,22 @@
       throw new TypeError("expected at most 64 KiB of UTF-8 text or bytes");
     return expected;
   };
-  const verifyBytes = async (path, bytes) => {
+  const verifyBytes = async (path, bytes, helper, branch) => {
     // Capture the expectation before yielding; callers may mutate a Uint8Array.
     const size = bytes.length, end = Math.max(1, size);
     const hex = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
-    const r = await tools.read_file({ path, encoding: "hex", selectors: [{kind:"bytes", start:0, end}] });
+    const r = await nativeCall(helper, branch, () =>
+      tools.read_file({ path, encoding: "hex", selectors: [{kind:"bytes", start:0, end}] }));
     const row = r.results?.[0];
     if (r.read_mode !== "byte_ranges" || r.selector_coordinate_space !== "source_bytes" ||
         r.complete !== true || r.file_bytes !== size || r.results?.length !== 1 ||
         row?.status !== "ok" || row.complete !== true || row.canonical_range?.start !== 0 ||
         row.canonical_range?.end !== size || row.exact_bytes !== size || row.data_hex !== hex)
       throw Object.assign(new Error("complete file bytes did not match"), { evidence: r });
+    if (!patchHash(r.readback_sha256))
+      throw Object.assign(new Error("complete file readback did not return its SHA-256"), { evidence: r });
     return { path: r.path, environment_id: r.environment_id, bytes: size, file_revision: r.file_revision,
-      ...(patchHash(r.readback_sha256) ? { readback_sha256: r.readback_sha256 } : {}) };
+      readback_sha256: r.readback_sha256 };
   };
   // A matched native absence probe observes the exact directory entry. A
   // timeout, cancellation or error is unknown, never a proof of absence.
@@ -149,27 +166,28 @@
     },
   });
   Object.defineProperty(globalThis, "verify_file_bytes", {
-    value: async (path, expected) => verifyBytes(path, smallBytes(expected)),
+    value: owned(async (helper, path, expected) =>
+      verifyBytes(path, smallBytes(expected), helper, 0), "verify_file_bytes"),
   });
   Object.defineProperty(globalThis, "create_verified_text", {
-    value: async function create_verified_text(path, content) {
+    value: owned(async (helper, path, content) => {
       if (!patchPath(path) || typeof content !== "string" || !content.isWellFormed())
         throw new TypeError("expected a patch-safe path and well-formed UTF-8 text");
       const bytes = smallBytes(content);
-      const patch = await apply(exactTextAdd(path, content));
+      const patch = await nativeCall(helper, 0, () => apply(exactTextAdd(path, content)));
       if (patch.success !== true || patch.changes_exact !== true || patch.outcome !== "committed")
         throw Object.assign(new Error("create was not confirmed; do not retry"), { evidence: patch });
       try {
-        return { patch, readback: await verifyBytes(path, bytes) };
+        return { patch, readback: await verifyBytes(path, bytes, helper, 0) };
       } catch (cause) {
         throw Object.assign(new Error("create committed; readback did not verify it", { cause }),
           { evidence: { patch, readback: cause.evidence ?? cause } });
       }
-    },
+    }, "create_verified_text"),
   });
 
   Object.defineProperty(globalThis, "create_verified_texts", {
-    value: async function create_verified_texts(entries) {
+    value: owned(async (helper, entries) => {
       if (!Array.isArray(entries) || !entries.length || entries.length > 32)
         throw new TypeError("expected 1–32 [path, text] pairs");
       const seen = new Set();
@@ -186,18 +204,22 @@
         seen.add(path);
         return { path, bytes, hunk: exactTextAdd(path, content) };
       });
-      const patch = await apply(files.map(file => file.hunk).join(""));
+      const patch = await nativeCall(helper, 0, () => apply(files.map(file => file.hunk).join("")));
       if (patch.success !== true || patch.changes_exact !== true || patch.outcome !== "committed")
         throw Object.assign(new Error("batch create was not confirmed; do not retry"), { evidence: patch });
-      const settled = await Promise.allSettled(files.map(file => verifyBytes(file.path, file.bytes)));
+      if (helper !== undefined) observeHelper("helper_fork_after_patch", helper);
+      const settled = await Promise.allSettled(
+        files.map((file, branch) => verifyBytes(file.path, file.bytes, helper, branch)),
+      );
       const readbacks = settled.map((result, i) => result.status === "fulfilled"
-        ? { path: files[i].path, status: "verified", readback: result.value }
+        ? { path: files[i].path, status: "verified", readback_sha256: result.value.readback_sha256,
+            readback: result.value }
         : { path: files[i].path, status: "unverified", error: result.reason?.message ?? String(result.reason),
             evidence: result.reason?.evidence ?? result.reason?.tool_failure ?? result.reason });
       if (readbacks.some(row => row.status !== "verified"))
         throw Object.assign(new Error("batch committed; readbacks incomplete"), { evidence: { patch, readbacks } });
       return { patch, readbacks };
-    },
+    }, "create_verified_texts"),
   });
 
   // Never substitute a combined display, a decoded pipe or the last poll's suffix.

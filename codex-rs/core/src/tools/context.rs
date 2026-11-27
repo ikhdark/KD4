@@ -1157,14 +1157,20 @@ impl ApplyPatchToolOutput {
                 }
                 // Hunk +coordinates refer to the committed post-edit source,
                 // not the proposed patch or a later filesystem read.
-                let mut unified_diff = diff.unified_diff().context_radius(3).to_string();
                 let headers_only = success && delta.is_exact() && kind == "update";
-                if headers_only {
-                    unified_diff = unified_diff
-                        .split_inclusive('\n')
-                        .filter(|line| line.starts_with("@@ "))
-                        .collect();
-                }
+                let mut unified = diff.unified_diff();
+                unified.context_radius(3);
+                let unified_diff = if headers_only {
+                    // The receipt never includes the body on this path.
+                    use std::fmt::Write as _;
+                    let mut headers = String::new();
+                    for hunk in unified.iter_hunks() {
+                        let _ = writeln!(headers, "{}", hunk.header());
+                    }
+                    headers
+                } else {
+                    unified.to_string()
+                };
                 let limit = remaining_diff_bytes.min(8 * 1024);
                 let end = unified_diff.floor_char_boundary(limit.min(unified_diff.len()));
                 remaining_diff_bytes -= end;
@@ -1428,9 +1434,25 @@ impl ToolOutput for ApplyPatchToolOutput {
     }
 
     fn requires_canonical_artifact(&self) -> bool {
-        // The small direct receipt deliberately omits displaced bytes and
-        // repetitive advisories. Retain them even when that receipt fits.
-        !self.diagnostics.is_empty()
+        // Successful, exact patches already inline these bounded status rows.
+        // Requiring a second, durable copy forces synchronous retention even
+        // for small Code Mode receipts. Real findings and failed or uncertain
+        // edits retain the existing canonical recovery path.
+        let diagnostics_need_retention = !self.diagnostics.is_empty()
+            && (!self.success
+                || !self.changes_exact
+                || self.diagnostics.len() > 2
+                || self.diagnostics.iter().any(|diagnostic| {
+                    let inline_status = match diagnostic["kind"].as_str() {
+                        Some("prior_evidence_review") => diagnostic["status"] == "not_reported",
+                        Some("historical_reversal_check_skipped") => {
+                            diagnostic["reason"] == "history_unavailable_or_budget_exceeded"
+                        }
+                        _ => false,
+                    };
+                    !inline_status || diagnostic.to_string().len() > 512
+                }));
+        diagnostics_need_retention
             || self
                 .changes
                 .iter()

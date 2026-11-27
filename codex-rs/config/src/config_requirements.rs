@@ -46,6 +46,14 @@ pub enum RequirementSource {
         id: String,
         name: String,
     },
+    CloudBaseline {
+        id: String,
+        name: String,
+    },
+    CloudSystemOverlay {
+        id: String,
+        name: String,
+    },
     SystemRequirementsToml {
         file: AbsolutePathBuf,
     },
@@ -104,6 +112,12 @@ impl fmt::Display for RequirementSource {
             }
             RequirementSource::EnterpriseManaged { id, name } => {
                 write!(f, "enterprise-managed requirements {name} ({id})")
+            }
+            RequirementSource::CloudBaseline { id, name } => {
+                write!(f, "cloud baseline requirements {name} ({id})")
+            }
+            RequirementSource::CloudSystemOverlay { id, name } => {
+                write!(f, "cloud system overlay requirements {name} ({id})")
             }
             RequirementSource::SystemRequirementsToml { file } => {
                 write!(f, "{}", file.as_path().display())

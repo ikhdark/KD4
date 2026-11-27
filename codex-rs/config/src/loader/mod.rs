@@ -18,6 +18,7 @@ use crate::diagnostics::ConfigError;
 use crate::diagnostics::config_error_from_toml;
 use crate::diagnostics::first_layer_config_error_from_entries as typed_first_layer_config_error_from_entries;
 use crate::diagnostics::io_error_from_config_error;
+use crate::merge::is_multi_agent_v2_feature_path;
 use crate::merge::merge_toml_values;
 use crate::overrides::build_cli_overrides_layer;
 use crate::project_root_markers::default_project_root_markers;
@@ -28,7 +29,7 @@ use crate::state::ConfigLoadOptions;
 use crate::state::LoaderOverrides;
 use crate::state::ProjectDiscoveryContext;
 use crate::strict_config::config_error_from_ignored_toml_value_fields;
-use crate::strict_config::ignored_toml_value_field;
+use crate::strict_config::ignored_config_toml_value_field;
 use crate::strict_config::unknown_feature_toml_value_field;
 use crate::thread_config::ThreadConfigContext;
 use crate::thread_config::ThreadConfigLoader;
@@ -73,8 +74,10 @@ async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> O
 /// composed with config-style TOML merging plus field-specific handling for
 /// hooks, rules, deny-read permissions, and remote sandbox config:
 ///
+/// - cloud baseline requirements
 /// - system    `%ProgramData%\OpenAI\Codex\requirements.toml`
-/// - cloud:    enterprise-managed cloud config bundle requirements
+/// - legacy enterprise cloud requirements
+/// - cloud system overlay requirements
 /// - legacy:   managed_config.toml reinterpreted as requirements.toml
 ///
 /// For backwards compatibility, we also load from
@@ -82,14 +85,17 @@ async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> O
 ///
 /// Configuration is built up from multiple layers in the following order:
 ///
+/// - cloud baseline config
 /// - system    `%ProgramData%\OpenAI\Codex\config.toml`
-/// - cloud     enterprise-managed cloud config bundle fragments
+/// - legacy enterprise cloud config
+/// - cloud system overlay config
 /// - user      `${CODEX_HOME}/config.toml`
 /// - profile   `${CODEX_HOME}/<name>.config.toml`, when selected
 /// - cwd       `${PWD}/config.toml` (loaded but disabled when the directory is untrusted)
 /// - tree      parent directories up to root looking for `./.codex/config.toml` (loaded but disabled when untrusted)
 /// - repo      `$(git rev-parse --show-toplevel)/.codex/config.toml` (loaded but disabled when untrusted)
 /// - runtime   e.g., --config flags, model selector in UI
+/// - legacy    managed_config.toml
 ///
 /// See https://developers.openai.com/codex/security for details.
 ///
@@ -117,24 +123,17 @@ pub async fn load_config_layers_state(
     let ignore_user_and_project_exec_policy_rules =
         overrides.ignore_user_and_project_exec_policy_rules;
     let mut requirements_layers = Vec::new();
-    let mut bundle_requirements_layers = Vec::new();
     let mut system_requirements_layer = None;
-    let mut cloud_config_layers = Vec::new();
+    let mut cloud_layers = CloudConfigBundleLayers::default();
 
     if !ignore_managed_requirements {
         if let Some(bundle) = cloud_config_bundle.get().await.map_err(io::Error::other)? {
             let cloud_config_base_dir = AbsolutePathBuf::from_absolute_path(codex_home)?;
-            let bundle_layers = if strict_config {
+            cloud_layers = if strict_config {
                 CloudConfigBundleLayers::from_bundle_strict_config(bundle, &cloud_config_base_dir)?
             } else {
                 CloudConfigBundleLayers::from_bundle(bundle, &cloud_config_base_dir)?
             };
-            let CloudConfigBundleLayers {
-                enterprise_managed_config,
-                enterprise_managed_requirements,
-            } = bundle_layers;
-            bundle_requirements_layers = enterprise_managed_requirements;
-            cloud_config_layers = enterprise_managed_config;
         }
 
         // Honor the system requirements.toml location.
@@ -142,12 +141,22 @@ pub async fn load_config_layers_state(
         system_requirements_layer = load_requirements_toml(fs, &requirements_toml_file).await?;
     }
 
+    let CloudConfigBundleLayers {
+        baseline_config,
+        enterprise_managed_config,
+        system_overlay_config,
+        baseline_requirements,
+        enterprise_managed_requirements,
+        system_overlay_requirements,
+    } = cloud_layers;
     let loaded_config_layers =
         layer_io::load_config_layers_internal(fs, overrides.clone(), strict_config)
             .await?;
     if !ignore_managed_requirements {
+        requirements_layers.extend(baseline_requirements);
         requirements_layers.extend(system_requirements_layer);
-        requirements_layers.extend(bundle_requirements_layers);
+        requirements_layers.extend(enterprise_managed_requirements);
+        requirements_layers.extend(system_overlay_requirements);
         // Continue to support the legacy `managed_config.toml` locations as
         // requirements layers for backwards compatibility.
         requirements_layers.extend(requirements_layers_from_legacy_scheme(
@@ -165,6 +174,7 @@ pub async fn load_config_layers_state(
     let local_layers_future = async {
         let mut layers = Vec::<ConfigLayerEntry>::new();
 
+        let mut cli_needs_merged_validation = false;
         let cli_overrides_layer = if cli_overrides.is_empty() {
             None
         } else {
@@ -174,7 +184,8 @@ pub async fn load_config_layers_state(
                 .map(AbsolutePathBuf::as_path)
                 .unwrap_or(codex_home);
             if strict_config {
-                validate_cli_overrides_strictly(&cli_overrides_layer, base_dir)?;
+                cli_needs_merged_validation =
+                    cli_overrides_need_merged_validation(&cli_overrides_layer, base_dir)?;
             }
             Some(resolve_relative_paths_in_config_toml(
                 cli_overrides_layer,
@@ -199,8 +210,10 @@ pub async fn load_config_layers_state(
             },
         )
         .await?;
+        layers.extend(baseline_config);
         layers.push(system_layer);
-        layers.extend(cloud_config_layers);
+        layers.extend(enterprise_managed_config);
+        layers.extend(system_overlay_config);
 
         // Add the base user config layer. When profile-v2 is selected, add the
         // profile config as a second user layer on top so the profile only needs to
@@ -340,12 +353,18 @@ pub async fn load_config_layers_state(
             ));
         }
 
-        Ok::<_, io::Error>((layers, startup_warnings, project_discovery))
+        Ok::<_, io::Error>((
+            layers,
+            startup_warnings,
+            project_discovery,
+            cli_needs_merged_validation,
+        ))
     };
     // Keep both acquisitions owned by this load and preserve remote-error precedence.
     let (thread_layers, local_layers) = tokio::join!(thread_layers_future, local_layers_future);
     let thread_config_layers = thread_layers.map_err(io::Error::other)?;
-    let (mut layers, startup_warnings, project_discovery) = local_layers?;
+    let (mut layers, startup_warnings, project_discovery, cli_needs_merged_validation) =
+        local_layers?;
 
     for thread_config_layer in thread_config_layers {
         insert_layer_by_precedence(&mut layers, thread_config_layer);
@@ -384,6 +403,9 @@ pub async fn load_config_layers_state(
         config_requirements_toml.into_toml(),
     )?
     .with_user_and_project_exec_policy_rules_ignored(ignore_user_and_project_exec_policy_rules);
+    if cli_needs_merged_validation {
+        validate_surviving_cli_overrides(&config_layer_stack)?;
+    }
     if let Some(project_discovery) = project_discovery {
         config_layer_stack = config_layer_stack.with_project_discovery(project_discovery);
     }
@@ -802,27 +824,83 @@ fn validate_config_toml_strictly(
     }
 }
 
-fn validate_cli_overrides_strictly(
+fn cli_overrides_need_merged_validation(
     cli_overrides_layer: &TomlValue,
     base_dir: &Path,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let _guard = AbsolutePathBufGuard::new(base_dir);
-    if let Some(ignored_path) = ignored_toml_value_field::<ConfigToml>(cli_overrides_layer.clone())
+    let ignored = ignored_config_toml_value_field(cli_overrides_layer.clone(), |_| true);
+    let needs_merged_validation = ignored.is_err();
+    if let Some(path) = ignored
+        .ok()
+        .flatten()
+        .or_else(|| unknown_feature_toml_value_field(cli_overrides_layer))
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown configuration field `{ignored_path}` in -c/--config override"),
-        ));
+        return Err(unknown_cli_override_field(&path));
     }
 
-    if let Some(ignored_path) = unknown_feature_toml_value_field(cli_overrides_layer) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown configuration field `{ignored_path}` in -c/--config override"),
-        ));
-    }
+    // A higher-priority layer may repair a known bad value. In that case,
+    // retry unknown-field detection on the merged config, not the broken input.
+    Ok(needs_merged_validation)
+}
 
+fn validate_surviving_cli_overrides(stack: &ConfigLayerStack) -> io::Result<()> {
+    let layers = stack.layers_high_to_low();
+    // Thread layers of equal precedence are inserted after the CLI, so the
+    // original CLI layer is the lowest-precedence SessionFlags entry.
+    let Some(cli_index) = layers
+        .iter()
+        .rposition(|layer| matches!(layer.name, ConfigLayerSource::SessionFlags))
+    else {
+        return Ok(());
+    };
+    let cli = &layers[cli_index].config;
+    let survives_cli = |path: &[String]| {
+        let cli_value = path.iter().try_fold(cli, |value, segment| match value {
+            TomlValue::Array(items) => segment.parse::<usize>().ok().and_then(|i| items.get(i)),
+            _ => value.get(segment.as_str()),
+        });
+        cli_value.is_some_and(|cli_value| {
+            !layers[..cli_index]
+                .iter()
+                .any(|layer| overlay_replaces_cli_path(&layer.config, path, cli_value))
+        })
+    };
+    if let Ok(Some(path)) = ignored_config_toml_value_field(stack.effective_config(), survives_cli) {
+        return Err(unknown_cli_override_field(&path));
+    }
+    // Keep the existing typed diagnostic if the merged value still fails.
     Ok(())
+}
+
+fn overlay_replaces_cli_path(
+    mut overlay: &TomlValue,
+    path: &[String],
+    cli_value: &TomlValue,
+) -> bool {
+    for (index, segment) in path.iter().enumerate() {
+        if let Some(table) = overlay.as_table() {
+            let Some(next) = table.get(segment) else {
+                return false;
+            };
+            overlay = next;
+        } else if overlay.is_bool() && is_multi_agent_v2_feature_path(&path[..index]) {
+            // An upper boolean toggle merges as .enabled into lower settings.
+            return segment == "enabled";
+        } else {
+            // Non-table overlays replace their entire subtree.
+            return true;
+        }
+    }
+    // Two tables at the target key merge rather than replacing the CLI field.
+    !(overlay.is_table() && cli_value.is_table())
+}
+
+fn unknown_cli_override_field(path: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unknown configuration field `{path}` in -c/--config override"),
+    )
 }
 
 /// If available, load requirements from the Windows system `requirements.toml`

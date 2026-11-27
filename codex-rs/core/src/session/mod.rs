@@ -4136,16 +4136,30 @@ impl Session {
         .await
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
     pub async fn request_user_input(
         &self,
         turn_context: &TurnContext,
         call_id: String,
-        mut args: RequestUserInputArgs,
+        args: RequestUserInputArgs,
     ) -> Option<RequestUserInputResponse> {
+        // Delegated and MCP prompts retain their existing no-answer policy.
+        // The native clarification tool distinguishes a failed durable append.
+        self.request_user_input_with_outcome(turn_context, call_id, args)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state updates must remain atomic"
+    )]
+    pub(crate) async fn request_user_input_with_outcome(
+        &self,
+        turn_context: &TurnContext,
+        call_id: String,
+        mut args: RequestUserInputArgs,
+    ) -> std::io::Result<Option<RequestUserInputResponse>> {
         // Legacy tool calls and delegates may still supply a timeout hint.
         // Human input waits must not advance the turn merely because time passed.
         args.auto_resolution_ms = None;
@@ -4157,7 +4171,9 @@ impl Session {
         let event_id = sub_id.clone();
         let (originating_turn_state, prev_entry) = {
             let mut active = self.active_turn.lock().await;
-            let at = active.as_mut()?;
+            let Some(at) = active.as_mut() else {
+                return Ok(None);
+            };
             // A late tool/delegate must not register an old turn's response key
             // in whichever turn happens to be active now.
             let active_id = at
@@ -4174,7 +4190,7 @@ impl Session {
                     terminal.interrupt_pending() || terminal.interaction_released())
                 || at.task.as_ref().is_some_and(|task| task.cancellation_token.is_cancelled())
             {
-                return None;
+                return Ok(None);
             }
             let mut ts = at.turn_state.lock().await;
             let previous = ts.insert_pending_user_input(sub_id, call_id.clone(), args.clone(), tx_response);
@@ -4212,7 +4228,7 @@ impl Session {
         let _interactive_wait_guard = turn_context
             .turn_timing_state
             .begin_interactive_wait(InteractiveWaitKind::UserInput);
-        rx_response.await.ok()
+        rx_response.await.ok().transpose()
     }
 
 
@@ -4273,10 +4289,10 @@ impl Session {
                 let _in_flight = in_flight;
                 if let Some(terminal) = terminal {
                     terminal
-                        .mark_interrupt_pending_if(|| tx_response.send(response).is_ok())
+                        .mark_interrupt_pending_if(|| tx_response.send(Ok(response)).is_ok())
                         .await;
                 } else {
-                    tx_response.send(response).ok();
+                    tx_response.send(Ok(response)).ok();
                 }
             });
             if let Err(error) = delivery.await {
@@ -4320,12 +4336,10 @@ impl Session {
                 Ok::<(), std::io::Error>(())
             }
             .await;
-            match result {
-                Ok(()) => {
-                    tx_response.send(response).ok();
-                }
-                Err(error) => warn!("Could not persist native user decision: {error}"),
+            if let Err(error) = &result {
+                warn!("Could not persist native user decision: {error}");
             }
+            let _ = tx_response.send(result.map(|()| response));
         });
         let _ = admission.await;
     }

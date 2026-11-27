@@ -123,31 +123,57 @@ impl BackendBundleClient {
 }
 
 pub(crate) fn bundle_from_response(response: ConfigBundleResponse) -> CloudConfigBundle {
-    let config_toml = response
-        .config_toml
+    let config_toml = response.config_toml.flatten().unwrap_or_default();
+    let config_managed = config_toml
+        .managed_layers
         .flatten()
-        .map(|config_toml| *config_toml)
-        .and_then(|config_toml| config_toml.enterprise_managed.flatten())
-        .unwrap_or_default()
-        .into_iter()
-        .map(config_fragment_from_delivered)
-        .collect();
-    let requirements_toml = response
-        .requirements_toml
+        .map(|layers| *layers)
+        .unwrap_or_default();
+    let requirements_toml = response.requirements_toml.flatten().unwrap_or_default();
+    let requirements_managed = requirements_toml
+        .managed_layers
         .flatten()
-        .map(|requirements_toml| *requirements_toml)
-        .and_then(|requirements_toml| requirements_toml.enterprise_managed.flatten())
-        .unwrap_or_default()
-        .into_iter()
-        .map(requirements_fragment_from_delivered)
-        .collect();
+        .map(|layers| *layers)
+        .unwrap_or_default();
 
     CloudConfigBundle {
         config_toml: CloudConfigTomlBundle {
-            enterprise_managed: config_toml,
+            baseline: config_managed
+                .baseline
+                .into_iter()
+                .map(config_fragment_from_delivered)
+                .collect(),
+            enterprise_managed: config_toml
+                .enterprise_managed
+                .flatten()
+                .unwrap_or_default()
+                .into_iter()
+                .map(config_fragment_from_delivered)
+                .collect(),
+            system_overlay: config_managed
+                .system_overlay
+                .into_iter()
+                .map(config_fragment_from_delivered)
+                .collect(),
         },
         requirements_toml: CloudRequirementsTomlBundle {
-            enterprise_managed: requirements_toml,
+            baseline: requirements_managed
+                .baseline
+                .into_iter()
+                .map(requirements_fragment_from_delivered)
+                .collect(),
+            enterprise_managed: requirements_toml
+                .enterprise_managed
+                .flatten()
+                .unwrap_or_default()
+                .into_iter()
+                .map(requirements_fragment_from_delivered)
+                .collect(),
+            system_overlay: requirements_managed
+                .system_overlay
+                .into_iter()
+                .map(requirements_fragment_from_delivered)
+                .collect(),
         },
     }
 }

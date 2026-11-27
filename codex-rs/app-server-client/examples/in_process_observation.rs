@@ -154,7 +154,7 @@ async fn run() -> Result<(), Failure> {
     let mut initialize_params: Option<InitializeParams> = None;
     let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<Value>(64);
     let (output_done_tx, mut output_done) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
+    let output = std::thread::spawn(move || {
         let result: Result<(), Failure> = (|| {
             let mut output = std::io::stdout().lock();
             while let Ok(value) = output_rx.recv() {
@@ -377,6 +377,9 @@ async fn run() -> Result<(), Failure> {
     if failure.is_none() {
         if input.join().is_err() { failure = Some("input reader panicked".into()); }
     }
+    if failure.is_none() && output.join().is_err() {
+        failure = Some("stdout owner panicked".into());
+    }
     match failure {
         Some(error) if !cleanup_failures.is_empty() => Err(std::io::Error::other(format!(
             "{error}; secondary cleanup failures: {}", cleanup_failures.join("; "),
@@ -409,5 +412,7 @@ fn main() -> Result<(), Failure> {
         .enable_all()
         .thread_stack_size(16 * 1024 * 1024)
         .build()?
-        .block_on(run())
+        .block_on(run())?;
+    codex_protocol::timing::client_probe::seal_after_normal_drain();
+    Ok(())
 }

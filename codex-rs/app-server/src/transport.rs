@@ -184,6 +184,53 @@ pub(crate) struct OutboundConnectionState {
     is_in_process: bool,
     remote_preview: bool,
     stdio_delivery: Option<StdioDelivery>,
+    stdio_drain: Option<StdioOutboundDrain>,
+}
+
+/// Retained by this runtime's router after the native writer route is removed.
+/// A clean transport exit alone cannot see discarded staging or router output.
+#[derive(Clone)]
+pub(crate) struct StdioOutboundDrain {
+    connection_id: ConnectionId,
+    initialized: Arc<AtomicBool>,
+    experimental_api_enabled: Arc<AtomicBool>,
+    opted_out_notification_methods: Arc<OutboundNotificationOptOuts>,
+    incomplete: Arc<AtomicBool>,
+}
+
+impl StdioOutboundDrain {
+    pub(crate) fn completed_connection(&self) -> Option<ConnectionId> {
+        (!self.incomplete.load(Ordering::Acquire)).then_some(self.connection_id)
+    }
+
+    fn mark_incomplete(&self) {
+        self.incomplete.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn observe_retired_output(
+        &self,
+        connections: &HashMap<ConnectionId, OutboundConnectionState>,
+        envelope: &OutgoingEnvelope,
+    ) {
+        if connections.contains_key(&self.connection_id) {
+            return;
+        }
+        let message = match envelope {
+            OutgoingEnvelope::ToConnection { connection_id, message, .. }
+                if *connection_id == self.connection_id => message,
+            OutgoingEnvelope::Broadcast { message } if self.initialized.load(Ordering::Acquire) => {
+                message
+            }
+            _ => return,
+        };
+        if !should_skip_notification(
+            &self.experimental_api_enabled,
+            &self.opted_out_notification_methods,
+            message,
+        ) {
+            self.mark_incomplete();
+        }
+    }
 }
 
 struct StdioStagedMessage {
@@ -397,12 +444,30 @@ impl OutboundConnectionState {
             is_in_process: false,
             remote_preview: false,
             stdio_delivery: None,
+            stdio_drain: None,
         }
     }
 
-    pub(crate) fn with_stdio_delivery(mut self) -> Self {
+    pub(crate) fn with_stdio_delivery(mut self, connection_id: ConnectionId) -> Self {
         self.is_stdio = true;
+        self.stdio_drain = Some(StdioOutboundDrain {
+            connection_id,
+            initialized: Arc::clone(&self.initialized),
+            experimental_api_enabled: Arc::clone(&self.experimental_api_enabled),
+            opted_out_notification_methods: Arc::clone(&self.opted_out_notification_methods),
+            incomplete: Arc::new(AtomicBool::new(false)),
+        });
         self
+    }
+
+    pub(crate) fn stdio_drain(&self) -> Option<&StdioOutboundDrain> {
+        self.stdio_drain.as_ref()
+    }
+
+    fn mark_stdio_delivery_incomplete(&self) {
+        if let Some(drain) = self.stdio_drain() {
+            drain.mark_incomplete();
+        }
     }
 
     pub(crate) fn with_remote_preview(mut self) -> Self {
@@ -444,24 +509,32 @@ fn should_skip_notification_for_connection(
     connection_state: &OutboundConnectionState,
     message: &OutgoingMessage,
 ) -> bool {
+    should_skip_notification(
+        &connection_state.experimental_api_enabled,
+        &connection_state.opted_out_notification_methods,
+        message,
+    )
+}
+
+fn should_skip_notification(
+    experimental_api_enabled: &AtomicBool,
+    opted_out_notification_methods: &OutboundNotificationOptOuts,
+    message: &OutgoingMessage,
+) -> bool {
     match message {
         OutgoingMessage::AppServerNotification(notification) => {
             if notification.experimental_reason().is_some()
-                && !connection_state
-                    .experimental_api_enabled
-                    .load(Ordering::Acquire)
+                && !experimental_api_enabled.load(Ordering::Acquire)
             {
                 return true;
             }
             // The common case is an empty set. Check its lock-free summary before taking the
             // lock or rendering the method name, which allocates for every stream delta.
-            if !connection_state.opted_out_notification_methods.has_any() {
+            if !opted_out_notification_methods.has_any() {
                 return false;
             }
             let method = notification.to_string();
-            let Some(contains_method) = connection_state
-                .opted_out_notification_methods
-                .contains(method.as_str())
+            let Some(contains_method) = opted_out_notification_methods.contains(method.as_str())
             else {
                 warn!("failed to read outbound opted-out notifications");
                 return false;
@@ -496,6 +569,12 @@ async fn send_message_to_connection(
         return false;
     };
     if connection_state.is_disconnected() {
+        if connection_state.stdio_drain().is_some()
+            && (notification_prechecked
+                || !should_skip_notification_for_connection(connection_state, &message))
+        {
+            connection_state.mark_stdio_delivery_incomplete();
+        }
         return disconnect_connection(connections, connection_id);
     }
     let mut message = filter_outgoing_message_for_connection(connection_state, message);
@@ -536,8 +615,10 @@ async fn send_message_to_connection(
         let shutdown = connection_state.disconnect_sender.clone()
             .unwrap_or_else(|| connection_state.transport_shutdown.clone());
         if shutdown.is_cancelled() {
+            connection_state.mark_stdio_delivery_incomplete();
             return disconnect_connection(connections, connection_id);
         }
+        let drain = connection_state.stdio_drain.clone();
         let delivery = connection_state.stdio_delivery.get_or_insert_with(|| {
             let (sender, mut receiver) =
                 mpsc::channel::<Arc<Mutex<Option<StdioStagedMessage>>>>(
@@ -551,22 +632,33 @@ async fn send_message_to_connection(
             let remote = connection_state.remote_preview;
             let encode_limit = if remote { 0 } else { STDIO_DELIVERY_BYTES };
             delivery_tasks.spawn(async move {
-                loop {
+                // The lease also covers dequeued frames and frames already
+                // handed to the native writer, not just this channel's length.
+                let idle = || {
+                    drained_bytes.available_permits() == STDIO_DELIVERY_BYTES
+                        && drained_oversized.available_permits() == 1
+                };
+                let complete = loop {
                     let next = tokio::select! {
                         biased;
-                        _ = shutdown.cancelled() => break,
+                        _ = shutdown.cancelled() => {
+                            if drain.is_some() {
+                                receiver.close();
+                            }
+                            break idle();
+                        }
                         next = receiver.recv() => next,
                     };
                     let Some(queued) = next else {
-                        break;
+                        break true;
                     };
                     let message = match queued.lock() {
                         Ok(mut queued) => queued.take(),
-                        Err(_) => { shutdown.cancel(); break; }
+                        Err(_) => { shutdown.cancel(); break false; }
                     };
                     let Some(StdioStagedMessage { mut message, credit, .. }) = message else {
                         shutdown.cancel();
-                        break;
+                        break false;
                     };
                     if remote {
                         codex_app_server_transport::observe_remote_response(
@@ -580,7 +672,7 @@ async fn send_message_to_connection(
                         Err(error) => {
                             warn!(?connection_id, %error, "failed to encode bounded stdio output");
                             shutdown.cancel();
-                            break;
+                            break false;
                         }
                     };
                     if encoded_bytes > STDIO_DELIVERY_BYTES {
@@ -610,9 +702,9 @@ async fn send_message_to_connection(
                     }
                     tokio::select! {
                         biased;
-                        _ = shutdown.cancelled() => break,
+                        _ = shutdown.cancelled() => break false,
                         result = writer.reserve() => {
-                            let Ok(slot) = result else { shutdown.cancel(); break };
+                            let Ok(slot) = result else { shutdown.cancel(); break false };
                             if remote {
                                 codex_app_server_transport::observe_remote_response(
                                     "mobile_response_writer_admitted", connection_id.0, &message.message,
@@ -621,16 +713,21 @@ async fn send_message_to_connection(
                             slot.send(message);
                         }
                     }
-                }
+                };
                 // Closing staging is not a physical-delivery barrier. Wait for
                 // the writer-held credits before reporting this owner retired.
-                tokio::select! {
+                let drained = tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => {}
+                    _ = shutdown.cancelled() => false,
                     _ = async {
                         let _bytes = drained_bytes.acquire_many(STDIO_DELIVERY_BYTES as u32).await;
                         let _oversized = drained_oversized.acquire().await;
-                    } => {}
+                    } => true,
+                };
+                if let Some(drain) = drain
+                    && !(complete && (drained || idle()))
+                {
+                    drain.mark_incomplete();
                 }
             });
             StdioDelivery { sender, tail: Weak::new(), bytes, oversized_frames }
@@ -644,6 +741,7 @@ async fn send_message_to_connection(
         if sent {
             return false;
         }
+        connection_state.mark_stdio_delivery_incomplete();
         // Queue saturation is a local, explicit delivery failure. Durable
         // thread state remains available to surviving/reconnecting clients.
         warn!(?connection_id, "retiring stdio connection after bounded output admission failed");

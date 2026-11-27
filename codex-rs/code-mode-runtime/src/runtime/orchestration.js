@@ -1,8 +1,6 @@
 // Mechanical continuations only. These helpers use normal nested-tool dispatch;
 // they do not grant permissions, retry effects, or establish semantic completion.
 (() => {
-  const observeHelper = globalThis.__codex_helper_observation;
-  delete globalThis.__codex_helper_observation;
   const fail = (message, evidence) => {
     const error = new Error(message);
     error.evidence = evidence;
@@ -486,6 +484,9 @@
       // Bound aggregate full-recovery data to 8 MiB, in addition to the normal
       // per-call payload cap. Oversize results retain their initial receipt.
       let remainingBytes = 8 * 1024 * 1024;
+      // A first page may deliver up to 1 MiB before it can reserve its
+      // whole-file size. Keep wide batches on the small preview path.
+      const scriptSizedFirstPage = full && unique.length <= 8 && readFileFullSnapshot;
       // A file awaiting several recovery pages must not occupy a worker for
       // its entire lifetime. FIFO admission bounds individual nested calls,
       // allowing queued initial reads to overlap the first file's recovery.
@@ -517,7 +518,8 @@
         unique.map(async (path, branch) => {
           const prior = refresh.get(path);
           const initial = await schedule(() => read({
-            path, revision, environment_id, ...(prior === undefined ? {} : { if_source_hash: prior }),
+            path, revision, environment_id, ...(scriptSizedFirstPage ? { full_snapshot: true } : {}),
+            ...(prior === undefined ? {} : { if_source_hash: prior }),
           }), branch);
           const evidence = {
             initial,
@@ -770,12 +772,14 @@
     },
   });
 
-  // Convert an existing native whole-original-UTF-8 readback, never decoded or rendered text.
+  // Convert a completed original UTF-8 snapshot, never decoded or rendered text.
   Object.defineProperty(globalThis, "full_read_bytes", {
     value: function full_read_bytes(row) {
       const initial = row?.value?.initial;
-      if (typeof initial?.readback_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(initial.readback_sha256) ||
-          initial.readback_sha256 !== initial.source_sha256)
+      const hash = initial?.source_sha256;
+      if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash) ||
+          !(initial.readback_sha256 === hash || (initial.snapshot_original_utf8 === true &&
+            (initial.canonical_sha256 ?? hash) === hash)))
         fail("full_read_bytes requires a whole original UTF-8 readback", row);
       return new TextEncoder().encode(full_read_text(row));
     },

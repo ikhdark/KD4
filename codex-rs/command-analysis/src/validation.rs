@@ -326,19 +326,27 @@ fn load_repository_runner_batch(
         None
     } else {
         let fields = header.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 || fields[1] != "blob" { return None; }
+        if fields.len() != 3 || !fields[0].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
         let size = fields[2].parse::<usize>().ok()?;
         let body = bytes.get(newline + 1..)?;
         if !read_justfile_body && !body.is_empty() {
             return None;
         }
-        if size > MAX_RUNNER_DECLARATION_BYTES {
-            return Some(CachedRepositoryRunners { runners, justfile: None });
+        let full_body = || size.checked_add(1) == Some(body.len()) && body.last() == Some(&b'\n');
+        match fields[1] {
+            "blob" if size > MAX_RUNNER_DECLARATION_BYTES => {
+                return Some(CachedRepositoryRunners { runners, justfile: None });
+            }
+            "blob" if read_justfile_body && full_body() => {
+                std::str::from_utf8(&body[..size]).ok().map(std::sync::Arc::from)
+            }
+            // A directory or gitlink cannot authenticate a Justfile alias,
+            // but says nothing about independently declared runners.
+            "tree" | "commit" if !read_justfile_body || full_body() => None,
+            _ => return None,
         }
-        if !read_justfile_body || body.len() != size + 1 || body.last() != Some(&b'\n') {
-            return None;
-        }
-        std::str::from_utf8(&body[..size]).ok().map(std::sync::Arc::from)
     };
     Some(CachedRepositoryRunners { runners, justfile })
 }

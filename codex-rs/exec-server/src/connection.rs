@@ -46,6 +46,8 @@ const JSONRPC_PAYLOAD_RESERVE_LEN: usize = 1024 * 1024;
 /// whole connection; file operations check this bound so they fail on their own.
 pub(crate) const MAX_FILE_PAYLOAD_BYTES: usize =
     (MAX_JSONRPC_MESSAGE_LEN - JSONRPC_PAYLOAD_RESERVE_LEN) / 4 * 3;
+const STDIO_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const STDIO_FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const STDIO_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(70);
 pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -202,24 +204,48 @@ fn spawn_stdio_child_supervisor(
     terminated_tx: watch::Sender<bool>,
 ) {
     tokio::spawn(async move {
-        tokio::select! {
+        let managed_root = Arc::new(managed_root);
+        let tree_result = tokio::select! {
             result = child_process.wait() => {
-                if let Err(err) = result {
-                    debug!("failed to wait for exec-server stdio child: {err}");
+                match result {
+                    Ok(_) => terminate_managed_root(&managed_root).await,
+                    Err(err) => {
+                        debug!("failed to wait for exec-server stdio child: {err}");
+                        terminate_stdio_child(&mut child_process, &managed_root).await
+                    }
                 }
             }
-            () = wait_for_stdio_termination(&mut terminate_rx) => {}
-        }
-
-        // A successful root wait is cached by Child and does not settle the
-        // Job. The shared cleanup owner retains admission while waiting and
-        // retains the Job for reconciliation if tree termination fails.
-        match managed_root.terminate_and_reap(child_process).await {
-            Ok(()) => {
-                terminated_tx.send_replace(true);
+            () = wait_for_stdio_termination(&mut terminate_rx) => {
+                terminate_stdio_child(&mut child_process, &managed_root).await
             }
-            Err(err) => warn!("exec-server stdio shutdown remains unconfirmed: {err}"),
+        };
+
+        // Both branches observed root exit, but that alone cannot settle the
+        // Job. Transfer the reaped child and admission to the shared owner on
+        // failure; Child caches its exit status and never reopens a PID.
+        if let Err(err) = tree_result {
+            warn!("exec-server stdio root exited with tree termination unconfirmed: {err}");
+            let mut owner = managed_root;
+            let managed_root = loop {
+                match Arc::try_unwrap(owner) {
+                    Ok(owner) => break owner,
+                    Err(in_flight) => {
+                        // An operation that exceeded its deadline may still
+                        // own the Job on the blocking pool. Keep our admission
+                        // reference until it can be transferred, not dropped.
+                        owner = in_flight;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            };
+            if let Err(err) = managed_root.terminate_and_reap(child_process).await {
+                warn!("exec-server stdio shutdown remains unconfirmed: {err}");
+                return;
+            }
+        } else {
+            drop(managed_root);
         }
+        terminated_tx.send_replace(true);
     });
 }
 
@@ -231,6 +257,45 @@ async fn wait_for_stdio_termination(terminate_rx: &mut watch::Receiver<bool>) {
         if terminate_rx.changed().await.is_err() {
             return;
         }
+    }
+}
+
+/// Job termination waits for the tree to empty; keep it off async workers.
+async fn terminate_managed_root(managed_root: &Arc<ManagedRootProcess>) -> std::io::Result<()> {
+    let owner = Arc::clone(managed_root);
+    codex_utils_pty::run_windows_process_operation(
+        codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT,
+        move || owner.terminate(),
+    )
+    .await
+}
+
+/// Return the tree result separately from the confirmed root exit.
+async fn terminate_stdio_child(
+    child_process: &mut Child,
+    managed_root: &Arc<ManagedRootProcess>,
+) -> std::io::Result<()> {
+    let mut wait_timeout = STDIO_TERMINATION_GRACE_PERIOD;
+    loop {
+        let tree_result = terminate_managed_root(managed_root).await;
+        if let Err(err) = &tree_result {
+            debug!("failed to terminate managed exec-server stdio process tree: {err}");
+            if let Err(err) = child_process.start_kill() {
+                debug!("failed to kill exec-server stdio child: {err}");
+            }
+        }
+        match timeout(wait_timeout, child_process.wait()).await {
+            Ok(Ok(_)) => return tree_result,
+            Ok(Err(err)) => {
+                debug!("failed to wait for exec-server stdio child; retaining admission: {err}");
+                if matches!(child_process.try_wait(), Ok(Some(_))) {
+                    return tree_result;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(_) => warn!("exec-server stdio child exit remains unconfirmed; retaining admission"),
+        }
+        wait_timeout = STDIO_FORCE_REAP_TIMEOUT;
     }
 }
 

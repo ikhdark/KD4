@@ -21,8 +21,7 @@ use thiserror::Error;
 /// Config fragment delivered by the cloud config bundle.
 ///
 /// The bundle orders fragments from highest precedence to lowest precedence.
-/// This module returns config layers in stack order, so callers can append the
-/// result between system and user config without re-sorting.
+/// This module returns config layers in stack order within their delivery tier.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CloudConfigFragment {
     pub id: String,
@@ -65,29 +64,39 @@ pub enum CloudConfigLayerError {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CloudConfigTier {
+    Baseline,
+    EnterpriseManaged,
+    SystemOverlay,
+}
+
 pub fn cloud_config_layers_from_fragments(
     fragments: impl IntoIterator<Item = CloudConfigFragment>,
     base_dir: &AbsolutePathBuf,
 ) -> Result<Vec<ConfigLayerEntry>, CloudConfigLayerError> {
-    cloud_config_layers_from_fragments_impl(fragments, base_dir, /*strict_config*/ false)
+    cloud_config_layers_from_fragments_for_tier(
+        fragments,
+        base_dir,
+        CloudConfigTier::EnterpriseManaged,
+        /*strict_config*/ false,
+    )
 }
 
-pub(crate) fn cloud_config_layers_from_fragments_strict(
+pub(crate) fn cloud_config_layers_from_fragments_for_tier(
     fragments: impl IntoIterator<Item = CloudConfigFragment>,
     base_dir: &AbsolutePathBuf,
-) -> Result<Vec<ConfigLayerEntry>, CloudConfigLayerError> {
-    cloud_config_layers_from_fragments_impl(fragments, base_dir, /*strict_config*/ true)
-}
-
-fn cloud_config_layers_from_fragments_impl(
-    fragments: impl IntoIterator<Item = CloudConfigFragment>,
-    base_dir: &AbsolutePathBuf,
+    tier: CloudConfigTier,
     strict_config: bool,
 ) -> Result<Vec<ConfigLayerEntry>, CloudConfigLayerError> {
     let mut layers = Vec::new();
     for fragment in fragments {
         let source_ref = fragment.source_ref();
-        let raw_toml = fragment.contents;
+        let CloudConfigFragment {
+            id,
+            name,
+            contents: raw_toml,
+        } = fragment;
         let value: TomlValue =
             toml::from_str(&raw_toml).map_err(|err| CloudConfigLayerError::Parse {
                 fragment: source_ref.clone(),
@@ -108,11 +117,13 @@ fn cloud_config_layers_from_fragments_impl(
                     message: err.to_string(),
                 }
             })?;
+        let source = match tier {
+            CloudConfigTier::Baseline => ConfigLayerSource::CloudBaseline { id, name },
+            CloudConfigTier::EnterpriseManaged => ConfigLayerSource::EnterpriseManaged { id, name },
+            CloudConfigTier::SystemOverlay => ConfigLayerSource::CloudSystemOverlay { id, name },
+        };
         layers.push(ConfigLayerEntry::new_with_raw_toml(
-            ConfigLayerSource::EnterpriseManaged {
-                id: fragment.id,
-                name: fragment.name,
-            },
+            source,
             resolved,
             raw_toml,
             base_dir.clone(),

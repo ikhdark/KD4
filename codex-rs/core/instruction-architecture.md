@@ -306,6 +306,13 @@ eager text and only detail in the reference.
 
 ### Code Mode descriptions and generated guidance
 
+After a script error, bulky successful raw byte reads and settled commands can
+appear in the nested recovery directory as a compact summary plus a selector
+for the exact native receipt. The command's output locator still refers to the
+producer transcript, not the receipt. If receipt storage does not complete,
+the original inline result stays available. Live handles and failed operations
+retain their existing recovery paths.
+
 | Component / source (under `codex-rs/`) | Responsibility and actual delivery | Overrides, dependencies and required follow-through |
 | --- | --- | --- |
 | `core/src/tools/context.rs::ToolDispatchState`; `parallel.rs`; `code_mode/mod.rs::{finish_packet,complete_packet_call}` | Existing dispatch/cancellation owner supplies queued, admitted, running and terminal invocation observations to nested-call receipts, preserving call, cell, parent and runtime identities. The packet owner identifies pre-dispatch rejection separately. | State changes piggyback on requested packets; unchanged observations and already-observed ordinary terminal results are not extra notifications. No queue position is asserted without a ranking owner, and invocation settlement is not process-exit or rollback evidence. |

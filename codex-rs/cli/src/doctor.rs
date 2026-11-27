@@ -3219,7 +3219,7 @@ fn standalone_release_cache_details(details: &mut Vec<String>) {
     let Some(releases_dir) = release_dir.parent() else {
         return;
     };
-    let count = match std::fs::read_dir(releases_dir) {
+    let count = match std::fs::read_dir(&releases_dir) {
         Ok(mut entries) => entries.try_fold(0usize, |count, entry| entry.map(|_| count + 1)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(err) => Err(err),

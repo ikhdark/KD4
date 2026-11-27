@@ -3175,6 +3175,32 @@ impl TurnTimingState {
         execution_id: &codex_protocol::protocol::ToolExecutionId,
         timing: ToolDispatchTimingSnapshot,
     ) -> bool {
+        let (updated, archived) = self.reserve_tool_dispatch_lifecycle(call_id, execution_id, timing);
+        detail_archive::write(archived);
+        updated
+    }
+
+    pub async fn update_tool_dispatch_lifecycle_async(
+        &self,
+        call_id: &str,
+        execution_id: &codex_protocol::protocol::ToolExecutionId,
+        timing: ToolDispatchTimingSnapshot,
+    ) -> bool {
+        let (updated, archived) = self.reserve_tool_dispatch_lifecycle(call_id, execution_id, timing);
+        if let Some(record) = archived
+            && let Err(error) = tokio::task::spawn_blocking(move || record.write()).await
+        {
+            tracing::warn!(%error, "tool relay timing archive worker failed");
+        }
+        updated
+    }
+
+    fn reserve_tool_dispatch_lifecycle(
+        &self,
+        call_id: &str,
+        execution_id: &codex_protocol::protocol::ToolExecutionId,
+        timing: ToolDispatchTimingSnapshot,
+    ) -> (bool, Option<detail_archive::PendingRecord>) {
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
@@ -3187,9 +3213,7 @@ impl TurnTimingState {
                 "retry_count":timing.retry_count, "reentry_count":timing.reentry_count,
                 "first_poll_to_output_collected_ms":timing.first_poll_to_output_collected_ms,
             }), false);
-            drop(state);
-            detail_archive::write(record);
-            return false;
+            return (false, record);
         };
         tool_call.lifecycle_events = timing.lifecycle_events;
         tool_call.timer_waits = timing.timer_waits;
@@ -3203,7 +3227,7 @@ impl TurnTimingState {
             .first_poll_at_ms
             .zip(timing.first_poll_to_output_collected_ms)
             .map(|(first_poll, duration)| first_poll.saturating_add(duration));
-        true
+        (true, None)
     }
 
     pub fn record_next_sample_block_reason(&self, reason: NextSampleBlockReason) {
@@ -3252,6 +3276,37 @@ impl TurnTimingState {
     }
 
     pub fn record_pending_tool_timer_wait(&self, wait: ToolLifecycleTimerWait) {
+        detail_archive::write(self.reserve_pending_tool_timer_wait(wait));
+    }
+
+    /// Publish both sampling observations before yielding to the overflow writer.
+    pub async fn record_sampling_timer_wait_and_block_reason(
+        &self,
+        wait: ToolLifecycleTimerWait,
+        next_reason: impl FnOnce() -> NextSampleBlockReason,
+    ) -> NextSampleBlockReason {
+        let timer_record = self.reserve_pending_tool_timer_wait(wait);
+        let reason = next_reason();
+        self.set_live_sampling_phase(Some(reason));
+        let reason_record = self.reserve_sample_block_reason(reason);
+        let records = [timer_record, reason_record];
+        if records.iter().any(Option::is_some)
+            && let Err(error) = tokio::task::spawn_blocking(move || {
+                for record in records.into_iter().flatten() {
+                    record.write();
+                }
+            })
+            .await
+        {
+            tracing::warn!(%error, "sampling timer and block reason archive worker failed");
+        }
+        reason
+    }
+
+    fn reserve_pending_tool_timer_wait(
+        &self,
+        wait: ToolLifecycleTimerWait,
+    ) -> Option<detail_archive::PendingRecord> {
         let mut state = self.state();
         let record = state.archive_record(serde_json::json!({"kind":"timer_wait", "wait":wait}), false);
         for tool_call in state.tool_calls.iter_mut().rev() {
@@ -3264,8 +3319,7 @@ impl TurnTimingState {
             );
             tool_call.reentry_count = tool_call.reentry_count.saturating_add(1);
         }
-        drop(state);
-        detail_archive::write(record);
+        record
     }
 
     /// Records the point at which a direct tool result has been inserted into

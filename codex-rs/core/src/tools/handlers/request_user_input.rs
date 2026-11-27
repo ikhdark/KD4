@@ -68,8 +68,13 @@ impl RequestUserInputHandler {
         let args =
             normalize_request_user_input_args(args).map_err(FunctionCallError::RespondToModel)?;
         let response = session
-            .request_user_input(turn.as_ref(), call_id, args)
+            .request_user_input_with_outcome(turn.as_ref(), call_id, args)
             .await
+            .map_err(|_| {
+                FunctionCallError::RespondToModel(format!(
+                    "{REQUEST_USER_INPUT_TOOL_NAME} could not persist the accepted response"
+                ))
+            })?
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
                     "{REQUEST_USER_INPUT_TOOL_NAME} was cancelled before receiving a response"

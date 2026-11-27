@@ -90,6 +90,20 @@ impl Capture {
         self.helpers.insert(id, predecessors);
     }
 
+    // All batch readbacks wait for the same committed patch, not each other.
+    pub(super) fn helper_fork_after_patch(&mut self, group: &str) {
+        let Some(root) = self.helpers.get_mut(group) else {
+            return;
+        };
+        if root.is_some() {
+            *root = self.helper_calls.get(group)
+                .filter(|branches| branches.len() == 1)
+                .and_then(|branches| branches.get("0"))
+                .filter(|calls| calls.len() == 1)
+                .cloned();
+        }
+    }
+
     fn helper_predecessors(&self, context: &str) -> Option<Vec<String>> {
         let (group, branch) = context.rsplit_once('/')?;
         let root = self.helpers.get(group)?.as_ref()?;

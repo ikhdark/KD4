@@ -1711,7 +1711,7 @@ fn refresh_ready_command_states(exec: &ExecContext, packet: &mut CodeModePacketR
 pub(super) type RuntimeResponseOutput =
     (FunctionToolOutput, Vec<String>, Result<Option<String>, JsonValue>);
 
-pub(super) fn handle_runtime_response(
+pub(super) async fn handle_runtime_response(
     exec: &ExecContext,
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
@@ -1844,31 +1844,46 @@ pub(super) fn handle_runtime_response(
                     &into_function_call_output_content_items(content_items.clone()),
                 ),
             };
-            let directory = packet.nested_recovery.into_iter()
-                .map(|(ordinal, entry)| {
-                    let entry = compact_emitted_packet_recovery(entry, &emitted);
-                    // A truncated successful read preview can repeat the exact
-                    // inline outcome below. Match identity AND bounded bytes;
-                    // a locator, partial directory, or failed read is not a copy.
-                    if let Some(preview) = packet.nested_results.iter().find(|r| r.ordinal == ordinal)
-                        && !preview.failed && preview.output_truncated
-                        && matches!(preview.tool_name.as_str(), "read_file" | "read_tool_output")
-                        && entry["call_id"].as_str() == Some(preview.call_id.as_str())
-                        && entry["tool_name"].as_str() == Some(preview.tool_name.as_str())
-                        && entry["failed"] == false
-                        && let Some(full) = entry.pointer("/outcome/result")
-                        && full["complete"] == true
-                        && !nested_presentations.contains_key(&ordinal)
-                        && bounded_serialized_json(full).0 == preview.output
-                    {
-                        nested_presentations.insert(ordinal, (
-                            serde_json::json!({"see":"nested_result_recovery_directory: matching call_id, outcome.result"}).to_string(),
-                            true,
-                        ));
-                    }
-                    entry
-                })
-                .collect::<Vec<_>>();
+            let script_failed = matches!(
+                &response,
+                RuntimeResponse::Result {
+                    error_text: Some(_),
+                    ..
+                }
+            );
+            let mut directory = Vec::with_capacity(packet.nested_recovery.len());
+            for (ordinal, entry) in packet.nested_recovery {
+                let mut entry = compact_emitted_packet_recovery(entry, &emitted);
+                // Preserve the existing inline references for bytes already
+                // printed by the script. Spill only an unprojected result.
+                if script_failed && entry.pointer("/outcome/result").is_some_and(|result| {
+                    ["stdout", "stderr", "output"].iter().all(|key| {
+                        result[*key].get("emitted_prefix").is_none()
+                    })
+                }) {
+                    retain_bulk_failed_cell_result(exec, &mut entry).await;
+                }
+                // A truncated successful read preview can repeat the exact
+                // inline outcome below. Match identity AND bounded bytes;
+                // a locator, partial directory, or failed read is not a copy.
+                if let Some(preview) = packet.nested_results.iter().find(|r| r.ordinal == ordinal)
+                    && !preview.failed && preview.output_truncated
+                    && matches!(preview.tool_name.as_str(), "read_file" | "read_tool_output")
+                    && entry["call_id"].as_str() == Some(preview.call_id.as_str())
+                    && entry["tool_name"].as_str() == Some(preview.tool_name.as_str())
+                    && entry["failed"] == false
+                    && let Some(full) = entry.pointer("/outcome/result")
+                    && full["complete"] == true
+                    && !nested_presentations.contains_key(&ordinal)
+                    && bounded_serialized_json(full).0 == preview.output
+                {
+                    nested_presentations.insert(ordinal, (
+                        serde_json::json!({"see":"nested_result_recovery_directory: matching call_id, outcome.result"}).to_string(),
+                        true,
+                    ));
+                }
+                directory.push(entry);
+            }
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
                 text: serde_json::json!({
                     "nested_result_recovery_directory": directory,
@@ -2503,6 +2518,96 @@ fn compact_emitted_packet_recovery(mut entry: JsonValue, emitted: &str) -> JsonV
         entry["outcome"]["result"] = presentation;
     }
     entry
+}
+
+/// Move a bulky successful result out of an error packet, not out of custody.
+async fn retain_bulk_failed_cell_result(exec: &ExecContext, entry: &mut JsonValue) {
+    use crate::tools::command_output_artifact::ToolOutputArtifactId;
+    use crate::tools::command_output_artifact::create_canonical_output_artifact_with_id;
+
+    if entry["failed"] != false {
+        return;
+    }
+    let Some(result) = entry.pointer("/outcome/result") else {
+        return;
+    };
+    let summary_keys: &[&str] = match entry["tool_name"].as_str() {
+        Some("exec_command" | "write_stdin")
+            if result["execution_state"] == "exited"
+                && result["process_exited"] == true
+                && result["output_drained"] == true
+                && result["exit_code"] == 0
+                && result["session_id"].is_null()
+                && result["error"].is_null()
+                && result["tool_failure"].is_null()
+                && result["pending_deferred_completions"].is_null()
+                && result["output_reference"]["capture_complete"] == true =>
+        {
+            &[
+                "execution_state",
+                "process_exited",
+                "exit_code",
+                "output_drained",
+                "output_reference",
+            ]
+        }
+        Some("read_file")
+            if result["read_mode"] == "byte_ranges"
+                && result["complete"] == true
+                && matches!(result["encoding"].as_str(), Some("hex" | "base64")) =>
+        {
+            &[
+                "path",
+                "environment_id",
+                "read_mode",
+                "complete",
+                "file_bytes",
+                "file_revision",
+                "readback_sha256",
+            ]
+        }
+        _ => return,
+    };
+    let canonical = codex_tools::CanonicalToolResult::json(result.clone());
+    if canonical.exact_bytes <= 2048 {
+        return;
+    }
+    let summary: serde_json::Map<String, JsonValue> = summary_keys
+        .iter()
+        .filter_map(|key| result.get(*key).map(|value| ((*key).to_string(), value.clone())))
+        .collect();
+    let artifact = create_canonical_output_artifact_with_id(
+        &exec.turn.config.codex_home,
+        &exec.session.thread_id.to_string(),
+        &canonical,
+        ToolOutputArtifactId::new(),
+    )
+    .await;
+    let Some(id) = artifact.artifact_id().filter(|_| artifact.complete) else {
+        // The inline copy was already admitted; never trade it for a failed
+        // or pending artifact write.
+        return;
+    };
+    if let Some(call_id) = entry["call_id"].as_str() {
+        exec.session
+            .register_tool_artifact_origin(
+                id.clone(),
+                call_id.to_owned(),
+                canonical.exact_bytes,
+                canonical.sha256.clone(),
+            )
+            .await;
+    }
+    entry["outcome"] = serde_json::json!({
+        "summary": summary,
+        "artifact_id": id,
+        "canonical_sha256": canonical.sha256,
+        "canonical_bytes": canonical.exact_bytes,
+        "recovery": {"tool":"read_tool_output","arguments": {
+            "artifact_id":id,
+            "selectors":[{"kind":"bytes","start":0,"end":canonical.exact_bytes}]
+        }},
+    });
 }
 
 /// The recovery route of a result whose own retained artifact holds its bytes.

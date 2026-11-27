@@ -73,11 +73,15 @@ pub fn note_stdio_output_retirement(connection_id: crate::outgoing_message::Conn
     OUTPUT_RETIRED_CONNECTION.store(connection_id.0, Ordering::Release);
 }
 
+/// Start stdio and return a positive-only observation for a clean native EOF
+/// with an idle stdout writer that observed no queued or reserved frames.
+/// Consume this after joining the transport owner; upstream delivery and
+/// supervisor completion are separate from this local observation.
 pub async fn start_stdio_connection(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     stdio_handles: &mut Vec<JoinHandle<()>>,
     initialize_client_name_tx: oneshot::Sender<String>,
-) -> IoResult<()> {
+) -> IoResult<oneshot::Receiver<ConnectionId>> {
     #[cfg(windows)]
     if let Err(error) = codex_utils_build_info::windows_process::initialize_stdio_peer() {
         tracing::debug!(%error, "Windows stdio peer identity is unavailable");
@@ -247,27 +251,39 @@ impl AsyncWrite for NativeStdout {
     }
 }
 
-fn spawn_stdin_line_reader() -> IoResult<mpsc::Receiver<IoResult<String>>> {
+struct StdinLines {
+    receiver: mpsc::Receiver<IoResult<String>>,
+    normal_eof: Arc<AtomicBool>,
+}
+
+fn spawn_stdin_line_reader() -> IoResult<StdinLines> {
     // Tokio's stdin reader uses an uncancellable blocking read that runtime shutdown waits for.
     // Keep that read on a detached OS thread so closing the async receiver lets this transport and
     // its runtime finish even when the client deliberately leaves stdin open.
     // One queued line plus the native reader's current line bounds staging to
     // two frames, rather than CHANNEL_CAPACITY potentially 32-MiB messages.
     let (line_tx, line_rx) = mpsc::channel(STDIN_READ_AHEAD);
+    let normal_eof = Arc::new(AtomicBool::new(false));
+    let reader_eof = Arc::clone(&normal_eof);
     std::thread::Builder::new()
         .name("codex-app-server-stdin".to_string())
         .spawn(move || {
             let stdin = std::io::stdin();
-            read_stdin_lines(stdin.lock(), line_tx, MAX_STDIN_LINE_BYTES);
+            read_stdin_lines(stdin.lock(), line_tx, MAX_STDIN_LINE_BYTES, &reader_eof);
         })?;
-    Ok(line_rx)
+    Ok(StdinLines {
+        receiver: line_rx,
+        normal_eof,
+    })
 }
 
 fn read_stdin_lines(
     mut stdin: impl BufRead,
     line_tx: mpsc::Sender<IoResult<String>>,
     max_line_bytes: usize,
+    normal_eof: &AtomicBool,
 ) {
+    let mut complete_frames = true;
     loop {
         let mut bytes = Vec::new();
         // Read at most one byte beyond the cap, even if the peer never sends a newline.
@@ -276,7 +292,10 @@ fn read_stdin_lines(
             .take(max_line_bytes as u64 + 1)
             .read_until(b'\n', &mut bytes)
         {
-            Ok(0) => break,
+            Ok(0) => {
+                normal_eof.store(complete_frames, Ordering::Release);
+                break;
+            }
             Ok(length) if length > max_line_bytes => {
                 let _ = line_tx.blocking_send(Err(std::io::Error::new(
                     ErrorKind::InvalidInput,
@@ -285,6 +304,9 @@ fn read_stdin_lines(
                 break;
             }
             Ok(_) => {
+                // Keep handling a final, unterminated line as before, but do
+                // not certify it as a normally framed transport drain.
+                complete_frames &= bytes.last() == Some(&b'\n');
                 while matches!(bytes.last(), Some(b'\n' | b'\r')) {
                     bytes.pop();
                 }
@@ -308,21 +330,23 @@ async fn start_stdio_connection_with_io<W>(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     stdio_handles: &mut Vec<JoinHandle<()>>,
     initialize_client_name_tx: oneshot::Sender<String>,
-    stdin_lines: mpsc::Receiver<IoResult<String>>,
+    stdin_lines: StdinLines,
     stdout: W,
-) -> IoResult<()>
+) -> IoResult<oneshot::Receiver<ConnectionId>>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let connection = open_stdio_connection(&transport_event_tx).await?;
+    let (drain_tx, drain_rx) = oneshot::channel();
     stdio_handles.push(tokio::spawn(serve_stdio_connections(
         transport_event_tx,
         initialize_client_name_tx,
         stdin_lines,
         stdout,
         connection,
+        drain_tx,
     )));
-    Ok(())
+    Ok(drain_rx)
 }
 
 struct OpenStdioConnection {
@@ -404,8 +428,14 @@ impl Drop for StdioConnectionState {
 
 struct StdioReaderEnd {
     // Present when the pipes are kept for a replacement connection.
-    stdin_lines: Option<mpsc::Receiver<IoResult<String>>>,
+    stdin_lines: Option<StdinLines>,
     initialize_client_name_tx: Option<oneshot::Sender<String>>,
+    normal_eof: bool,
+}
+
+struct StdioWriterEnd<W> {
+    kept_stdout: Option<(W, bool)>,
+    drained: bool,
 }
 
 /// Serves one connection at a time on the process's stdio. A connection that the
@@ -414,13 +444,15 @@ struct StdioReaderEnd {
 async fn serve_stdio_connections<W>(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     initialize_client_name_tx: oneshot::Sender<String>,
-    mut stdin_lines: mpsc::Receiver<IoResult<String>>,
+    mut stdin_lines: StdinLines,
     mut stdout: W,
     mut connection: OpenStdioConnection,
+    drain_tx: oneshot::Sender<ConnectionId>,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut initialize_client_name_tx = Some(initialize_client_name_tx);
+    let mut reattached = false;
     loop {
         let OpenStdioConnection {
             connection_id,
@@ -456,12 +488,22 @@ async fn serve_stdio_connections<W>(
         };
         initialize_client_name_tx = reader_end.initialize_client_name_tx;
         let (Some(kept_stdin_lines), Some((kept_stdout, frame_interrupted))) =
-            (reader_end.stdin_lines, writer_end)
+            (reader_end.stdin_lines, writer_end.kept_stdout)
         else {
             close_stdio_connection(&transport_event_tx, connection_id, &cancellation, &state.closed)
                 .await;
+            if reader_end.normal_eof
+                && writer_end.drained
+                && !reattached
+                && OUTPUT_RETIRED_CONNECTION.load(Ordering::Acquire) != connection_id.0
+            {
+                let _ = drain_tx.send(connection_id);
+            }
             return;
         };
+        // Backlog retirement can discard output. A later clean generation
+        // cannot retroactively certify the entire lifetime of these pipes.
+        reattached = true;
         stdin_lines = kept_stdin_lines;
         stdout = kept_stdout;
         // Register the replacement before the retired connection closes, so a
@@ -518,7 +560,7 @@ async fn write_stdio_retired_notice<W: AsyncWrite + Unpin>(
 }
 
 fn spawn_stdio_reader(
-    mut stdin_lines: mpsc::Receiver<IoResult<String>>,
+    mut stdin_lines: StdinLines,
     mut initialize_client_name_tx: Option<oneshot::Sender<String>>,
     transport_event_tx_for_reader: mpsc::Sender<TransportEvent>,
     writer_tx_for_reader: mpsc::Sender<QueuedOutgoingMessage>,
@@ -527,16 +569,19 @@ fn spawn_stdio_reader(
     state: Arc<StdioConnectionState>,
 ) -> JoinHandle<StdioReaderEnd> {
     tokio::spawn(async move {
+        let mut faulted = false;
+        let mut normal_eof = false;
         loop {
             let line = tokio::select! {
                 _ = cancellation_for_reader.cancelled() => break,
-                line = stdin_lines.recv() => line,
+                line = stdin_lines.receiver.recv() => line,
             };
             match line {
                 Some(Ok(line)) => {
                     let message = match serde_json::from_str::<JSONRPCMessage>(&line) {
                         Ok(message) => message,
                         Err(err) => {
+                            faulted = true;
                             error!("Failed to deserialize JSONRPCMessage: {err}");
                             continue;
                         }
@@ -563,6 +608,7 @@ fn spawn_stdio_reader(
                     }
                 }
                 Some(Err(err)) => {
+                    faulted = true;
                     error!("Failed reading stdin: {err}");
                     if err.kind() != ErrorKind::InvalidData {
                         state.transport_ended.store(true, Ordering::Release);
@@ -570,6 +616,9 @@ fn spawn_stdio_reader(
                     }
                 }
                 None => {
+                    normal_eof = !faulted
+                        && stdin_lines.normal_eof.load(Ordering::Acquire)
+                        && !cancellation_for_reader.is_cancelled();
                     state.transport_ended.store(true, Ordering::Release);
                     break;
                 }
@@ -582,6 +631,7 @@ fn spawn_stdio_reader(
             return StdioReaderEnd {
                 stdin_lines: Some(stdin_lines),
                 initialize_client_name_tx,
+                normal_eof: false,
             };
         }
         // Either half may win close publication. Release native input admission
@@ -598,12 +648,12 @@ fn spawn_stdio_reader(
         StdioReaderEnd {
             stdin_lines: None,
             initialize_client_name_tx,
+            normal_eof,
         }
     })
 }
 
-/// Returns stdout, and whether a streamed frame was cut short, when the pipes
-/// are kept for a replacement connection.
+/// Retains stdout and the cut-frame flag only for reattachment.
 fn spawn_stdio_writer<W>(
     mut stdout: W,
     mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
@@ -611,7 +661,7 @@ fn spawn_stdio_writer<W>(
     connection_id: crate::outgoing_message::ConnectionId,
     cancellation_for_writer: CancellationToken,
     state: Arc<StdioConnectionState>,
-) -> JoinHandle<Option<(W, bool)>>
+) -> JoinHandle<StdioWriterEnd<W>>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -619,16 +669,27 @@ where
         let mut batch = Vec::new();
         let mut pending_message = None;
         let mut frame_interrupted = false;
+        let mut faulted = false;
+        let mut drained = false;
         'writer: loop {
             let queued_message = if pending_message.is_some() {
                 pending_message.take()
             } else {
                 tokio::select! {
-                    _ = cancellation_for_writer.cancelled() => break,
+                    _ = cancellation_for_writer.cancelled() => {
+                        // Only an idle exit with no queued messages or reserved
+                        // slots can count. Close admission before sampling:
+                        // existing reservations still charge channel capacity.
+                        // Cancellation inside a write or flush leaves this false.
+                        writer_rx.close();
+                        drained = writer_rx.capacity() == writer_rx.max_capacity();
+                        break;
+                    }
                     queued_message = writer_rx.recv() => queued_message,
                 }
             };
             let Some(mut queued_message) = queued_message else {
+                drained = true;
                 break;
             };
             let flush_boundary = !queued_message.message.can_batch();
@@ -695,6 +756,7 @@ where
                         write_complete_tx = queued_message.write_complete_tx;
                     }
                     Err(err) => {
+                        faulted = true;
                         batch.truncate(frame_start);
                         error!("Failed to serialize OutgoingMessage: {err}");
                     }
@@ -756,7 +818,10 @@ where
         if state.keeps_pipes() {
             // The owner publishes this close once the replacement is registered.
             cancellation_for_writer.cancel();
-            return Some((stdout, frame_interrupted));
+            return StdioWriterEnd {
+                kept_stdout: Some((stdout, frame_interrupted)),
+                drained: false,
+            };
         }
         close_stdio_connection(
             &transport_event_tx,
@@ -766,7 +831,10 @@ where
         )
         .await;
         info!("stdout writer exited (channel closed)");
-        None
+        StdioWriterEnd {
+            kept_stdout: None,
+            drained: drained && !faulted,
+        }
     })
 }
 

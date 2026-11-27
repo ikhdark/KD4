@@ -1961,19 +1961,20 @@ fn resolve_tool_suggest_config_from_config(
         }
     } else {
         for layer in layers {
-            // This field is additive across layers. Other fields can be overridden
-            // by a higher layer, so deserialize only the values being accumulated.
+            // This field is additive across layers. Decode entries independently so
+            // a masked malformed entry does not discard valid suppressions in its layer.
             let Some(disabled_tools) = layer
                 .config
                 .get("tool_suggest")
                 .and_then(|value| value.get("disabled_tools"))
-                .cloned()
-                .and_then(|value| value.try_into::<Vec<ToolSuggestDisabledTool>>().ok())
+                .and_then(TomlValue::as_array)
             else {
                 continue;
             };
-            for disabled_tool in disabled_tools {
-                add_disabled_tool(disabled_tool);
+            for value in disabled_tools {
+                if let Ok(disabled_tool) = value.clone().try_into::<ToolSuggestDisabledTool>() {
+                    add_disabled_tool(disabled_tool);
+                }
             }
         }
     }

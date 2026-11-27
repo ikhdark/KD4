@@ -59,6 +59,18 @@ pub(crate) fn bundle_shape_tag(bundle: Option<&CloudConfigBundle>) -> String {
     };
 
     let mut sources = Vec::new();
+    if !bundle.config_toml.baseline.is_empty() {
+        sources.push("baseline_config");
+    }
+    if !bundle.requirements_toml.baseline.is_empty() {
+        sources.push("baseline_requirements");
+    }
+    if !bundle.config_toml.system_overlay.is_empty() {
+        sources.push("system_overlay_config");
+    }
+    if !bundle.requirements_toml.system_overlay.is_empty() {
+        sources.push("system_overlay_requirements");
+    }
     if !bundle.config_toml.enterprise_managed.is_empty() {
         sources.push("enterprise_config");
     }

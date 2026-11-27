@@ -6120,11 +6120,12 @@ async fn drain_in_flight_with_buffer(
             .mark_relay_delivery(&expected_execution_id);
         turn_context
             .turn_timing_state
-            .update_tool_dispatch_lifecycle(
+            .update_tool_dispatch_lifecycle_async(
                 &completion.call_id,
                 &expected_execution_id,
                 completion.timing.snapshot(tokio::time::Instant::now()),
-            );
+            )
+            .await;
         let (response_input, required_terminal, completion_error, failure_detail, pending_continuation_ack) =
             match stale_relay_error {
                 Some(err) => {
@@ -6334,6 +6335,20 @@ async fn record_reconciliation_async(
     );
     turn_timing_state.record_next_sample_block_reason_async(reason).await;
     trace_reconciliation(reason, pending_tool_count, event);
+}
+
+async fn record_sampling_timer_reconciliation(
+    turn_timing_state: &TurnTimingState,
+    wait: ToolLifecycleTimerWait,
+    active_without_pending_passes: &mut u8,
+    event: &'static str,
+) {
+    let reason = turn_timing_state
+        .record_sampling_timer_wait_and_block_reason(wait, || {
+            reconcile_turn_progress(turn_timing_state, 0, active_without_pending_passes)
+        })
+        .await;
+    trace_reconciliation(reason, 0, event);
 }
 
 fn trace_reconciliation(reason: NextSampleBlockReason, pending_tool_count: usize, event: &'static str) {
@@ -6968,9 +6983,9 @@ fn try_run_sampling_request<'a>(
                 terminal.wait_for_interrupt_resolution(&expected_generation),
             ).await;
             let wait_finished_at_ms = turn_context.turn_timing_state.monotonic_offset_ms();
-            turn_context
-                .turn_timing_state
-                .record_pending_tool_timer_wait(ToolLifecycleTimerWait {
+            record_sampling_timer_reconciliation(
+                &turn_context.turn_timing_state,
+                ToolLifecycleTimerWait {
                     wait_kind: "sampling_interrupt_resolution".to_string(),
                     requested_timeout_ms: None,
                     effective_timeout_ms: Some(
@@ -6983,10 +6998,7 @@ fn try_run_sampling_request<'a>(
                         ToolLifecycleWakeReason::Retry
                     },
                     sequence: 0,
-                });
-            record_reconciliation_async(
-                &turn_context.turn_timing_state,
-                0,
+                },
                 &mut active_without_pending_passes,
                 "sampling interrupt resolution",
             )
@@ -7172,6 +7184,7 @@ fn try_run_sampling_request<'a>(
                     turn_timing_state
                         .record_next_sample_block_reason_async(NextSampleBlockReason::WaitingForGate).await;
                     let wait_started_at_ms = turn_timing_state.monotonic_offset_ms();
+                    let mut active_without_pending_passes = 0;
                     let sampling_waiter =
                         SamplingGateWaiterGuard::new(Arc::clone(&turn_timing_state));
                     let Some(admission) = turn_timing_state.observe_wait(
@@ -7186,25 +7199,26 @@ fn try_run_sampling_request<'a>(
                             terminal.wait_for_interrupt_resolution(&expected_generation),
                         ).await;
                         let wait_finished_at_ms = turn_timing_state.monotonic_offset_ms();
-                        turn_timing_state.record_pending_tool_timer_wait(ToolLifecycleTimerWait {
-                            wait_kind: "sampling_gate_acquisition_and_resolution".to_string(),
-                            requested_timeout_ms: None,
-                            effective_timeout_ms: Some(
-                                wait_finished_at_ms.saturating_sub(wait_started_at_ms),
-                            ),
-                            deadline_at_ms: None,
-                            wake_reason: if wake == TerminalWakeResult::Applied {
-                                ToolLifecycleWakeReason::Completed
-                            } else {
-                                ToolLifecycleWakeReason::Retry
-                            },
-                            sequence: 0,
-                        });
-                        reconcile_turn_progress_event(
+                        record_sampling_timer_reconciliation(
                             &turn_timing_state,
-                            0,
+                            ToolLifecycleTimerWait {
+                                wait_kind: "sampling_gate_acquisition_and_resolution".to_string(),
+                                requested_timeout_ms: None,
+                                effective_timeout_ms: Some(
+                                    wait_finished_at_ms.saturating_sub(wait_started_at_ms),
+                                ),
+                                deadline_at_ms: None,
+                                wake_reason: if wake == TerminalWakeResult::Applied {
+                                    ToolLifecycleWakeReason::Completed
+                                } else {
+                                    ToolLifecycleWakeReason::Retry
+                                },
+                                sequence: 0,
+                            },
+                            &mut active_without_pending_passes,
                             "sampling gate fenced",
-                        );
+                        )
+                        .await;
                         return if terminal.interrupt_persistence_failed() {
                             Err(CodexErr::Fatal(
                                 "interrupted request_user_input output was not durably persisted"
@@ -7216,17 +7230,22 @@ fn try_run_sampling_request<'a>(
                     };
                     drop(sampling_waiter);
                     let wait_finished_at_ms = turn_timing_state.monotonic_offset_ms();
-                    turn_timing_state.record_pending_tool_timer_wait(ToolLifecycleTimerWait {
-                        wait_kind: "sampling_gate_acquisition".to_string(),
-                        requested_timeout_ms: None,
-                        effective_timeout_ms: Some(
-                            wait_finished_at_ms.saturating_sub(wait_started_at_ms),
-                        ),
-                        deadline_at_ms: None,
-                        wake_reason: ToolLifecycleWakeReason::Completed,
-                        sequence: 0,
-                    });
-                    reconcile_turn_progress_event(&turn_timing_state, 0, "sampling gate acquired");
+                    record_sampling_timer_reconciliation(
+                        &turn_timing_state,
+                        ToolLifecycleTimerWait {
+                            wait_kind: "sampling_gate_acquisition".to_string(),
+                            requested_timeout_ms: None,
+                            effective_timeout_ms: Some(
+                                wait_finished_at_ms.saturating_sub(wait_started_at_ms),
+                            ),
+                            deadline_at_ms: None,
+                            wake_reason: ToolLifecycleWakeReason::Completed,
+                            sequence: 0,
+                        },
+                        &mut active_without_pending_passes,
+                        "sampling gate acquired",
+                    )
+                    .await;
                     Some(admission)
                 } else {
                     None

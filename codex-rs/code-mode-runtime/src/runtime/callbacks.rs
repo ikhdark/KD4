@@ -168,6 +168,11 @@ pub(super) fn graph_observation_callback(
             if let Some(value) = v8::String::new(scope, &id) { retval.set(value.into()); }
         }
         "helper_bind" => super::causal::bind_helper(scope, args.get(2), key),
+        "helper_fork_after_patch" => {
+            if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+                state.causal.helper_fork_after_patch(&key);
+            }
+        }
         "helper_enter" => {
             let branch = args.get(2).uint32_value(scope).unwrap_or(u32::MAX);
             let previous = scope.get_continuation_preserved_embedder_data();

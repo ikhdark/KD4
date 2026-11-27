@@ -451,12 +451,14 @@ impl Drop for TurnTerminalPermit {
     }
 }
 
+type UserInputResponseSender = oneshot::Sender<std::io::Result<RequestUserInputResponse>>;
+
 /// Mutable state for a single turn.
 #[derive(Default)]
 pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_request_permissions: HashMap<String, PendingRequestPermissions>,
-    pending_user_input: HashMap<String, (String, RequestUserInputArgs, oneshot::Sender<RequestUserInputResponse>)>,
+    pending_user_input: HashMap<String, (String, RequestUserInputArgs, UserInputResponseSender)>,
     user_input_request_counts: HashMap<String, usize>,
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
     pending_dynamic_tools: HashMap<String, (String, oneshot::Sender<DynamicToolResponse>)>,
@@ -548,8 +550,8 @@ impl TurnState {
         key: String,
         call_id: String,
         args: RequestUserInputArgs,
-        tx: oneshot::Sender<RequestUserInputResponse>,
-    ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
+        tx: UserInputResponseSender,
+    ) -> Option<UserInputResponseSender> {
         let count = self
             .user_input_request_counts
             .entry(key.clone())
@@ -563,7 +565,7 @@ impl TurnState {
     pub(crate) fn remove_pending_user_input(
         &mut self,
         key: &str,
-    ) -> Option<(String, RequestUserInputArgs, oneshot::Sender<RequestUserInputResponse>)> {
+    ) -> Option<(String, RequestUserInputArgs, UserInputResponseSender)> {
         self.pending_user_input.remove(key)
     }
 
@@ -571,7 +573,7 @@ impl TurnState {
         &mut self,
         key: &str,
         call_id: Option<&str>,
-    ) -> Option<(String, RequestUserInputArgs, oneshot::Sender<RequestUserInputResponse>)> {
+    ) -> Option<(String, RequestUserInputArgs, UserInputResponseSender)> {
         let (pending_id, _, _) = self.pending_user_input.get(key)?;
         let matches = match call_id {
             Some(call_id) => call_id == pending_id,

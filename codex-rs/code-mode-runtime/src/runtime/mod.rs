@@ -310,10 +310,39 @@ struct RuntimeStart {
     task_failure_handler: Option<TaskFailureHandler>,
 }
 
-fn spare_runtime() -> &'static Mutex<Option<std_mpsc::Sender<RuntimeStart>>> {
-    static SPARE: std::sync::OnceLock<Mutex<Option<std_mpsc::Sender<RuntimeStart>>>> =
-        std::sync::OnceLock::new();
-    SPARE.get_or_init(|| Mutex::new(None))
+struct SpareRuntime {
+    prewarming: bool,
+    sender: Option<std_mpsc::Sender<RuntimeStart>>,
+}
+
+fn lock_spare_runtime() -> std::sync::MutexGuard<'static, SpareRuntime> {
+    static SPARE: Mutex<SpareRuntime> = Mutex::new(SpareRuntime {
+        prewarming: false,
+        sender: None,
+    });
+    SPARE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// Own the sole prewarm reservation even if the executor discards queued work.
+struct SparePrewarm(Option<std_mpsc::Sender<RuntimeStart>>);
+
+impl SparePrewarm {
+    fn run(mut self) {
+        match create_spare_runtime() {
+            Ok(sender) => self.0 = Some(sender),
+            Err(error) => tracing::warn!(%error, "code mode runtime prewarm failed"),
+        }
+    }
+}
+
+impl Drop for SparePrewarm {
+    fn drop(&mut self) {
+        let mut spare = lock_spare_runtime();
+        spare.sender = self.0.take();
+        spare.prewarming = false;
+    }
 }
 
 fn create_spare_runtime() -> std::io::Result<std_mpsc::Sender<RuntimeStart>> {
@@ -369,14 +398,22 @@ fn create_spare_runtime() -> std::io::Result<std_mpsc::Sender<RuntimeStart>> {
 }
 
 pub(crate) fn prewarm_runtime() {
-    let mut spare = spare_runtime()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if spare.is_none() {
-        match create_spare_runtime() {
-            Ok(sender) => *spare = Some(sender),
-            Err(error) => tracing::warn!(%error, "code mode runtime prewarm failed"),
+    let reservation = {
+        let mut spare = lock_spare_runtime();
+        if spare.prewarming || spare.sender.is_some() {
+            return;
         }
+        spare.prewarming = true;
+        SparePrewarm(None)
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // Even dispatch to Tokio's blocking pool can start a worker thread.
+        // Defer it so an async caller can finish registering its session first.
+        drop(handle.spawn(async move {
+            drop(tokio::task::spawn_blocking(move || reservation.run()));
+        }));
+    } else {
+        reservation.run();
     }
 }
 
@@ -406,10 +443,10 @@ pub(crate) async fn spawn_runtime_with_catalog(
         output_admission,
     };
 
-    let sender = spare_runtime()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
+    // A cell needs its own runtime now, not admission to the optional prewarm
+    // queue. Take the ready spare, or start a dedicated runtime without the lock.
+    let warm_sender = lock_spare_runtime().sender.take();
+    let sender = warm_sender
         .map(Ok)
         .unwrap_or_else(create_spare_runtime)
         .map_err(|error| format!("failed to start code mode runtime: {error}"))?;
@@ -517,6 +554,7 @@ pub(crate) struct EnabledToolCatalog {
     by_requested_name: HashMap<String, Option<usize>>,
     operation_routes: HashMap<usize, BTreeMap<String, usize>>,
     compatibility_tools: HashSet<usize>,
+    read_file_full_snapshot: bool,
     input_bytes: usize,
 }
 
@@ -555,6 +593,16 @@ impl EnabledToolCatalog {
                 .collect(),
         )?;
         catalog.configure_native_routes(definitions)?;
+        // A newer host can serve an older CLI. Use the admitted producer's
+        // argument schema, not the host's release or a rejected probe call.
+        catalog.read_file_full_snapshot = definitions.iter().any(|definition| {
+            definition.tool_name.namespace.is_none()
+                && definition.tool_name.name == "read_file"
+                && definition.input_schema.as_ref().is_some_and(|schema| {
+                    schema.pointer("/properties/full_snapshot/type").and_then(serde_json::Value::as_str)
+                        == Some("boolean")
+                })
+        });
         Ok(catalog)
     }
 
@@ -781,6 +829,7 @@ impl EnabledToolCatalog {
             by_requested_name,
             operation_routes: HashMap::new(),
             compatibility_tools: HashSet::new(),
+            read_file_full_snapshot: false,
             input_bytes,
         })
     }

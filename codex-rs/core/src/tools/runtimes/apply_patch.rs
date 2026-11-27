@@ -14,9 +14,13 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::with_cached_approval;
+use codex_agent_task_store::AgentTaskAuthorization;
 use codex_agent_task_store::AttemptState;
+use codex_agent_task_store::SourceWriteOperation;
+use codex_agent_task_store::StoreError;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchAction;
+use codex_apply_patch::ApplyPatchFileChange;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_protocol::error::CodexErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -25,7 +29,9 @@ use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::ReviewDecision;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize)]
@@ -51,13 +57,24 @@ pub struct ApplyPatchRequest {
     pub cancellation_token: tokio_util::sync::CancellationToken,
 }
 
+struct AssignmentEndpointCheck {
+    path: PathUri,
+    operation: SourceWriteOperation,
+    move_path: Option<PathUri>,
+}
+
+enum AssignmentEndpointError {
+    Refused { endpoint: String, reason: String },
+    Rejected(String),
+}
+
 #[derive(Default)]
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
     patch_mismatch: Option<codex_apply_patch::PatchContextMismatch>,
     revision_guard_mismatch: bool,
     failure: Option<codex_protocol::tool_failure::ToolFailure>,
-    workspace_operation_permit: Option<crate::scoped_workspace_gate::WorkspaceLease>,
+    workspace_operation_permit: Option<Arc<crate::scoped_workspace_gate::WorkspaceLease>>,
     mutation_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -76,7 +93,7 @@ impl ApplyPatchRuntime {
         workspace_operation_permit: Option<crate::scoped_workspace_gate::WorkspaceLease>,
     ) -> Self {
         Self {
-            workspace_operation_permit,
+            workspace_operation_permit: workspace_operation_permit.map(Arc::new),
             ..Self::new()
         }
     }
@@ -146,7 +163,7 @@ impl ApplyPatchRuntime {
     /// no typed assignment governs; a bound turn returns the authorization its
     /// per-endpoint checks need.
     async fn write_authority(&mut self, ctx: &ToolCtx, environment: &TurnEnvironment)
-        -> Result<Option<codex_agent_task_store::AgentTaskAuthorization>, ToolError>
+        -> Result<Option<AgentTaskAuthorization>, ToolError>
     {
         let coordinator = ctx.session.services.agent_control.task_coordinator();
         let Some(binding) = coordinator.binding_for_turn(&ctx.turn) else {
@@ -194,43 +211,83 @@ impl ApplyPatchRuntime {
         let Some(authorization) = self.write_authority(ctx, &req.turn_environment).await? else {
             return Ok(());
         };
+        // Keep the verified action's iteration order without copying patch contents.
+        let endpoints = req
+            .action
+            .changes()
+            .iter()
+            .map(|(path, change)| {
+                let (operation, move_path) = match change {
+                    ApplyPatchFileChange::Add { .. } => (SourceWriteOperation::Create, None),
+                    ApplyPatchFileChange::Delete { .. } => (SourceWriteOperation::Delete, None),
+                    ApplyPatchFileChange::Update { move_path, .. } => {
+                        (SourceWriteOperation::Update, move_path.clone())
+                    }
+                };
+                AssignmentEndpointCheck { path: path.clone(), operation, move_path }
+            })
+            .collect::<Vec<_>>();
+        let permit = self.workspace_operation_permit.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            // The patch owner awaits these read-only checks before mutation.
+            // Keep the same admission alive even if its waiter is dropped.
+            let _permit = permit;
+            Self::check_assignment_endpoints(&authorization, endpoints)
+        })
+        .await
+        .map_err(|error| ToolError::Rejected(format!("apply_patch: endpoint validation task failed: {error}")))?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(AssignmentEndpointError::Refused { endpoint, reason }) => {
+                Err(self.endpoint_denied(ctx, &endpoint, reason))
+            }
+            Err(AssignmentEndpointError::Rejected(reason)) => Err(ToolError::Rejected(reason)),
+        }
+    }
+
+    fn check_assignment_endpoints(
+        authorization: &AgentTaskAuthorization,
+        endpoints: Vec<AssignmentEndpointCheck>,
+    ) -> Result<(), AssignmentEndpointError> {
+        use SourceWriteOperation as Op;
+
         let assignment = &authorization.assignment;
         let amendment = authorization.current_attempt.amendment.as_ref();
-        let root = std::path::Path::new(&authorization.repo_root);
-        for (path, change) in req.action.changes() {
-            let absolute = path.to_abs_path().map_err(|error| ToolError::Rejected(error.to_string()))?;
-            // An endpoint outside the assigned repository is an authority refusal;
-            // filesystem errors while resolving it remain ordinary failures.
-            let relative = match codex_agent_task_store::normalize_absolute_source_path(root, &absolute) {
-                Ok(relative) => relative,
-                Err(error @ codex_agent_task_store::StoreError::InvalidScope(_)) =>
-                    return Err(self.endpoint_denied(ctx, &absolute.display().to_string(), error.to_string())),
-                Err(error) => return Err(ToolError::Rejected(format!("apply_patch: {error}"))),
-            };
-            use codex_agent_task_store::SourceWriteOperation as Op;
-            let operation = match change {
-                codex_apply_patch::ApplyPatchFileChange::Add { .. } => Op::Create,
-                codex_apply_patch::ApplyPatchFileChange::Delete { .. } => Op::Delete,
-                codex_apply_patch::ApplyPatchFileChange::Update { .. } => Op::Update,
-            };
-            if let Err(error) = codex_agent_task_store::authorize_source_write(assignment, amendment, &relative, operation) {
-                return Err(self.endpoint_denied(ctx, &relative, error.to_string()));
-            }
-            if let codex_apply_patch::ApplyPatchFileChange::Update { move_path: Some(destination), .. } = change {
-                let absolute = destination.to_abs_path().map_err(|error| ToolError::Rejected(error.to_string()))?;
-                let destination = match codex_agent_task_store::normalize_absolute_source_path(root, &absolute) {
-                    Ok(destination) => destination,
-                    Err(error @ codex_agent_task_store::StoreError::InvalidScope(_)) =>
-                        return Err(self.endpoint_denied(ctx, &absolute.display().to_string(), error.to_string())),
-                    Err(error) => return Err(ToolError::Rejected(format!("apply_patch: {error}"))),
-                };
+        let root = Path::new(&authorization.repo_root);
+        let normalize = |absolute: &Path| {
+            // Scope violations are capability refusals; filesystem errors are not.
+            codex_agent_task_store::normalize_absolute_source_path(root, absolute).map_err(|error| {
+                match error {
+                    error @ StoreError::InvalidScope(_) => AssignmentEndpointError::Refused {
+                        endpoint: absolute.display().to_string(),
+                        reason: error.to_string(),
+                    },
+                    error => AssignmentEndpointError::Rejected(format!("apply_patch: {error}")),
+                }
+            })
+        };
+        let authorize = |path: &str, operation| {
+            codex_agent_task_store::authorize_source_write(assignment, amendment, path, operation)
+                .map_err(|error| AssignmentEndpointError::Refused {
+                    endpoint: path.to_owned(),
+                    reason: error.to_string(),
+                })
+        };
+
+        for AssignmentEndpointCheck { path, operation, move_path } in endpoints {
+            let absolute = path.to_abs_path()
+                .map_err(|error| AssignmentEndpointError::Rejected(error.to_string()))?;
+            let relative = normalize(&absolute)?;
+            authorize(&relative, operation)?;
+            if let Some(destination) = move_path {
+                let absolute = destination.to_abs_path()
+                    .map_err(|error| AssignmentEndpointError::Rejected(error.to_string()))?;
+                let destination = normalize(&absolute)?;
                 let destination_operation = if absolute.exists() { Op::Update } else { Op::Create };
                 for (path, operation) in [(&relative, Op::Move), (&relative, Op::Delete),
                     (&destination, Op::Move), (&destination, destination_operation)]
                 {
-                    if let Err(error) = codex_agent_task_store::authorize_source_write(assignment, amendment, path, operation) {
-                        return Err(self.endpoint_denied(ctx, path, error.to_string()));
-                    }
+                    authorize(path, operation)?;
                 }
             }
         }
@@ -357,7 +414,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             if self.workspace_operation_permit.is_none() {
                 let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
                 let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("patch_gate_wait");
-                self.workspace_operation_permit = Some(tokio::select! {
+                self.workspace_operation_permit = Some(Arc::new(tokio::select! {
                     biased;
                     _ = req.cancellation_token.cancelled() => {
                         return Err(ToolError::Codex(CodexErr::TurnAborted));
@@ -366,7 +423,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                         &req.turn_environment.environment,
                         &req.action.cwd,
                     ) => permit.map_err(ToolError::Denied)?,
-                });
+                }));
             }
             self.validate_assignment(ctx, req).await?;
             let started_at = Instant::now();

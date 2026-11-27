@@ -634,13 +634,33 @@ def lane_name_for_process(process: RustProcess) -> str | None:
     return process.classification.lane_name
 
 
-def cargo_lock_is_busy(target_dir: Path, *, profile: str | None = None) -> bool:
+def cargo_lock_is_busy(
+    target_dir: Path, *, profile: str | None = None, for_admission: bool = False,
+) -> bool:
     if _binary_file_lock_is_busy(target_dir / ".rust-test-runner.lock"):
         return True
-    return _cargo_profile_locks_are_busy(target_dir, profile=profile)
+    return _cargo_profile_locks_are_busy(target_dir, profile=profile, for_admission=for_admission)
 
 
-def _cargo_profile_locks_are_busy(target_dir: Path, *, profile: str | None) -> bool:
+def _is_v8_gn_source_link(path: Path) -> bool:
+    """Recognize the cross-volume V8 build artifact without following its link."""
+    if os.name != "nt" or path.name != "gn_root" or not path.is_symlink():
+        return False
+    target = path.readlink()
+    parts = target.parts
+    if not (target.is_absolute() and len(parts) >= 5
+            and parts[-4:-2] == ("registry", "src")
+            and re.fullmatch(r"[\w.-]+-[a-f0-9]{16}", parts[-2])
+            and re.fullmatch(r"v8-\d+\.\d+\.\d+(?:[-+][\w.-]+)?", parts[-1])):
+        return False
+    # This is a member of a built Cargo profile, not the profile itself.
+    siblings = (path.with_name(name) for name in ("gn_out", ".fingerprint", "deps"))
+    return all(not is_indirect_directory(sibling) and sibling.is_dir() for sibling in siblings)
+
+
+def _cargo_profile_locks_are_busy(
+    target_dir: Path, *, profile: str | None = None, for_admission: bool = False,
+) -> bool:
     # Cargo locks each profile directory, optionally below a target triple.
     # Inspect only those two levels; never follow junctions into other trees.
     # Admission can ignore unrelated Cargo profiles; lane reservation/pruning
@@ -660,6 +680,8 @@ def _cargo_profile_locks_are_busy(target_dir: Path, *, profile: str | None) -> b
             for candidate in profiles:
                 if candidate.is_dir():
                     if is_indirect_directory(candidate):
+                        if for_admission and _is_v8_gn_source_link(candidate):
+                            continue
                         return True
                     if _cargo_lock_file_is_busy(candidate / ".cargo-lock"):
                         return True
@@ -1374,6 +1396,78 @@ def _nonnegative_wait_seconds(value: str | float) -> float:
     return seconds
 
 
+def _lane_compile_kind(command: Sequence[str]) -> str | None:
+    index = _cargo_subcommand_index(command) if command and Path(command[0]).stem.casefold() == "cargo" else None
+    return {"build": "build", "b": "build", "check": "check", "c": "check"}.get(command[index]) if index is not None else None
+
+
+def _lane_duration_samples(path: Path) -> dict[str, float]:
+    """Advisory durations only; lane and resource locks still own admission."""
+    try:
+        row = json.loads((path / ".lane-build-duration.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(row, dict):
+        return {}
+    return {
+        key: float(row[key]) for key in ("warm", "cold", "seeded")
+        if type(row.get(key)) in (int, float) and 0 < row[key] <= 3600
+    }
+
+
+def _observe_lane_duration(path: Path, kind: str, seconds: float, *, reuse_samples: bool) -> None:
+    if not 0 < seconds <= 3600:
+        return
+    samples = _lane_duration_samples(path) if reuse_samples else {}
+    samples[kind] = seconds
+    try:
+        write_json_atomic(path / ".lane-build-duration.json", samples)
+    except OSError as error:
+        print(f"warning: could not save advisory Cargo lane durations: {error}", file=sys.stderr)
+
+
+def _prefer_busy_warm_lane(
+    busy: Sequence[Path], compatible: set[Path], *, seeded: bool,
+    subcommand: str | None, deadline: float, progress: dict[str, object] | None,
+) -> bool:
+    if subcommand not in ("build", "check") or not busy or time.monotonic() >= deadline:
+        return False
+    histories = {path: _lane_duration_samples(path) for path in compatible}
+    kind = "seeded" if seeded else "cold"
+    prior = [samples[kind] for samples in histories.values() if kind in samples]
+    now = time.time()
+    estimates = []
+    for path in busy:
+        # An external Cargo lock without this runner's active reservation
+        # cannot provide a reliable start timestamp.
+        if path not in histories or not lane_active_lock_is_held(path):
+            continue
+        try:
+            age = now - (path / LANE_LAST_USED_STAMP).stat().st_mtime
+        except OSError:
+            continue
+        warm = histories[path].get("warm", 15.0 if subcommand == "build" else 5.0)
+        if not 0 <= age <= warm + 3:
+            continue
+        estimates.append((max(0.0, warm - age) + warm, warm))
+    if not estimates:
+        return False
+    via_warm, warm = min(estimates)
+    # Bias toward overlap when seed copying is cheap or another full compile
+    # is actually predicted to win. An unmeasured estimate is not a receipt.
+    overflow = min(prior) if prior else (
+        warm + 8 if seeded else (120.0 if subcommand == "build" else 30.0)
+    )
+    wait = via_warm + 1 < overflow
+    if progress is not None:
+        progress["overflowEstimate"] = {
+            "choice": "wait-warm" if wait else "allow-overflow",
+            "warmSeconds": round(via_warm, 3), "overflowSeconds": round(overflow, 3),
+            "overflowClass": kind, "overflowMeasured": bool(prior),
+        }
+    return wait
+
+
 def _lanes_in_use(candidates: Sequence[LaneReservationCandidate]) -> int:
     """Existing lanes of one family that hold a reservation or a Cargo lock."""
     return len(_busy_lane_paths(candidates))
@@ -1386,7 +1480,7 @@ def _busy_lane_paths(candidates: Sequence[LaneReservationCandidate]) -> list[Pat
         if candidate.path.is_dir()
         and (
             lane_active_lock_is_held(candidate.path)
-            or cargo_lock_is_busy(candidate.path)
+            or cargo_lock_is_busy(candidate.path, for_admission=True)
         )
     ]
 
@@ -1536,13 +1630,16 @@ def reserve_cargo_lane(
     active_handle: BinaryIO | None = None
     target_dir: Path | None = None
     resolved_lane: str | None = None
-    deadline = time.monotonic() + max(0.0, warm_wait_seconds)
+    deadline = time.monotonic() + warm_wait_seconds
+    adaptive_deadline = deadline + 30
+    estimate_subcommand = _lane_compile_kind(command) if build_context is not None else None
     announced_wait = False
     coordination_waits: dict[str, float | str] = {}
     retry_delay = 0.01
     waits = _ReservationProgress(base_lane, progress)
     while active_handle is None:
         busy_reusable = False
+        busy_compatible: list[Path] = []
         waits.enter("coordination-lock")
         with waits.coordinating(coordination_waits), _reservation_coordination_lock(
             root, lock_timeout_seconds, coordination_waits,
@@ -1556,7 +1653,7 @@ def reserve_cargo_lane(
                 path
                 for path in warm_paths
                 if build_context is None
-                or _read_lane_build_context(path) == build_context
+                or _lane_cache_affinity(_read_lane_build_context(path), build_context) < 2
             }
             candidates.sort(
                 key=lambda candidate: (
@@ -1590,10 +1687,19 @@ def reserve_cargo_lane(
                 warm = candidate_dir in warm_paths
                 compatible = candidate_dir in compatible_paths
                 if busy_reusable and not compatible and (compatible_paths or not warm):
-                    if not allow_cold_overflow or time.monotonic() < deadline:
+                    if (not allow_cold_overflow or time.monotonic() < deadline
+                            or _prefer_busy_warm_lane(
+                                busy_compatible, {
+                                    path for path in compatible_paths
+                                    if _read_lane_build_context(path) == build_context
+                                }, seeded=False,
+                                subcommand=estimate_subcommand, deadline=adaptive_deadline, progress=progress,
+                            )):
                         break
                 candidate_dir.mkdir(exist_ok=True)
-                if cargo_lock_is_busy(candidate_dir):
+                if cargo_lock_is_busy(candidate_dir, for_admission=True):
+                    if compatible:
+                        busy_compatible.append(candidate_dir)
                     busy_reusable |= compatible or not compatible_paths
                     continue
                 active_handle = _try_acquire_binary_file_lock(
@@ -1604,6 +1710,8 @@ def reserve_cargo_lane(
                     resolved_lane = candidate_name
                     break
                 busy_reusable |= compatible or not compatible_paths
+                if compatible:
+                    busy_compatible.append(candidate_dir)
         outcome = "at-capacity" if at_capacity else "lanes-busy"
         if active_handle is not None:
             waits.enter("resource-admission")
@@ -2268,6 +2376,21 @@ def request_cargo_lane_maintenance(repo_root: Path, lane_root: Path) -> None:
     threading.Thread(target=reap, daemon=True).start()
 
 
+def _lane_cache_affinity(previous: object, requested: Mapping[str, object]) -> int:
+    """Exact context, reusable dependency cache, or unqualified (lower is better).
+
+    Package selection changes the unit graph, not Cargo's authority to decide
+    which dependency units are fresh. Never use this for binary admission.
+    """
+    if previous == requested:
+        return 0
+    if (not isinstance(previous, dict) or not requested.get("selectedManifest")
+            or requested.get("reuseGaps") or previous.get("reuseGaps")):
+        return 2
+    return 1 if ({k: v for k, v in previous.items() if k != "packages"}
+                 == {k: v for k, v in requested.items() if k != "packages"}) else 2
+
+
 def _read_lane_build_context(target_dir: Path) -> object:
     try:
         return json.loads(
@@ -2758,7 +2881,7 @@ def _source_mirror_skip_reason(
         elif source_lane is not None and _is_warm_lane_dir(source_lane):
             reason = "existing warm lane for this source root"
     # Mirrors are created below mirrors_root; the source's own root is copied.
-    if reason is None and _cargo_configs_from(repo_root.parent) != _cargo_configs_from(mirrors_root):
+    if reason is None and _cargo_configs_from(Path(os.path.abspath(repo_root)).parent) != _cargo_configs_from(mirrors_root):
         reason = "Cargo/rustup files above the source root differ from the mirror's"
     if reason is not None and mode == "always":
         raise ValueError(f"--source-mirror always: {reason}")
@@ -2820,7 +2943,7 @@ def _cargo_launch_subcommand(command: Sequence[str]) -> int | None:
 
 
 def _cargo_command_with_message_format(
-    command: Sequence[str], option: str = "--freeze-bundle",
+    command: Sequence[str], option: str = "--freeze-bundle", *, structured_diagnostics: bool = False,
 ) -> list[str]:
     result = list(command)
     options = result[: result.index("--")] if "--" in result else result
@@ -2829,7 +2952,8 @@ def _cargo_command_with_message_format(
     index = _cargo_launch_subcommand(result)
     if index is None:
         raise ValueError(f"{option} requires a Cargo command")
-    return [*result[: index + 1], FREEZE_MESSAGE_FORMAT, *result[index + 1 :]]
+    message_format = "--message-format=json" if structured_diagnostics else FREEZE_MESSAGE_FORMAT
+    return [*result[: index + 1], message_format, *result[index + 1 :]]
 
 
 def _build_unit_dir(path: Path, crate: str) -> Path | None:
@@ -2849,6 +2973,7 @@ def _cargo_executables(
     messages: Path, freshness: dict[str, object] | None = None,
     *, link_crates: Sequence[str] = (), link_artifacts: list[dict[str, object]] | None = None,
     observe_units: bool = False,
+    failure: dict[str, object] | None = None, render_diagnostics: bool = False,
 ) -> list[Path]:
     executables: dict[str, Path] = {}
     with messages.open(encoding="utf-8", errors="replace") as stream:
@@ -2859,6 +2984,19 @@ def _cargo_executables(
                 message = json.loads(line)
             except ValueError:
                 continue
+            if message.get("reason") == "compiler-message":
+                diagnostic = message.get("message") or {}
+                if render_diagnostics and diagnostic.get("rendered"):
+                    sys.stderr.write(diagnostic["rendered"])
+                if failure is not None and diagnostic.get("level") == "error" and "firstDiagnostic" not in failure:
+                    target = message.get("target") or {}
+                    failure.update(kind="compiler_diagnostic", firstDiagnostic={
+                        "packageId": message.get("package_id"), "manifestPath": message.get("manifest_path"),
+                        "target": target.get("name"), "code": (diagnostic.get("code") or {}).get("code"),
+                        "message": diagnostic.get("message"),
+                        "primarySpans": [{"file": span.get("file_name"), "line": span.get("line_start")}
+                                         for span in diagnostic.get("spans", []) if span.get("is_primary")][:8],
+                    })
             if message.get("reason") == "compiler-artifact":
                 if freshness is not None:
                     freshness["status"] = "observed"
@@ -3635,7 +3773,7 @@ def run_in_cargo_lane(
             record["resources"] = {"schemaVersion": 1, "command": list(command), "status": "pending"}
             resource_lease = BuildLease(child_env, True, record["resources"])
             def admission(path):
-                resource_lease.cold = not _is_warm_lane_dir(path) or _read_lane_build_context(path) != build_context
+                resource_lease.cold = not _is_warm_lane_dir(path) or _lane_cache_affinity(_read_lane_build_context(path), build_context) == 2
                 return resource_lease.acquire(wait=False)
         lane_wait_started = time.perf_counter()
         # Kept in the receipt even when the wait ends without a lane.
@@ -3650,7 +3788,7 @@ def run_in_cargo_lane(
         ) as (resolved_lane, target_dir):
             record["laneAdmissionMs"] = (time.perf_counter() - lane_wait_started) * 1000
             record["laneWaitMs"] = max(0, record["laneAdmissionMs"] - record.get("resources", {}).get("resourceWaitMs", 0))
-            cold_build = not _is_warm_lane_dir(target_dir) or _read_lane_build_context(target_dir) != build_context
+            cold_build = not _is_warm_lane_dir(target_dir) or _lane_cache_affinity(_read_lane_build_context(target_dir), build_context) == 2
             record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
             if os.name == "nt":
                 record["nativeOutputPathPreflight"] = {
@@ -3700,9 +3838,14 @@ def run_in_cargo_lane(
             except OSError as error:
                 print(f"warning: could not request Cargo maintenance: {error}", file=sys.stderr)
             messages_path = None
-            if freeze or observe_units:
+            cargo_options = child_command[:child_command.index("--")] if "--" in child_command else child_command
+            timing_diagnostics = (timing_path is not None and _lane_compile_kind(command) is not None
+                                  and not any(arg == "--message-format" or arg.startswith("--message-format=")
+                                              for arg in cargo_options))
+            if freeze or observe_units or timing_diagnostics:
+                capture_option = "--observe-units" if observe_units else "--freeze-bundle" if freeze else "--timing-json"
                 child_command = _cargo_command_with_message_format(
-                    child_command, "--observe-units" if observe_units else "--freeze-bundle",
+                    child_command, capture_option, structured_diagnostics=timing_path is not None,
                 )
                 messages_path = target_dir / f".cargo-messages-{uuid.uuid4().hex}.jsonl"
             try:
@@ -3726,26 +3869,41 @@ def run_in_cargo_lane(
                         runner = run_build
                         resource_options = {"cold": cold_build, "resource_record": record["resources"],
                                             "lane_wait_ms": record["laneWaitMs"], "lease": resource_lease}
-                    code = runner(
-                        child_command, env=child_env, cwd=child_cwd,
-                        prepare_sccache=True, check=False,
-                        stdout=messages if messages_path is not None else sys.stdout,
-                        stderr=sys.stderr,
-                        **resource_options,
-                    ).returncode
-                    record["cargoMs"] = (time.perf_counter() - cargo_started) * 1000
+                    try:
+                        code = runner(
+                            child_command, env=child_env, cwd=child_cwd,
+                            prepare_sccache=True, check=False,
+                            stdout=messages if messages_path is not None else sys.stdout,
+                            stderr=sys.stderr,
+                            **resource_options,
+                        ).returncode
+                    finally:
+                        record["cargoMs"] = (time.perf_counter() - cargo_started) * 1000
                 record["cargoExitCode"] = code
                 record["exitCode"] = code
                 link_artifacts: list[dict[str, object]] = []
+                failure = None
+                if code != 0 and messages_path is not None:
+                    failure = record["failureAttribution"] = {
+                        "kind": "cargo_failed_without_compiler_diagnostic",
+                        "requestedPackages": build_context.get("packages") or [],
+                    }
                 executables = (
                     _cargo_executables(messages_path, cache_reuse["cargoFreshness"],
                         link_crates=record_link_crates if code == 0 else (),
-                        link_artifacts=link_artifacts, observe_units=observe_units)
+                        link_artifacts=link_artifacts, observe_units=observe_units, failure=failure,
+                        render_diagnostics=timing_path is not None)
                     if messages_path is not None else []
                 )
                 if code == 0 and set(record_link_crates) != {row["crate"] for row in link_artifacts}:
                     raise ValueError("requested link crates missing from actual Cargo artifacts")
                 if code == 0:
+                    if _lane_compile_kind(command) is not None:
+                        _observe_lane_duration(
+                            target_dir, "cold" if cold_build else "warm",
+                            (time.perf_counter() - lane_wait_started) - record["laneAdmissionMs"] / 1000,
+                            reuse_samples=_read_lane_build_context(target_dir) == build_context,
+                        )
                     try:
                         (target_dir / ".lane-build-context.json").write_text(
                             json.dumps(build_context, indent=2) + "\n", encoding="utf-8"

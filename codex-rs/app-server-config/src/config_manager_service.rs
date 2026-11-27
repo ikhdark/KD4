@@ -808,7 +808,9 @@ fn override_message(layer: &ConfigLayerSource) -> String {
         ConfigLayerSource::System { file } => {
             format!("Overridden by managed config (system): {}", file.display())
         }
-        ConfigLayerSource::EnterpriseManaged { id: _, name } => {
+        ConfigLayerSource::CloudBaseline { name, .. }
+        | ConfigLayerSource::EnterpriseManaged { name, .. }
+        | ConfigLayerSource::CloudSystemOverlay { name, .. } => {
             format!("Overridden by enterprise-managed config: {name}")
         }
         ConfigLayerSource::Project { dot_codex_folder } => format!(

@@ -324,9 +324,27 @@ function Get-ActiveCargoLaneNames {
     return @($names)
 }
 
+function Test-V8GnSourceLink {
+    param([IO.DirectoryInfo]$Entry)
+
+    if ($Entry.Name -cne 'gn_root' -or $Entry.LinkType -ne 'SymbolicLink') { return $false }
+    $link = [string]$Entry.Target
+    if ($link -notmatch '(?i)(?:^[A-Z]:\\|^\\\\).*\\registry\\src\\[\w.-]+-[a-f0-9]{16}\\v8-\d+\.\d+\.\d+(?:[-+][\w.-]+)?$') {
+        return $false
+    }
+    foreach ($name in @('gn_out', '.fingerprint', 'deps')) {
+        $sibling = Get-Item -LiteralPath (Join-Path $Entry.Parent.FullName $name) -Force -ErrorAction Stop
+        if (-not $sibling.PSIsContainer -or ($sibling.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Test-CargoLockBusy {
     param(
-        [string]$TargetDir
+        [string]$TargetDir,
+        [switch]$ForAdmission
     )
 
     if (-not (Test-Path -LiteralPath $TargetDir -PathType Container)) {
@@ -338,7 +356,10 @@ function Test-CargoLockBusy {
             if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
             if (Test-ExclusiveLaneFileBusy -TargetDir $child.FullName -LockFileName ".cargo-lock") { return $true }
             foreach ($profile in Get-ChildItem -LiteralPath $child.FullName -Directory -Force -ErrorAction Stop) {
-                if (($profile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+                if (($profile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    if ($ForAdmission -and (Test-V8GnSourceLink -Entry $profile)) { continue }
+                    return $true
+                }
                 if (Test-ExclusiveLaneFileBusy -TargetDir $profile.FullName -LockFileName ".cargo-lock") { return $true }
             }
         }
@@ -768,7 +789,7 @@ function Try-AcquireCargoLaneReservation {
             $inUse = 0
             foreach ($candidate in $unique) {
                 $target = Join-Path $LaneRoot $candidate
-                if ((Test-CargoLockBusy -TargetDir $target) -or (Test-LaneActiveLockBusy -TargetDir $target)) {
+                if ((Test-CargoLockBusy -TargetDir $target -ForAdmission) -or (Test-LaneActiveLockBusy -TargetDir $target)) {
                     $inUse++
                     if ($inUse -ge $MaxActiveLanes) { return $null }
                 }
@@ -792,7 +813,7 @@ function Try-AcquireCargoLaneReservation {
             if (Test-CargoLanesRootReparsePoint -LanesRoot $target) { continue }
             # The earlier process/lock snapshot can be stale while waiting for
             # coordination. Recheck Cargo's profile locks before reservation.
-            if (Test-CargoLockBusy -TargetDir $target) { $busy = $true; continue }
+            if (Test-CargoLockBusy -TargetDir $target -ForAdmission) { $busy = $true; continue }
             $lockPath = Join-Path $target ".lane-active.lock"
             $stream = $null
             try {

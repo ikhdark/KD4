@@ -46,8 +46,11 @@ the compiled bundle. Ordinary checkout builds without freezing stay in place;
 checks and in-place source-change rejection remain unchanged.
 
 In-place Python builds wait for busy reusable lanes by default. Eligible
-mirrored builds allow cold siblings immediately when capacity remains.
-`--warm-wait-seconds` delays overflow; `--no-cold-overflow` waits for a
+mirrored Python builds allow cold siblings when capacity remains, but for Cargo
+build/check they can wait up to 30 additional seconds if a compatible managed
+lane is expected to finish sooner. Successful lane timings are advisory;
+resource admission is still authoritative, and no running build is preempted.
+`--warm-wait-seconds` sets the minimum delay before overflow; `--no-cold-overflow` waits for a
 reusable lane rather than creating a cold sibling behind it. Mirrored and
 overflow-enabled families default to eight active lanes; `--max-active-lanes`
 can override the Python limit. PowerShell preserves its bounded busy exit
