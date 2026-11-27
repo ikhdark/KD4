@@ -19,6 +19,7 @@ use crate::loader::load_plugin_apps_from_manifest;
 use crate::loader::load_plugin_mcp_servers_from_manifest;
 use crate::loader::load_plugin_skill_inventory;
 use crate::manager::ConfiguredMarketplacePlugin;
+use crate::manager::CuratedToolSuggestSnapshot;
 use crate::manager::remote_plugin_install_required_description;
 use crate::manifest::load_plugin_manifest;
 use crate::marketplace::MarketplaceError;
@@ -49,6 +50,7 @@ struct PluginArtifactIdentity {
     plugin_id: String,
     source: MarketplacePluginSource,
     local_version: Option<String>,
+    curated_revision: Option<Arc<str>>,
 }
 
 pub(crate) struct ToolSuggestMetadataFragment {
@@ -115,12 +117,52 @@ impl ToolSuggestMetadataCache {
         marketplace_name: &str,
         plugin: &ConfiguredMarketplacePlugin,
         restriction_product: Option<Product>,
+        curated_snapshot: Option<&Arc<CuratedToolSuggestSnapshot>>,
     ) -> Result<Arc<ToolSuggestMetadataFragment>, MarketplaceError> {
         let artifact = PluginArtifactIdentity {
             plugin_id: plugin.id.clone(),
             source: plugin.source.clone(),
             local_version: plugin.local_version.clone(),
+            curated_revision: curated_snapshot.and_then(|snapshot| snapshot.revision.clone()),
         };
+        if let Some(snapshot) = curated_snapshot {
+            // No stable identity can be inferred from a legacy checkout's path or
+            // declared plugin version. Load under the lease without retaining it.
+            let cacheable = artifact.curated_revision.is_some();
+            if cacheable && let Some(entry) = self.cached_entry(&artifact) {
+                return entry.map_err(MarketplaceError::InvalidPlugin);
+            }
+
+            // Do not wait on the unrelated loader's semaphore under the publication
+            // lease. Own the lease inside the task so a cancelled suggestion cannot
+            // unlock while its blocking manifest/capability reads are still running.
+            let generation = self.generation();
+            let entry = if matches!(&plugin.source, MarketplacePluginSource::Local { .. }) {
+                let snapshot = Arc::clone(snapshot);
+                let marketplace_name = marketplace_name.to_string();
+                let plugin = plugin.clone();
+                tokio::spawn(async move {
+                    let result =
+                        load_plugin_metadata(&marketplace_name, &plugin, restriction_product).await;
+                    drop(snapshot);
+                    result
+                })
+                .await
+                .map_err(|err| {
+                    MarketplaceError::InvalidPlugin(format!(
+                        "failed to load curated plugin metadata: {err}"
+                    ))
+                })?
+            } else {
+                // Git/npm suggestions use only the advertised source; no checkout I/O.
+                load_plugin_metadata(marketplace_name, plugin, restriction_product).await
+            };
+            if cacheable {
+                self.cache_entry_if_current(generation, artifact, entry.clone());
+            }
+            return entry.map_err(MarketplaceError::InvalidPlugin);
+        }
+
         loop {
             if let Some(entry) = self.cached_entry(&artifact) {
                 return entry.map_err(MarketplaceError::InvalidPlugin);

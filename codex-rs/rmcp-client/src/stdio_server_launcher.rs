@@ -334,6 +334,31 @@ impl LocalStdioServerLauncher {
     }
 }
 
+// The blocking result can settle after the manager or the native-operation
+// timeout drops its join handle. Report the exact error if no observer took it.
+struct LocalTerminationFailure {
+    program_name: String,
+    error: Option<io::Error>,
+}
+
+impl LocalTerminationFailure {
+    fn into_result(mut self) -> io::Result<()> {
+        self.error.take().map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for LocalTerminationFailure {
+    fn drop(&mut self) {
+        if let Some(error) = &self.error {
+            warn!(
+                program_name = %self.program_name,
+                %error,
+                "unobserved failure terminating local MCP stdio server process",
+            );
+        }
+    }
+}
+
 impl LocalProcessTerminator {
     fn new(managed: Arc<ManagedRootProcess>) -> Self {
         Self {
@@ -407,11 +432,19 @@ impl StdioServerProcessHandle {
                     let StdioServerProcessKind::Local(terminator) = &inner.kind else {
                         return Err(io::Error::other("MCP process kind changed during termination"));
                     };
-                    terminator.terminate()?;
-                    inner.terminated.store(true, Ordering::Release);
-                    Ok(())
+                    match terminator.terminate() {
+                        Ok(()) => {
+                            inner.terminated.store(true, Ordering::Release);
+                            Ok(None)
+                        }
+                        Err(error) => Ok(Some(LocalTerminationFailure {
+                            program_name: inner.program_name.clone(),
+                            error: Some(error),
+                        })),
+                    }
                 })
-                .await;
+                .await?
+                .map_or(Ok(()), LocalTerminationFailure::into_result);
             }
             StdioServerProcessKind::Executor(process) => {
                 process.terminate().await.map_err(io::Error::other)

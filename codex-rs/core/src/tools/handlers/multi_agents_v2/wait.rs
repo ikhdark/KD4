@@ -200,6 +200,7 @@ impl Handler {
                     model: None,
                     reasoning_effort: None,
                     agents_states: Default::default(),
+                    historical_agent_completions: None,
                 }),
             )
             .await;
@@ -529,7 +530,7 @@ impl Handler {
                                 false
                             } else {
                                 nudge_stalled_assignments(
-                                    session.as_ref(),
+                                    &session,
                                     turn.as_ref(),
                                     store.as_ref(),
                                     root_session_id.as_deref(),
@@ -1157,6 +1158,7 @@ impl Handler {
                     model: None,
                     reasoning_effort: None,
                     agents_states: receivers.states,
+                    historical_agent_completions: None,
                 }),
             )
             .await;
@@ -2270,7 +2272,7 @@ pub(crate) async fn inspect_authoritative_wait_snapshot(
 }
 
 async fn nudge_stalled_assignments(
-    session: &crate::session::session::Session,
+    session: &Arc<crate::session::session::Session>,
     turn: &crate::session::turn_context::TurnContext,
     store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
@@ -2280,13 +2282,8 @@ async fn nudge_stalled_assignments(
     let (Some(store), Some(root_session_id)) = (store, root_session_id) else {
         return false;
     };
-    if let Err(error) = session
-        .services
-        .agent_control
-        .task_coordinator()
-        .recover_unstarted_assignments()
-        .await
-    {
+    let coordinator = session.services.agent_control.task_coordinator();
+    if let Err(error) = coordinator.recover_unstarted_assignments().await {
         tracing::warn!(%error, "failed to reconcile interrupted task launches");
     }
     let author = turn
@@ -2323,15 +2320,19 @@ async fn nudge_stalled_assignments(
         };
         let status = session.services.agent_control.get_status(thread_id).await;
         if !runtime_status_allows_nonproductive_recovery(&status) {
-            if let Ok(path) = AgentPath::try_from(binding.agent_path.as_str())
-                && let Err(error) = session
-                    .services
-                    .agent_control
-                    .task_coordinator()
+            // Status watches can see terminal before post-dispatch retains it.
+            // The coordinator fences this fallback behind live/durable custody.
+            if let Ok(path) = AgentPath::try_from(binding.agent_path.as_str()) {
+                match coordinator
                     .seal_missing_receipt_for_attempt(&path, thread_id, &status, binding.attempt_id)
                     .await
-            {
-                tracing::warn!(%error, "terminal receipt recovery remains pending");
+                {
+                    Ok(Some(receipt)) => coordinator.maybe_emit_terminal_metrics(
+                        receipt.assignment_id, &turn.session_telemetry,
+                    ).await,
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "terminal receipt recovery remains pending"),
+                }
             }
             continue;
         }
@@ -2343,16 +2344,16 @@ async fn nudge_stalled_assignments(
         {
             break;
         }
-        match store
-            .recover_nonproductive_assignment(binding.assignment_id, no_progress_before)
-            .await
-        {
-            Ok(NonproductiveRecovery::Recovered { productivity, .. }) => {
-                let _ = session
-                    .services
-                    .agent_control
-                    .interrupt_agent(thread_id)
-                    .await;
+        match coordinator.recover_stalled_binding(&binding, no_progress_before).await {
+            Ok(Some(NonproductiveRecovery::Recovered { productivity, receipt })) => {
+                coordinator.maybe_emit_terminal_metrics(
+                    receipt.assignment_id, &turn.session_telemetry,
+                ).await;
+                if coordinator.binding_for_assignment(receipt.assignment_id)
+                    .is_some_and(|current| current.attempt_id == receipt.attempt_id)
+                {
+                    let _ = session.services.agent_control.interrupt_agent(thread_id).await;
+                }
                 if productivity.cancelled_expired_operation_count > 0 {
                     turn.session_telemetry.counter(
                         "codex.multi_agent.bounded_operation",
@@ -2367,7 +2368,7 @@ async fn nudge_stalled_assignments(
                 );
                 continue;
             }
-            Ok(NonproductiveRecovery::Suspended(productivity)) => {
+            Ok(Some(NonproductiveRecovery::Suspended(productivity))) => {
                 turn.session_telemetry.counter(
                     "codex.multi_agent.bounded_operation",
                     i64::from(productivity.active_owned_operation_count),
@@ -2375,7 +2376,9 @@ async fn nudge_stalled_assignments(
                 );
                 continue;
             }
-            Ok(NonproductiveRecovery::NotEligible) => {}
+            Ok(Some(NonproductiveRecovery::NotEligible)) => {}
+            // Stale binding or terminal custody: do not fall through to a nudge.
+            Ok(None) => continue,
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -2395,53 +2398,102 @@ async fn nudge_stalled_assignments(
         {
             break;
         }
-        let Ok(true) = store
-            .reserve_stalled_nudge(binding.assignment_id, no_progress_before)
-            .await
-        else {
-            continue;
-        };
-        let release_undelivered_nudge = || async {
-            if let Err(error) = store.release_stalled_nudge(binding.assignment_id).await {
-                tracing::warn!(
-                    %error,
-                    assignment_id = %binding.assignment_id,
-                    "failed to release an undelivered stalled-task nudge"
-                );
+        let assignment_id = binding.assignment_id.to_string();
+        let owner_session = Arc::clone(session);
+        let owner_store = Arc::clone(store);
+        let owner_author = author.clone();
+        // The tracker, not the passive wait, owns a reservation from the first
+        // SQLite write through mailbox acknowledgement or exact cleanup.
+        match session.terminal_tasks.spawn(async move {
+            deliver_stalled_nudge(owner_session, owner_store, binding, thread_id, owner_author, no_progress_before).await
+        }).await {
+            Ok(true) => {
+                fresh_nudge = true;
+                if !nudged.contains(&assignment_id) {
+                    nudged.push(assignment_id);
+                }
             }
-        };
-        let Ok(receiver) = session.services.agent_control.ensure_agent_known(thread_id) else {
-            release_undelivered_nudge().await;
-            continue;
-        };
-        let Some(receiver_path) = receiver.agent_path else {
-            release_undelivered_nudge().await;
-            continue;
-        };
-        if !is_strict_agent_descendant(&author, receiver_path.as_ref()) {
-            release_undelivered_nudge().await;
-            continue;
-        }
-        let communication = stalled_assignment_nudge(author.clone(), receiver_path);
-        let context =
-            AgentCommunicationContext::new(AgentCommunicationKind::Message, session.thread_id);
-        if session
-            .services
-            .agent_control
-            .send_inter_agent_communication(thread_id, communication, context)
-            .await
-            .is_ok()
-        {
-            fresh_nudge = true;
-            let assignment_id = binding.assignment_id.to_string();
-            if !nudged.contains(&assignment_id) {
-                nudged.push(assignment_id);
-            }
-        } else {
-            release_undelivered_nudge().await;
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, %assignment_id, "stalled-task nudge owner failed; admission is unconfirmed"),
         }
     }
     fresh_nudge
+}
+
+async fn deliver_stalled_nudge(
+    session: Arc<crate::session::session::Session>,
+    store: Arc<codex_agent_task_store::LocalAgentTaskStore>,
+    binding: codex_agent_task_store::AgentTaskBinding,
+    thread_id: codex_protocol::ThreadId,
+    author: AgentPath,
+    no_progress_before: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    use codex_protocol::error::CodexErr;
+
+    let control = &session.services.agent_control;
+    let coordinator = control.task_coordinator();
+    let Ok(receiver) = control.ensure_agent_known(thread_id) else {
+        return false;
+    };
+    let Some(receiver_path) = receiver.agent_path.filter(|path| {
+        path.as_str() == binding.agent_path && is_strict_agent_descendant(&author, path.as_str())
+    }) else {
+        return false;
+    };
+    let reserved_at = chrono::Utc::now();
+    let release = || async {
+        for delay_ms in [0_u64, 100, 500, 2_000] {
+            if delay_ms != 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            if let Err(error) = store.release_stalled_nudge_owned(
+                binding.assignment_id, binding.attempt_id, reserved_at,
+            ).await {
+                tracing::warn!(%error, assignment_id = %binding.assignment_id,
+                    attempt_id = %binding.attempt_id, "failed to release an undelivered stalled-task nudge");
+            } else {
+                return;
+            }
+        }
+    };
+    match store.reserve_stalled_nudge_owned(
+        binding.assignment_id, binding.attempt_id, no_progress_before, reserved_at,
+    ).await {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            tracing::warn!(%error, attempt_id = %binding.attempt_id, "stalled nudge reservation is unconfirmed");
+            release().await;
+            return false;
+        }
+    }
+    match coordinator.stalled_nudge_binding_is_current(&binding, reserved_at).await {
+        Ok(true) => {}
+        result => {
+            if let Err(error) = result {
+                tracing::warn!(%error, attempt_id = %binding.attempt_id, "failed to recheck stalled nudge binding");
+            }
+            release().await;
+            return false;
+        }
+    }
+    let communication = stalled_assignment_nudge(author, receiver_path);
+    let context = AgentCommunicationContext::new(AgentCommunicationKind::Message, session.thread_id);
+    match control.send_inter_agent_communication(thread_id, communication, context).await {
+        Ok(_) => true,
+        Err(CodexErr::InvalidRequest(_) | CodexErr::ThreadNotFound(_)
+            | CodexErr::AgentLimitReached { .. } | CodexErr::ResumeParentNotLoaded(_)) => {
+            // Known refusal: nothing reached the receiver's mailbox.
+            release().await;
+            false
+        }
+        Err(error) => {
+            // Lost acknowledgement or a storage error can follow a durable
+            // write. Keep the reservation, but do not count this as delivered.
+            tracing::warn!(%error, attempt_id = %binding.attempt_id, "stalled nudge mailbox admission is unknown");
+            false
+        }
+    }
 }
 
 fn stalled_assignment_nudge(author: AgentPath, recipient: AgentPath) -> InterAgentCommunication {

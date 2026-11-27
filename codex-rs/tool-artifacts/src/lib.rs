@@ -810,8 +810,6 @@ struct RetentionRootState {
 #[derive(Debug, Default)]
 struct RetentionRegistry {
     roots: BTreeMap<PathBuf, RetentionRootState>,
-    pending_canonical: BTreeSet<PathBuf>,
-    failed_canonical: BTreeMap<PathBuf, String>,
     access_clock: u64,
     pending_sync: BTreeMap<PathBuf, u64>,
     next_sync: u64,
@@ -862,6 +860,22 @@ fn retention_registry() -> &'static StdMutex<RetentionRegistry> {
 
 fn lock_retention_registry() -> std::sync::MutexGuard<'static, RetentionRegistry> {
     retention_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// Capability publication and lookup should not share the index/eviction
+// lock. The pending-to-failed transition still has one authority.
+#[derive(Default)]
+struct CanonicalRetentionRegistry {
+    pending_canonical: BTreeSet<PathBuf>,
+    failed_canonical: BTreeMap<PathBuf, String>,
+}
+
+fn lock_canonical_retention_registry() -> std::sync::MutexGuard<'static, CanonicalRetentionRegistry> {
+    static REGISTRY: OnceLock<StdMutex<CanonicalRetentionRegistry>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -1052,15 +1066,14 @@ fn reject_stale_delta(token: &RetentionIndexToken) {
     transition_current_root_to_dirty(&mut registry, &token.root);
 }
 
-fn protection_marker_status(marker: &Path, expected: &[u8]) -> std::io::Result<bool> {
+fn open_protection_marker(marker: &Path) -> std::io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     configure_no_follow_open(&mut options);
-    let mut file = match options.open(marker) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
+    options.open(marker)
+}
+
+fn protection_marker_matches(mut file: File, expected: &[u8]) -> std::io::Result<bool> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata_is_reparse_point(&metadata)
@@ -1068,12 +1081,13 @@ fn protection_marker_status(marker: &Path, expected: &[u8]) -> std::io::Result<b
     {
         return Ok(false);
     }
-    let mut bytes = vec![0_u8; expected.len()];
-    match file.read_exact(&mut bytes) {
-        Ok(()) if bytes == expected => {}
-        Ok(()) => return Ok(false),
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
-        Err(err) => return Err(err),
+    // A short read ending normally is invalid content, not an I/O error.
+    let mut bytes = Vec::with_capacity(expected.len());
+    (&mut file)
+        .take(expected.len() as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes != expected {
+        return Ok(false);
     }
     let mut trailing = [0_u8; 1];
     match file.read(&mut trailing) {
@@ -1084,16 +1098,20 @@ fn protection_marker_status(marker: &Path, expected: &[u8]) -> std::io::Result<b
 }
 
 fn retention_protection_marker_status(marker: &Path, expected: &[u8]) -> std::io::Result<bool> {
-    match protection_marker_status(marker, expected) {
-        Ok(true) => Ok(true),
-        Ok(false) => match std::fs::symlink_metadata(marker) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Ok(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid retention protection marker `{}`", marker.display()),
-            )),
-            Err(err) => Err(err),
-        },
+    let matches = match open_protection_marker(marker) {
+        Ok(file) => protection_marker_matches(file, expected)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err),
+    };
+    if matches {
+        return Ok(true);
+    }
+    match std::fs::symlink_metadata(marker) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid retention protection marker `{}`", marker.display()),
+        )),
         Err(err) => Err(err),
     }
 }
@@ -1249,11 +1267,13 @@ struct ThreadRetentionListing {
 /// attributes, so this opens no files; per-artifact opens took ~6 s at 14.5K
 /// records. With a `record_budget`, every family's marker is validated but only
 /// evictable (unprotected) records are returned and charged to that budget.
+/// The transaction budget retains only the prefix the caller can use.
 /// Listings can run without the shared lock, so an entry may
 /// vanish mid-listing. Returns `None` when the directory no longer exists.
 fn list_thread_retention_directory_blocking(
     directory: &Path,
     record_budget: Option<usize>,
+    transaction_budget: usize,
 ) -> std::io::Result<Option<ThreadRetentionListing>> {
     let mut entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -1279,7 +1299,9 @@ fn list_thread_retention_directory_blocking(
         has_staging_entries |= name.starts_with('.');
         let extension = path.extension().and_then(|extension| extension.to_str());
         if extension == Some(LOGICAL_ARTIFACT_TRANSACTION_EXTENSION) {
-            listing.transactions.push(path.with_extension("log"));
+            if listing.transactions.len() < transaction_budget {
+                listing.transactions.push(path.with_extension("log"));
+            }
             continue;
         }
         let is_log = extension == Some("log");
@@ -1328,40 +1350,54 @@ fn list_thread_retention_directory_blocking(
     if has_staging_entries {
         recover_abandoned_stages(directory);
     }
-    if collect {
+    if let Some(record_budget) = record_budget {
+        listing.candidates = 0;
         for (stem, (bytes, log)) in artifacts_by_stem {
             let Some((path, metadata)) = log else {
                 continue;
             };
             let record = listed_retention_record(&path, bytes, &metadata, markers.get(&stem))?;
-            // Marker validation above still applies; only evictable records are
-            // indexed and charged to the index budget.
-            if !record.protected {
+            if record.protected {
+                continue;
+            }
+            listing.candidates = listing.candidates.saturating_add(1);
+            // An oversized listing returns no records, but later families
+            // still contribute to the count and can fail validation above.
+            if listing.over_budget {
+                continue;
+            }
+            if listing.records.len() == record_budget {
+                listing.over_budget = true;
+                listing.records = Vec::new();
+            } else {
                 listing.records.push(record);
             }
-        }
-        listing.candidates = listing.records.len() as u64;
-        if record_budget.is_some_and(|budget| listing.records.len() > budget) {
-            listing.over_budget = true;
-            listing.records.clear();
         }
     }
     Ok(Some(listing))
 }
 
-/// The thread directories that a listing of `root` reaches.
+/// The thread directories that a listing of `root` reaches, in directory order.
 fn retention_thread_directories_blocking(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut directories = Vec::new();
+    visit_retention_thread_directories_blocking(root, |path| directories.push(path))?;
+    Ok(directories)
+}
+
+fn visit_retention_thread_directories_blocking(
+    root: &Path,
+    mut visit: impl FnMut(PathBuf),
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => directories.push(entry.path()),
+            Ok(file_type) if file_type.is_dir() => visit(entry.path()),
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
     }
-    Ok(directories)
+    Ok(())
 }
 
 /// Also returns the artifacts whose transaction markers were listed.
@@ -1373,17 +1409,19 @@ fn scan_retention_root_blocking(
     let mut index = Some(RetentionIndex::default());
     let mut candidates_visited = 0_u64;
     let mut transactions = Vec::new();
+    // Check the entire root listing before any per-directory staging recovery.
     for directory in retention_thread_directories_blocking(root)? {
         let record_budget = index
             .as_ref()
             .map(|_| capacity.saturating_sub(candidates_visited as usize));
-        let Some(listing) = list_thread_retention_directory_blocking(&directory, record_budget)?
+        let transaction_budget = capacity.saturating_sub(transactions.len());
+        let Some(listing) =
+            list_thread_retention_directory_blocking(&directory, record_budget, transaction_budget)?
         else {
             continue;
         };
         candidates_visited = candidates_visited.saturating_add(listing.candidates);
-        let room = capacity.saturating_sub(transactions.len());
-        transactions.extend(listing.transactions.into_iter().take(room));
+        transactions.extend(listing.transactions);
         if listing.over_budget {
             index = None;
         }
@@ -3568,7 +3606,7 @@ pub fn reserve_canonical_retention(
     id: ToolOutputArtifactId,
 ) -> PendingCanonicalRetention {
     let path = home.join("tool-output").join(thread_id).join(format!("{id}.log"));
-    lock_retention_registry().pending_canonical.insert(path.clone());
+    lock_canonical_retention_registry().pending_canonical.insert(path.clone());
     PendingCanonicalRetention { path, settled: false }
 }
 
@@ -3579,7 +3617,7 @@ pub struct PendingCanonicalRetention {
 
 impl PendingCanonicalRetention {
     pub fn settle(mut self, artifact: &CanonicalOutputArtifact) {
-        let mut registry = lock_retention_registry();
+        let mut registry = lock_canonical_retention_registry();
         registry.pending_canonical.remove(&self.path);
         if !artifact.complete {
             registry.failed_canonical.insert(self.path.clone(),
@@ -3596,7 +3634,7 @@ impl PendingCanonicalRetention {
 impl Drop for PendingCanonicalRetention {
     fn drop(&mut self) {
         if !self.settled {
-            let mut registry = lock_retention_registry();
+            let mut registry = lock_canonical_retention_registry();
             registry.pending_canonical.remove(&self.path);
             registry.failed_canonical.insert(self.path.clone(),
                 "canonical retention owner ended before settlement; do not replay effects".into());
@@ -4032,25 +4070,32 @@ fn commit_create_canonical_output_artifact(
         && canonical.exact_bytes.saturating_add(metadata_budget)
             <= MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD.min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL);
     let usage = if protected_source {
-        None
+        Ok(None)
     } else {
         enforce_retention_locked_blocking(
             &directory,
             &path,
             canonical.exact_bytes.saturating_add(metadata_budget),
             1,
-        );
-        Some(retention_usage_locked_blocking(&directory))
+        )
+        .map(|()| Some(retention_usage_locked_blocking(&directory)))
     };
-    if !retention_shared_lock_held(&root) {
-        return CanonicalOutputArtifact {
-            id: Some(id),
-            retained_bytes: 0,
-            complete: false,
-            unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
-            error: Some("lost the canonical artifact retention lock".to_string()),
-        };
-    }
+    let usage = match usage {
+        _ if !retention_shared_lock_held(&root) => Err("lost the canonical artifact retention lock"),
+        other => other,
+    };
+    let usage = match usage {
+        Ok(usage) => usage,
+        Err(error) => {
+            return CanonicalOutputArtifact {
+                id: Some(id),
+                retained_bytes: 0,
+                complete: false,
+                unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
+                error: Some(error.to_string()),
+            };
+        }
+    };
     let available = usage.map_or(
         MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD.min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL),
         |usage| MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
@@ -4556,7 +4601,7 @@ fn commit_attach_canonical_output_artifact(
             };
         }
     };
-    enforce_retention_locked_blocking(
+    let usage = enforce_retention_locked_blocking(
         &directory,
         &path,
         canonical
@@ -4564,21 +4609,28 @@ fn commit_attach_canonical_output_artifact(
             .saturating_sub(existing.len() as u64)
             .saturating_add(metadata_budget),
         0,
-    );
-    let usage = retention_usage_locked_blocking(&directory);
-    if !retention_shared_lock_held(&root) {
-        return CanonicalOutputArtifact {
-            id: Some(id),
-            retained_bytes: existing.len() as u64,
-            complete: false,
-            unavailable_ranges: normalized_unavailable_ranges(
-                canonical.exact_bytes,
-                &canonical.unavailable_ranges,
-                existing.len() as u64,
-            ),
-            error: Some("lost the canonical artifact retention lock".to_string()),
-        };
-    }
+    )
+    .map(|()| retention_usage_locked_blocking(&directory));
+    let usage = match usage {
+        _ if !retention_shared_lock_held(&root) => Err("lost the canonical artifact retention lock"),
+        other => other,
+    };
+    let usage = match usage {
+        Ok(usage) => usage,
+        Err(error) => {
+            return CanonicalOutputArtifact {
+                id: Some(id),
+                retained_bytes: existing.len() as u64,
+                complete: false,
+                unavailable_ranges: normalized_unavailable_ranges(
+                    canonical.exact_bytes,
+                    &canonical.unavailable_ranges,
+                    existing.len() as u64,
+                ),
+                error: Some(error.to_string()),
+            };
+        }
+    };
     let additional_available = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
         .saturating_sub(usage.thread_bytes)
         .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(usage.global_bytes));
@@ -5150,11 +5202,13 @@ async fn protect_tool_history_artifact_batch(
             let result = (|| {
                 match std::fs::symlink_metadata(&marker) {
                     Ok(_) => {
-                        if !protection_marker_status(
-                            &marker,
+                        let file = open_protection_marker(&marker)
+                            .map_err(|error| format!("failed to open artifact protection: {error}"))?;
+                        if !protection_marker_matches(
+                            file,
                             ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
                         )
-                        .unwrap_or(false)
+                        .map_err(|error| format!("failed to inspect artifact protection: {error}"))?
                         {
                             return Err(
                                 "active tool-history protection marker is invalid".to_string()
@@ -7759,7 +7813,7 @@ pub async fn read_complete_canonical_snapshot(
         .join(thread_id)
         .join(format!("{id}.log"));
     {
-        let registry = lock_retention_registry();
+        let registry = lock_canonical_retention_registry();
         if registry.pending_canonical.contains(&path) {
             return Err(ReadToolOutputError::StillWriting);
         }
@@ -7953,7 +8007,7 @@ async fn load_tool_output_snapshot_with_limit(
         // its metadata file. Consult custody before interpreting a missing file
         // as expiry; no disk or cache lock is held under this registry guard.
         {
-            let registry = lock_retention_registry();
+            let registry = lock_canonical_retention_registry();
             if registry.pending_canonical.contains(&path) {
                 return Err(ReadToolOutputError::StillWriting);
             }
@@ -9081,9 +9135,9 @@ fn reconcile_retention_root_listing_transactions_blocking(
     }
 }
 
-fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> RetentionModeKind {
+fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> Option<RetentionModeKind> {
     if indexing_disabled().load(Ordering::Acquire) {
-        return RetentionModeKind::Disabled;
+        return Some(RetentionModeKind::Disabled);
     }
     let root = normalized_tool_output_root(root);
     let mode = {
@@ -9126,21 +9180,24 @@ fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> R
         }
     };
     if mode != RetentionModeKind::Dirty {
-        return mode;
+        return Some(mode);
     }
     // A permit holder rebuilds without the shared lock, then recovers the
     // interrupted transactions the scan listed once the lock is back.
     let mut transactions = Vec::new();
-    let reconciled = without_shared_retention_lock(&root, || {
+    let Some(reconciled) = without_shared_retention_lock(&root, || {
         reconcile_retention_root_listing_transactions_blocking(&root, &mut transactions)
-    });
+    }) else {
+        // The scan may already have published locally. Retire that view before
+        // this permit holder can use it for eviction or admission.
+        let mut registry = lock_retention_registry();
+        transition_current_root_to_dirty(&mut registry, &root);
+        return None;
+    };
     if !transactions.is_empty() && retention_shared_lock_held(&root) {
         recover_listed_logical_artifact_transactions_blocking(&root, &transactions);
     }
-    if reconciled != RetentionModeKind::Indexed {
-        return reconciled;
-    }
-    RetentionModeKind::Indexed
+    Some(reconciled)
 }
 
 /// Periodic reconciliation only corrects drift in an index that deltas keep
@@ -9187,16 +9244,22 @@ async fn refresh_indexed_retention_root(root: PathBuf) {
             return;
         };
         let step_root = root.clone();
+        let transaction_budget = capacity.saturating_sub(transactions.len());
         let step = tokio::task::spawn_blocking(move || {
             let _admission = admission;
-            refresh_retention_directory_step_blocking(&step_root, generation, &directory, capacity)
+            refresh_retention_directory_step_blocking(
+                &step_root,
+                generation,
+                &directory,
+                capacity,
+                transaction_budget,
+            )
         })
         .await;
         let Ok(Some(listed_transactions)) = step else {
             return;
         };
-        let room = capacity.saturating_sub(transactions.len());
-        transactions.extend(listed_transactions.into_iter().take(room));
+        transactions.extend(listed_transactions);
     }
     let finish_root = root.clone();
     let _ = tokio::task::spawn_blocking(move || {
@@ -9219,7 +9282,7 @@ async fn refresh_indexed_retention_root(root: PathBuf) {
 /// Starts a due refresh: observes the shared generation it starts from and
 /// lists the root. Returns the generation, capacity, and directories to list,
 /// including indexed directories that have since been removed.
-fn begin_retention_refresh_blocking(root: &Path) -> Option<(u64, usize, Vec<PathBuf>)> {
+fn begin_retention_refresh_blocking(root: &Path) -> Option<(u64, usize, BTreeSet<PathBuf>)> {
     let (generation, capacity) = {
         let registry = lock_retention_registry();
         let state = registry.roots.get(root)?;
@@ -9236,23 +9299,27 @@ fn begin_retention_refresh_blocking(root: &Path) -> Option<(u64, usize, Vec<Path
         // The stale mark stays set, so a later pass rescans.
         tracing::debug!(target: "codex_core::tools::command_output_artifact", %error, "artifact retention generation is unavailable");
     }
-    let listed = retention_thread_directories_blocking(root);
+    // Complete the root listing before any refresh step updates the index.
+    // Store it directly in the ordered set that the async loop will consume.
+    let mut directories = BTreeSet::new();
+    let listed = visit_retention_thread_directories_blocking(root, |path| {
+        directories.insert(path);
+    });
     let mut registry = lock_retention_registry();
     let state = registry.roots.get_mut(root)?;
     if state.generation != generation {
         return None;
     }
-    let Ok(listed) = listed else {
+    if listed.is_err() {
         // Like a failed rebuild, an unreadable root leaves no usable index.
         transition_current_root_to_dirty(&mut registry, root);
         return None;
-    };
+    }
     let RetentionRootMode::Indexed(index) = &state.mode else {
         return None;
     };
-    let mut directories = listed.into_iter().collect::<BTreeSet<_>>();
     directories.extend(index.threads.keys().cloned());
-    Some((generation, capacity, directories.into_iter().collect()))
+    Some((generation, capacity, directories))
 }
 
 /// Lists one directory and applies it to the live index, unless a rebuild has
@@ -9263,8 +9330,10 @@ fn refresh_retention_directory_step_blocking(
     generation: u64,
     directory: &Path,
     capacity: usize,
+    transaction_budget: usize,
 ) -> Option<Vec<PathBuf>> {
-    let listing = list_thread_retention_directory_blocking(directory, Some(capacity));
+    let listing =
+        list_thread_retention_directory_blocking(directory, Some(capacity), transaction_budget);
     let mut registry = lock_retention_registry();
     let state = registry.roots.get_mut(root)?;
     if state.generation != generation {
@@ -9364,7 +9433,7 @@ fn refresh_retention_thread_directory_blocking(root: &Path, directory: &Path) ->
         }
         (state.generation, MAX_RETENTION_INDEX_RECORDS)
     };
-    let listing = list_thread_retention_directory_blocking(directory, Some(capacity));
+    let listing = list_thread_retention_directory_blocking(directory, Some(capacity), 0);
     let mut registry = lock_retention_registry();
     let Some(state) = registry.roots.get_mut(root) else {
         return RetentionModeKind::Dirty;
@@ -9629,7 +9698,7 @@ async fn enforce_retention(directory: &Path, keep_path: &Path) {
     if let Err(error) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         publish_observed_path_blocking(&token, &keep_path);
-        enforce_retention_locked_blocking(&directory, &keep_path, 0, 0);
+        let _ = enforce_retention_locked_blocking(&directory, &keep_path, 0, 0);
     })
     .await
     {
@@ -9654,7 +9723,7 @@ async fn enforce_retention_after_observation(
     if let Err(error) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         publish_observed_path_blocking(&token, &path);
-        enforce_retention_locked_blocking(&directory, &path, 0, 0);
+        let _ = enforce_retention_locked_blocking(&directory, &path, 0, 0);
     })
     .await
     {
@@ -9683,7 +9752,7 @@ async fn enforce_retention_after_upsert(
             Ok(None) => publish_known_remove(&token, &path, false),
             Err(_) => reject_stale_delta(&token),
         }
-        enforce_retention_locked_blocking(&directory, &path, 0, 0);
+        let _ = enforce_retention_locked_blocking(&directory, &path, 0, 0);
     })
     .await
     {
@@ -10088,13 +10157,13 @@ fn enforce_retention_locked_blocking(
     keep_path: &Path,
     reserved_bytes: u64,
     reserved_artifacts: usize,
-) {
+) -> Result<(), &'static str> {
     let root = tool_output_root_for_directory(directory);
     let shared_lock_held = retention_shared_lock_held(&root);
     if reconcile_logical_artifact_transactions(directory).is_err() {
         let mut registry = lock_retention_registry();
         transition_current_root_to_dirty(&mut registry, &root);
-        return;
+        return Ok(());
     }
     let mut external_generation_changed = take_retention_interprocess_index_stale(&root);
     if external_generation_changed && defer_external_retention_reconciliation(&root) {
@@ -10103,9 +10172,12 @@ fn enforce_retention_locked_blocking(
         external_generation_changed = false;
     }
     // A forced rebuild also recovers other threads' interrupted transactions.
-    let mode = prepare_retention_mode_blocking(&root, external_generation_changed);
+    let Some(mode) = prepare_retention_mode_blocking(&root, external_generation_changed) else {
+        // Do not let byte headroom substitute for the skipped count check.
+        return Err("artifact retention changed during the quota scan");
+    };
     if shared_lock_held && !retention_shared_lock_held(&root) {
-        return;
+        return Ok(());
     }
     match mode {
         RetentionModeKind::Indexed => {
@@ -10116,7 +10188,7 @@ fn enforce_retention_locked_blocking(
                 reserved_bytes,
                 reserved_artifacts,
             ) {
-                return;
+                return Ok(());
             }
             let _ = enforce_indexed_global_retention_blocking(
                 &root,
@@ -10136,6 +10208,7 @@ fn enforce_retention_locked_blocking(
         }
         RetentionModeKind::Dirty | RetentionModeKind::Reconciling => {}
     }
+    Ok(())
 }
 
 fn run_scan_only_retention_blocking(
@@ -10362,6 +10435,7 @@ fn retention_usage_locked_blocking(directory: &Path) -> RetentionUsage {
         global_bytes: without_shared_retention_lock(&root, || {
             log_bytes_in_tool_output_root_blocking(&root)
         })
+        .and_then(Result::ok)
         .unwrap_or(u64::MAX),
     }
 }
@@ -10449,26 +10523,31 @@ fn retention_shared_lock_held(root: &Path) -> bool {
 /// every other process's artifact commit behind it for seconds. Commits that
 /// land meanwhile leave the pass incomplete rather than wrong, and retaking
 /// the lock advances the generation, which marks this index stale for them.
-/// If the lock cannot be retaken, `retention_shared_lock_held` turns false and
-/// the holder must not mutate the root. Without a held permit, just runs.
-fn without_shared_retention_lock<R>(root: &Path, pass: impl FnOnce() -> R) -> R {
+/// Discard the pass result if the generation changed or the lock could not be
+/// retaken. If reacquisition fails, the holder must not mutate the root.
+/// Without a held permit, just runs the pass as before.
+fn without_shared_retention_lock<R>(root: &Path, pass: impl FnOnce() -> R) -> Option<R> {
     let root = normalized_tool_output_root(root);
     let released = held_retention_locks().remove(&root);
     let Some(lock) = released else {
-        return pass();
+        return Some(pass());
     };
     drop(lock);
     let result = pass();
     let lock_target = retention_interprocess_lock_target(&root);
     match acquire_atomic_write_lock(&lock_target).and_then(|lock| {
-        advance_retention_interprocess_generation(&root, &lock_target, None).map(|()| lock)
+        advance_retention_interprocess_generation(&root, &lock_target, None)
+            .map(|generation_changed| (lock, generation_changed))
     }) {
-        Ok(lock) => {
+        Ok((lock, generation_changed)) => {
             held_retention_locks().insert(root, lock);
+            (!generation_changed).then_some(result)
         }
-        Err(error) => record_retention_sweep_permit_failure(&root, &error),
+        Err(error) => {
+            record_retention_sweep_permit_failure(&root, &error);
+            None
+        }
     }
-    result
 }
 
 fn record_retention_sweep_permit_failure(root: &Path, error: &dyn fmt::Display) {
@@ -10527,7 +10606,7 @@ fn advance_retention_interprocess_generation(
     root: &Path,
     lock_target: &Path,
     deadline: Option<tokio::time::Instant>,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     if let Some(deadline) = deadline {
         remaining_admission_time(deadline)?;
     }
@@ -10569,11 +10648,15 @@ fn advance_retention_interprocess_generation(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state = retention_interprocess_state(&mut states, root);
-    if recovered || state.generation.is_none_or(|observed| observed != previous) {
+    // Report this advance's observation separately from an older stale flag
+    // retained for a deliberately deferred background scan.
+    let generation_changed =
+        recovered || state.generation.is_none_or(|observed| observed != previous);
+    if generation_changed {
         state.index_stale = true;
     }
     state.generation = Some(next);
-    Ok(())
+    Ok(generation_changed)
 }
 
 /// Records the shared generation that a scan without the shared lock starts

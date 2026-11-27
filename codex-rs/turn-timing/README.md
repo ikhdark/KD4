@@ -169,7 +169,9 @@ provider compute/queue/reasoning timing still requires provider evidence.
 
 Terminal diagnostics use the same opt-in journal and process clock:
 `terminal_state_complete` brackets only the terminal snapshot's inner
-state completion, with a flag for cached results. The start/end pairs for
+state completion, with a flag for cached results. The snapshot admits this row
+to the prepared bounded runtime-async lane; only a retained row is append
+evidence. The start/end pairs for
 `terminal_rollout_append` and `terminal_rollout_barrier` distinguish ordered
 append acknowledgment from stable-storage acknowledgment; an abandoned span
 does not establish cancellation of a queued write. These pairs are absent on

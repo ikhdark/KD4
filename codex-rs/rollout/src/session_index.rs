@@ -112,21 +112,26 @@ fn with_session_index_lock<T>(
     // not block every later index mutation forever (upstream #57358).
     let deadline = std::time::Instant::now() + SESSION_INDEX_LOCK_TIMEOUT;
     loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         match lock_file.try_lock() {
+            Ok(()) if std::time::Instant::now() < deadline => return operation(),
             Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    "timed out waiting for the session index lock; another Codex process may be suspended",
-                ));
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
             }
             Err(std::fs::TryLockError::Error(err)) => return Err(err),
         }
     }
-    operation()
+    Err(std::io::Error::new(
+        ErrorKind::TimedOut,
+        "timed out waiting for the session index lock; another Codex process may be suspended",
+    ))
 }
 
 fn remove_thread_name_entries_blocking(

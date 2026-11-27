@@ -78,14 +78,13 @@ impl PluginsManager {
 
         let use_remote_global_catalog =
             input.plugins.remote_plugin_enabled && auth.is_some_and(CodexAuth::uses_codex_backend);
-        let marketplaces = self
-            .list_marketplaces_for_config_async(
+        let (outcome, curated_snapshot) = self
+            .list_tool_suggest_marketplaces(
                 &input.plugins,
                 /*include_openai_curated*/ !use_remote_global_catalog,
             )
             .await
-            .context("failed to list plugin marketplaces for tool suggestions")?
-            .marketplaces;
+            .context("failed to list plugin marketplaces for tool suggestions")?;
         let remote_installed_marketplaces = if use_remote_global_catalog {
             self.build_remote_installed_plugin_marketplaces_from_cache(&[
                 REMOTE_GLOBAL_MARKETPLACE_NAME,
@@ -95,10 +94,9 @@ impl PluginsManager {
         };
         let skill_config_rules = skill_config_rules_from_stack(&input.plugins.config_layer_stack);
 
-        let mut discoverable_plugins = Vec::<ToolSuggestDiscoverablePlugin>::new();
-        for marketplace in marketplaces {
-            let marketplace_name = marketplace.name;
-
+        let mut curated = Vec::new();
+        let mut other = Vec::new();
+        for marketplace in outcome.marketplaces {
             for plugin in marketplace.plugins {
                 let is_configured_plugin = input.configured_plugin_ids.contains(plugin.id.as_str());
                 let is_fallback_plugin = is_tool_suggest_fallback_plugin(&plugin.id);
@@ -110,12 +108,29 @@ impl PluginsManager {
                     continue;
                 }
 
-                let plugin_id = plugin.id.clone();
+                let candidates = if curated_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.contains_plugin(&plugin.id))
+                {
+                    &mut curated
+                } else {
+                    &mut other
+                };
+                candidates.push((marketplace.name.clone(), plugin));
+            }
+        }
+
+        // Release the publication lease before touching non-curated metadata or
+        // the installed/remote plugin loaders, which can wait on other owners.
+        let mut discoverable_plugins = Vec::new();
+        for (candidates, snapshot) in [(curated, curated_snapshot), (other, None)] {
+            for (marketplace_name, plugin) in candidates {
                 match self
                     .tool_suggest_metadata_for_marketplace_plugin(
                         &marketplace_name,
                         &plugin,
                         &skill_config_rules,
+                        snapshot.as_ref(),
                     )
                     .await
                 {
@@ -135,7 +150,10 @@ impl PluginsManager {
                         });
                     }
                     Err(err) => {
-                        warn!("failed to load discoverable plugin suggestion {plugin_id}: {err:#}")
+                        warn!(
+                            "failed to load discoverable plugin suggestion {}: {err:#}",
+                            plugin.id
+                        );
                     }
                 }
             }

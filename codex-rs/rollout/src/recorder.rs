@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::fs;
 use std::fs::File;
+use std::future::Future;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Read;
@@ -26,6 +27,8 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use time::macros::format_description;
@@ -245,6 +248,8 @@ enum RolloutCmd {
     Maintenance {
         ack: oneshot::Sender<std::io::Result<()>>,
         decision: oneshot::Receiver<MaintenanceDecision>,
+        preserve_bytes: bool,
+        publication_order: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     },
 }
 
@@ -743,6 +748,26 @@ impl RolloutRecorder {
     /// Quiesce this recorder before acquiring rollout-move or maintenance locks.
     /// Bounded admission prevents blocked storage from stranding a delete caller.
     pub async fn pause_for_maintenance(&self) -> std::io::Result<RolloutMaintenanceGuard> {
+        self.pause_for_maintenance_inner(false, None).await
+    }
+
+    /// Quiesce under the caller's per-thread publication order. Keep a share
+    /// until the writer completes rollback, including after caller cancellation.
+    /// An outstanding intent owns its exact bytes: do not flush or repair them.
+    pub async fn pause_for_maintenance_ordered(
+        &self,
+        publication_order: Arc<tokio::sync::OwnedMutexGuard<()>>,
+        preserve_bytes: bool,
+    ) -> std::io::Result<RolloutMaintenanceGuard> {
+        self.pause_for_maintenance_inner(preserve_bytes, Some(publication_order))
+            .await
+    }
+
+    async fn pause_for_maintenance_inner(
+        &self,
+        preserve_bytes: bool,
+        publication_order: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> std::io::Result<RolloutMaintenanceGuard> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let enqueue_guard = Arc::clone(&self.writer_task.enqueue_gate)
                 .acquire_owned()
@@ -764,6 +789,8 @@ impl RolloutRecorder {
             permit.send(RolloutCmd::Maintenance {
                 ack,
                 decision: receiver,
+                preserve_bytes,
+                publication_order,
             });
             ready.await.map_err(|_| {
                 self.writer_task
@@ -1487,7 +1514,9 @@ impl RolloutRecorder {
         if exclude_context_replay {
             reader.exclude_context_replay();
         }
-        if codex_protocol::timing::observations::enabled() { reader.capture_source_revision(false); }
+        if codex_protocol::timing::observations::prepare_runtime_async_lane() {
+            reader.capture_source_revision(false);
+        }
         if capture_payload_versions {
             reader.capture_payload_versions();
         }
@@ -1564,7 +1593,7 @@ impl RolloutRecorder {
         }
         let thread_id = decoder.finish(path)?;
         if let Some(revision) = reader.source_revision() {
-            let _ = codex_protocol::timing::observations::record("reload_rollout_observed",
+            let _ = codex_protocol::timing::observations::enqueue_runtime("reload_rollout_observed",
                 &thread_id.map(|id| id.to_string()).unwrap_or_default(), "", "source_reconstruction",
                 serde_json::json!({"store_id":crate::diagnostic_revision::store_id(path),
                     "revision":revision, "parse_errors":decoder.parse_errors,
@@ -2119,12 +2148,14 @@ impl LockedRolloutFile {
 }
 
 fn open_log_file(path: &Path) -> std::io::Result<LockedRolloutFile> {
-    open_log_file_with_options(path, /*create*/ true).map(|(_, file)| file)
+    open_log_file_with_options(path, /*create*/ true, /*repair_tail*/ true)
+        .map(|(_, file)| file)
 }
 
 fn open_log_file_with_options(
     path: &Path,
     create: bool,
+    repair_tail: bool,
 ) -> std::io::Result<(PathBuf, LockedRolloutFile)> {
     let payload_retention = crate::payload_artifact::lock_publication(path)?;
     let (path, append_lock) = compression::lock_rollout_for_append_blocking(path)?;
@@ -2142,7 +2173,9 @@ fn open_log_file_with_options(
 
     let mut file = options.open(&path)?;
 
-    ensure_rollout_is_newline_terminated(&mut file)?;
+    if repair_tail {
+        ensure_rollout_is_newline_terminated(&mut file)?;
+    }
     let locked_file = LockedRolloutFile {
         path: path.clone(),
         file,
@@ -2690,9 +2723,14 @@ async fn rollout_writer(
                 let _ = ack.send(());
                 return Ok(());
             }
-            RolloutCmd::Maintenance { ack, decision } => {
+            RolloutCmd::Maintenance {
+                ack,
+                decision,
+                preserve_bytes,
+                publication_order: _publication_order,
+            } => {
                 let materialized = !state.is_deferred();
-                if materialized && let Err(error) = state.flush().await {
+                if !preserve_bytes && materialized && let Err(error) = state.flush().await {
                     if state.retry_blocked_error.is_some() {
                         let _ = ack.send(Err(clone_io_error(&error)));
                         return Err(error);
@@ -2714,8 +2752,26 @@ async fn rollout_writer(
                         return Err(IoError::other("rollout maintenance restoration failed"));
                     }
                     MaintenanceDecision::Resume if materialized => {
-                        // Restore must have succeeded: never create a new file.
-                        let (_, writer) = open_rollout_for_append(&state.rollout_path).await?;
+                        // Restore must have succeeded: never create an empty rollout.
+                        let writer = if preserve_bytes {
+                            // Do not parse or repair the checkpoint's unowned tail.
+                            // Keep the retained writer state and lossless representation
+                            // handling, even if compression ran while it was paused.
+                            let path = state.rollout_path.clone();
+                            tokio::task::spawn_blocking(move || {
+                                open_log_file_with_options(
+                                    &path,
+                                    /*create*/ false,
+                                    /*repair_tail*/ false,
+                                )
+                            })
+                            .await
+                            .map_err(IoError::other)??
+                            .1
+                            .into_jsonl_writer()
+                        } else {
+                            open_rollout_for_append(&state.rollout_path).await?.1
+                        };
                         state.residency = Some((
                             Arc::clone(&writer._append_lock),
                             Arc::clone(&writer._payload_retention),
@@ -2766,6 +2822,348 @@ pub async fn append_rollout_item_to_path(
     .map_err(IoError::other)?
 }
 
+/// Opaque, versioned custody for a single physical SessionMeta append. Serialize
+/// only into the caller's durable private intent store; this contains rollout
+/// bytes and deliberately does not implement Debug.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct RolloutAppendCheckpoint {
+    version: u8,
+    recipient: ThreadId,
+    source_session: SessionId,
+    rollout_name: String,
+    offset: u64,
+    preceding_sha256: [u8; 32],
+    record_sha256: [u8; 32],
+    record: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum DurableRolloutAppendOutcome {
+    /// This call appended, including a failed write proven complete in place.
+    Appended,
+    /// A prior append was found at its checkpoint and synced without rewriting.
+    AlreadyPresent,
+    /// The intended record is not present and this attempt made no rollout
+    /// change, or the current byte owner verified a rollback to the append point.
+    Retryable(IoError),
+    /// Publication cannot be ruled out, ownership is unproven, or durability
+    /// was not confirmed. Keep the intent; never retry with a fresh checkpoint.
+    Unknown(IoError),
+    /// The input or the initial append point is unsuitable; no record was written.
+    Rejected(IoError),
+}
+
+/// Append an immutable compatibility SessionMeta record. The caller owns the
+/// logical thread lease and serializes these intents with live writer startup
+/// and other updates across retries. This routine owns representation and byte
+/// locks (also across the callback), not application-level ordering.
+///
+/// The callback must durably save this checkpoint before returning success.
+/// It must not reenter the rollout writer, nor wait for work that needs its
+/// locks. Any newly externalized payload is secured first, but no bytes have
+/// been appended to the rollout. Dropping the caller does not cancel the owner.
+pub async fn append_checkpointed_session_meta<F, Fut>(
+    rollout_path: &Path,
+    session_meta: SessionMetaLine,
+    persist_checkpoint: F,
+) -> DurableRolloutAppendOutcome
+where
+    F: FnOnce(RolloutAppendCheckpoint) -> Fut + Send + 'static,
+    Fut: Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    let path = rollout_path.to_path_buf();
+    tokio::spawn(async move {
+        append_checkpointed_session_meta_owned(&path, session_meta, persist_checkpoint).await
+    })
+    .await
+    .unwrap_or_else(|_| DurableRolloutAppendOutcome::Unknown(IoError::other(
+        "rollout append owner did not confirm its result",
+    )))
+}
+
+/// Query or complete the exact persisted append; never selects an alternate
+/// recipient or re-encodes the record. Supply the same immutable SessionMeta
+/// from the intent so a collected, unreferenced external body can be restored.
+/// Resolve a unique current active/archive target and retain the logical
+/// writer/order custody described by append_checkpointed_session_meta.
+pub async fn replay_checkpointed_session_meta(
+    rollout_path: &Path,
+    session_meta: SessionMetaLine,
+    checkpoint: RolloutAppendCheckpoint,
+) -> DurableRolloutAppendOutcome {
+    let path = rollout_path.to_path_buf();
+    tokio::spawn(async move {
+        replay_checkpointed_session_meta_owned(&path, session_meta, checkpoint).await
+    })
+    .await
+    .unwrap_or_else(|_| DurableRolloutAppendOutcome::Unknown(IoError::other(
+        "rollout replay owner did not confirm its result",
+    )))
+}
+
+const ROLLOUT_APPEND_CHECKPOINT_VERSION: u8 = 1;
+const ROLLOUT_APPEND_ANCHOR_BYTES: u64 = 4096;
+
+fn checkpointed_rollout_name(path: &Path) -> Option<String> {
+    let plain = compression::plain_rollout_path(path);
+    plain.file_name()?.to_str()
+        .filter(|name| name.ends_with(".jsonl"))
+        .map(str::to_owned)
+}
+
+// This path intentionally does not run newline repair. A persisted checkpoint
+// has first claim on interpreting an unterminated tail; repair could consume
+// the reserved position before the exact-byte comparison.
+async fn open_checkpointed_rollout(
+    path: &Path,
+    recipient: (ThreadId, SessionId),
+) -> std::io::Result<(JsonlWriter, compression::RolloutWriteLock)> {
+    let (_, writer, _, write_lock) =
+        open_rollout_for_append_with_replay_inner(path, |_, _| {}, None, Some(recipient)).await?;
+    let write_lock = write_lock.ok_or_else(|| IoError::other("missing checkpoint byte lock"))?;
+    Ok((writer, write_lock))
+}
+
+async fn append_checkpointed_session_meta_owned<F, Fut>(
+    path: &Path,
+    session_meta: SessionMetaLine,
+    persist_checkpoint: F,
+) -> DurableRolloutAppendOutcome
+where
+    F: FnOnce(RolloutAppendCheckpoint) -> Fut,
+    Fut: Future<Output = std::io::Result<()>>,
+{
+    use DurableRolloutAppendOutcome::{Rejected, Retryable, Unknown};
+
+    let Some(rollout_name) = checkpointed_rollout_name(path) else {
+        return Rejected(IoError::other("invalid rollout recipient path"));
+    };
+    let recipient = session_meta.meta.id;
+    let source_session = session_meta.meta.session_id;
+    let (mut writer, write_lock) = match open_checkpointed_rollout(path, (recipient, source_session)).await {
+        Ok(owned) => owned,
+        Err(error) if matches!(error.kind(), ErrorKind::InvalidData | ErrorKind::Unsupported) => {
+            return Rejected(IoError::other("rollout recipient is invalid or ambiguous"));
+        }
+        Err(_) => return Retryable(IoError::other("could not open rollout append position")),
+    };
+    let Ok(offset) = writer.file.metadata().await.map(|metadata| metadata.len()) else {
+        return Retryable(IoError::other("could not determine rollout append position"));
+    };
+    let preceding_sha256 = match preceding_rollout_anchor(&mut writer.file, offset).await {
+        Ok(Some(anchor)) => anchor,
+        Ok(None) => return Rejected(IoError::other("rollout append position is unterminated")),
+        Err(_) => return Retryable(IoError::other("could not read preceding rollout anchor")),
+    };
+    let captured =
+        CapturedRolloutItem::new(RolloutItem::SessionMeta(session_meta), OffsetDateTime::now_utc());
+    let Ok(record) = writer.encode_rollout_items(&[&captured]).await else {
+        return Retryable(IoError::other("could not encode rollout append"));
+    };
+    if offset.checked_add(record.len() as u64).is_none() {
+        return Rejected(IoError::other("rollout checkpoint offset overflow"));
+    }
+    let checkpoint = RolloutAppendCheckpoint {
+        version: ROLLOUT_APPEND_CHECKPOINT_VERSION,
+        recipient,
+        source_session,
+        rollout_name,
+        offset,
+        preceding_sha256,
+        record_sha256: Sha256::digest(&record).into(),
+        record,
+    };
+    if crate::payload_artifact::sync_payload_artifacts(&writer.path).await.is_err() {
+        return Retryable(IoError::other("could not secure rollout payload before checkpoint"));
+    }
+    if persist_checkpoint(checkpoint.clone()).await.is_err() {
+        // A failed acknowledgement cannot tell us whether the caller's store
+        // committed the checkpoint. No rollout write was attempted.
+        return Unknown(IoError::other("could not confirm durable rollout checkpoint"));
+    }
+    write_checkpointed_record(&mut writer, &checkpoint, &write_lock).await
+}
+
+async fn replay_checkpointed_session_meta_owned(
+    path: &Path,
+    session_meta: SessionMetaLine,
+    checkpoint: RolloutAppendCheckpoint,
+) -> DurableRolloutAppendOutcome {
+    use DurableRolloutAppendOutcome::{AlreadyPresent, Retryable, Unknown};
+
+    let record_sha256: [u8; 32] = Sha256::digest(&checkpoint.record).into();
+    if checkpoint.version != ROLLOUT_APPEND_CHECKPOINT_VERSION
+        || checkpoint.recipient != session_meta.meta.id
+        || checkpoint.source_session != session_meta.meta.session_id
+        || checkpointed_rollout_name(path).as_deref() != Some(checkpoint.rollout_name.as_str())
+        || record_sha256 != checkpoint.record_sha256
+        || !checkpoint.record.strip_suffix(b"\n")
+            .is_some_and(|line| !line.is_empty() && !line.contains(&b'\n'))
+        || checkpoint.offset.checked_add(checkpoint.record.len() as u64).is_none()
+    {
+        return Unknown(IoError::other("rollout checkpoint or recipient did not match"));
+    }
+    let recipient = (checkpoint.recipient, checkpoint.source_session);
+    let Ok((mut writer, write_lock)) = open_checkpointed_rollout(path, recipient).await else {
+        return Unknown(IoError::other("could not verify checkpoint rollout recipient"));
+    };
+    let observed = match observe_checkpoint(&mut writer.file, &checkpoint).await {
+        Ok(Some(observed)) => observed,
+        _ => return Unknown(IoError::other("rollout bytes did not confirm the checkpoint position")),
+    };
+    if observed == CheckpointPosition::Partial {
+        // A matching prefix alone is not a durable ownership witness after
+        // releasing the byte lock. In-call recovery remains in write_transaction.
+        return Unknown(IoError::other("rollout has an unowned short tail at the checkpoint"));
+    }
+    if !verify_checkpointed_metadata(&writer.path, &checkpoint, session_meta).await {
+        return Unknown(IoError::other("could not verify the checkpoint payload"));
+    }
+    if crate::payload_artifact::sync_payload_artifacts(&writer.path).await.is_err() {
+        return if observed == CheckpointPosition::Eof {
+            Retryable(IoError::other("could not secure rollout payload before retry"))
+        } else {
+            Unknown(IoError::other("could not sync the already published rollout payload"))
+        };
+    }
+    if observed == CheckpointPosition::Present {
+        if sync_checkpointed_rollout(&writer, &write_lock).await.is_err() {
+            return Unknown(IoError::other("could not sync the already published rollout record"));
+        }
+        return AlreadyPresent;
+    }
+    write_checkpointed_record(&mut writer, &checkpoint, &write_lock).await
+}
+
+#[derive(PartialEq, Eq)]
+enum CheckpointPosition {
+    Eof,
+    Partial,
+    Present,
+}
+
+async fn preceding_rollout_anchor(
+    file: &mut tokio::fs::File,
+    offset: u64,
+) -> std::io::Result<Option<[u8; 32]>> {
+    let anchor_len = offset.min(ROLLOUT_APPEND_ANCHOR_BYTES);
+    let mut anchor = [0u8; ROLLOUT_APPEND_ANCHOR_BYTES as usize];
+    let anchor = &mut anchor[..anchor_len as usize];
+    file.seek(SeekFrom::Start(offset - anchor_len)).await?;
+    file.read_exact(anchor).await?;
+    Ok((anchor.last() == Some(&b'\n')).then(|| Sha256::digest(&*anchor).into()))
+}
+
+async fn observe_checkpoint(
+    file: &mut tokio::fs::File,
+    checkpoint: &RolloutAppendCheckpoint,
+) -> std::io::Result<Option<CheckpointPosition>> {
+    let file_len = file.metadata().await?.len();
+    let Some(available) = file_len.checked_sub(checkpoint.offset) else {
+        return Ok(None);
+    };
+    if preceding_rollout_anchor(file, checkpoint.offset).await? != Some(checkpoint.preceding_sha256) {
+        return Ok(None);
+    }
+    if available == 0 {
+        return Ok(Some(CheckpointPosition::Eof));
+    }
+    let read_len = available.min(checkpoint.record.len() as u64) as usize;
+    let mut observed = [0u8; 8192];
+    for expected in checkpoint.record[..read_len].chunks(observed.len()) {
+        let observed = &mut observed[..expected.len()];
+        file.read_exact(observed).await?;
+        if &*observed != expected {
+            return Ok(None);
+        }
+    }
+    Ok(Some(if read_len == checkpoint.record.len() {
+        CheckpointPosition::Present
+    } else {
+        CheckpointPosition::Partial
+    }))
+}
+
+async fn verify_checkpointed_metadata(
+    path: &Path,
+    checkpoint: &RolloutAppendCheckpoint,
+    session_meta: SessionMetaLine,
+) -> bool {
+    let path = path.to_path_buf();
+    let record = checkpoint.record.clone();
+    let recipient = (checkpoint.recipient, checkpoint.source_session);
+    tokio::task::spawn_blocking(move || {
+        use crate::payload_artifact::HydratedRecord;
+        let record = String::from_utf8(record)?;
+        let hydrated = match crate::payload_artifact::hydrate_record(
+            &path, record.clone(), true, true, None,
+        ) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // A not-yet-referenced body may have been reclaimed while the
+                // process was down. Recreate from the immutable intent, not
+                // SQLite's current Git info, and demand the same reference.
+                let reference: Value = serde_json::from_str(&record)?;
+                let timestamp = reference["timestamp"].as_str()
+                    .ok_or_else(|| IoError::other("invalid checkpoint payload timestamp"))?;
+                let item = RolloutItem::SessionMeta(session_meta);
+                let line = RolloutLineRef {
+                    timestamp: timestamp.to_owned(),
+                    format_version: CURRENT_ROLLOUT_FORMAT_VERSION,
+                    diagnostic_origin: None,
+                    item: &item,
+                };
+                if crate::payload_artifact::store_value(&path, serde_json::to_value(&line)?)?
+                    .as_deref() != Some(record.as_bytes())
+                {
+                    return Ok(false);
+                }
+                crate::payload_artifact::hydrate_record(&path, record, true, true, None)?
+            }
+            result => result?,
+        };
+        let line: RolloutLine = match hydrated {
+            HydratedRecord::Text(line) => serde_json::from_str(&line)?,
+            HydratedRecord::Parsed(value) => serde_json::from_value(value)?,
+        };
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+            matches!(line.item, RolloutItem::SessionMeta(meta)
+                if (meta.meta.id, meta.meta.session_id) == recipient),
+        )
+    })
+    .await
+    .is_ok_and(|result| result.unwrap_or(false))
+}
+
+async fn write_checkpointed_record(
+    writer: &mut JsonlWriter,
+    checkpoint: &RolloutAppendCheckpoint,
+    write_lock: &compression::RolloutWriteLock,
+) -> DurableRolloutAppendOutcome {
+    use DurableRolloutAppendOutcome::{Appended, Retryable, Unknown};
+
+    match writer.write_transaction(&checkpoint.record, checkpoint.offset).await {
+        Ok(_) => match sync_checkpointed_rollout(writer, write_lock).await {
+            Ok(()) => Appended,
+            Err(_) => Unknown(IoError::other("could not confirm rollout append durability")),
+        },
+        Err(error) if is_unrecoverable_rollout_append_error(&error) => {
+            Unknown(IoError::other("rollout append recovery did not establish ownership"))
+        }
+        Err(_) => Retryable(IoError::other("rollout append did not commit")),
+    }
+}
+
+async fn sync_checkpointed_rollout(
+    writer: &JsonlWriter,
+    _write_lock: &compression::RolloutWriteLock,
+) -> std::io::Result<()> {
+    writer.file.sync_data().await?;
+    let path = writer.path.clone();
+    tokio::task::spawn_blocking(move || sync_rollout_namespace(&path))
+        .await
+        .map_err(IoError::other)?
+}
+
 async fn open_rollout_for_append(path: &Path) -> std::io::Result<(PathBuf, JsonlWriter)> {
     let (path, writer, _) = open_rollout_for_append_with_replay(path, |_, _| {}).await?;
     Ok((path, writer))
@@ -2795,16 +3193,19 @@ where
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let started = (*ENABLED.get_or_init(|| {
         std::env::var_os("CODEX_ROLLOUT_WRITER_OPEN_TIMING").is_some_and(|value| value == "1")
-    }) && observations::enabled())
+    }) && observations::prepare_runtime_async_lane())
     .then(Instant::now);
     let mut timing = started.map(|_| AppendWriterTiming::default());
-    let result = open_rollout_for_append_with_replay_inner(path, visit, timing.as_mut()).await;
+    let result = open_rollout_for_append_with_replay_inner(path, visit, timing.as_mut(), None)
+        .await
+        .map(|(path, writer, integrity, _)| (path, writer, integrity));
     if let (Some(started), Some(timing)) = (started, timing) {
         let total_ns = started.elapsed().as_nanos();
         let integrity = result.as_ref().ok().and_then(|(_, _, integrity)| *integrity);
         let thread_id = integrity.and_then(|(id, ..)| id).map(|id| id.to_string());
         let store_id = crate::diagnostic_revision::store_id(path);
-        let _ = observations::record(
+        // This receipt is queue admission only. The journal writer owns disk I/O.
+        let _ = observations::enqueue_runtime(
             "rollout_writer_open_summary",
             thread_id.as_deref().unwrap_or_default(),
             "",
@@ -2836,7 +3237,13 @@ async fn open_rollout_for_append_with_replay_inner<F>(
     path: &Path,
     mut visit: F,
     mut timing: Option<&mut AppendWriterTiming>,
-) -> std::io::Result<(PathBuf, JsonlWriter, Option<AppendReplayIntegrity>)>
+    checkpoint_recipient: Option<(ThreadId, SessionId)>,
+) -> std::io::Result<(
+    PathBuf,
+    JsonlWriter,
+    Option<AppendReplayIntegrity>,
+    Option<compression::RolloutWriteLock>,
+)>
 where
     F: FnMut(RolloutItem, usize),
 {
@@ -2849,6 +3256,12 @@ where
         let retention = crate::payload_artifact::lock_publication(&lock_path)?;
         let append = compression::lock_rollout_before_append_blocking(&lock_path)?;
         let snapshot = compression::lock_rollout_for_write_blocking(&lock_path)?;
+        if checkpoint_recipient.is_some() {
+            let plain = compression::plain_rollout_path(&lock_path);
+            if plain.try_exists()? && plain.with_extension("jsonl.zst").try_exists()? {
+                return Err(IoError::new(ErrorKind::InvalidData, "ambiguous rollout representations"));
+            }
+        }
         Ok::<_, IoError>((retention, append, snapshot))
     })
     .await
@@ -2861,6 +3274,7 @@ where
     // Collection and append preflight share this one verified observation,
     // while all publication/representation/byte-write owners remain held.
     let preflight_started = timing.as_ref().map(|_| Instant::now());
+    let mut actual_recipient = None;
     let replay = RolloutRecorder::visit_rollout_with_origins(
         &path,
         true,
@@ -2868,7 +3282,15 @@ where
         false,
         false,
         timing.as_deref_mut(),
-        |item, record, _| visit(item, record),
+        |item, record, _| {
+            if checkpoint_recipient.is_some()
+                && actual_recipient.is_none()
+                && let RolloutItem::SessionMeta(meta) = &item
+            {
+                actual_recipient = Some((meta.meta.id, meta.meta.session_id));
+            }
+            visit(item, record);
+        },
     )
     .await;
     if let (Some(timing), Some(started)) = (timing.as_mut(), preflight_started) {
@@ -2885,6 +3307,10 @@ where
             Some((id, errors, partial, unresolved))
         }
     };
+    // Do not use the decoder's filename fallback as recipient proof.
+    if checkpoint_recipient.is_some() && checkpoint_recipient != actual_recipient {
+        return Err(IoError::new(ErrorKind::InvalidData, "rollout recipient mismatch"));
+    }
     let materialize_started = timing.as_ref().map(|_| Instant::now());
     let materialized = tokio::task::spawn_blocking(move || {
         let path = compression::materialize_rollout_for_append_locked(&path)?;
@@ -2892,7 +3318,9 @@ where
             .read(true)
             .append(true)
             .open(&path)?;
-        ensure_rollout_is_newline_terminated(&mut file)?;
+        if checkpoint_recipient.is_none() {
+            ensure_rollout_is_newline_terminated(&mut file)?;
+        }
         let file = LockedRolloutFile {
             path: path.clone(),
             file,
@@ -2900,16 +3328,16 @@ where
             append_lock,
             payload_retention,
         };
-        drop(snapshot);
-        Ok::<_, IoError>((path, file.into_jsonl_writer()))
+        let write_lock = checkpoint_recipient.is_some().then_some(snapshot);
+        Ok::<_, IoError>((path, file.into_jsonl_writer(), write_lock))
     })
     .await
     .map_err(IoError::other);
     if let (Some(timing), Some(started)) = (timing, materialize_started) {
         timing.writer_materialize = started.elapsed();
     }
-    let (path, writer) = materialized??;
-    Ok((path, writer, integrity))
+    let (path, writer, write_lock) = materialized??;
+    Ok((path, writer, integrity, write_lock))
 }
 
 fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> {
@@ -3091,6 +3519,14 @@ impl JsonlWriter {
         if rollout_items.is_empty() {
             return Ok(append_start);
         }
+        let bytes = self.encode_rollout_items(rollout_items).await?;
+        self.write_transaction(&bytes, append_start).await
+    }
+
+    async fn encode_rollout_items(
+        &self,
+        rollout_items: &[&CapturedRolloutItem],
+    ) -> std::io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         for captured in rollout_items {
             let item = match &captured.item {
@@ -3144,7 +3580,7 @@ impl JsonlWriter {
                 }
             }
         }
-        self.write_transaction(&bytes, append_start).await
+        Ok(bytes)
     }
 
     async fn write_transaction(&mut self, bytes: &[u8], append_start: u64) -> std::io::Result<u64> {

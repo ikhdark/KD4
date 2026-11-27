@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::SESSIONS_SUBDIR;
@@ -489,6 +490,7 @@ struct StagedRolloutFiles {
     committed: bool,
     // Retained through rollback/commit, including detached filesystem work.
     _writer_leases: Vec<std::sync::Arc<std::fs::File>>,
+    _publication_orders: Vec<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     recorder_pauses: Vec<codex_rollout::RolloutMaintenanceGuard>,
     _rollout_locks: Vec<std::fs::File>,
     retirement_pending: bool,
@@ -839,21 +841,42 @@ async fn stage_thread_deletes_inner<'a>(
     let mut ordered_ids = requested_ids.clone();
     ordered_ids.sort_by_key(ToString::to_string);
     ordered_ids.dedup();
+    // Match metadata/live writer lock order. Stale staging recovery above
+    // owns moves first and must never wait for a local publication order.
+    // Obtain all orders in a stable order before pausing any recorder.
+    let mut publication_orders = Vec::with_capacity(ordered_ids.len());
+    for &id in &ordered_ids {
+        publication_orders.push(Arc::new(store.lock_rollout_publication(id).await));
+    }
     let mut writer_leases = Vec::new();
     let mut recorder_pauses = Vec::new();
-    for id in ordered_ids {
+    for (id, order) in ordered_ids.into_iter().zip(&publication_orders) {
         // Never hold the registry mutex or moves lock while waiting for a writer.
-        // Sorted IDs also serialize overlapping multi-thread deletions consistently.
         if let Ok(recorder) = store.live_recorder(id).await {
+            let lease = match recorder.writer_lease() {
+                Some(lease) => lease,
+                None => store.acquire_writer_lease(id, false).await?,
+            };
+            // Inspect the authoritative head under the order and exact writer
+            // lease, without reentering staged recovery via state_db().
+            let preserve_bytes = if let Some(db) = store.state_db.as_ref() {
+                match db.next_thread_git_compatibility_intent(id).await {
+                    Ok(intent) => intent.is_some(),
+                    Err(error) => {
+                        // Unknown is not permission to repair or append. The
+                        // authoritative delete transaction can still retire it.
+                        tracing::warn!(thread_id = %id, %error, "preserving rollout bytes during deletion: Git intent state is unknown");
+                        true
+                    }
+                }
+            } else {
+                false
+            };
             let pause = recorder
-                .pause_for_maintenance()
+                .pause_for_maintenance_ordered(Arc::clone(order), preserve_bytes)
                 .await
                 .map_err(delete_recovery_error)?;
-            if let Some(lease) = recorder.writer_lease() {
-                writer_leases.push(lease);
-            } else {
-                writer_leases.push(store.acquire_writer_lease(id, false).await?);
-            }
+            writer_leases.push(lease);
             recorder_pauses.push(pause);
         } else {
             writer_leases.push(store.acquire_writer_lease(id, false).await?);
@@ -870,29 +893,30 @@ async fn stage_thread_deletes_inner<'a>(
                 delete_recovery_error(error)
             }
         })?;
-    let (moves, recorder_pauses, writer_leases) = if let Some(cutoff) = archive_cutoff {
-        // Keep the move fence, writer pauses and leases until the age check settles.
-        let owners = (moves, recorder_pauses, writer_leases);
-        tokio::task::spawn_blocking(move || {
-            for lease in &owners.2 {
-                let modified: chrono::DateTime<chrono::Utc> = lease
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .map_err(delete_recovery_error)?
-                    .into();
-                if modified.timestamp() > cutoff {
-                    return Err(ThreadStoreError::Conflict {
-                        message: "recent archive or newly observed writer lease".into(),
-                    });
+    let (moves, recorder_pauses, writer_leases, publication_orders) =
+        if let Some(cutoff) = archive_cutoff {
+            // Keep the move fence and all writer ownership until the age check settles.
+            let owners = (moves, recorder_pauses, writer_leases, publication_orders);
+            tokio::task::spawn_blocking(move || {
+                for lease in &owners.2 {
+                    let modified: chrono::DateTime<chrono::Utc> = lease
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .map_err(delete_recovery_error)?
+                        .into();
+                    if modified.timestamp() > cutoff {
+                        return Err(ThreadStoreError::Conflict {
+                            message: "recent archive or newly observed writer lease".into(),
+                        });
+                    }
                 }
-            }
-            Ok(owners)
-        })
-        .await
-        .map_err(delete_recovery_error)??
-    } else {
-        (moves, recorder_pauses, writer_leases)
-    };
+                Ok(owners)
+            })
+            .await
+            .map_err(delete_recovery_error)??
+        } else {
+            (moves, recorder_pauses, writer_leases, publication_orders)
+        };
     let staging_kind = if store.state_db.is_some() {
         SQLITE_BACKED_STAGING
     } else {
@@ -941,6 +965,7 @@ async fn stage_thread_deletes_inner<'a>(
                 owner_lock: None,
                 committed: false,
                 _writer_leases: writer_leases,
+                _publication_orders: publication_orders,
                 recorder_pauses,
                 _rollout_locks: Vec::new(),
                 retirement_pending: false,

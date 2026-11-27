@@ -564,6 +564,11 @@ impl MessageProcessor {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Freeze server-request issuance while standalone cleanup receives replies.
+    pub fn stop_server_request_publication(&self) {
+        self.outgoing.stop_server_request_publication();
+    }
+
     pub async fn process_request(
         self: &Arc<Self>,
         connection_id: ConnectionId,

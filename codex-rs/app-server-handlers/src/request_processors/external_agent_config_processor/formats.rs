@@ -414,10 +414,17 @@ struct HookAsset {
 impl HookAssets {
     fn read(root: &Path) -> io::Result<Self> {
         let mut entries = Vec::new();
-        let mut remaining = 256 * 1024 * 1024;
+        let mut remaining_bytes = 256 * 1024 * 1024;
+        let mut remaining_entries = 10_000;
         match fs::symlink_metadata(root) {
             Ok(metadata) if metadata.file_type().is_dir() => {
-                read_hook_assets(root, Path::new(""), &mut entries, &mut remaining)?;
+                read_hook_assets(
+                    root,
+                    Path::new(""),
+                    &mut entries,
+                    &mut remaining_bytes,
+                    &mut remaining_entries,
+                )?;
             }
             Ok(_) => return Err(io::Error::new(io::ErrorKind::Unsupported, "hook assets root must be a real directory")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -482,25 +489,30 @@ impl HookAssets {
     }
 }
 
-fn read_hook_assets(root: &Path, relative: &Path, assets: &mut Vec<HookAsset>, remaining: &mut usize) -> io::Result<()> {
+fn read_hook_assets(
+    root: &Path,
+    relative: &Path,
+    assets: &mut Vec<HookAsset>,
+    remaining_bytes: &mut usize,
+    remaining_entries: &mut usize,
+) -> io::Result<()> {
     use std::io::Read;
     let mut entries = Vec::new();
     for entry in fs::read_dir(root.join(relative))? {
-        if entries.len() + assets.len() >= 10_000 {
-            return Err(invalid_data_error("hook assets exceed the entry budget"));
-        }
+        // Ancestor batches remain live during descent. Charge each discovered
+        // entry once, before staging it, not only when it becomes an asset.
+        *remaining_entries = remaining_entries
+            .checked_sub(1)
+            .ok_or_else(|| invalid_data_error("hook assets exceed the entry budget"))?;
         entries.push(entry?);
     }
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        if assets.len() >= 10_000 {
-            return Err(invalid_data_error("hook assets exceed the entry budget"));
-        }
         let path = relative.join(entry.file_name());
         let kind = entry.file_type()?;
         if kind.is_dir() {
             assets.push(HookAsset { relative: path.clone(), contents: None, permissions: None });
-            read_hook_assets(root, &path, assets, remaining)?;
+            read_hook_assets(root, &path, assets, remaining_bytes, remaining_entries)?;
         } else if kind.is_file() {
             let file = fs::File::open(entry.path())?;
             let metadata = file.metadata()?;
@@ -508,11 +520,11 @@ fn read_hook_assets(root: &Path, relative: &Path, assets: &mut Vec<HookAsset>, r
                 return Err(invalid_data_error("hook asset changed during import"));
             }
             let mut contents = Vec::new();
-            file.take(*remaining as u64 + 1).read_to_end(&mut contents)?;
-            if contents.len() > *remaining {
+            file.take(*remaining_bytes as u64 + 1).read_to_end(&mut contents)?;
+            if contents.len() > *remaining_bytes {
                 return Err(invalid_data_error("hook assets exceed the byte budget"));
             }
-            *remaining -= contents.len();
+            *remaining_bytes -= contents.len();
             assets.push(HookAsset { relative: path, contents: Some(contents), permissions: Some(metadata.permissions()) });
         } else {
             return Err(io::Error::new(io::ErrorKind::Unsupported, format!("hook assets contain a symlink or special file: {}", entry.path().display())));

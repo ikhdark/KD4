@@ -344,7 +344,8 @@ fn json_outline(value: &serde_json::Value, depth: usize, out: &mut String) {
                 if index > 0 {
                     out.push(',');
                 }
-                let _ = write!(out, "{}:", Value::String(key.clone()));
+                json_outline_string(key, out);
+                out.push(':');
                 json_outline(child, depth - 1, out);
             }
             out.push('}');
@@ -361,21 +362,24 @@ fn json_outline(value: &serde_json::Value, depth: usize, out: &mut String) {
             }
             out.push(']');
         }
-        Value::String(text) => {
-            let chars = text.chars().count();
-            if chars <= JSON_OUTLINE_STRING_CHARS {
-                let _ = write!(out, "{value}");
-            } else {
-                let prefix = text
-                    .chars()
-                    .take(JSON_OUTLINE_STRING_CHARS)
-                    .collect::<String>();
-                let _ = write!(out, "{}…({chars} chars)", Value::String(prefix));
-            }
-        }
+        Value::String(text) => json_outline_string(text, out),
         other => {
             let _ = write!(out, "{other}");
         }
+    }
+}
+
+/// Bound the serialized preview of both values and object keys. The outline
+/// is lossy; the original string remains in the retained source.
+fn json_outline_string(text: &str, out: &mut String) {
+    let chars = text.chars().count();
+    let mut boundary = text.char_indices();
+    let prefix = boundary
+        .nth(JSON_OUTLINE_STRING_CHARS)
+        .map_or(text, |(offset, _)| &text[..offset]);
+    let _ = write!(out, "{}", serde_json::Value::String(prefix.to_owned()));
+    if chars > JSON_OUTLINE_STRING_CHARS {
+        let _ = write!(out, "…({chars} chars)");
     }
 }
 

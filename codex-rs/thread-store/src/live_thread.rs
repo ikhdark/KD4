@@ -29,9 +29,11 @@ use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadMetadataPatch;
 use crate::ThreadStore;
+use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::UpdateThreadMetadataParams;
 use crate::thread_metadata_sync::ThreadMetadataSync;
+use crate::types::ThreadGitInfoOrigin;
 
 /// Handle for an active thread's persistence lifecycle.
 ///
@@ -51,25 +53,51 @@ pub struct LiveThread {
 }
 
 struct TerminalEventIndex {
-    by_turn_id: HashMap<String, EventMsg>,
-    input_turn_ids: HashSet<String>,
-    current_turn_id: Option<String>,
-    inputs_trusted: bool,
+    // The append owner takes the reducer while the pending fence is set.
+    data: Option<TerminalEventData>,
     trusted: bool,
     pending_terminal_appends: usize,
     revision: u64,
 }
 
 impl TerminalEventIndex {
+    fn new(data: TerminalEventData) -> Self {
+        Self {
+            data: Some(data),
+            trusted: true,
+            pending_terminal_appends: 0,
+            revision: 0,
+        }
+    }
+
+    fn trusted_data(&self) -> Option<&TerminalEventData> {
+        if self.trusted && self.pending_terminal_appends == 0 {
+            self.data.as_ref()
+        } else {
+            None
+        }
+    }
+
+    // Outer None means the index cannot answer; inner None is a trusted miss.
+    fn trusted_event(&self, turn_id: &str) -> Option<Option<Arc<EventMsg>>> {
+        Some(self.trusted_data()?.by_turn_id.get(turn_id).cloned())
+    }
+}
+
+struct TerminalEventData {
+    by_turn_id: HashMap<String, Arc<EventMsg>>,
+    input_turn_ids: HashSet<String>,
+    current_turn_id: Option<String>,
+    inputs_trusted: bool,
+}
+
+impl TerminalEventData {
     fn trusted_empty() -> Self {
         Self {
             by_turn_id: HashMap::new(),
             input_turn_ids: HashSet::new(),
             current_turn_id: None,
             inputs_trusted: true,
-            trusted: true,
-            pending_terminal_appends: 0,
-            revision: 0,
         }
     }
 
@@ -112,13 +140,14 @@ impl TerminalEventIndex {
             };
             self.by_turn_id
                 .entry(turn_id.to_string())
-                .or_insert_with(|| event.clone());
+                .or_insert_with(|| Arc::new(event.clone()));
         }
     }
 }
 
 struct TerminalAppendGuard {
     index: Arc<StdMutex<TerminalEventIndex>>,
+    data: Option<TerminalEventData>,
     active: bool,
 }
 
@@ -129,42 +158,57 @@ impl TerminalAppendGuard {
                 || matches!(event, EventMsg::TurnStarted(_) | EventMsg::UserMessage(_) | EventMsg::ThreadRolledBack(_))
                 || matches!(event, EventMsg::ItemCompleted(event) if matches!(&event.item, codex_protocol::items::TurnItem::UserMessage(_))))
         });
-        if active {
+        let data = if active {
             let mut terminal_events = index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             terminal_events.pending_terminal_appends += 1;
             terminal_events.revision = terminal_events.revision.wrapping_add(1);
+            terminal_events.data.take()
+        } else {
+            None
+        };
+        Self {
+            index,
+            data,
+            active,
         }
-        Self { index, active }
     }
 
     fn commit(mut self, items: &[RolloutItem]) {
-        if self.active {
+        // The caller holds metadata_sync until settlement, so no other append
+        // or recovery can modify the reducer while it is detached.
+        if let Some(data) = self.data.as_mut() {
+            data.observe_items(items);
+        }
+        self.settle(true);
+    }
+
+    fn settle(&mut self, accepted: bool) {
+        if !self.active {
+            return;
+        }
+        let displaced = {
             let mut terminal_events = self
                 .index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            terminal_events.observe_items(items);
+            let displaced = std::mem::replace(&mut terminal_events.data, self.data.take());
             terminal_events.pending_terminal_appends -= 1;
+            terminal_events.trusted &= accepted;
             terminal_events.revision = terminal_events.revision.wrapping_add(1);
-            self.active = false;
-        }
+            displaced
+        };
+        self.active = false;
+        drop(displaced);
     }
 }
 
 impl Drop for TerminalAppendGuard {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let mut terminal_events = self
-            .index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        terminal_events.pending_terminal_appends -= 1;
-        terminal_events.trusted = false;
-        terminal_events.revision = terminal_events.revision.wrapping_add(1);
+        // Cancellation, store errors and unwinding may leave the canonical
+        // prefix ambiguous. Restore ownership without restoring trust.
+        self.settle(false);
     }
 }
 
@@ -249,7 +293,9 @@ impl LiveThread {
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             writer_retired: Default::default(),
-            terminal_events: Arc::new(StdMutex::new(TerminalEventIndex::trusted_empty())),
+            terminal_events: Arc::new(StdMutex::new(TerminalEventIndex::new(
+                TerminalEventData::trusted_empty(),
+            ))),
             fork_history: Arc::default(),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
@@ -266,7 +312,7 @@ impl LiveThread {
         let terminal_events = params
             .history
             .as_deref()
-            .map(|history| TerminalEventIndex::from_items(history));
+            .map(|history| TerminalEventData::from_items(history));
         let metadata_sync = ThreadMetadataSync::for_resume(&params);
         thread_store.resume_thread(params).await?;
         let live_thread = Self {
@@ -275,9 +321,9 @@ impl LiveThread {
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             writer_retired: Default::default(),
-            terminal_events: Arc::new(StdMutex::new(
-                terminal_events.unwrap_or_else(TerminalEventIndex::trusted_empty),
-            )),
+            terminal_events: Arc::new(StdMutex::new(TerminalEventIndex::new(
+                terminal_events.unwrap_or_else(TerminalEventData::trusted_empty),
+            ))),
             fork_history: Arc::default(),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         };
@@ -297,11 +343,14 @@ impl LiveThread {
                         .lock()
                         .await
                         .record_resume_history(&history.items);
-                    *live_thread
+                    let data = TerminalEventData::from_items(&history.items);
+                    let previous = live_thread
                         .terminal_events
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        TerminalEventIndex::from_items(&history.items);
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .data
+                        .replace(data);
+                    drop(previous);
                 }
                 Err(err) => {
                     init_guard.discard().await;
@@ -392,6 +441,11 @@ impl LiveThread {
         if items.is_empty() {
             return Ok(());
         }
+        let git_origin = if copied_origins.is_some() {
+            ThreadGitInfoOrigin::HistoricalFill
+        } else {
+            ThreadGitInfoOrigin::LiveObservation
+        };
         let origins = match copied_origins {
             None => DiagnosticOriginSource::Fresh(self.thread_id),
             Some(origins) if origins.is_empty() || items.len() == raw_items.len() => {
@@ -446,6 +500,9 @@ impl LiveThread {
         }
         terminal_append.commit(items.as_slice());
         let update = if observation_was_uncertain {
+            if git_origin == ThreadGitInfoOrigin::LiveObservation {
+                metadata_sync.record_accepted_git_observation(items.as_slice());
+            }
             if !durable {
                 // Ordered appends defer projection repair to the next barrier.
                 return Ok(());
@@ -453,7 +510,7 @@ impl LiveThread {
             self.recover_uncertain_metadata(&mut metadata_sync).await?;
             metadata_sync.take_pending_update_for_existing_history()
         } else {
-            let update = metadata_sync.observe_appended_items(items.as_slice());
+            let update = metadata_sync.observe_appended_items(items.as_slice(), git_origin);
             metadata_sync.history_observation_uncertain = false;
             update
         };
@@ -462,18 +519,9 @@ impl LiveThread {
         if durable {
             self.thread_store.flush_thread(self.thread_id).await?;
         }
-        if durable && let Some(update) = update {
-            let applied = self
-                .thread_store
-                .update_thread_metadata_applied(UpdateThreadMetadataParams {
-                    thread_id: self.thread_id,
-                    patch: update.patch.clone(),
-                    include_archived: true,
-                })
+        if durable {
+            self.apply_pending_metadata_update(&mut metadata_sync, update)
                 .await?;
-            if applied {
-                metadata_sync.mark_pending_update_applied(&update);
-            }
         }
         Ok(())
     }
@@ -582,11 +630,11 @@ impl LiveThread {
             .terminal_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let recorded = index.input_turn_ids.contains(turn_id);
-        Ok((index.trusted
-            && index.pending_terminal_appends == 0
-            && (index.inputs_trusted || recorded))
-            .then_some(recorded))
+        let Some(data) = index.trusted_data() else {
+            return Ok(None);
+        };
+        let recorded = data.input_turn_ids.contains(turn_id);
+        Ok((data.inputs_trusted || recorded).then_some(recorded))
     }
 
     /// Returns the first terminal event accepted into the canonical stream for `turn_id`.
@@ -603,46 +651,49 @@ impl LiveThread {
         turn_id: &str,
         include_archived: bool,
     ) -> ThreadStoreResult<Option<EventMsg>> {
-        {
-            let terminal_events = self
-                .terminal_events
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if terminal_events.trusted && terminal_events.pending_terminal_appends == 0 {
-                return Ok(terminal_events.by_turn_id.get(turn_id).cloned());
-            }
+        let snapshot = self
+            .terminal_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .trusted_event(turn_id);
+        if let Some(event) = snapshot {
+            return Ok(event.as_deref().cloned());
         }
 
         let _metadata_sync = self.metadata_sync.lock().await;
-        let revision = {
+        let (snapshot, revision) = {
             let terminal_events = self
                 .terminal_events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // An append or another recovery may have repaired the index while we waited.
-            if terminal_events.trusted && terminal_events.pending_terminal_appends == 0 {
-                return Ok(terminal_events.by_turn_id.get(turn_id).cloned());
-            }
-            terminal_events.revision
+            (terminal_events.trusted_event(turn_id), terminal_events.revision)
         };
+        if let Some(event) = snapshot {
+            return Ok(event.as_deref().cloned());
+        }
         // Recovery reads must include accepted ordered appends, even in a lazy writer.
         // The normal trusted lookup above never forces persistence.
         self.thread_store.persist_thread(self.thread_id).await?;
         let history = self.load_history(include_archived).await?;
-        let mut replacement = TerminalEventIndex::from_items(&history.items);
-        let loaded_event = replacement.by_turn_id.get(turn_id).cloned();
-        let mut terminal_events = self
-            .terminal_events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if terminal_events.revision == revision && terminal_events.pending_terminal_appends == 0 {
-            replacement.revision = terminal_events.revision;
-            std::mem::swap(&mut *terminal_events, &mut replacement);
-        } else if terminal_events.trusted && terminal_events.pending_terminal_appends == 0 {
-            return Ok(terminal_events.by_turn_id.get(turn_id).cloned());
-        }
-        drop(terminal_events);
-        Ok(loaded_event)
+        let data = TerminalEventData::from_items(&history.items);
+        let loaded_event = data.by_turn_id.get(turn_id).cloned();
+        let mut replacement = Some(data);
+        let event = {
+            let mut terminal_events = self
+                .terminal_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if terminal_events.revision == revision && terminal_events.pending_terminal_appends == 0 {
+                std::mem::swap(&mut terminal_events.data, &mut replacement);
+                terminal_events.trusted = true;
+                loaded_event
+            } else {
+                terminal_events.trusted_event(turn_id).unwrap_or(loaded_event)
+            }
+        };
+        drop(replacement);
+        Ok(event.as_deref().cloned())
     }
 
     pub async fn read_thread(
@@ -714,22 +765,39 @@ impl LiveThread {
                 let update = metadata_sync.take_pending_update();
                 live_thread
                     .apply_pending_metadata_update(&mut metadata_sync, update)
-                    .await?;
+                    .await
+                    .map_err(|err| match err {
+                        // This intent belongs to observed history, not the requested patch.
+                        // Do not tell callers their patch committed before it was submitted.
+                        err @ ThreadStoreError::GitCompatibilityPending { .. } => {
+                            ThreadStoreError::Conflict {
+                                message: format!(
+                                    "requested metadata update not submitted: {err}"
+                                ),
+                            }
+                        }
+                        err => err,
+                    })?;
                 let explicit_patch = patch.clone();
                 *live_thread
                     .fork_history
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Weak::new();
-                let thread = live_thread
+                let result = live_thread
                     .thread_store
                     .update_thread_metadata(UpdateThreadMetadataParams {
                         thread_id,
                         patch,
                         include_archived,
                     })
-                    .await?;
-                metadata_sync.record_explicit_update(explicit_patch);
-                Ok(thread)
+                    .await;
+                if matches!(
+                    &result,
+                    Ok(_) | Err(ThreadStoreError::GitCompatibilityPending { .. })
+                ) {
+                    metadata_sync.record_explicit_update(explicit_patch);
+                }
+                result
             }
             .await;
             if let Err(error) = &result {
@@ -778,7 +846,7 @@ impl LiveThread {
                 .await;
             match history {
                 Ok(history) => {
-                    sync.observe_appended_items(&history.items);
+                    sync.observe_recovered_history(&history.items);
                 }
                 // A barrier with no accepted items leaves a genuinely lazy local
                 // thread pathless; do not invent observed facts for that case.
@@ -806,11 +874,15 @@ impl LiveThread {
                 patch: update.patch.clone(),
                 include_archived: true,
             })
-            .await?;
-        if applied {
+            .await;
+        if matches!(
+            &applied,
+            Ok(true) | Err(ThreadStoreError::GitCompatibilityPending { .. })
+        ) {
+            // Once SQLite commits, the store owns recovery; never replay this patch.
             metadata_sync.mark_pending_update_applied(&update);
         }
-        Ok(())
+        applied.map(|_| ())
     }
 }
 

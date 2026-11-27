@@ -1434,7 +1434,9 @@ impl RemoteControlWebsocket {
     /// notices credentials written elsewhere, as the connect loop does, without
     /// reloading auth every second for a session that never signs in.
     async fn wait_for_preference_resolution_retry(&mut self, retry_attempt: &mut u64) -> bool {
-        let retry_delay = next_reconnect_delay(retry_attempt);
+        // Keep the existing polling cadence for preference resolution.
+        let retry_number = (*retry_attempt).max(1);
+        let retry_delay = advance_reconnect_delay(retry_attempt, retry_number);
         tokio::select! {
             _ = self.shutdown_token.cancelled() => false,
             changed = self.desired_state_rx.changed() => changed.is_ok(),
@@ -2420,9 +2422,19 @@ fn build_remote_control_websocket_request(
 }
 
 fn next_reconnect_delay(reconnect_attempt: &mut u64) -> std::time::Duration {
+    // The stored counter is zero-based; the backoff takes the ordinal
+    // reported for this attempt, including jitter on the first retry.
+    let retry_number = reconnect_attempt.saturating_add(1);
+    advance_reconnect_delay(reconnect_attempt, retry_number)
+}
+
+fn advance_reconnect_delay(
+    reconnect_attempt: &mut u64,
+    retry_number: u64,
+) -> std::time::Duration {
     let reconnect_delay = capped_backoff(
         std::time::Duration::from_millis(200),
-        (*reconnect_attempt).max(1),
+        retry_number,
         std::time::Duration::from_secs(30),
     )
     .min(REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);

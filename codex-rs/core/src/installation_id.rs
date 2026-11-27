@@ -24,9 +24,16 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
     // Never put a blocking native lock in Tokio's blocking pool: cancelling its
     // caller cannot stop it and runtime teardown would still wait for the lock.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let timed_out = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "installation ID lock contention exceeded 10 seconds",
+        )
+    };
     loop {
         match file.try_lock() {
-            Ok(()) => break,
+            Ok(()) if tokio::time::Instant::now() < deadline => break,
+            Ok(()) => return Err(timed_out()),
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(err)) => return Err(err),
         }
@@ -37,10 +44,7 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
         }
         // A scheduled wake can arrive after the deadline. Check before retrying.
         if tokio::time::Instant::now() >= deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "installation ID lock contention exceeded 10 seconds",
-            ));
+            return Err(timed_out());
         }
     }
     tokio::task::spawn_blocking(move || {

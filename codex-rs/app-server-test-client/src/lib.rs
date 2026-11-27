@@ -1117,8 +1117,17 @@ fn websocket_connect_retry_delay(error: &tungstenite::Error) -> Option<Duration>
                     .headers()
                     .get("Retry-After")
                     .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(Duration::from_secs)
+                    .and_then(|value| {
+                        if let Ok(seconds) = value.parse::<u64>() {
+                            return Some(Duration::from_secs(seconds));
+                        }
+                        let retry_at = httpdate::parse_http_date(value).ok()?;
+                        Some(
+                            retry_at
+                                .duration_since(std::time::SystemTime::now())
+                                .unwrap_or_default(),
+                        )
+                    })
                     .unwrap_or(Duration::from_millis(50)),
             )
         }

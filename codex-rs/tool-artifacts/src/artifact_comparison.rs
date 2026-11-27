@@ -2,11 +2,12 @@
 //! Reuses the snapshot owner's authentication and thread confinement.
 
 use super::ReadToolOutputError;
-use super::ReadToolOutputResult;
 use super::ToolOutputSelector;
+use super::ToolOutputSelectorResult;
 use super::capture;
 use super::load_tool_output_snapshot;
 use base64::Engine as _;
+use serde::Deserialize;
 use serde::Serialize;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
@@ -18,12 +19,25 @@ const MAX_DIFFERENCE_RANGES: usize = 32;
 #[derive(Serialize)]
 pub(crate) struct ComparisonSource {
     artifact_id: String,
-    canonical_sha256: String,
+    canonical_sha256: Option<String>,
     canonical_bytes: u64,
     retained_bytes: u64,
     capture_complete: bool,
     historical_authenticity: &'static str,
     available_prefix_bytes: u64,
+}
+
+// Decode the raw command reader's envelope without weakening snapshot identity.
+#[derive(Deserialize)]
+struct RawCommandComparisonInput {
+    artifact_id: String,
+    // Raw output always has this key, but may explicitly report a missing digest.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    canonical_sha256: Option<String>,
+    canonical_bytes: u64,
+    retained_bytes: u64,
+    retained_artifact_complete: bool,
+    results: Vec<ToolOutputSelectorResult>,
 }
 
 struct Input {
@@ -73,9 +87,14 @@ async fn load_input(
     )
     .await?
     {
-        let output: ReadToolOutputResult = serde_json::from_value(value).map_err(|error| {
+        let output: RawCommandComparisonInput = serde_json::from_value(value).map_err(|error| {
             ReadToolOutputError::Io(format!("invalid command comparison input: {error}"))
         })?;
+        if output.retained_artifact_complete && output.canonical_sha256.is_none() {
+            return Err(ReadToolOutputError::Io(
+                "invalid command comparison input: complete capture has no digest".into(),
+            ));
+        }
         let row = output.results.first().ok_or_else(|| {
             ReadToolOutputError::Io("command comparison input has no byte selection".into())
         })?;
@@ -101,13 +120,13 @@ async fn load_input(
             ));
         }
         return Ok(Input {
-            exact_prefix: output.capture_complete,
+            exact_prefix: output.retained_artifact_complete,
             source: ComparisonSource {
                 artifact_id: output.artifact_id,
                 canonical_sha256: output.canonical_sha256,
                 canonical_bytes: output.canonical_bytes,
                 retained_bytes: output.retained_bytes,
-                capture_complete: output.capture_complete,
+                capture_complete: output.retained_artifact_complete,
                 // The command-log reader does not authenticate producer-time identity.
                 historical_authenticity: "unverified",
                 available_prefix_bytes: output.retained_bytes,
@@ -132,7 +151,7 @@ async fn load_input(
         exact_prefix: metadata.version != 0 && metadata.capture_complete,
         source: ComparisonSource {
             artifact_id: metadata.artifact_id.clone(),
-            canonical_sha256: metadata.canonical_sha256.clone(),
+            canonical_sha256: Some(metadata.canonical_sha256.clone()),
             canonical_bytes: metadata.canonical_bytes,
             retained_bytes: metadata.retained_bytes,
             capture_complete: metadata.version != 0

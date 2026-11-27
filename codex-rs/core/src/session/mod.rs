@@ -233,6 +233,7 @@ mod mailbox_storage;
 mod mcp;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
+pub(crate) mod paired_lifecycle;
 mod review;
 pub(crate) mod resume_inventory;
 mod rollout_reconstruction;
@@ -551,11 +552,21 @@ pub struct Codex {
 
 pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, Result<(), &'static str>>>;
 
+/// Reports the loop's bounded shutdown observation, not proof of retirement.
+/// A deadline is superseded by a positive receipt; a real failure is not.
+#[derive(Clone)]
+pub(crate) enum ShutdownObservation {
+    Complete,
+    Pending(&'static str),
+    Failed(String),
+}
+
 /// Receiver-owned admission metadata stays out of the public submission protocol.
 #[derive(Debug)]
 pub(crate) struct MailboxAdmission {
     ack: oneshot::Sender<CodexResult<()>>,
     validation_origin: Option<(String, String)>,
+    task_message: Option<crate::agent::control::MailboxTaskMessage>,
 }
 
 #[derive(Debug)]
@@ -969,14 +980,27 @@ impl Codex {
                 .instrument(info_span!("session_loop", thread_id = %thread_id))
                 .await;
             session_for_loop.terminal_tasks.close();
-            session_for_loop.terminal_tasks.wait().await;
         });
+        let submission_loop_termination = session
+            .submission_loop_termination
+            .get_or_init(|| session_loop_termination_from_handle(session_loop_handle))
+            .clone();
+        // Keep the full completion used by delegates and admission waiters,
+        // while direct shutdown only observes the submission loop.
+        let terminal_tasks = session.terminal_tasks.clone();
+        let session_loop_termination = async move {
+            submission_loop_termination.await?;
+            terminal_tasks.wait().await;
+            Ok(())
+        }
+        .boxed()
+        .shared();
         let codex = Codex {
             tx_sub,
             rx_event,
             agent_status: agent_status_rx,
             session,
-            session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+            session_loop_termination,
         };
 
         Ok(CodexSpawnOk { codex, thread_id })
@@ -1011,7 +1035,7 @@ impl Codex {
     /// unique IDs for each submission.
     pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
         Self::await_mailbox_admission(
-            self.enqueue_submission(sub, /*validation_origin*/ None)
+            self.enqueue_submission(sub, /*validation_origin*/ None, /*task_message*/ None)
                 .await?,
         )
         .await
@@ -1049,7 +1073,7 @@ impl Codex {
                 .services
                 .agent_control
                 .register_execution_permit(self.session.thread_id, &turn_id, execution_guard)?;
-            let admission = self.enqueue_submission(sub, /*validation_origin*/ None).await?;
+            let admission = self.enqueue_submission(sub, /*validation_origin*/ None, /*task_message*/ None).await?;
             registration.commit();
             Self::await_mailbox_admission(admission).await
         }
@@ -1099,6 +1123,7 @@ impl Codex {
         &self,
         mut sub: Submission,
         validation_origin: Option<(String, String)>,
+        task_message: Option<crate::agent::control::MailboxTaskMessage>,
     ) -> CodexResult<Option<oneshot::Receiver<CodexResult<()>>>> {
         if self.rx_event.is_closed() {
             // Required stream failure is fatal to this runtime. Closing intake
@@ -1127,6 +1152,7 @@ impl Codex {
                     Some(MailboxAdmission {
                         ack: tx,
                         validation_origin,
+                        task_message,
                     }),
                     Some(rx),
                 )
@@ -1164,42 +1190,41 @@ impl Codex {
         Ok(())
     }
 
+    pub(crate) fn submission_loop_termination(&self) -> SessionLoopTermination {
+        self.session.submission_loop_termination.get()
+            .expect("published Codex has a submission loop")
+            .clone()
+    }
+
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
-        let session_loop_termination = self.session_loop_termination.clone();
         self.request_shutdown().await?;
-        session_loop_termination
+        self.submission_loop_termination()
             .await
             .map_err(|error| CodexErr::Fatal(error.to_string()))?;
-        match self.session.rollout_durability_error.try_lock() {
-            Ok(outcome) => {
-                if let Some(error) = outcome.as_ref() {
-                    return Err(CodexErr::Fatal(format!(
-                        "session persistence unconfirmed: {error}"
-                    )));
-                }
-            }
-            Err(_) => {
-                return Err(CodexErr::Fatal(
-                    "session durable barrier remains pending".to_string(),
-                ));
-            }
+        self.observe_retirement()
+    }
+
+    /// Rollback may discard storage, so retain the old terminal drain
+    /// boundary even when the direct observation already expired.
+    pub(crate) async fn shutdown_and_wait_for_terminals(&self) -> CodexResult<()> {
+        self.request_shutdown().await?;
+        self.session_loop_termination.clone().await
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        self.observe_retirement()
+    }
+
+    fn observe_retirement(&self) -> CodexResult<()> {
+        self.session.check_retirement_durability().map_err(CodexErr::Fatal)?;
+        let observation = self.session.shutdown_observation();
+        if let Some(ShutdownObservation::Failed(error)) = &observation {
+            return Err(CodexErr::Fatal(error.clone()));
         }
-        if let Some(Err(error)) = self
-            .session
-            .persistence_shutdown_result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
-            return Err(CodexErr::Fatal(error));
-        }
-        match self.session.persistence_retirement_result.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+        match self.session.retirement_result() {
             Some(result) => result.map_err(CodexErr::Fatal),
-            None if self.session.live_thread().is_some() || self.session.persistence_tasks.is_closed() => Err(CodexErr::Fatal(
-                "session persistence shutdown was not confirmed".to_string(),
-            )),
-            None => Ok(()),
+            None => Err(CodexErr::Fatal(match observation {
+                Some(ShutdownObservation::Pending(message)) => message.to_string(),
+                _ => "session persistence shutdown was not confirmed".to_string(),
+            })),
         }
     }
 
@@ -1534,6 +1559,12 @@ fn push_rendered_prompt_fragment(
     }
 }
 
+pub(crate) enum BackgroundCommandAppendReceipt {
+    Accepted,
+    NotRequired,
+    Failed(String),
+}
+
 struct PreparedEventDispatch {
     terminal_source: Option<EventMsg>,
     legacy_events: Vec<EventMsg>,
@@ -1818,6 +1849,29 @@ impl Session {
     #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
         self.flush_rollout_with_durability(/*durable*/ false).await
+    }
+
+    pub(crate) fn shutdown_observation(&self) -> Option<ShutdownObservation> {
+        self.shutdown_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn retirement_result(&self) -> Option<Result<(), String>> {
+        self.persistence_retirement_result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn check_retirement_durability(&self) -> Result<(), String> {
+        let outcome = self.rollout_durability_error.try_lock()
+            .map_err(|_| "session durable barrier remains pending".to_string())?;
+        match outcome.as_ref() {
+            Some(error) => Err(format!("session persistence unconfirmed: {error}")),
+            None => Ok(()),
+        }
     }
 
     /// [`Self::flush_rollout`] plus a stable-storage barrier for the rollout itself, so a
@@ -2542,7 +2596,7 @@ impl Session {
                 self.persist_rollout_items_durable(&[RolloutItem::EventMsg(event)])
                     .await?;
             }
-            // Publish the new configuration only after its durable write succeeds.
+            // Publish the new configuration after its configured write barrier succeeds.
             state.session_configuration = updated.clone();
             if updates.service_tier.is_some()
                 && self.session_id() == SessionId::from(self.thread_id)
@@ -2957,12 +3011,14 @@ impl Session {
         turn_context: &TurnContext,
         msg: EventMsg,
         published: &mut Option<EventMsg>,
+        dispatch_source: &mut Option<EventMsg>,
         recovering_publication: bool,
     ) -> EventMsg {
         self.publish_terminal_event_with_barrier(
             turn_context,
             msg,
             published,
+            dispatch_source,
             recovering_publication,
             async || self.flush_rollout_durable().await,
         )
@@ -2978,11 +3034,20 @@ impl Session {
         turn_context: &TurnContext,
         msg: EventMsg,
         published: &mut Option<EventMsg>,
+        dispatch_source: &mut Option<EventMsg>,
         recovering_publication: bool,
         durable_barrier: impl AsyncFnOnce() -> std::io::Result<()>,
     ) -> EventMsg {
         if let Some(event) = published.as_ref() {
             return event.clone();
+        }
+        if let Some(event) = dispatch_source.as_ref() {
+            // An earlier offer reached the channel boundary. Its stable
+            // history decision and diagnostic amendments must not be redone.
+            let event = event.clone();
+            self.send_event_before_post_dispatch(turn_context, event.clone(), false, Some(published))
+                .await;
+            return event;
         }
         debug_assert!(matches!(
             &msg,
@@ -3161,6 +3226,9 @@ impl Session {
                 .await;
             }
         }
+        // Channel acceptance is a separate receipt. Even if the channel
+        // refuses the event, post-dispatch owns this exact, annotated payload.
+        *dispatch_source = Some(msg.clone());
         let post_dispatch = self
             .send_event_before_post_dispatch(turn_context, msg, false, Some(published))
             .await;
@@ -3210,6 +3278,16 @@ impl Session {
             _ => false,
         };
         let post_dispatch = PreparedEventDispatch::new(&msg, self.show_raw_agent_reasoning());
+        if turn_context.multi_agent_version == MultiAgentVersion::V2
+            && (post_dispatch.terminal_source.is_some()
+                || matches!(&msg, EventMsg::Error(error) if error.affects_turn_status()))
+            && let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref)
+        {
+            // Status becomes observable during live delivery, before the
+            // post-dispatch owner can write the pending terminal row.
+            self.services.agent_control.task_coordinator()
+                .begin_terminal_dispatch(binding, &turn_context.sub_id);
+        }
         if let EventMsg::Error(error) = &msg
             && error.affects_turn_status()
         {
@@ -3259,6 +3337,28 @@ impl Session {
         parent_notification_completed
     }
 
+    async fn terminal_dispatch_status(
+        &self,
+        turn_context: &TurnContext,
+        event: &EventMsg,
+    ) -> Option<(AgentStatus, bool)> {
+        match turn_context.terminal_error.lock().await.as_ref() {
+            Some(error) => Some((AgentStatus::Errored(error.message.clone()), true)),
+            None => agent_status_from_event(event).map(|status| (status, false)),
+        }
+    }
+
+    pub(crate) async fn park_terminal_event_dispatch(&self, turn_context: &TurnContext, event: &EventMsg) {
+        if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_path: Some(_), .. }) =
+            &turn_context.session_source
+            && let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref)
+            && let Some((status, _)) = self.terminal_dispatch_status(turn_context, event).await
+        {
+            self.services.agent_control.task_coordinator()
+                .park_terminal_dispatch(binding, &turn_context.sub_id, status, event.clone());
+        }
+    }
+
     /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.
     pub(crate) async fn maybe_notify_parent_of_terminal_turn(
         &self,
@@ -3282,54 +3382,36 @@ impl Session {
             return true;
         };
 
-        let mut status = match turn_context.terminal_error.lock().await.clone() {
-            Some(error) => {
-                let status = AgentStatus::Errored(error.message);
-                self.update_agent_status(&turn_context.sub_id, msg, status.clone());
-                status
-            }
-            None => {
-                let Some(status) = agent_status_from_event(msg) else {
-                    return true;
-                };
-                status
-            }
+        let Some((mut status, override_live_status)) = self.terminal_dispatch_status(turn_context, msg).await else {
+            return true;
         };
+        if override_live_status {
+            self.update_agent_status(&turn_context.sub_id, msg, status.clone());
+        }
+        let task_coordinator = self.services.agent_control.task_coordinator();
         if !is_final(&status) {
-            if let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref)
-                && let Err(error) = self.services.agent_control.task_coordinator()
+            if let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref) {
+                if let Err(error) = task_coordinator
                     .record_host_completion_observation(binding, self.thread_id, &turn_context.sub_id,
                         format!("Host terminal boundary for turn {}: turn interrupted; partial effects may remain.", turn_context.sub_id), None).await
-            {
-                warn!(%error, "failed to retain interrupted host terminal boundary");
-                return false;
+                {
+                    warn!(%error, "failed to retain interrupted host terminal boundary");
+                    return false;
+                }
+                task_coordinator.finish_terminal_dispatch(binding.attempt_id, &turn_context.sub_id);
             }
             return true;
         }
 
-        let mut protected_host_summary = match msg {
-            EventMsg::TurnComplete(event) => Some(
-                event
-                    .timing
-                    .as_ref()
-                    .and_then(|timing| timing.completion_assessment.as_ref())
-                    .and_then(|assessment| assessment.bounded_summary(&event.turn_id))
-                    .unwrap_or_else(|| crate::agent::status::NO_COMPLETION_DIAGNOSTICS.to_string()),
-            ),
-            EventMsg::TurnAborted(_) => Some(format!(
-                "Host terminal boundary for turn {}: turn aborted; partial effects may remain.",
-                turn_context.sub_id
-            )),
-            _ => None,
-        };
-        let task_coordinator = self.services.agent_control.task_coordinator();
+        let mut protected_host_summary =
+            crate::agent::task_coordinator::terminal_completion_diagnostics(&turn_context.sub_id, msg);
         let mut handoff = None;
         if let Some(binding) = turn_context
             .agent_task_binding
             .get()
             .and_then(Option::as_ref)
         {
-            task_coordinator.mark_host_terminal(binding.assignment_id, binding.attempt_id);
+            task_coordinator.mark_attempt_terminal(binding.assignment_id, binding.attempt_id);
             match task_coordinator
                 .retain_terminal_outcome(binding.clone(), turn_context.sub_id.clone(), &status, msg)
                 .await
@@ -3341,17 +3423,16 @@ impl Session {
                     return false;
                 }
             }
-            if let Some(summary) = protected_host_summary.clone()
-                && let Err(error) = task_coordinator
-                    .record_host_completion_and_seal(
-                        binding,
-                        child_agent_path,
-                        self.thread_id,
-                        &turn_context.sub_id,
-                        summary,
-                        &status,
-                    )
-                    .await
+            if let Err(error) = task_coordinator
+                .record_host_completion_and_seal(
+                    binding,
+                    child_agent_path,
+                    self.thread_id,
+                    &turn_context.sub_id,
+                    &status,
+                    msg,
+                )
+                .await
             {
                 warn!(%error, "failed to retain host completion observations");
                 return false;
@@ -3684,6 +3765,49 @@ impl Session {
         .await;
     }
 
+    /// Start the ordered append independently of the command caller. The caller
+    /// retains this exact receipt even if it is dropped before live delivery.
+    pub(crate) fn prepare_unified_exec_command_start(
+        self: &Arc<Self>,
+        turn_context: &TurnContext,
+        item: TurnItem,
+    ) -> (EventMsg, Option<JoinHandle<std::io::Result<()>>>) {
+        debug_assert!(matches!(&item, TurnItem::CommandExecution(_)));
+        let event = EventMsg::ItemStarted(ItemStartedEvent {
+            thread_id: self.thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            item,
+            started_at_ms: now_unix_timestamp_ms(),
+        });
+        let append = self
+            .live_thread()
+            .filter(|thread| thread.should_persist_event(&event))
+            .map(|_| {
+                let session = Arc::clone(self);
+                let item = RolloutItem::EventMsg(event.clone());
+                self.terminal_tasks.spawn(async move {
+                    session.persist_rollout_items_ordered(&[item]).await
+                })
+            });
+        (event, append)
+    }
+
+    pub(crate) async fn dispatch_unified_exec_command_start(
+        &self,
+        turn_context: &TurnContext,
+        event: EventMsg,
+        on_canonical_delivery: impl FnOnce(),
+    ) {
+        let dispatch = self
+            .send_event_before_post_dispatch(turn_context, event, false, None)
+            .await;
+        // Live-only sessions acquire their End obligation here, not before an
+        // attempt to deliver the canonical Begin. Legacy delivery follows.
+        on_canonical_delivery();
+        self.finish_prepared_event_dispatch(turn_context, dispatch)
+            .await;
+    }
+
     pub(crate) async fn emit_turn_item_completed(
         &self,
         turn_context: &TurnContext,
@@ -3700,6 +3824,30 @@ impl Session {
         item: TurnItem,
         emit_legacy: bool,
     ) {
+        self.emit_turn_item_completed_inner(turn_context, item, emit_legacy, None)
+            .await;
+    }
+
+    /// Reports the canonical command append before attempting live delivery.
+    /// The receipt is not a durability barrier or a live-channel acknowledgement.
+    pub(crate) async fn emit_background_command_completed(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+        record_append: &(dyn Fn(BackgroundCommandAppendReceipt) + Sync),
+    ) {
+        debug_assert!(matches!(&item, TurnItem::CommandExecution(_)));
+        self.emit_turn_item_completed_inner(turn_context, item, true, Some(record_append))
+            .await;
+    }
+
+    async fn emit_turn_item_completed_inner(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+        emit_legacy: bool,
+        record_append: Option<&(dyn Fn(BackgroundCommandAppendReceipt) + Sync)>,
+    ) {
         record_turn_ttfm_metric(turn_context, &item);
         let event = EventMsg::ItemCompleted(ItemCompletedEvent {
             thread_id: self.thread_id,
@@ -3707,8 +3855,33 @@ impl Session {
             item,
             completed_at_ms: now_unix_timestamp_ms(),
         });
+        let persist = if let Some(record_append) = record_append {
+            let receipt = if self
+                .live_thread()
+                .is_some_and(|thread| thread.should_persist_event(&event))
+            {
+                match self
+                    .persist_rollout_items_ordered(&[RolloutItem::EventMsg(event.clone())])
+                    .await
+                {
+                    Ok(()) => BackgroundCommandAppendReceipt::Accepted,
+                    Err(error) => {
+                        error!("failed to record background command completion: {error:#}");
+                        BackgroundCommandAppendReceipt::Failed(error.to_string())
+                    }
+                }
+            } else {
+                BackgroundCommandAppendReceipt::NotRequired
+            };
+            record_append(receipt);
+            // Dispatch the same canonical item without appending it again. The
+            // ExecCommandEnd compatibility event is live-only under rollout policy.
+            false
+        } else {
+            true
+        };
         let mut dispatch = self
-            .send_event_before_post_dispatch(turn_context, event, true, None)
+            .send_event_before_post_dispatch(turn_context, event, persist, None)
             .await;
         if !emit_legacy {
             dispatch.legacy_events.clear();

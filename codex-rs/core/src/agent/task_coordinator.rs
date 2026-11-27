@@ -18,6 +18,7 @@ use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::LocalAgentTaskStore;
+use codex_agent_task_store::NonproductiveRecovery;
 use codex_agent_task_store::ObservationKind;
 use codex_agent_task_store::PendingTerminalOutcome;
 use codex_agent_task_store::ReceiptDraft;
@@ -28,7 +29,9 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TurnCompletionAssessment;
 use codex_state::StateRuntime;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -49,16 +52,47 @@ use super::task_metrics::terminal_metrics_ready;
 struct BindingIndex {
     by_agent_path: HashMap<String, AgentTaskBinding>,
     by_assignment: HashMap<AssignmentId, AgentTaskBinding>,
+    // Exact turn custody, before the matching outcome can be retained.
+    pending_terminal_dispatches: HashMap<AttemptId, HashSet<String>>,
+    // A finalizer that exhausts its local retries transfers the actual event,
+    // not a status-only fence, to the coordinator's recovery pass.
+    retry_terminal_dispatches: HashMap<(AttemptId, String), TerminalDispatchRetry>,
 }
 
 #[derive(Default)]
 struct TaskMetricIndex {
     runtimes: HashMap<AssignmentId, TaskMetricRuntime>,
     active: HashSet<AssignmentId>,
-    host_terminal_attempts: HashMap<AssignmentId, AttemptId>,
+    live_usage: HashMap<(ThreadId, String), LiveTaskUsage>,
+    pending_abandonment_metrics: HashSet<AssignmentId>,
     first_progress_attempts: HashSet<AttemptId>,
     hydrated_receipt_attempts: HashSet<AttemptId>,
     configured_capacity: Option<u32>,
+}
+
+struct LiveTaskUsage {
+    assignment_id: AssignmentId,
+    worker_stopped: bool,
+    final_usage_settled: bool,
+}
+
+#[derive(Clone)]
+struct TerminalDispatchRetry {
+    binding: AgentTaskBinding,
+    status: AgentStatus,
+    event: EventMsg,
+}
+
+pub(crate) struct TerminalDispatchOwner {
+    coordinator: AgentTaskCoordinator,
+    binding: AgentTaskBinding,
+    turn_id: String,
+}
+
+impl Drop for TerminalDispatchOwner {
+    fn drop(&mut self) {
+        self.coordinator.finish_terminal_dispatch(self.binding.attempt_id, &self.turn_id);
+    }
 }
 
 const MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES: usize = 4_096;
@@ -108,14 +142,34 @@ pub(crate) struct AgentTaskCoordinator {
     /// same idempotent evidence and bump the task revision.
     reconciled_terminal_outcomes: Arc<Mutex<HashSet<(AttemptId, String)>>>,
     heartbeat_receipts: Arc<Mutex<HeartbeatReceipts>>,
-    /// Why the host's own terminal assessment declared an attempt's turn incomplete.
-    /// Every sealing path reads this, so whichever reaches the attempt first decides alike.
-    declared_gaps: Arc<Mutex<HashMap<AttemptId, Vec<String>>>>,
+}
+
+fn terminal_assessment(event: &EventMsg) -> Option<&TurnCompletionAssessment> {
+    match event {
+        EventMsg::TurnComplete(event) => event.timing.as_ref(),
+        EventMsg::TurnAborted(event) => event.timing.as_ref(),
+        _ => None,
+    }
+    .and_then(|timing| timing.completion_assessment.as_ref())
+}
+
+pub(crate) fn terminal_completion_diagnostics(turn_id: &str, event: &EventMsg) -> Option<String> {
+    match event {
+        EventMsg::TurnComplete(completed) => Some(
+            terminal_assessment(event)
+                .and_then(|assessment| assessment.bounded_summary(&completed.turn_id))
+                .unwrap_or_else(|| crate::agent::status::NO_COMPLETION_DIAGNOSTICS.to_string()),
+        ),
+        EventMsg::TurnAborted(_) => Some(format!(
+            "Host terminal boundary for turn {turn_id}: turn aborted; partial effects may remain."
+        )),
+        _ => None,
+    }
 }
 
 /// The reasons a terminal assessment declares its task `incomplete`, bounded for a receipt.
 fn declared_incomplete_reasons(
-    assessment: Option<&codex_protocol::protocol::TurnCompletionAssessment>,
+    assessment: Option<&TurnCompletionAssessment>,
 ) -> Vec<String> {
     let Some(assessment) = assessment.filter(|assessment| {
         assessment
@@ -368,7 +422,7 @@ impl AgentTaskCoordinator {
             bound_at: admitted.attempt.created_at,
             updated_at: admitted.attempt.created_at,
         });
-        self.start_task_metrics(&admitted.assignment);
+        self.start_task_metrics(&admitted.assignment, admitted.attempt.attempt_id);
         Ok(admitted)
     }
 
@@ -402,7 +456,8 @@ impl AgentTaskCoordinator {
                 .store
                 .recover_unstarted_assignment(assignment, threshold, owner)
                 .await?;
-            if matches!(recovered, codex_agent_task_store::NonproductiveRecovery::Recovered { .. }) {
+            if let NonproductiveRecovery::Recovered { receipt, .. } = recovered {
+                self.mark_attempt_terminal(receipt.assignment_id, receipt.attempt_id);
                 self.forget_binding(assignment);
             }
         }
@@ -413,6 +468,7 @@ impl AgentTaskCoordinator {
         let Some(initialized) = self.store.get() else {
             return Ok(());
         };
+        self.retry_terminal_dispatches().await;
         let Some(through_sequence) = initialized.store.terminal_outcome_high_water().await? else {
             return Ok(());
         };
@@ -470,20 +526,9 @@ impl AgentTaskCoordinator {
                 .ok_or_else(|| {
                     StoreError::CorruptData("pending terminal has no thread".into())
                 })?;
-            let summary = match &event {
-                codex_protocol::protocol::EventMsg::TurnComplete(event) => {
-                    let assessment = event.timing.as_ref()
-                        .and_then(|timing| timing.completion_assessment.as_ref());
-                    self.note_terminal_assessment(binding.attempt_id, assessment);
-                    assessment
-                        .and_then(|assessment| assessment.bounded_summary(&event.turn_id))
-                        .unwrap_or_else(|| crate::agent::status::NO_COMPLETION_DIAGNOSTICS.to_string())
-                }
-                codex_protocol::protocol::EventMsg::TurnAborted(_) => format!(
-                    "Host terminal boundary for turn {}: turn aborted; partial effects may remain.", pending.turn_id),
-                _ => return Err(StoreError::CorruptData("pending terminal event is not terminal".into())),
-            };
-            self.record_host_completion_and_seal(&binding, &path, thread, &pending.turn_id, summary, &status).await?;
+            self.record_host_completion_and_seal(
+                &binding, &path, thread, &pending.turn_id, &status, &event,
+            ).await?;
             self.record_host_completion_observation(&binding, thread,
                 &format!("{}:parent-delivery", pending.turn_id),
                 format!("Completion retained across recovery; parent delivery is unacknowledged. Read get_agent_task for assignment {} attempt {}; do not replay the child.", binding.assignment_id, binding.attempt_id), None).await?;
@@ -517,6 +562,53 @@ impl AgentTaskCoordinator {
         }
     }
 
+    async fn retry_terminal_dispatches(&self) {
+        let pending: Vec<_> = self.bindings.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retry_terminal_dispatches.iter()
+            .map(|(key, retry)| (key.clone(), retry.clone()))
+            .collect();
+        for ((attempt_id, turn_id), retry) in pending {
+            let result = if super::status::is_final(&retry.status) {
+                self.retain_terminal_outcome(retry.binding, turn_id.clone(), &retry.status, &retry.event)
+                    .await.map(|_| ())
+            } else if let Some(thread_id) = retry.binding.thread_id.as_deref()
+                .and_then(|id| ThreadId::from_string(id).ok())
+            {
+                self.record_host_completion_observation(
+                    &retry.binding, thread_id, &turn_id,
+                    format!("Host terminal boundary for turn {turn_id}: turn interrupted; partial effects may remain."), None,
+                ).await
+            } else {
+                Err(StoreError::CorruptData("terminal dispatch retry has no thread".into()))
+            };
+            match result {
+                Ok(()) | Err(StoreError::AttemptNotActive(_)) => {
+                    self.bindings.write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .retry_terminal_dispatches.remove(&(attempt_id, turn_id));
+                }
+                Err(error) => {
+                    // An ambiguous commit or conflicting retry can already
+                    // have an authoritative row for this exact turn.
+                    let retained = match self.store.get() {
+                        Some(initialized) => initialized.store
+                            .has_retained_terminal_dispatch(attempt_id, Some(&turn_id))
+                            .await.unwrap_or(false),
+                        None => false,
+                    };
+                    if retained {
+                        self.bindings.write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .retry_terminal_dispatches.remove(&(attempt_id, turn_id.clone()));
+                    }
+                    warn!(%attempt_id, %turn_id, %error, retained,
+                        "exact terminal dispatch could not be retried");
+                }
+            }
+        }
+    }
+
     pub(crate) async fn retain_terminal_outcome(
         &self,
         binding: AgentTaskBinding,
@@ -525,14 +617,19 @@ impl AgentTaskCoordinator {
         event: &codex_protocol::protocol::EventMsg,
     ) -> StoreResult<bool> {
         self.require_root_scope(&binding.root_session_id)?;
-        self.required_store()?
+        let attempt_id = binding.attempt_id;
+        let retained = self.required_store()?
             .retain_terminal_outcome(
                 binding,
-                turn_id,
+                turn_id.clone(),
                 serde_json::to_string(status)?,
                 serde_json::to_string(event)?,
             )
-            .await
+            .await?;
+        // A successful write transfers custody to the durable pending row; a
+        // stale attempt has no fallback authority. On error keep the live fence.
+        self.finish_terminal_dispatch(attempt_id, &turn_id);
+        Ok(retained)
     }
 
     pub(crate) async fn acknowledge_terminal_outcome(&self, attempt: AttemptId, turn_id: &str) -> StoreResult<()> {
@@ -554,7 +651,7 @@ impl AgentTaskCoordinator {
             .await?;
         let binding = self.required_store()?.bind_agent_task(draft).await?;
         self.remember_binding(binding.clone());
-        self.set_task_metric_active(binding.assignment_id, true);
+        self.set_task_metric_active(binding.assignment_id, binding.attempt_id, true);
         Ok(binding)
     }
 
@@ -572,12 +669,12 @@ impl AgentTaskCoordinator {
             .required_store()?
             .amend_agent_task_with_binding(self.root_actor()?, assignment_id, amendment)
             .await?;
+        self.advance_task_metric_attempt(assignment_id, attempt.attempt_id);
         if let Some(binding) = binding {
             self.remember_binding(binding);
         } else {
             self.forget_binding(assignment_id);
         }
-        self.set_task_metric_active(assignment_id, true);
         Ok(attempt)
     }
 
@@ -598,10 +695,9 @@ impl AgentTaskCoordinator {
             .remove_agent_task_binding(self.root_actor()?, assignment_id)
             .await?;
         if let Some(attempt) = terminal_attempt {
-            self.mark_host_terminal(assignment_id, attempt);
+            self.mark_attempt_terminal(assignment_id, attempt);
         }
         self.forget_binding(assignment_id);
-        self.mark_task_inactive(assignment_id);
         Ok(removed)
     }
 
@@ -727,19 +823,23 @@ impl AgentTaskCoordinator {
         agent_path: &AgentPath,
         thread_id: ThreadId,
         turn_id: &str,
-        summary: String,
         status: &AgentStatus,
+        event: &EventMsg,
     ) -> StoreResult<()> {
         if binding.thread_id.as_deref() != Some(thread_id.to_string().as_str()) {
             return Ok(());
         }
+        let summary = terminal_completion_diagnostics(turn_id, event)
+            .ok_or_else(|| StoreError::CorruptData("pending terminal event is not terminal".into()))?;
+        self.mark_attempt_terminal(binding.assignment_id, binding.attempt_id);
+        let declared_gaps = Some(declared_incomplete_reasons(terminal_assessment(event)));
         let store = self.required_store()?;
         if matches!(status, AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. }) {
             let mut publication = store.record_host_completion_deferred(
                 binding.attempt_id, format!("{thread_id}:{turn_id}"), summary,
             ).await?;
             let result = self.seal_missing_receipt_with_host_completion(
-                agent_path, thread_id, status, binding.attempt_id, Some(&mut publication),
+                agent_path, thread_id, status, binding.attempt_id, declared_gaps, Some(turn_id), Some(&mut publication),
             ).await;
             // An existing receipt or unresolved seal still needs its actual
             // host evidence. This is idempotent after an atomic publication.
@@ -756,7 +856,9 @@ impl AgentTaskCoordinator {
         } else {
             // Failures, stops and cancellation are actionable immediately.
             self.record_host_completion_observation(binding, thread_id, turn_id, summary, Some(status)).await?;
-            self.seal_missing_receipt_for_attempt(agent_path, thread_id, status, binding.attempt_id).await?;
+            self.seal_missing_receipt_with_host_completion(
+                agent_path, thread_id, status, binding.attempt_id, declared_gaps, Some(turn_id), None,
+            ).await?;
             Ok(())
         }
     }
@@ -882,26 +984,103 @@ impl AgentTaskCoordinator {
         true
     }
 
-    pub(crate) fn mark_task_inactive(&self, assignment_id: AssignmentId) {
-        self.set_task_metric_active(assignment_id, false);
+    pub(crate) fn begin_task_usage(&self, thread_id: ThreadId, turn: &crate::session::turn_context::TurnContext) {
+        let Some(binding) = self.binding_for_source(&turn.session_source)
+            .filter(|binding| binding.thread_id.as_deref() == Some(thread_id.to_string().as_str()))
+        else {
+            return;
+        };
+        self.metrics.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .live_usage.insert((thread_id, turn.sub_id.clone()), LiveTaskUsage {
+                assignment_id: binding.assignment_id,
+                worker_stopped: false,
+                final_usage_settled: false,
+            });
     }
 
-    pub(crate) fn mark_host_terminal(&self, assignment_id: AssignmentId, attempt_id: AttemptId) {
-        if self
-            .binding_for_assignment(assignment_id)
-            .is_some_and(|binding| binding.attempt_id != attempt_id)
-        {
+    pub(crate) async fn finish_task_usage(
+        &self,
+        thread_id: ThreadId,
+        turn_id: &str,
+        worker_stopped: bool,
+        session_telemetry: &SessionTelemetry,
+    ) {
+        let assignment_id = {
+            let mut metrics = self.metrics.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = (thread_id, turn_id.to_owned());
+            let Some(usage) = metrics.live_usage.get_mut(&key) else {
+                return;
+            };
+            if worker_stopped {
+                usage.worker_stopped = true;
+            } else {
+                usage.final_usage_settled = true;
+            }
+            if !usage.worker_stopped || !usage.final_usage_settled {
+                return;
+            }
+            let assignment_id = usage.assignment_id;
+            metrics.live_usage.remove(&key);
+            if !metrics.pending_abandonment_metrics.contains(&assignment_id)
+                || metrics.live_usage.values().any(|usage| usage.assignment_id == assignment_id)
+            {
+                return;
+            }
+            assignment_id
+        };
+        self.maybe_emit_abandoned_metrics(assignment_id, session_telemetry).await;
+    }
+
+    async fn maybe_emit_abandoned_metrics(
+        &self,
+        assignment_id: AssignmentId,
+        session_telemetry: &SessionTelemetry,
+    ) {
+        if !self.has_task_metric_runtime(assignment_id) {
             return;
         }
-        self.mark_task_inactive(assignment_id);
+        match self.get_agent_task(assignment_id, Some(0)).await {
+            Ok(task) if task.current_attempt.state == AttemptState::Abandoned => {
+                self.emit_terminal_metrics_from_snapshot(&task, session_telemetry);
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%assignment_id, %error, "failed to load abandonment for terminal metrics"),
+        }
+    }
+
+    pub(crate) fn mark_task_inactive(&self, assignment_id: AssignmentId, attempt_id: AttemptId) {
+        self.set_task_metric_active(assignment_id, attempt_id, false);
+    }
+
+    pub(crate) fn mark_attempt_abandoned(&self, assignment_id: AssignmentId, attempt_id: AttemptId) {
+        self.mark_attempt_terminal_inner(assignment_id, attempt_id, /*abandoned*/ true);
+    }
+
+    pub(crate) fn mark_attempt_terminal(&self, assignment_id: AssignmentId, attempt_id: AttemptId) {
+        self.mark_attempt_terminal_inner(assignment_id, attempt_id, /*abandoned*/ false);
+    }
+
+    fn mark_attempt_terminal_inner(&self, assignment_id: AssignmentId, attempt_id: AttemptId, abandoned: bool) {
         let mut metrics = self
             .metrics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if metrics.runtimes.contains_key(&assignment_id) {
-            metrics
-                .host_terminal_attempts
-                .insert(assignment_id, attempt_id);
+        let Some(runtime) = metrics.runtimes.get_mut(&assignment_id) else {
+            return;
+        };
+        if runtime.attempt_id != attempt_id {
+            return;
+        }
+        runtime.terminal = true;
+        if abandoned && metrics.live_usage.values().any(|usage| usage.assignment_id == assignment_id) {
+            metrics.pending_abandonment_metrics.insert(assignment_id);
+        }
+        if metrics.active.remove(&assignment_id) {
+            let errors = transition_metric_runtimes(&mut metrics);
+            drop(metrics);
+            warn_metric_transition_errors(errors);
         }
     }
 
@@ -952,32 +1131,30 @@ impl AgentTaskCoordinator {
             .metrics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if metrics.host_terminal_attempts.get(&assignment_id)
-            != Some(&task.current_attempt.attempt_id)
+        if !metrics.runtimes.get(&assignment_id).is_some_and(|runtime| {
+            runtime.attempt_id == task.current_attempt.attempt_id && runtime.terminal
+        }) {
+            return;
+        }
+        if task.current_attempt.state == AttemptState::Abandoned
+            && metrics.live_usage.values().any(|usage| usage.assignment_id == assignment_id)
         {
+            metrics.pending_abandonment_metrics.insert(assignment_id);
             return;
         }
         let Some(mut runtime) = metrics.runtimes.remove(&assignment_id) else {
             return;
         };
-        if task.current_attempt.ordinal < runtime.minimum_attempt_ordinal {
-            metrics.runtimes.insert(assignment_id, runtime);
-            return;
-        }
         let transition_errors = if metrics.active.remove(&assignment_id) {
             transition_metric_runtimes(&mut metrics)
         } else {
             Vec::new()
         };
         let result = runtime.finish(task);
-        match &result {
-            Ok(Some(_)) => {
-                metrics.host_terminal_attempts.remove(&assignment_id);
-            }
-            Err(_) => {
-                metrics.runtimes.insert(assignment_id, runtime);
-            }
-            Ok(None) => {}
+        if result.is_err() {
+            metrics.runtimes.insert(assignment_id, runtime);
+        } else {
+            metrics.pending_abandonment_metrics.remove(&assignment_id);
         }
         drop(metrics);
         warn_metric_transition_errors(transition_errors);
@@ -1022,7 +1199,10 @@ impl AgentTaskCoordinator {
         {
             if !self.has_task_metric_runtime(binding.assignment_id) {
                 match store.get_agent_task(binding.assignment_id, Some(0)).await {
-                    Ok(task) => self.activate_task_metric_attempt(&task, true),
+                    Ok(task) if task.current_attempt.attempt_id == binding.attempt_id => {
+                        self.activate_task_metric_attempt(&task, true);
+                    }
+                    Ok(_) => {}
                     Err(error) => warn!(?error, assignment_id = %binding.assignment_id,
                         "active agent attempt is bound but task metrics could not be restored"),
                 }
@@ -1041,11 +1221,18 @@ impl AgentTaskCoordinator {
             )));
         }
         let renewed = store.begin_legacy_agent_turn(binding.assignment_id).await?;
+        self.advance_task_metric_attempt(renewed.assignment_id, renewed.attempt_id);
+        let attempt_id = renewed.attempt_id;
         self.remember_binding(renewed);
-        match store.get_agent_task(binding.assignment_id, Some(0)).await {
-            Ok(task) => self.activate_task_metric_attempt(&task, false),
-            Err(error) => warn!(?error, assignment_id = %binding.assignment_id,
-                "plain-message follow-up committed but task metrics could not be restored"),
+        if !self.has_task_metric_runtime(binding.assignment_id) {
+            match store.get_agent_task(binding.assignment_id, Some(0)).await {
+                Ok(task) if task.current_attempt.attempt_id == attempt_id => {
+                    self.activate_task_metric_attempt(&task, false);
+                }
+                Ok(_) => {}
+                Err(error) => warn!(?error, assignment_id = %binding.assignment_id,
+                    "plain-message follow-up committed but task metrics could not be restored"),
+            }
         }
         Ok(())
     }
@@ -1062,7 +1249,12 @@ impl AgentTaskCoordinator {
         if let std::collections::hash_map::Entry::Vacant(entry) =
             metrics.runtimes.entry(task.assignment.assignment_id)
         {
-            match TaskMetricRuntime::new(&task.assignment, active_turns, capacity) {
+            match TaskMetricRuntime::new(
+                &task.assignment,
+                task.current_attempt.attempt_id,
+                active_turns,
+                capacity,
+            ) {
                 Ok(runtime) => {
                     entry.insert(runtime);
                 }
@@ -1076,7 +1268,9 @@ impl AgentTaskCoordinator {
         let Some(runtime) = metrics.runtimes.get_mut(&task.assignment.assignment_id) else {
             return;
         };
-        runtime.minimum_attempt_ordinal = task.current_attempt.ordinal;
+        if runtime.attempt_id != task.current_attempt.attempt_id || runtime.terminal {
+            return;
+        }
         runtime.usage_history_partial |= restored_active_attempt;
         if metrics.active.insert(task.assignment.assignment_id) {
             let errors = transition_metric_runtimes(&mut metrics);
@@ -1086,31 +1280,68 @@ impl AgentTaskCoordinator {
     }
 
 
-    /// A later terminal of the same attempt replaces the earlier assessment.
-    pub(crate) fn note_terminal_assessment(
+    pub(crate) fn own_terminal_dispatch(
         &self,
-        attempt_id: AttemptId,
-        assessment: Option<&codex_protocol::protocol::TurnCompletionAssessment>,
+        binding: AgentTaskBinding,
+        turn_id: String,
+    ) -> TerminalDispatchOwner {
+        self.begin_terminal_dispatch(&binding, &turn_id);
+        TerminalDispatchOwner { coordinator: self.clone(), binding, turn_id }
+    }
+
+    pub(crate) fn park_terminal_dispatch(
+        &self,
+        binding: &AgentTaskBinding,
+        turn_id: &str,
+        status: AgentStatus,
+        event: EventMsg,
     ) {
-        let reasons = declared_incomplete_reasons(assessment);
-        let mut gaps = self
-            .declared_gaps
-            .lock()
+        let mut bindings = self.bindings.write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reasons.is_empty() {
-            gaps.remove(&attempt_id);
-        } else {
-            gaps.insert(attempt_id, reasons);
+        if bindings.pending_terminal_dispatches.get(&binding.attempt_id)
+            .is_some_and(|turns| turns.contains(turn_id))
+        {
+            bindings.retry_terminal_dispatches.insert(
+                (binding.attempt_id, turn_id.to_owned()),
+                TerminalDispatchRetry { binding: binding.clone(), status, event },
+            );
         }
     }
 
-    fn forget_declared_gaps(&self, attempt_id: AttemptId) {
-        self.declared_gaps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&attempt_id);
+    pub(crate) fn begin_terminal_dispatch(&self, binding: &AgentTaskBinding, turn_id: &str) {
+        let mut bindings = self.bindings.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bindings.by_assignment.get(&binding.assignment_id)
+            .is_some_and(|current| current.attempt_id == binding.attempt_id
+                && current.thread_id == binding.thread_id)
+        {
+            bindings.pending_terminal_dispatches
+                .entry(binding.attempt_id)
+                .or_default()
+                .insert(turn_id.to_owned());
+        }
     }
 
+    pub(crate) fn finish_terminal_dispatch(&self, attempt_id: AttemptId, turn_id: &str) {
+        let mut bindings = self.bindings.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(turns) = bindings.pending_terminal_dispatches.get_mut(&attempt_id)
+            && turns.remove(turn_id)
+            && turns.is_empty()
+        {
+            bindings.pending_terminal_dispatches.remove(&attempt_id);
+        }
+    }
+
+    fn live_terminal_dispatch_pending(&self, attempt_id: AttemptId) -> bool {
+        let bindings = self.bindings.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bindings.pending_terminal_dispatches.contains_key(&attempt_id)
+            || bindings.retry_terminal_dispatches.keys().any(|(attempt, _)| *attempt == attempt_id)
+    }
+
+    /// A status-only fallback cannot preempt either the live terminal producer
+    /// or the existing paged reconciliation owner of a retained event.
     pub(crate) async fn seal_missing_receipt_for_attempt(
         &self,
         agent_path: &AgentPath,
@@ -1119,18 +1350,84 @@ impl AgentTaskCoordinator {
         expected_attempt_id: AttemptId,
     ) -> StoreResult<Option<AgentReceipt>> {
         self.seal_missing_receipt_with_host_completion(
-            agent_path, expected_thread_id, status, expected_attempt_id, None,
+            agent_path, expected_thread_id, status, expected_attempt_id, None, None, None,
         ).await
     }
 
+    async fn terminal_dispatch_pending(
+        &self,
+        store: &LocalAgentTaskStore,
+        attempt_id: AttemptId,
+    ) -> StoreResult<bool> {
+        Ok(self.live_terminal_dispatch_pending(attempt_id)
+            || store.has_retained_terminal_outcome(attempt_id).await?
+            || self.live_terminal_dispatch_pending(attempt_id))
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Fence stalled recovery against local attempt and binding transitions"
+    )]
+    pub(crate) async fn recover_stalled_binding(
+        &self,
+        observed: &AgentTaskBinding,
+        no_progress_before: DateTime<Utc>,
+    ) -> StoreResult<Option<NonproductiveRecovery>> {
+        let _update = self.binding_updates.lock().await;
+        self.require_root_scope(&observed.root_session_id)?;
+        let store = self.required_store()?;
+        if !store.get_agent_task_binding(observed.assignment_id).await?.is_some_and(|current| {
+            current.attempt_id == observed.attempt_id && current.thread_id == observed.thread_id
+        }) {
+            return Ok(None);
+        }
+        if self.terminal_dispatch_pending(store.as_ref(), observed.attempt_id).await? {
+            return Ok(None);
+        }
+        let recovery = store
+            .recover_nonproductive_assignment_for_attempt(
+                observed.assignment_id, Some(observed.attempt_id), no_progress_before,
+            )
+            .await?;
+        if let NonproductiveRecovery::Recovered { receipt, .. } = &recovery {
+            self.mark_attempt_abandoned(receipt.assignment_id, receipt.attempt_id);
+        } else if matches!(recovery, NonproductiveRecovery::NotEligible)
+            && (store.has_retained_terminal_outcome(observed.attempt_id).await?
+                || self.live_terminal_dispatch_pending(observed.attempt_id))
+        {
+            // SQLite may have seen custody acquired after the initial check.
+            // Do not reinterpret that refusal as permission to send a nudge.
+            return Ok(None);
+        }
+        Ok(Some(recovery))
+    }
+
+    pub(crate) async fn stalled_nudge_binding_is_current(
+        &self,
+        observed: &AgentTaskBinding,
+        reserved_at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.require_root_scope(&observed.root_session_id)?;
+        Ok(!self.live_terminal_dispatch_pending(observed.attempt_id)
+            && self.required_store()?.stalled_nudge_reservation_is_current(observed, reserved_at).await?
+            && !self.live_terminal_dispatch_pending(observed.attempt_id))
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Keep lease-fenced recovery ordered with local attempt and binding transitions"
+    )]
     async fn seal_missing_receipt_with_host_completion(
         &self,
         agent_path: &AgentPath,
         expected_thread_id: ThreadId,
         status: &AgentStatus,
         expected_attempt_id: AttemptId,
+        declared_gaps: Option<Vec<String>>,
+        retained_turn_id: Option<&str>,
         mut host_completion: Option<&mut codex_agent_task_store::DeferredHostCompletionWake>,
     ) -> StoreResult<Option<AgentReceipt>> {
+        let _update = self.binding_updates.lock().await;
         // Retain the complete identity across awaits; a reused path must never select a new child.
         let Some(binding) = self.binding_for_agent_path(agent_path).filter(|binding| {
             binding.thread_id.as_deref() == Some(expected_thread_id.to_string().as_str())
@@ -1139,17 +1436,23 @@ impl AgentTaskCoordinator {
             return Ok(None);
         };
         let store = self.required_store()?;
-        let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
+        let mut task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
         if task.current_attempt.attempt_id != binding.attempt_id {
             return Ok(None);
         }
         if task.receipt.is_some() || task.current_attempt.state != AttemptState::Active {
-            self.forget_declared_gaps(binding.attempt_id);
             if let Some(publication) = host_completion.as_mut() {
                 publication.publish().await?;
             }
             return Ok(None);
         }
+        let declared_gaps = match declared_gaps {
+            Some(gaps) => gaps,
+            None if self.terminal_dispatch_pending(store.as_ref(), binding.attempt_id).await? => {
+                return Ok(None);
+            }
+            None => Vec::new(),
+        };
         if super::status::is_final(status)
             && task
                 .validation_calls
@@ -1161,15 +1464,36 @@ impl AgentTaskCoordinator {
             if let Some(publication) = host_completion.as_mut() {
                 publication.publish().await?;
             }
-            // The terminal runtime no longer produces work. Reuse the store's
-            // lease-fenced recovery: unexpired operations suspend settlement;
-            // expired operations become cancelled, never successful evidence.
-            if let codex_agent_task_store::NonproductiveRecovery::Recovered { receipt, .. } = store
-                .recover_nonproductive_assignment(binding.assignment_id, Utc::now())
-                .await?
-            {
-                self.mark_task_inactive(binding.assignment_id);
-                return Ok(Some(*receipt));
+            if let Some(turn_id) = retained_turn_id {
+                // The exact retained outcome must win. Settle only expired
+                // validation leases; do not generate a nonproductive receipt.
+                if !store.settle_retained_terminal_validation_calls(
+                    binding.assignment_id, binding.attempt_id, turn_id,
+                ).await? {
+                    return Err(StoreError::InvalidAssignment(
+                        "retained terminal outcome is waiting for active validation leases".into(),
+                    ));
+                }
+                task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
+                if task.current_attempt.attempt_id != binding.attempt_id || task.receipt.is_some() {
+                    return Ok(None);
+                }
+            } else {
+                match store.recover_nonproductive_assignment_for_attempt(
+                    binding.assignment_id, Some(binding.attempt_id), Utc::now(),
+                ).await? {
+                    NonproductiveRecovery::Recovered { receipt, .. } => {
+                        self.mark_attempt_terminal(receipt.assignment_id, receipt.attempt_id);
+                        return Ok(Some(*receipt));
+                    }
+                    NonproductiveRecovery::Suspended(_) => return Ok(None),
+                    NonproductiveRecovery::NotEligible => {
+                        // A durable row may have won since the original check.
+                        if self.terminal_dispatch_pending(store.as_ref(), binding.attempt_id).await? {
+                            return Ok(None);
+                        }
+                    }
+                }
             }
         }
         let validation_call_ids = task
@@ -1219,13 +1543,6 @@ impl AgentTaskCoordinator {
         };
         // A final response ends the turn; it cannot outrank the host's own record
         // that the turn left work undone. The report still reaches the parent.
-        let declared_gaps = self
-            .declared_gaps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&binding.attempt_id)
-            .cloned()
-            .unwrap_or_default();
         let unfulfilled = legacy_outcome
             && outcome == AgentStatusClaim::Completed
             && !declared_gaps.is_empty();
@@ -1282,14 +1599,12 @@ impl AgentTaskCoordinator {
         };
         match result {
             Ok(receipt) => {
-                self.forget_declared_gaps(binding.attempt_id);
-                self.mark_task_inactive(binding.assignment_id);
+                self.mark_attempt_terminal(receipt.assignment_id, receipt.attempt_id);
                 Ok(Some(receipt))
             }
             Err(error) => {
                 if binding_no_longer_needs_receipt(store.as_ref(), &binding).await? {
-                    self.forget_declared_gaps(binding.attempt_id);
-                    self.mark_task_inactive(binding.assignment_id);
+                    self.mark_task_inactive(binding.assignment_id, binding.attempt_id);
                     Ok(None)
                 } else {
                     Err(error)
@@ -1314,9 +1629,13 @@ impl AgentTaskCoordinator {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(previous) = bindings.by_assignment.remove(&binding.assignment_id) {
             bindings.by_agent_path.remove(&previous.agent_path);
+            if previous.attempt_id != binding.attempt_id || previous.thread_id != binding.thread_id {
+                bindings.pending_terminal_dispatches.remove(&previous.attempt_id);
+            }
         }
         if let Some(previous) = bindings.by_agent_path.remove(&binding.agent_path) {
             bindings.by_assignment.remove(&previous.assignment_id);
+            bindings.pending_terminal_dispatches.remove(&previous.attempt_id);
         }
         bindings
             .by_agent_path
@@ -1336,6 +1655,7 @@ impl AgentTaskCoordinator {
         let Some(binding) = bindings.by_assignment.remove(&assignment_id) else {
             return;
         };
+        bindings.pending_terminal_dispatches.remove(&binding.attempt_id);
         if bindings
             .by_agent_path
             .get(&binding.agent_path)
@@ -1345,14 +1665,14 @@ impl AgentTaskCoordinator {
         }
     }
 
-    fn start_task_metrics(&self, assignment: &Assignment) {
+    fn start_task_metrics(&self, assignment: &Assignment, attempt_id: AttemptId) {
         let mut metrics = self
             .metrics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active_turns = saturating_active_turns(metrics.active.len());
         let capacity = metric_capacity(&metrics, active_turns);
-        match TaskMetricRuntime::new(assignment, active_turns, capacity) {
+        match TaskMetricRuntime::new(assignment, attempt_id, active_turns, capacity) {
             Ok(runtime) => {
                 metrics.runtimes.insert(assignment.assignment_id, runtime);
             }
@@ -1367,12 +1687,43 @@ impl AgentTaskCoordinator {
         }
     }
 
-    fn set_task_metric_active(&self, assignment_id: AssignmentId, active: bool) {
+    // Call only for a successor selected by the durable binding mutation, while
+    // holding binding_updates. Keep all un-emitted assignment totals intact.
+    fn advance_task_metric_attempt(&self, assignment_id: AssignmentId, attempt_id: AttemptId) {
         let mut metrics = self
             .metrics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !metrics.runtimes.contains_key(&assignment_id) {
+        let Some(runtime) = metrics.runtimes.get_mut(&assignment_id) else {
+            return;
+        };
+        if runtime.attempt_id != attempt_id {
+            runtime.attempt_id = attempt_id;
+            runtime.terminal = false;
+            metrics.pending_abandonment_metrics.remove(&assignment_id);
+        }
+        if metrics.runtimes.get(&assignment_id).is_some_and(|runtime| !runtime.terminal)
+            && metrics.active.insert(assignment_id)
+        {
+            let errors = transition_metric_runtimes(&mut metrics);
+            drop(metrics);
+            warn_metric_transition_errors(errors);
+        }
+    }
+
+    fn set_task_metric_active(
+        &self,
+        assignment_id: AssignmentId,
+        attempt_id: AttemptId,
+        active: bool,
+    ) {
+        let mut metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !metrics.runtimes.get(&assignment_id).is_some_and(|runtime| {
+            runtime.attempt_id == attempt_id && (!active || !runtime.terminal)
+        }) {
             return;
         }
         let changed = if active {

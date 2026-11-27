@@ -297,6 +297,136 @@ pub(crate) struct AgentControl {
     pub(crate) inherited_validation_context: Option<super::task_coordinator::ValidationTurnContext>,
 }
 
+/// Ephemeral authority belonging to a single running parent turn. The lock
+/// orders sealing against final child installation; it is never held over I/O.
+#[derive(Debug, Default)]
+pub(crate) struct FollowupTurn(std::sync::Mutex<FollowupTurnState>);
+
+#[derive(Debug, Default)]
+pub(crate) struct FollowupTurnState {
+    sealed: bool,
+    wakes: Vec<Weak<FollowupWake>>,
+}
+
+impl FollowupTurn {
+    fn lock(&self) -> std::sync::MutexGuard<'_, FollowupTurnState> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn track(&self, wake: &Arc<FollowupWake>) {
+        let mut state = self.lock();
+        if !state.sealed {
+            state.wakes.retain(|wake| wake.strong_count() != 0);
+            // A weak in-flight proposal lets ordinary failure remember the
+            // possibility of admission. Only fresh mail may hold/install it.
+            state.wakes.push(Arc::downgrade(wake));
+        }
+    }
+
+    pub(crate) fn has_work(&self) -> bool {
+        self.lock().wakes.iter().any(|wake| wake.strong_count() != 0)
+    }
+
+    pub(crate) fn seal(&self) -> bool {
+        !std::mem::replace(&mut self.lock().sealed, true)
+    }
+
+    pub(crate) fn started_wakes(&self) -> Vec<(ThreadId, String, Arc<FollowupWake>)> {
+        let state = self.lock();
+        debug_assert!(state.sealed);
+        state.wakes.iter().filter_map(Weak::upgrade).filter_map(|wake| {
+            let turn = wake.started_turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()?;
+            Some((wake.child, turn, wake))
+        }).collect()
+    }
+}
+
+/// A scheduling lease, not part of the durable envelope. The parent
+/// can revoke it even while the receiver is admitting or transferring mail.
+#[derive(Debug)]
+pub(crate) struct FollowupWake {
+    owner: Option<Arc<FollowupTurn>>,
+    registry: Weak<AgentRegistry>,
+    parent: ThreadId,
+    child: ThreadId,
+    started_turn: std::sync::Mutex<Option<String>>,
+}
+
+impl FollowupWake {
+    pub(crate) fn new(
+        owner: Option<Arc<FollowupTurn>>,
+        registry: &Arc<AgentRegistry>,
+        parent: ThreadId,
+        child: ThreadId,
+    ) -> Arc<Self> {
+        let wake = Arc::new(Self {
+            owner,
+            registry: Arc::downgrade(registry),
+            parent,
+            child,
+            started_turn: Default::default(),
+        });
+        if let Some(owner) = &wake.owner {
+            owner.track(&wake);
+        }
+        wake
+    }
+
+    pub(crate) fn is_direct_child(&self) -> bool {
+        self.registry.upgrade().is_some_and(|registry| {
+            registry.is_direct_spawn_child(self.parent, self.child)
+        })
+    }
+
+    pub(crate) fn can_start(&self) -> bool {
+        self.owner.as_ref().is_some_and(|owner| !owner.lock().sealed)
+            && self.is_direct_child()
+    }
+
+    // Keep the guard through actual task installation and validation commit.
+    pub(crate) fn install(&self, turn_id: &str) -> Option<std::sync::MutexGuard<'_, FollowupTurnState>> {
+        let state = self.owner.as_ref()?.lock();
+        if state.sealed || !self.registry.upgrade()?.record_followup_start(self.parent, self.child)
+        {
+            return None;
+        }
+        *self.started_turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(turn_id.to_owned());
+        Some(state)
+    }
+}
+
+/// Receiver-owned admission effects. An absent effect preserves the preview;
+/// an effect with no preview explicitly clears it (including encrypted input).
+pub(crate) struct MailboxTaskMessage {
+    registry: Weak<AgentRegistry>,
+    thread_id: ThreadId,
+    preview: Option<String>,
+    followup_wake: Option<Arc<FollowupWake>>,
+}
+
+impl std::fmt::Debug for MailboxTaskMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailboxTaskMessage").finish_non_exhaustive()
+    }
+}
+
+impl MailboxTaskMessage {
+    pub(crate) fn followup_wake(&self) -> Option<Arc<FollowupWake>> {
+        self.followup_wake.clone()
+    }
+
+    pub(crate) fn accept(self) -> Option<Arc<FollowupWake>> {
+        if let Some(registry) = self.registry.upgrade() {
+            match self.preview {
+                Some(preview) => registry.update_last_task_message(self.thread_id, preview),
+                None => registry.clear_last_task_message(self.thread_id),
+            }
+        }
+        self.followup_wake
+    }
+}
+
 impl AgentControl {
     /// Construct a new `AgentControl` that can spawn/message agents via the given manager state.
     pub(crate) fn new(manager: Weak<ThreadManagerState>) -> Self {
@@ -386,7 +516,7 @@ impl AgentControl {
                 return Err("validation root turn is no longer active".to_string());
             }
         }
-        session.persist_rollout_items_durable(&[RolloutItem::TurnContext(item)]).await
+        session.persist_rollout_items_then_sync(&[RolloutItem::TurnContext(item)]).await
             .map_err(|error| format!("failed to checkpoint root validation admissions: {error}"))
     }
 
@@ -605,6 +735,20 @@ impl AgentControl {
     ) -> CodexResult<String> {
         self.validate_inter_agent_communication(&communication, &agent_communication_context)?;
         let state = self.upgrade()?;
+        let followup_wake = if let Some((parent, turn_id)) = agent_communication_context
+            .followup_turn_owner()
+            .filter(|(parent, _)| communication.trigger_turn
+                && self.state.is_direct_spawn_child(*parent, agent_id))
+        {
+            Some(match state.get_thread(parent).await {
+                Ok(thread) => thread.codex.session
+                    .followup_wake_for_active_turn(turn_id, agent_id, &self.state).await,
+                Err(CodexErr::ThreadNotFound(_)) => FollowupWake::new(None, &self.state, parent, agent_id),
+                Err(error) => return Err(error),
+            })
+        } else {
+            None
+        };
         let execution_guard = self
             .reserve_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
             .await?;
@@ -614,6 +758,7 @@ impl AgentControl {
             communication,
             agent_communication_context,
             execution_guard,
+            followup_wake,
         )
         .await
     }
@@ -675,10 +820,14 @@ impl AgentControl {
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         execution_guard: Option<AgentExecutionGuard>,
+        followup_wake: Option<Arc<FollowupWake>>,
     ) -> CodexResult<String> {
-        let last_task_message = last_task_message_from_communication(&communication);
-        self.submit_inter_agent_communication_with_preview(
-            agent_id, state, communication, context, execution_guard, last_task_message,
+        let last_task_message = context
+            .tracks_last_task_message()
+            .then(|| last_task_message_from_communication(&communication))
+            .flatten();
+        self.submit_inter_agent_communication_with_effects(
+            agent_id, state, communication, context, execution_guard, last_task_message, followup_wake,
         ).await
     }
 
@@ -691,15 +840,36 @@ impl AgentControl {
         execution_guard: Option<AgentExecutionGuard>,
         last_task_message: Option<String>,
     ) -> CodexResult<String> {
+        self.submit_inter_agent_communication_with_effects(
+            agent_id, state, communication, context, execution_guard, last_task_message, None,
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_inter_agent_communication_with_effects(
+        &self,
+        agent_id: ThreadId,
+        state: &Arc<ThreadManagerState>,
+        communication: InterAgentCommunication,
+        context: AgentCommunicationContext,
+        execution_guard: Option<AgentExecutionGuard>,
+        last_task_message: Option<String>,
+        followup_wake: Option<Arc<FollowupWake>>,
+    ) -> CodexResult<String> {
+        let task_message = context.tracks_last_task_message().then(|| MailboxTaskMessage {
+            registry: Arc::downgrade(&self.state),
+            thread_id: agent_id,
+            preview: last_task_message,
+            followup_wake,
+        });
         let communication_log_metadata = crate::agent_communication::logging_enabled()
             .then(|| crate::agent_communication::agent_communication_log_metadata(&communication));
-        let turn_owner = communication.trigger_turn.then(|| context.followup_turn_owner()).flatten();
         let queue = (!communication.trigger_turn)
             .then(|| self.state.input_queue_for_delivery(agent_id))
             .flatten();
         let result = if let Some(queue) = queue {
             state
-                .enqueue_queue_only_communication(agent_id, &queue, communication)
+                .enqueue_queue_only_communication(agent_id, &queue, communication, task_message)
                 .await
         } else {
             let receiver = state.get_thread(agent_id).await?;
@@ -707,7 +877,12 @@ impl AgentControl {
                 .then(|| context.followup_validation_scope().cloned())
                 .flatten();
             let submitted = receiver
-                .submit_mailbox_communication(communication, execution_guard, validation_origin)
+                .submit_mailbox_communication(
+                    communication,
+                    execution_guard,
+                    validation_origin,
+                    task_message,
+                )
                 .await;
             self.handle_thread_request_result(
                 agent_id,
@@ -726,19 +901,6 @@ impl AgentControl {
                 agent_id,
             );
         }
-        if result.is_ok() {
-            // Publish ownership only for accepted work, without an intervening
-            // await or rewriting immutable creation-turn provenance.
-            if let Some((parent, turn)) = turn_owner {
-                self.state.record_turn_followup_owner(agent_id, parent, turn);
-            }
-            match last_task_message {
-                Some(last_task_message) => self
-                    .state
-                    .update_last_task_message(agent_id, last_task_message),
-                None => self.state.clear_last_task_message(agent_id),
-            }
-        }
         result
     }
 
@@ -753,6 +915,31 @@ impl AgentControl {
         .await
     }
 
+    pub(crate) async fn interrupt_followup_turn(
+        &self,
+        child: ThreadId,
+        turn_id: &str,
+        wake: &Arc<FollowupWake>,
+    ) -> CodexResult<bool> {
+        match self.upgrade()?.get_thread(child).await {
+            Ok(thread) => Ok(thread.codex.session.interrupt_followup_turn(turn_id, wake).await),
+            Err(CodexErr::ThreadNotFound(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn interrupt_spawn_owned_agent(
+        &self,
+        child: ThreadId,
+        root: ThreadId,
+    ) -> CodexResult<bool> {
+        match self.upgrade()?.get_thread(child).await {
+            Ok(thread) => Ok(thread.codex.session.interrupt_spawn_owned_agent(&self.state, root).await),
+            Err(CodexErr::ThreadNotFound(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn handle_thread_request_result(
         &self,
         agent_id: ThreadId,
@@ -761,6 +948,35 @@ impl AgentControl {
     ) -> CodexResult<String> {
         let (expected_thread, result) = request?;
         if matches!(result, Err(CodexErr::InternalAgentDied)) {
+            if Self::is_v2_resident_thread(&expected_thread) {
+                let retirement = tokio::time::timeout(
+                    residency::RESIDENCY_ACQUISITION_TIMEOUT,
+                    expected_thread.retire_stopped_generation(),
+                )
+                .await;
+                let detach_result = match retirement {
+                    Ok(Ok(retirement)) => {
+                        state
+                            .remove_stopped_thread_if_same(
+                                agent_id,
+                                &expected_thread,
+                                &retirement,
+                                || {},
+                            )
+                            .await
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => {
+                        warn!(%agent_id, "failed agent runtime is still retiring; preserving registration and residency");
+                        return result;
+                    }
+                };
+                if let Err(error) = detach_result {
+                    warn!(%agent_id, %error, "failed agent runtime retirement is unconfirmed; preserving registration and residency");
+                }
+                // V2 runtime death is a cold-residency transition, not a logical close.
+                return result;
+            }
             let drained = tokio::time::timeout(
                 residency::RESIDENCY_ACQUISITION_TIMEOUT,
                 async {
@@ -776,9 +992,6 @@ impl AgentControl {
                 expected_thread.multi_agent_version() == Some(MultiAgentVersion::V2);
             state
                 .remove_thread_if_same_with_cleanup(&agent_id, &expected_thread, || {
-                    self.forget_v2_residency(agent_id);
-                    // V2 runtime death is a cold-residency transition, not a logical close.
-                    // A loader may already own the retained identity while rebuilding it.
                     if !retain_cold_identity {
                         self.state.release_spawned_thread(agent_id);
                     }
@@ -912,9 +1125,9 @@ impl AgentControl {
         &self,
         parent: ThreadId,
         turn_id: &str,
-    ) -> CodexResult<Vec<ThreadId>> {
+    ) -> CodexResult<HashMap<ThreadId, ThreadId>> {
         let state = self.upgrade()?;
-        let ephemeral_owners = self.state.turn_spawn_owners();
+        let (ephemeral_owners, reused_roots) = self.state.turn_spawn_owners();
         let mut roots = ephemeral_owners.iter().filter_map(|(child, (owner, turn))| {
                 (*owner == parent && turn == turn_id).then_some(*child)
             }).collect::<HashSet<_>>();
@@ -940,18 +1153,19 @@ impl AgentControl {
             }) {
                 continue;
             }
-            if owner != parent || roots.contains(&child) {
+            if owner != parent || (roots.contains(&child) && !reused_roots.contains(&child)) {
                 children.entry(owner).or_default().push(child);
             }
         }
         let mut seen = HashSet::from([parent]);
-        let mut pending = vec![parent];
-        let mut result = Vec::new();
-        while let Some(owner) = pending.pop() {
+        let mut pending = vec![(parent, parent)];
+        let mut result = HashMap::new();
+        while let Some((owner, root)) = pending.pop() {
             for child in children.remove(&owner).unwrap_or_default() {
                 if seen.insert(child) {
-                    result.push(child);
-                    pending.push(child);
+                    let root = if owner == parent { child } else { root };
+                    result.insert(child, root);
+                    pending.push((child, root));
                 }
             }
         }

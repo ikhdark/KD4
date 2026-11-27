@@ -7,6 +7,7 @@ const AGENT_COMMUNICATION_TARGET: &str = "codex_otel.agent_communication";
 pub(crate) enum AgentCommunicationKind {
     Spawn,
     Message,
+    SettledSourceAdvisory,
     Followup,
     Result,
 }
@@ -15,7 +16,7 @@ impl AgentCommunicationKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Spawn => "spawn",
-            Self::Message => "message",
+            Self::Message | Self::SettledSourceAdvisory => "message",
             Self::Followup => "followup",
             Self::Result => "result",
         }
@@ -63,6 +64,15 @@ impl AgentCommunicationContext {
         (self.kind == AgentCommunicationKind::Followup)
             .then(|| self.sender_turn_id.as_deref().map(|turn| (self.sender_thread_id, turn)))
             .flatten()
+    }
+
+    pub(crate) fn tracks_last_task_message(&self) -> bool {
+        matches!(
+            self.kind,
+            AgentCommunicationKind::Spawn
+                | AgentCommunicationKind::Message
+                | AgentCommunicationKind::Followup
+        )
     }
 
     pub(crate) fn is_terminal_result(&self) -> bool {

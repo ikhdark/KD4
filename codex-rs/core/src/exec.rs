@@ -721,24 +721,28 @@ async fn exec(
     if cancellations.iter().any(CancellationToken::is_cancelled) {
         return Err(CodexErr::Io(io::Error::new(io::ErrorKind::Interrupted, "execution cancelled before spawn")));
     }
-    let (child, observation) = spawn_child_with_observation_async(SpawnChildRequest {
-        program: PathBuf::from(program),
-        args: args.into(),
-        arg0: arg0_ref,
-        cwd,
-        stdio_policy: StdioPolicy::RedirectForShellTool,
-        env,
+    let (child, observation, managed_root) = spawn_child_with_observation_async(
+        SpawnChildRequest {
+            program: PathBuf::from(program),
+            args: args.into(),
+            arg0: arg0_ref,
+            cwd,
+            stdio_policy: StdioPolicy::RedirectForShellTool,
+            env,
 
-        creation_flags: 0,
-    })
-    .await?;
+            creation_flags: 0,
+        },
+        managed_root,
+    )
+    .await?
+    .into_parts();
     // Creation already happened, even if containment fails below.
     crate::tools::tool_dispatch_trace::mark_exec_process_spawned();
-    if let Err(err) = managed_root.attach_and_resume(
-        child
-            .id()
-            .ok_or_else(|| io::Error::other("missing child process id"))?,
-    ) {
+    let attach_result = child
+        .id()
+        .ok_or_else(|| io::Error::other("missing child process id"))
+        .and_then(|pid| managed_root.attach_and_resume(pid));
+    if let Err(err) = attach_result {
         if let Err(cleanup_error) = managed_root.cleanup_after_failed_attach(child).await {
             observation.cleanup_observed("attach_failed_cleanup_failed");
             tracing::warn!("Failed to clean up uncontained exec child: {cleanup_error}");

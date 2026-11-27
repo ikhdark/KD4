@@ -2222,6 +2222,7 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
                     (
                         thread_id.clone(),
                         CollabAgentState {
+                            completion: None,
                             stop_cause: state.stop_cause,
                             status: state.status.clone(),
                             message: None,

@@ -31,6 +31,7 @@ const CURATED_PLUGINS_FETCH_REF: &str = "refs/codex/curated-sync";
 const CURATED_PLUGINS_RELATIVE_DIR: &str = ".tmp/plugins";
 const CURATED_PLUGINS_SHA_FILE: &str = ".tmp/plugins.sha";
 const CURATED_PLUGINS_SYNC_LOCK_FILE: &str = ".tmp/plugins.sync.lock";
+const CURATED_PLUGINS_PUBLICATION_LOCK_FILE: &str = ".tmp/plugins.publication.lock";
 const CURATED_PLUGINS_BACKUP_ARCHIVE_FALLBACK_VERSION: &str = "export-backup";
 const CURATED_PLUGINS_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CURATED_PLUGINS_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -186,6 +187,32 @@ pub(crate) fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<Fil
     Ok(lock_file)
 }
 
+/// Short-lived catalog read lease; independent of the startup/network lock.
+/// Acquire only on a blocking thread. Readers never acquire the startup lock
+/// while holding this lease; writers always take the startup lock first.
+pub(crate) fn lock_curated_plugins_catalog(codex_home: &Path) -> Result<File, String> {
+    lock_curated_plugins_publication(codex_home, /*write*/ false)
+}
+
+fn lock_curated_plugins_publication(codex_home: &Path, write: bool) -> Result<File, String> {
+    let lock_path = codex_home.join(CURATED_PLUGINS_PUBLICATION_LOCK_FILE);
+    std::fs::create_dir_all(codex_home.join(".tmp"))
+        .map_err(|err| format!("failed to create curated plugins publication directory: {err}"))?;
+    let lock_file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open curated plugins publication lock: {err}"))?;
+    if write {
+        lock_file.lock()
+    } else {
+        lock_file.lock_shared()
+    }
+    .map_err(|err| format!("failed to lock curated plugins publication: {err}"))?;
+    Ok(lock_file)
+}
+
 fn sync_openai_plugins_repo_via_git(
     codex_home: &Path,
     git_binary: &Path,
@@ -198,7 +225,9 @@ fn sync_openai_plugins_repo_via_git(
         && ensure_marketplace_manifest_exists(&repo_path).is_ok()
     {
         if read_sha_file(&sha_path).as_deref() != Some(remote_sha.as_str()) {
-            write_curated_plugins_sha(&sha_path, &remote_sha)?;
+            let staged_sha = stage_curated_plugins_sha(&sha_path, &remote_sha)?;
+            let _publication = lock_curated_plugins_publication(codex_home, /*write*/ true)?;
+            publish_curated_plugins_sha(staged_sha, &sha_path)?;
         }
         return Ok(remote_sha);
     }
@@ -232,9 +261,7 @@ fn sync_openai_plugins_repo_via_git(
     }
 
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
-    activate_curated_repo(&repo_path, staged_repo_dir, || {
-        write_curated_plugins_sha(&sha_path, &remote_sha)
-    })?;
+    activate_curated_repo(codex_home, staged_repo_dir, &remote_sha)?;
     Ok(remote_sha)
 }
 
@@ -341,9 +368,7 @@ fn sync_openai_plugins_repo_via_http(
     ))?;
     extract_zipball_to_dir(&zipball_bytes, staged_repo_dir.path())?;
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
-    activate_curated_repo(&repo_path, staged_repo_dir, || {
-        write_curated_plugins_sha(&sha_path, &remote_sha)
-    })?;
+    activate_curated_repo(codex_home, staged_repo_dir, &remote_sha)?;
     Ok(remote_sha)
 }
 
@@ -353,7 +378,6 @@ fn sync_openai_plugins_repo_via_backup_archive(
     http_clients: &RouteAwareClientPool,
 ) -> Result<String, String> {
     let repo_path = curated_plugins_repo_path(codex_home);
-    let sha_path = curated_plugins_sha_path(codex_home);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -367,9 +391,7 @@ fn sync_openai_plugins_repo_via_backup_archive(
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
     let export_version = read_extracted_backup_archive_git_sha(staged_repo_dir.path())?
         .unwrap_or_else(|| CURATED_PLUGINS_BACKUP_ARCHIVE_FALLBACK_VERSION.to_string());
-    activate_curated_repo(&repo_path, staged_repo_dir, || {
-        write_curated_plugins_sha(&sha_path, &export_version)
-    })?;
+    activate_curated_repo(codex_home, staged_repo_dir, &export_version)?;
     Ok(export_version)
 }
 
@@ -531,12 +553,16 @@ fn ensure_marketplace_manifest_exists(repo_path: &Path) -> Result<(), String> {
 }
 
 fn activate_curated_repo(
-    repo_path: &Path,
+    codex_home: &Path,
     staged_repo_dir: TempDir,
-    publish_revision: impl FnOnce() -> Result<(), String>,
+    revision: &str,
 ) -> Result<(), String> {
-    let staged_repo_path = staged_repo_dir.path();
-    if repo_path.exists() {
+    let repo_path = curated_plugins_repo_path(codex_home);
+    let sha_path = curated_plugins_sha_path(codex_home);
+    // The caller already holds the startup lock, so another sync cannot change
+    // the live path while we prepare and flush the replacement revision.
+    let staged_sha = stage_curated_plugins_sha(&sha_path, revision)?;
+    let mut backup_dir = if repo_path.exists() {
         let parent = repo_path.parent().ok_or_else(|| {
             format!(
                 "failed to determine curated plugins parent directory for {}",
@@ -552,7 +578,29 @@ fn activate_curated_repo(
                     parent.display()
                 )
             })?;
-        let backup_repo_path = backup_dir.path().join("repo");
+        Some(backup_dir)
+    } else {
+        None
+    };
+
+    // Declared after the TempDirs so checkout cleanup happens after unlock.
+    let _publication = lock_curated_plugins_publication(codex_home, /*write*/ true)?;
+    replace_curated_repo(
+        &repo_path,
+        staged_repo_dir.path(),
+        &mut backup_dir,
+        || publish_curated_plugins_sha(staged_sha, &sha_path),
+    )
+}
+
+fn replace_curated_repo(
+    repo_path: &Path,
+    staged_repo_path: &Path,
+    backup_dir: &mut Option<TempDir>,
+    publish_revision: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(backup) = backup_dir.as_ref() {
+        let backup_repo_path = backup.path().join("repo");
 
         std::fs::rename(repo_path, &backup_repo_path).map_err(|err| {
             format!(
@@ -569,7 +617,11 @@ fn activate_curated_repo(
                     repo_path.display()
                 )),
                 Err(rollback_err) => {
-                    let backup_path = backup_dir.keep().join("repo");
+                    let backup_path = backup_dir
+                        .take()
+                        .expect("previous checkout has a backup directory")
+                        .keep()
+                        .join("repo");
                     Err(format!(
                         "failed to activate new curated plugins repo at {}: {err}; failed to restore previous repo (left at {}): {rollback_err}",
                         repo_path.display(),
@@ -587,7 +639,11 @@ fn activate_curated_repo(
             return match rollback_result {
                 Ok(()) => Err(err),
                 Err(rollback_err) => {
-                    let backup_path = backup_dir.keep().join("repo");
+                    let backup_path = backup_dir
+                        .take()
+                        .expect("previous checkout has a backup directory")
+                        .keep()
+                        .join("repo");
                     Err(format!(
                         "{err}; failed to restore previous curated plugins repo at {} (left at {}): {rollback_err}",
                         repo_path.display(),
@@ -617,28 +673,41 @@ fn activate_curated_repo(
     Ok(())
 }
 
-fn write_curated_plugins_sha(sha_path: &Path, remote_sha: &str) -> Result<(), String> {
+fn stage_curated_plugins_sha(
+    sha_path: &Path,
+    revision: &str,
+) -> Result<tempfile::NamedTempFile, String> {
     use std::io::Write;
 
-    let write_revision = || -> std::io::Result<()> {
+    let stage_revision = || -> std::io::Result<_> {
         let parent = sha_path.parent().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "SHA path has no parent")
         })?;
         std::fs::create_dir_all(parent)?;
         let mut staged_sha = tempfile::NamedTempFile::new_in(parent)?;
-        writeln!(staged_sha, "{remote_sha}")?;
+        writeln!(staged_sha, "{revision}")?;
         staged_sha.as_file().sync_all()?;
-        // Commit last: no fallible work may follow this replacement because an
-        // error tells the caller to restore the previous checkout.
-        staged_sha.persist(sha_path).map_err(|err| err.error)?;
-        Ok(())
+        Ok(staged_sha)
     };
-    write_revision().map_err(|err| {
-        format!(
-            "failed to write curated plugins sha file {}: {err}",
-            sha_path.display()
-        )
-    })
+    stage_revision().map_err(|err| curated_plugins_sha_write_error(sha_path, err))
+}
+
+fn publish_curated_plugins_sha(
+    staged_sha: tempfile::NamedTempFile,
+    sha_path: &Path,
+) -> Result<(), String> {
+    // Commit last: an error tells the caller to restore the previous checkout.
+    staged_sha
+        .persist(sha_path)
+        .map(|_| ())
+        .map_err(|err| curated_plugins_sha_write_error(sha_path, err.error))
+}
+
+fn curated_plugins_sha_write_error(sha_path: &Path, err: std::io::Error) -> String {
+    format!(
+        "failed to write curated plugins sha file {}: {err}",
+        sha_path.display()
+    )
 }
 
 fn git_ls_remote_head_sha(git_binary: &Path) -> Result<String, String> {

@@ -3,11 +3,17 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -235,15 +241,20 @@ pub async fn payload_versions_match(versions: &[PayloadDependencyVersion]) -> bo
     .unwrap_or(false)
 }
 
+// Path ordering deduplicates payloads within one rollout; each fresh Arc is
+// also the identity of one enrollment, independent of the file's content hash.
+type PendingPayloads = Mutex<BTreeSet<Arc<Path>>>;
+
 #[derive(Default)]
-struct PendingSync {
-    sequence: u64,
-    paths: std::collections::BTreeMap<(PathBuf, PathBuf), u64>,
-    owners: std::collections::BTreeMap<PathBuf, usize>,
+struct PendingRollout {
+    owners: usize,
+    payloads: Arc<PendingPayloads>,
 }
 
-fn pending_sync() -> &'static std::sync::Mutex<PendingSync> {
-    static PENDING: std::sync::OnceLock<std::sync::Mutex<PendingSync>> = std::sync::OnceLock::new();
+fn pending_sync() -> &'static Mutex<BTreeMap<PathBuf, PendingRollout>> {
+    // Only owner counts and state handles are touched under this registry lock.
+    // Never take a rollout's payload lock or drop its set while holding it.
+    static PENDING: OnceLock<Mutex<BTreeMap<PathBuf, PendingRollout>>> = OnceLock::new();
     PENDING.get_or_init(Default::default)
 }
 
@@ -255,56 +266,60 @@ pub(crate) struct PayloadSyncOwner {
 }
 
 impl PayloadSyncOwner {
-    pub(crate) fn new(path: &Path) -> std::sync::Arc<Self> {
+    pub(crate) fn new(path: &Path) -> Arc<Self> {
         let rollout = crate::compression::plain_rollout_path(path);
-        let mut pending = pending_sync()
+        pending_sync()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *pending.owners.entry(rollout.clone()).or_default() += 1;
-        std::sync::Arc::new(Self { rollout })
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(rollout.clone())
+            .or_default()
+            .owners += 1;
+        Arc::new(Self { rollout })
     }
 }
 
 impl Drop for PayloadSyncOwner {
     fn drop(&mut self) {
-        let mut pending = pending_sync()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(owners) = pending.owners.get_mut(&self.rollout) else {
-            return;
+        let retired = {
+            let mut registry = pending_sync().lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(state) = registry.get_mut(&self.rollout) else {
+                return;
+            };
+            state.owners -= 1;
+            if state.owners != 0 {
+                return;
+            }
+            registry.remove(&self.rollout)
         };
-        *owners -= 1;
-        if *owners != 0 {
-            return;
-        }
-        pending.owners.remove(&self.rollout);
-        let keys = pending.paths.range((self.rollout.clone(), PathBuf::new())..)
-            .take_while(|((owner, _), _)| owner == &self.rollout)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        for key in keys {
-            pending.paths.remove(&key);
-        }
+        drop(retired);
     }
 }
 
 /// Sync payloads before their rollout references. Failed barriers retain their
-/// work; concurrent publications retain newer sequences for the next barrier.
+/// work; concurrent publications retain newer enrollments for the next barrier.
 pub(crate) async fn sync_payload_artifacts(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     let directory = root(path);
-    let rollout = path.to_path_buf();
+    let rollout = crate::compression::plain_rollout_path(path);
     tokio::task::spawn_blocking(move || {
-        // Keys order by owner first, so a barrier visits only its own entries rather
-        // than every rollout's retained work.
-        let pending = pending_sync()
+        let payloads = pending_sync()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .paths
-            .range((rollout.clone(), PathBuf::new())..)
-            .take_while(|((owner, _), _)| owner == &rollout)
-            .map(|(path, sequence)| (path.clone(), *sequence))
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&rollout)
+            .map(|state| Arc::clone(&state.payloads));
+        let Some(payloads) = payloads else {
+            return Ok(());
+        };
+        let pending = payloads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
             .collect::<Vec<_>>();
+        // Don't keep the full set alive during I/O after its last owner leaves.
+        // An old barrier cannot acknowledge a successor's re-enrolled payloads.
+        let generation = Arc::downgrade(&payloads);
+        drop(payloads);
         if pending.is_empty() {
             return Ok(());
         }
@@ -318,12 +333,13 @@ pub(crate) async fn sync_payload_artifacts(path: &Path) -> io::Result<()> {
         })?;
         #[cfg(unix)]
         std::fs::File::open(&directory)?.sync_all()?;
-        let mut registry = pending_sync()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (path, sequence) in pending {
-            if registry.paths.get(&path) == Some(&sequence) {
-                registry.paths.remove(&path);
+        if let Some(payloads) = generation.upgrade() {
+            let mut current = payloads.lock().unwrap_or_else(PoisonError::into_inner);
+            for path in &pending {
+                let key = path.as_ref();
+                if current.get(key).is_some_and(|entry| Arc::ptr_eq(entry, path)) {
+                    current.remove(key);
+                }
             }
         }
         Ok(())
@@ -336,7 +352,7 @@ pub(crate) async fn sync_payload_artifacts(path: &Path) -> io::Result<()> {
 /// wait for every worker. No registry lock is held during I/O; cancellation of
 /// the async observer leaves this blocking barrier and its acknowledgements owned.
 fn sync_payload_files(
-    pending: &[((PathBuf, PathBuf), u64)],
+    pending: &[Arc<Path>],
     parallelism: usize,
     sync_file: impl Fn(&Path) -> io::Result<()> + Sync,
 ) -> io::Result<()> {
@@ -346,7 +362,7 @@ fn sync_payload_files(
     if workers <= 1 {
         return pending
             .iter()
-            .try_for_each(|((_, path), _)| sync_file(path));
+            .try_for_each(|path| sync_file(path.as_ref()));
     }
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
@@ -354,7 +370,7 @@ fn sync_payload_files(
         for chunk in pending.chunks(pending.len().div_ceil(workers)) {
             let sync_file = &sync_file;
             match std::thread::Builder::new().spawn_scoped(scope, move || {
-                chunk.iter().try_for_each(|((_, path), _)| sync_file(path))
+                chunk.iter().try_for_each(|path| sync_file(path.as_ref()))
             }) {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
@@ -755,15 +771,7 @@ fn publish_payload(
     // A preexisting object or a concurrent writer that won admission is
     // verified: never reference a partial, corrupted, or substituted object,
     // including a preexisting symlink.
-    let mut pending = pending_sync()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pending.sequence = pending.sequence.saturating_add(1);
-    let sequence = pending.sequence;
-    pending
-        .paths
-        .insert((path.to_path_buf(), destination), sequence);
-    drop(pending);
+    enroll_payload_path_for_sync(path, destination);
     Ok(())
 }
 
@@ -1021,19 +1029,28 @@ fn check_payload_type(
 }
 
 fn enroll_payload_for_sync(path: &Path, sha256: &str) {
-    let mut pending = pending_sync()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pending.sequence = pending.sequence.saturating_add(1);
-    let sequence = pending.sequence;
-    // A cold reader observes `.jsonl.zst`, but the writer's durable barrier
-    // syncs dependencies keyed by the materialized plain rollout path.
-    pending.paths.insert(
-        (
-            crate::compression::plain_rollout_path(path),
-            root(path).join(format!("{sha256}.json")),
-        ),
-        sequence,
+    enroll_payload_path_for_sync(path, root(path).join(format!("{sha256}.json")));
+}
+
+fn enroll_payload_path_for_sync(path: &Path, destination: PathBuf) {
+    // A cold reader can observe the compressed representation. All custody
+    // and durable barriers use the same materialized plain rollout key.
+    let rollout = crate::compression::plain_rollout_path(path);
+    let payloads = Arc::clone(
+        &pending_sync()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(rollout)
+            .or_default()
+            .payloads,
     );
+    // Publication and append preflight hold an owner across this handoff, so
+    // the state cannot retire between lookup and enrollment.
+    let destination = Arc::<Path>::from(destination);
+    let replaced = payloads
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(destination);
+    drop(replaced);
 }
 

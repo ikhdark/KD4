@@ -13,6 +13,7 @@ use tracing::warn;
 
 use super::LocalThreadStore;
 use super::create_thread;
+use super::update_thread_metadata::recover_git_compatibility_before_write;
 use crate::CreateThreadParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
@@ -22,6 +23,11 @@ use crate::error::reject_paginated_history_mode;
 use crate::types::canonical_history_mode_from_rollout_items;
 
 const ROLLOUT_SIZE_BYTES_METRIC: &str = "codex.rollout.size_bytes";
+
+pub(super) struct StartedRecorder {
+    recorder: RolloutRecorder,
+    history: Option<Arc<Vec<RolloutItem>>>,
+}
 
 /// Keep startup custody until the observer actually receives the initialized
 /// writer. Dropping an unreceived result cleans up only this append owner.
@@ -43,6 +49,7 @@ impl Drop for InitializationGuard {
             return;
         };
         runtime.spawn(async move {
+            let _order = store.lock_rollout_publication(thread_id).await;
             if let Err(error) = discard_and_retire(&store, thread_id, &recorder).await {
                 warn!(%thread_id, %error, "failed to discard unclaimed recorder initialization");
             }
@@ -57,20 +64,18 @@ pub(super) async fn initialize<F, Fut>(
 ) -> ThreadStoreResult<()>
 where
     F: FnOnce(LocalThreadStore) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ThreadStoreResult<Option<Arc<Vec<RolloutItem>>>>>
-        + Send
-        + 'static,
+    Fut: std::future::Future<Output = ThreadStoreResult<StartedRecorder>> + Send + 'static,
 {
     let (send, receive) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let result = async {
-            let history = start(store.clone()).await?;
+            let StartedRecorder { recorder, history } = start(store.clone()).await?;
             let guard = InitializationGuard {
-                recorder: Some(store.live_recorder(thread_id).await?),
+                recorder: Some(recorder.clone()),
                 store: store.clone(),
                 thread_id,
             };
-            super::projection::initialize_deferred(&store, thread_id, history).await?;
+            super::projection::initialize_deferred(&store, thread_id, &recorder, history).await?;
             Ok::<_, ThreadStoreError>(guard)
         }
         .await;
@@ -108,43 +113,78 @@ async fn remove_current_recorder(
 pub(super) async fn create_thread(
     store: &LocalThreadStore,
     params: CreateThreadParams,
-) -> ThreadStoreResult<()> {
+) -> ThreadStoreResult<StartedRecorder> {
     let thread_id = params.thread_id;
     let history_mode = params.history_mode;
+    let _order = store.lock_rollout_publication(thread_id).await;
     store.ensure_live_recorder_absent(thread_id).await?;
     let recorder = create_thread::create_thread(store, params).await?;
-    store
+    reject_pending_git_on_create(store, thread_id).await?;
+    let recorder = store
         .insert_live_recorder(thread_id, recorder, history_mode)
-        .await
+        .await?;
+    Ok(StartedRecorder {
+        recorder,
+        history: None,
+    })
 }
 
 pub(super) async fn create_thread_with_repository_context(
     store: &LocalThreadStore,
     params: CreateThreadParams,
     repository_context: Option<RepositoryContext>,
-) -> ThreadStoreResult<()> {
+) -> ThreadStoreResult<StartedRecorder> {
     let thread_id = params.thread_id;
     let history_mode = params.history_mode;
+    let _order = store.lock_rollout_publication(thread_id).await;
     store.ensure_live_recorder_absent(thread_id).await?;
     let recorder =
         create_thread::create_thread_with_repository_context(store, params, repository_context)
             .await?;
-    store
+    reject_pending_git_on_create(store, thread_id).await?;
+    let recorder = store
         .insert_live_recorder(thread_id, recorder, history_mode)
-        .await
+        .await?;
+    Ok(StartedRecorder {
+        recorder,
+        history: None,
+    })
+}
+
+/// A newly allocated ID should have no persisted intent. Check under the
+/// created recorder's lease before exposing it to ordinary append admission.
+async fn reject_pending_git_on_create(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+) -> ThreadStoreResult<()> {
+    if let Some(state_db) = store.state_db.as_ref()
+        && state_db
+            .next_thread_git_compatibility_intent(thread_id)
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("could not check new thread {thread_id} for pending Git compatibility: {error}"),
+            })?
+            .is_some()
+    {
+        return Err(ThreadStoreError::Conflict {
+            message: format!("thread {thread_id} already has a pending Git compatibility intent"),
+        });
+    }
+    Ok(())
 }
 
 pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
-) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
+) -> ThreadStoreResult<StartedRecorder> {
     resume_thread_owned(store, params).await
 }
 
 async fn resume_thread_owned(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
-) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
+) -> ThreadStoreResult<StartedRecorder> {
+    let _order = store.lock_rollout_publication(params.thread_id).await;
     store.ensure_live_recorder_absent(params.thread_id).await?;
     let lease = store
         .acquire_writer_lease(params.thread_id, false)
@@ -211,10 +251,18 @@ async fn resume_thread_owned(
         }
         Ok(())
     };
+    // Reject supplied history before any repair or writer materialization.
+    if let Some(history) = params.history.as_ref() {
+        validate_history(history)?;
+    }
+    if let Some(state_db) = store.state_db.as_ref() {
+        // A prepared checkpoint owns interpretation of an unterminated tail.
+        // The ordinary recorder opener can repair newlines, so it must wait.
+        recover_git_compatibility_before_write(store, state_db, params.thread_id, &rollout_path)
+            .await?;
+    }
     let (recorder, history) = match params.history {
         Some(history) => {
-            // Reject supplied history before opening or materializing a writer.
-            validate_history(&history)?;
             let recorder = RolloutRecorder::new_with_writer_lease(
                 &config,
                 RolloutRecorderParams::resume(rollout_path),
@@ -243,10 +291,13 @@ async fn resume_thread_owned(
     repair_resume_discovery_metadata(store, params.thread_id, recorder.rollout_path())
         .instrument(debug_span!("resume_writer.discovery_repair"))
         .await;
-    store
+    let recorder = store
         .insert_live_recorder(params.thread_id, recorder, history_mode)
         .await?;
-    Ok(history)
+    Ok(StartedRecorder {
+        recorder,
+        history: Some(history),
+    })
 }
 
 /// Canonical history is the restart receipt for deferred index facts. Repair
@@ -357,23 +408,75 @@ pub(super) async fn append_persisted_items_ordered_with_origins(
     if items.is_empty() {
         return Ok(());
     }
-    let recorder = store.live_recorder(thread_id).await?;
+    let _order = store.lock_rollout_publication(thread_id).await;
+    let recorder = recorder_before_rollout_write(store, thread_id).await?;
     recorder
         .record_canonical_items_ordered_with_origins(items, origins)
         .await
         .map_err(thread_store_io_error)
 }
 
+/// Called only while the local publication order is held. The flag avoids
+/// a SQLite read per ordinary append when no Git commit could be pending.
+async fn current_recorder_and_git_fence(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+) -> ThreadStoreResult<(RolloutRecorder, bool)> {
+    let entries = store.live_recorders.lock().await;
+    let entry = entries
+        .get(&thread_id)
+        .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+    Ok((entry.recorder.clone(), entry.git_compatibility_needs_check))
+}
+
+async fn recorder_before_rollout_write(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+) -> ThreadStoreResult<RolloutRecorder> {
+    let (recorder, needs_check) = current_recorder_and_git_fence(store, thread_id).await?;
+    if needs_check {
+        let _lease = recorder.writer_lease().ok_or_else(|| ThreadStoreError::Conflict {
+            message: format!("thread {thread_id} no longer owns the current rollout writer"),
+        })?;
+        let Some(state_db) = store.state_db.as_ref() else {
+            return Err(ThreadStoreError::Internal {
+                message: format!("missing SQLite handle for Git compatibility fence on thread {thread_id}"),
+            });
+        };
+        recover_git_compatibility_before_write(store, state_db, thread_id, recorder.rollout_path())
+            .await?;
+    }
+    Ok(recorder)
+}
+
 pub(super) async fn persist_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
-    store
-        .live_recorder(thread_id)
-        .await?
-        .persist()
-        .await
-        .map_err(thread_store_io_error)?;
+    let _order = store.lock_rollout_publication(thread_id).await;
+    let recorder = recorder_before_rollout_write(store, thread_id).await?;
+    persist_recorder(store, thread_id, &recorder).await
+}
+
+/// The metadata owner already holds publication order. A later metadata
+/// patch may commit independently without flushing across an earlier fence.
+pub(super) async fn persist_thread_for_metadata(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+) -> ThreadStoreResult<()> {
+    let (recorder, needs_check) = current_recorder_and_git_fence(store, thread_id).await?;
+    if needs_check {
+        return Ok(());
+    }
+    persist_recorder(store, thread_id, &recorder).await
+}
+
+async fn persist_recorder(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    recorder: &RolloutRecorder,
+) -> ThreadStoreResult<()> {
+    recorder.persist().await.map_err(thread_store_io_error)?;
     sync_materialized_rollout_path(store, thread_id).await
 }
 
@@ -382,7 +485,8 @@ pub(super) async fn flush_thread(
     thread_id: ThreadId,
     durable: bool,
 ) -> ThreadStoreResult<()> {
-    let recorder = store.live_recorder(thread_id).await?;
+    let _order = store.lock_rollout_publication(thread_id).await;
+    let recorder = recorder_before_rollout_write(store, thread_id).await?;
     if durable {
         recorder.flush_durable().await
     } else {
@@ -408,7 +512,8 @@ async fn shutdown_thread_owned(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
-    let recorder = store.live_recorder(thread_id).await?;
+    let _order = store.lock_rollout_publication(thread_id).await;
+    let recorder = recorder_before_rollout_write(store, thread_id).await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
     recorder.shutdown().await.map_err(thread_store_io_error)?;
     sync_materialized_rollout_path(store, thread_id).await?;
@@ -441,6 +546,7 @@ pub(super) async fn discard_thread(
 ) -> ThreadStoreResult<()> {
     let store = store.clone();
     let completion = tokio::spawn(async move {
+        let _order = store.lock_rollout_publication(thread_id).await;
         let recorder = store.live_recorder(thread_id).await?;
         discard_and_retire(&store, thread_id, &recorder).await
     });

@@ -94,6 +94,7 @@ struct LiveRecorderEntry {
     // canonical SessionMeta is durable. Retain the mode captured when live persistence was opened
     // so missing SQLite rows can still be seeded.
     history_mode: ThreadHistoryMode,
+    git_compatibility_needs_check: bool,
 }
 
 /// Process-scoped configuration for local thread storage.
@@ -127,6 +128,35 @@ impl std::fmt::Debug for LocalThreadStore {
 }
 
 impl LocalThreadStore {
+    /// Common admission boundary for compatibility publication and live
+    /// recorder operations that may enqueue/flush rollout bytes.
+    async fn lock_rollout_publication(&self, thread_id: ThreadId) -> tokio::sync::OwnedMutexGuard<()> {
+        let order = {
+            let mut orders = self
+                .metadata_update_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !orders.contains_key(&thread_id) {
+                orders.retain(|_, order| order.strong_count() > 0);
+            }
+            match orders.get(&thread_id).and_then(std::sync::Weak::upgrade) {
+                Some(order) => order,
+                None => {
+                    let order = Arc::new(Mutex::new(()));
+                    orders.insert(thread_id, Arc::downgrade(&order));
+                    order
+                }
+            }
+        };
+        order.lock_owned().await
+    }
+
+    async fn mark_git_compatibility_check(&self, thread_id: ThreadId, needs_check: bool) {
+        if let Some(entry) = self.live_recorders.lock().await.get_mut(&thread_id) {
+            entry.git_compatibility_needs_check = needs_check;
+        }
+    }
+
     pub(super) async fn acquire_writer_lease(
         &self,
         id: ThreadId,
@@ -215,6 +245,21 @@ impl LocalThreadStore {
         self
     }
 
+    /// Make one bounded recovery pass for idle threads at local-store startup.
+    /// A live writer's admission, resume and explicit metadata updates use the
+    /// same per-thread recovery path; this builder does not start a retry loop.
+    pub fn with_git_compatibility_recovery(self) -> Self {
+        if let Some(state_db) = self.state_db.clone()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let store = self.clone();
+            runtime.spawn(async move {
+                update_thread_metadata::recover_idle_git_compatibility(&store, &state_db).await;
+            });
+        }
+        self
+    }
+
     /// Return the state DB handle used by local rollout writers.
     pub async fn state_db(&self) -> Option<StateDbHandle> {
         if let Err(err) = self
@@ -234,6 +279,85 @@ impl LocalThreadStore {
             tracing::warn!(%err, "staged deletion recovery incomplete; unresolved files retained for retry");
         }
         self.state_db.clone()
+    }
+
+    /// Session import reservations require both a durable rollout and a SQLite receipt.
+    pub fn supports_durable_session_import(&self) -> bool {
+        self.state_db.is_some()
+    }
+
+    /// Commit the import patch together with proof for this exact reservation.
+    pub async fn commit_imported_session_metadata(
+        &self,
+        params: UpdateThreadMetadataParams,
+        content_sha256: &str,
+    ) -> ThreadStoreResult<()> {
+        self.session_import_db()?;
+        update_thread_metadata::commit_imported_session_metadata(self, params, content_sha256).await
+    }
+
+    /// Check the historical commit, not the thread's current editable metadata.
+    pub async fn has_imported_session_metadata_receipt(
+        &self,
+        thread_id: ThreadId,
+        content_sha256: &str,
+    ) -> ThreadStoreResult<bool> {
+        self.session_import_db()?
+            .has_imported_thread_metadata_receipt(thread_id, content_sha256)
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("failed to read session import metadata receipt for {thread_id}: {error}"),
+            })
+    }
+
+    /// A history miss alone does not exclude a live writer, SQLite-only row,
+    /// or a rollout that is moving between the active and archived namespaces.
+    pub async fn reserved_import_thread_is_absent(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<bool> {
+        let db = self.session_import_db()?;
+        let maintenance_busy = || ThreadStoreError::Conflict {
+            message: "rollout maintenance is busy; session import recovery deferred".into(),
+        };
+        if !delete_thread::recover_staged_deletes(self).await? {
+            return Err(maintenance_busy());
+        }
+        if self.live_recorder(thread_id).await.is_ok() {
+            return Ok(false);
+        }
+        let _lease = self.acquire_writer_lease(thread_id, false).await?;
+        let _moves = codex_rollout::try_lock_rollout_moves(&self.config.codex_home)
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("failed to inspect reserved import thread {thread_id}: {error}"),
+            })?
+            .ok_or_else(maintenance_busy)?;
+        if db
+            .get_thread(thread_id)
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("failed to read reserved import thread {thread_id}: {error}"),
+            })?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        // Only the import ledger allocates this reserved ID. Creation obtains
+        // the normal exclusive writer lease again; an absence check never
+        // confers ownership of an existing writer.
+        codex_rollout::find_thread_rollout_paths(&self.config.codex_home, thread_id)
+            .await
+            .map(|paths| paths.is_empty())
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("failed to inspect reserved import rollout {thread_id}: {error}"),
+            })
+    }
+
+    fn session_import_db(&self) -> ThreadStoreResult<&StateDbHandle> {
+        self.state_db.as_ref().ok_or(ThreadStoreError::Unsupported {
+            operation: "durable_session_import",
+        })
     }
 
     /// Remove all local persistence for a newly created thread that failed to start.
@@ -332,17 +456,18 @@ impl LocalThreadStore {
         thread_id: ThreadId,
         recorder: RolloutRecorder,
         history_mode: ThreadHistoryMode,
-    ) -> ThreadStoreResult<()> {
+    ) -> ThreadStoreResult<RolloutRecorder> {
         match self.live_recorders.lock().await.entry(thread_id) {
             Entry::Occupied(entry) => Err(ThreadStoreError::InvalidRequest {
                 message: format!("thread {} already has a live local writer", entry.key()),
             }),
             Entry::Vacant(entry) => {
                 entry.insert(LiveRecorderEntry {
-                    recorder,
+                    recorder: recorder.clone(),
                     history_mode,
+                    git_compatibility_needs_check: false,
                 });
-                Ok(())
+                Ok(recorder)
             }
         }
     }
@@ -433,7 +558,12 @@ impl LocalThreadStore {
                 message: format!("flush projection handoff failed: {error}"),
             })??;
         } else {
-            live_writer::flush_thread(self, thread_id, durable).await?;
+            let store = self.clone();
+            tokio::spawn(async move { live_writer::flush_thread(&store, thread_id, durable).await })
+                .await
+                .map_err(|error| ThreadStoreError::Internal {
+                    message: format!("rollout flush handoff failed: {error}"),
+                })??;
         }
         Ok(())
     }
@@ -448,8 +578,7 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move {
             let thread_id = params.thread_id;
             live_writer::initialize(self.clone(), thread_id, |store| async move {
-                live_writer::create_thread(&store, params).await?;
-                Ok(None)
+                live_writer::create_thread(&store, params).await
             })
             .await
         })
@@ -468,8 +597,7 @@ impl ThreadStore for LocalThreadStore {
                     params,
                     repository_context,
                 )
-                .await?;
-                Ok(None)
+                .await
             })
             .await
         })
@@ -479,7 +607,7 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move {
             let thread_id = params.thread_id;
             live_writer::initialize(self.clone(), thread_id, |store| async move {
-                live_writer::resume_thread(&store, params).await.map(Some)
+                live_writer::resume_thread(&store, params).await
             })
             .await
         })
@@ -618,7 +746,12 @@ impl ThreadStore for LocalThreadStore {
                     message: format!("persist projection handoff failed: {error}"),
                 })??;
             } else {
-                live_writer::persist_thread(self, thread_id).await?;
+                let store = self.clone();
+                tokio::spawn(async move { live_writer::persist_thread(&store, thread_id).await })
+                    .await
+                    .map_err(|error| ThreadStoreError::Internal {
+                        message: format!("rollout persist handoff failed: {error}"),
+                    })??;
             }
             Ok(())
         })

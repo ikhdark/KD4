@@ -52,9 +52,14 @@ struct ActiveAgents {
     agent_tree: HashMap<String, AgentMetadata>,
     // Residency is not lineage: keep the edge through cold/pathless intermediates.
     parents: HashMap<ThreadId, ThreadId>,
-    // Live turn ownership (ephemeral spawns and accepted follow-ups) retires
-    // with its existing lineage edge; durable creation provenance is unchanged.
+    // Ephemeral creation provenance retires with the existing lineage edge.
     turn_spawn_owners: HashMap<ThreadId, (ThreadId, String)>,
+    // After an actual follow-up start, the branch must not be stopped via
+    // creation provenance. Its new owner can stop the exact associated turn.
+    followup_started: HashSet<ThreadId>,
+    // At most the latest proposer per live parent. Do not retain the turn
+    // after finalization or give late senders a way to recreate its authority.
+    followup_turns: HashMap<ThreadId, (String, std::sync::Weak<super::control::FollowupTurn>)>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
     closing_threads: HashMap<ThreadId, usize>,
@@ -157,8 +162,10 @@ impl AgentRegistry {
                 .find_map(|(key, metadata)| (metadata.agent_id == Some(thread_id)).then_some(key))
                 .cloned();
             active_agents.input_queues.remove(&thread_id);
+            active_agents.followup_turns.remove(&thread_id);
             if !active_agents.parents.contains_key(&thread_id) {
                 active_agents.turn_spawn_owners.remove(&thread_id);
+                active_agents.followup_started.remove(&thread_id);
             }
             let removed = removed_key
                 .and_then(|key| active_agents.agent_tree.remove(key.as_str()))
@@ -181,6 +188,7 @@ impl AgentRegistry {
                     break;
                 };
                 active_agents.turn_spawn_owners.remove(&retired);
+                active_agents.followup_started.remove(&retired);
                 retired = parent;
             }
             removed
@@ -439,17 +447,44 @@ impl AgentRegistry {
             .turn_spawn_owners.insert(child, (parent, turn));
     }
 
-    pub(crate) fn record_turn_followup_owner(&self, child: ThreadId, parent: ThreadId, turn: &str) {
-        let mut agents = self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A sibling/ancestor message cannot acquire another parent's subtree.
-        if agents.parents.get(&child) == Some(&parent) {
-            agents.turn_spawn_owners.insert(child, (parent, turn.to_string()));
-        }
+    pub(crate) fn is_direct_spawn_child(&self, parent: ThreadId, child: ThreadId) -> bool {
+        let agents = self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        agents.parents.get(&child) == Some(&parent)
     }
 
-    pub(crate) fn turn_spawn_owners(&self) -> HashMap<ThreadId, (ThreadId, String)> {
+    pub(crate) fn record_followup_start(&self, parent: ThreadId, child: ThreadId) -> bool {
+        let mut agents = self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if agents.parents.get(&child) != Some(&parent) {
+            return false;
+        }
+        agents.followup_started.insert(child);
+        true
+    }
+
+    pub(crate) fn remember_followup_turn(
+        &self,
+        parent: ThreadId,
+        turn_id: &str,
+        owner: &Arc<super::control::FollowupTurn>,
+    ) {
         self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .turn_spawn_owners.clone()
+            .followup_turns.insert(parent, (turn_id.to_owned(), Arc::downgrade(owner)));
+    }
+
+    pub(crate) fn followup_turn(&self, parent: ThreadId, turn_id: &str) -> Option<Arc<super::control::FollowupTurn>> {
+        let agents = self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (remembered, owner) = agents.followup_turns.get(&parent)?;
+        (remembered == turn_id).then(|| owner.upgrade()).flatten()
+    }
+
+    pub(crate) fn has_followup_started(&self, child: ThreadId) -> bool {
+        self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .followup_started.contains(&child)
+    }
+
+    pub(crate) fn turn_spawn_owners(&self) -> (HashMap<ThreadId, (ThreadId, String)>, HashSet<ThreadId>) {
+        let agents = self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (agents.turn_spawn_owners.clone(), agents.followup_started.clone())
     }
 
     pub(crate) fn restore_cold_agent(

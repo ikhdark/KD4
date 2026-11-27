@@ -5,6 +5,7 @@ use crate::agent::AgentControl;
 use crate::agent::control::AgentExecutionGuard;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
+use crate::codex_thread::StoppedThreadRetirement;
 use crate::config::Config;
 use crate::config::PermissionProfileSnapshot;
 use crate::config::ThreadStoreConfig;
@@ -100,6 +101,7 @@ pub(crate) use fork_history::resumed_rollout_unfinished_turn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
 const THREAD_REGISTRY_RECLAIM_BATCH: usize = 16;
+const RESUMED_THREAD_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct InheritedInstructionSnapshot {
@@ -218,13 +220,59 @@ pub struct ThreadManager {
 pub(crate) struct ThreadRegistryLease {
     // Unlock before releasing the entry reference.
     _guard: OwnedMutexGuard<()>,
+    entry: Arc<ThreadRegistryLeaseEntry>,
+}
+
+pub(crate) trait V2ResidencyOwner: Send + Sync {
+    fn retire_resident_generation(&self, thread_id: ThreadId, expected: &Arc<CodexThread>);
+}
+
+/// Keeps this ID's publication fence alive for a charged residency generation.
+#[derive(Clone)]
+pub(crate) struct V2ResidencyRegistration {
     _entry: Arc<ThreadRegistryLeaseEntry>,
+}
+
+impl ThreadRegistryLease {
+    pub(crate) fn register_v2_residency_owner(
+        &self,
+        owner: Weak<dyn V2ResidencyOwner>,
+    ) -> V2ResidencyRegistration {
+        let mut owners = self
+            .entry
+            .v2_residency_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.retain(|owner| owner.strong_count() != 0);
+        if !owners.iter().any(|current| current.ptr_eq(&owner)) {
+            owners.push(owner);
+        }
+        V2ResidencyRegistration {
+            _entry: Arc::clone(&self.entry),
+        }
+    }
+
+    fn retire_v2_residency(&self, expected: &Arc<CodexThread>) {
+        let mut owners = self
+            .entry
+            .v2_residency_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.retain(|owner| {
+            let Some(owner) = owner.upgrade() else {
+                return false;
+            };
+            owner.retire_resident_generation(self.entry.thread_id, expected);
+            true
+        });
+    }
 }
 
 struct ThreadRegistryLeaseEntry {
     thread_id: ThreadId,
     lock: Arc<AsyncMutex<()>>,
     registry: Weak<ThreadRegistryLeases>,
+    v2_residency_owners: std::sync::Mutex<Vec<Weak<dyn V2ResidencyOwner>>>,
 }
 
 impl Drop for ThreadRegistryLeaseEntry {
@@ -300,6 +348,7 @@ impl ThreadRegistryLeases {
             thread_id,
             lock: Arc::new(AsyncMutex::new(())),
             registry: Arc::downgrade(self),
+            v2_residency_owners: Default::default(),
         });
         *slot = Arc::downgrade(&entry);
         entry
@@ -446,7 +495,8 @@ pub fn thread_store_from_config(
         ThreadStoreConfig::Local => {
             let store =
                 LocalThreadStore::new(LocalThreadStoreConfig::from_config(config), state_db)
-                    .with_archive_retention();
+                    .with_archive_retention()
+                    .with_git_compatibility_recovery();
             Arc::new(
                 if config
                     .features
@@ -1231,9 +1281,15 @@ impl ThreadManager {
             )
             .await
         {
-            self.remove_thread_if_same(&new_thread.thread_id, &new_thread.thread)
-                .await;
-            if let Err(shutdown_err) = new_thread.thread.shutdown_and_wait().await {
+            if let Err(shutdown_err) = self
+                .state
+                .rollback_resumed_runtime(
+                    new_thread.thread_id,
+                    &new_thread.thread,
+                    /*shutdown_if_detached*/ true,
+                )
+                .await
+            {
                 warn!(
                     "failed to shut down thread {} after settings reconstruction failed: {shutdown_err}",
                     new_thread.thread_id
@@ -1253,9 +1309,15 @@ impl ThreadManager {
                 .restore_cold_descendants(new_thread.thread_id)
                 .await
             {
-                self.remove_thread_if_same(&new_thread.thread_id, &new_thread.thread)
-                    .await;
-                if let Err(shutdown_err) = new_thread.thread.shutdown_and_wait().await {
+                if let Err(shutdown_err) = self
+                    .state
+                    .rollback_resumed_runtime(
+                        new_thread.thread_id,
+                        &new_thread.thread,
+                        /*shutdown_if_detached*/ true,
+                    )
+                    .await
+                {
                     warn!(
                         "failed to shut down thread {} after cold descendant recovery failed: {shutdown_err}",
                         new_thread.thread_id
@@ -1286,23 +1348,32 @@ impl ThreadManager {
             .await
     }
 
-    /// Retire ID-keyed consumers under the existing replacement-publication
-    /// lease, without holding the global map lock across asynchronous cleanup.
-    /// The callback receives (removed_expected, replacement_present). A replaced
-    /// instance must not be cleaned up; after its old unload marker is released,
-    /// its creation notification is retried so attachment cannot be stranded.
+    /// Observe positive shutdown proof, then retire this exact generation and
+    /// ID-keyed consumers under the replacement publication lease (not the map
+    /// lock). A replacement is not cleaned up and its creation is reannounced.
+    /// An unconfirmed exact generation returns an error without running cleanup.
     #[doc(hidden)]
     pub async fn retire_thread_with_cleanup<F, Fut>(
         &self,
         thread_id: ThreadId,
         expected_thread: &Arc<CodexThread>,
+        shutdown_timeout: Duration,
+        allow_confirmed_loop_failure: bool,
         cleanup: F,
-    ) -> bool
+    ) -> CodexResult<bool>
     where
         F: FnOnce(bool, bool) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        self.state.retire_thread_with_cleanup(thread_id, expected_thread, cleanup).await
+        self.state
+            .retire_thread_with_cleanup(
+                thread_id,
+                expected_thread,
+                shutdown_timeout,
+                allow_confirmed_loop_failure,
+                cleanup,
+            )
+            .await
     }
 
     /// Clean ID-keyed consumers only while replacement publication is fenced
@@ -1336,7 +1407,7 @@ impl ThreadManager {
         {
             return false;
         }
-        let shutdown = expected_thread.shutdown_and_wait().await;
+        let shutdown = expected_thread.codex.shutdown_and_wait_for_terminals().await;
         if let Err(err) = &shutdown {
             warn!("failed to shut down rolled-back thread {thread_id}: {err}");
         }
@@ -1346,25 +1417,25 @@ impl ThreadManager {
 
     /// Roll back a resumed thread that failed before its creator could publish
     /// a successful response, preserving the pre-existing persisted thread.
-    /// Returns true only after the removed runtime confirms shutdown.
+    /// Returns true only after removing the exact runtime and confirming shutdown.
+    /// A resident V2 generation must confirm retirement before it can be removed.
     #[doc(hidden)]
     pub async fn rollback_resumed_thread_spawn(
         &self,
         thread_id: ThreadId,
         expected_thread: &Arc<CodexThread>,
     ) -> bool {
-        if !self
+        match self
             .state
-            .remove_thread_if_same(&thread_id, expected_thread)
+            .rollback_resumed_runtime(thread_id, expected_thread, /*shutdown_if_detached*/ false)
             .await
         {
-            return false;
+            Ok(removed_expected) => removed_expected,
+            Err(err) => {
+                warn!("failed to shut down rolled-back resumed thread {thread_id}: {err}");
+                false
+            }
         }
-        if let Err(err) = expected_thread.shutdown_and_wait().await {
-            warn!("failed to shut down rolled-back resumed thread {thread_id}: {err}");
-            return false;
-        }
-        true
     }
 
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
@@ -1404,15 +1475,10 @@ impl ThreadManager {
                     let observation = codex_protocol::timing::observations::Span::start(
                         "shutdown_thread", &thread_id.to_string(), "", "drain_and_retire",
                         serde_json::json!({"scope":"exact_tracked_thread_instance"}));
-                    let shutdown_result = thread.shutdown_and_wait().await;
-                    let drain_result = thread.wait_until_drained().await;
-                    drain_result?;
-                    if shutdown_result.is_err() {
-                        // A bounded observation may have expired before the
-                        // independently owned persistence retirement succeeded.
-                        thread.shutdown_and_wait().await?;
-                    }
-                    state.remove_thread_if_same(&thread_id, &thread).await;
+                    let retirement = thread.confirm_orderly_retirement().await?;
+                    state
+                        .remove_stopped_thread_if_same(thread_id, &thread, &retirement, || {})
+                        .await?;
                     observation.finish("drained_and_retired", serde_json::Value::Null);
                     CodexResult::Ok(())
                 });
@@ -1694,10 +1760,11 @@ impl ThreadManagerState {
         _thread_id: ThreadId,
         queue: &Arc<crate::session::InputQueue>,
         communication: codex_protocol::protocol::InterAgentCommunication,
+        task_message: Option<crate::agent::control::MailboxTaskMessage>,
     ) -> CodexResult<String> {
         debug_assert!(!communication.trigger_turn);
         let id = uuid::Uuid::now_v7().to_string();
-        if queue.enqueue_mailbox_communication(communication).await? {
+        if queue.enqueue_mailbox_communication(communication, task_message).await? {
             crate::agent_communication::emit_agent_communication_receive(&id);
         }
         Ok(id)
@@ -1984,21 +2051,146 @@ impl ThreadManagerState {
         true
     }
 
+    /// Commit dependent state only while the exact generation is still published.
+    pub(crate) async fn with_current_thread_generation<T>(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+        commit: impl FnOnce(&ThreadRegistryLease) -> T,
+    ) -> Option<T> {
+        let lease = self.acquire_thread_registry_lease(thread_id).await;
+        let threads = self.threads.read().await;
+        threads
+            .get(&thread_id)
+            .filter(|thread| Arc::ptr_eq(thread, expected_thread))
+            .map(|_| commit(&lease))
+    }
+
+    async fn rollback_resumed_runtime(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+        shutdown_if_detached: bool,
+    ) -> CodexResult<bool> {
+        if AgentControl::is_v2_resident_thread(expected_thread) {
+            // Resuming publishes before setup completes. Other arbiters may
+            // already have charged this exact generation. Neither detach nor
+            // release those charges until teardown and persistence are proven.
+            let retirement = tokio::time::timeout(
+                RESUMED_THREAD_ROLLBACK_TIMEOUT,
+                expected_thread.retire_stopped_generation(),
+            )
+            .await
+            .map_err(|_| {
+                CodexErr::Fatal(format!("resumed thread {thread_id} rollback is still retiring"))
+            })??;
+            return self
+                .remove_stopped_thread_if_same(thread_id, expected_thread, &retirement, || {})
+                .await;
+        }
+
+        let removed = self.remove_thread_if_same(&thread_id, expected_thread).await;
+        if removed || shutdown_if_detached {
+            expected_thread.codex.shutdown_and_wait_for_terminals().await?;
+        }
+        Ok(removed)
+    }
+
+    /// Remove a positively retired generation and reconcile its residency
+    /// before a replacement can publish for the same ID.
+    pub(crate) async fn remove_stopped_thread_if_same(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+        retirement: &StoppedThreadRetirement,
+        cleanup: impl FnOnce(),
+    ) -> CodexResult<bool> {
+        let lease = self.acquire_thread_registry_lease(thread_id).await;
+        self.detach_stopped_thread_if_same(&lease, expected_thread, retirement, cleanup)
+            .await
+    }
+
+    async fn detach_stopped_thread_if_same(
+        &self,
+        lease: &ThreadRegistryLease,
+        expected_thread: &Arc<CodexThread>,
+        retirement: &StoppedThreadRetirement,
+        cleanup: impl FnOnce(),
+    ) -> CodexResult<bool> {
+        AgentControl::confirm_stopped_v2_residency(expected_thread)?;
+        let thread_id = lease.entry.thread_id;
+        let mut threads = self.threads.write().await;
+        let removed = threads
+            .get(&thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected_thread));
+        if removed {
+            threads.remove(&thread_id);
+            self.forget_thread_created_instance_if_same(&thread_id, expected_thread);
+        }
+        drop(threads);
+        if removed {
+            // A successful eviction transfers its own exact charge to a pending
+            // slot before retiring any other arbiter's charge for this generation.
+            cleanup();
+        }
+        // A genuine receipt authorizes clearing this generation's charges
+        // even if another owner detached it first, never a replacement's.
+        lease.retire_v2_residency(expected_thread);
+        if removed
+            && let StoppedThreadRetirement::ConfirmedAfterLoopFailure(failure) = retirement
+        {
+            warn!(%thread_id, failure = *failure, "retired stopped generation after independent shutdown confirmation");
+        }
+        Ok(removed)
+    }
+
     async fn retire_thread_with_cleanup<F, Fut>(
         &self,
         thread_id: ThreadId,
         expected_thread: &Arc<CodexThread>,
+        shutdown_timeout: Duration,
+        allow_confirmed_loop_failure: bool,
         cleanup: F,
-    ) -> bool
+    ) -> CodexResult<bool>
     where
         F: FnOnce(bool, bool) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        let is_current = self
+            .threads
+            .read()
+            .await
+            .get(&thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected_thread));
+        // Do not fence registry publication while waiting for accepted owners
+        // or the writer. The final exact-instance check is under the lease.
+        let retirement = if is_current {
+            let proof = tokio::time::timeout(shutdown_timeout, async {
+                if allow_confirmed_loop_failure {
+                    let retirement = expected_thread.retire_stopped_generation().await?;
+                    AgentControl::confirm_stopped_v2_residency(expected_thread)?;
+                    Ok::<_, CodexErr>(retirement)
+                } else {
+                    expected_thread.confirm_orderly_retirement().await
+                }
+            })
+            .await
+            .map_err(|_| CodexErr::Fatal(format!("thread {thread_id} retirement is still pending")))??;
+            Some(proof)
+        } else {
+            None
+        };
+
         let lease = self.acquire_thread_registry_lease(thread_id).await;
         let (removed_expected, replacement) = {
             let mut threads = self.threads.write().await;
             match threads.get(&thread_id) {
                 Some(current) if Arc::ptr_eq(current, expected_thread) => {
+                    if retirement.is_none() {
+                        return Err(CodexErr::Fatal(format!(
+                            "thread {thread_id} is current but retirement is unconfirmed"
+                        )));
+                    }
                     threads.remove(&thread_id);
                     self.forget_thread_created_instance_if_same(&thread_id, expected_thread);
                     (true, None)
@@ -2007,13 +2199,21 @@ impl ThreadManagerState {
                 None => (false, None),
             }
         };
+        if retirement.is_some() && AgentControl::is_v2_resident_thread(expected_thread) {
+            lease.retire_v2_residency(expected_thread);
+        }
+        if removed_expected
+            && let Some(StoppedThreadRetirement::ConfirmedAfterLoopFailure(failure)) = retirement
+        {
+            warn!(%thread_id, failure, "retired stopped generation after independent shutdown confirmation");
+        }
         cleanup(removed_expected, replacement.is_some()).await;
         drop(lease);
         if let Some(replacement) = replacement {
             self.notify_thread_created(thread_id, &replacement).await;
-            false
+            Ok(false)
         } else {
-            true
+            Ok(true)
         }
     }
 
@@ -2065,7 +2265,7 @@ impl ThreadManagerState {
         let guard = Arc::clone(&entry.lock).lock_owned().await;
         ThreadRegistryLease {
             _guard: guard,
-            _entry: entry,
+            entry,
         }
     }
 
@@ -2468,9 +2668,14 @@ impl ThreadManagerState {
             )
             .await
         {
-            self.remove_thread_if_same(&new_thread.thread_id, &new_thread.thread)
-                .await;
-            if let Err(shutdown_err) = new_thread.thread.shutdown_and_wait().await {
+            if let Err(shutdown_err) = self
+                .rollback_resumed_runtime(
+                    new_thread.thread_id,
+                    &new_thread.thread,
+                    /*shutdown_if_detached*/ true,
+                )
+                .await
+            {
                 warn!(
                     "failed to shut down thread {} after settings reconstruction failed: {shutdown_err}",
                     new_thread.thread_id
@@ -2597,7 +2802,7 @@ impl ThreadManagerState {
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
         let rollback_persistence_on_finalize_error = !is_resumed_thread && !config.ephemeral;
         if let InitialHistory::Resumed(resumed) = &initial_history {
-            let _thread_registry_lease = self
+            let thread_registry_lease = self
                 .acquire_thread_registry_lease(resumed.conversation_id)
                 .await;
             let stopped_thread = {
@@ -2627,12 +2832,26 @@ impl ThreadManagerState {
                 // A closed event stream is not proof that accepted effects or
                 // durable writers have stopped. Retain registration while the
                 // exact instance drains; never wait with the global map locked.
-                thread.request_shutdown().await?;
-                thread.wait_until_drained().await?;
-                let mut threads = self.threads.write().await;
-                if threads.get(&resumed.conversation_id).is_some_and(|current| Arc::ptr_eq(current, &thread)) {
-                    threads.remove(&resumed.conversation_id);
-                    self.forget_thread_created_instance_if_same(&resumed.conversation_id, &thread);
+                let retirement = thread.retire_stopped_generation().await?;
+                self.detach_stopped_thread_if_same(
+                    &thread_registry_lease,
+                    &thread,
+                    &retirement,
+                    || {},
+                )
+                .await?;
+                let late_reason = match retirement {
+                    StoppedThreadRetirement::Orderly => None,
+                    StoppedThreadRetirement::ConfirmedAfterDeadline => Some("a shutdown deadline"),
+                    StoppedThreadRetirement::ConfirmedAfterLoopFailure(_) => Some("a session loop failure"),
+                };
+                if let Some(reason) = late_reason {
+                    // This caller reconstructed history and settings before the
+                    // drain. Retry with a fresh read instead of replaying it.
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "stopped thread {} retired after {reason}; retry resume to reload persisted history",
+                        resumed.conversation_id,
+                    )));
                 }
             }
         }
@@ -2745,7 +2964,7 @@ impl ThreadManagerState {
         let event = match codex.next_event().await {
             Ok(event) => event,
             Err(err) => {
-                if let Err(shutdown_err) = codex.shutdown_and_wait().await {
+                if let Err(shutdown_err) = codex.shutdown_and_wait_for_terminals().await {
                     warn!("failed to shut down unregistered thread {thread_id}: {shutdown_err}");
                 }
                 if rollback_persistence_on_error {
@@ -2760,7 +2979,7 @@ impl ThreadManagerState {
                 msg: EventMsg::SessionConfigured(session_configured),
             } if id == INITIAL_SUBMIT_ID => session_configured,
             _ => {
-                if let Err(err) = codex.shutdown_and_wait().await {
+                if let Err(err) = codex.shutdown_and_wait_for_terminals().await {
                     warn!("failed to shut down unregistered thread {thread_id}: {err}");
                 }
                 if rollback_persistence_on_error {
@@ -2814,7 +3033,7 @@ impl ThreadManagerState {
             }
         }
 
-        if let Err(err) = codex.shutdown_and_wait().await {
+        if let Err(err) = codex.shutdown_and_wait_for_terminals().await {
             warn!("failed to shut down duplicate thread {thread_id}: {err}");
         }
         if removal_blocked {
@@ -2898,6 +3117,15 @@ fn thread_store_metadata_update_error(thread_id: ThreadId, err: ThreadStoreError
         ThreadStoreError::Unsupported { operation } => CodexErr::UnsupportedOperation(format!(
             "thread metadata update is not supported by this store: {operation}"
         )),
+        ThreadStoreError::GitCompatibilityPending {
+            thread_id,
+            intent_id,
+            outcome_unknown,
+        } => CodexErr::GitCompatibilityPending {
+            thread_id,
+            intent_id,
+            outcome_unknown,
+        },
         err => CodexErr::Fatal(format!(
             "failed to update thread metadata {thread_id}: {err}"
         )),

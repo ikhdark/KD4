@@ -6133,6 +6133,9 @@ impl ModelClientSession {
                     }
 
                     self.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
+                    // HTTP will not consume the startup WebSocket preparation. Close its
+                    // local phases before starting HTTP's own dispatch accounting.
+                    drop(self.prepared_startup_websocket_attempt.take());
                     let pending = self.client.state.cached_websocket_transport.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .startup_retry_decision.take();
@@ -7275,6 +7278,7 @@ impl RequestTelemetry for ApiTelemetry {
             None,
             Some(&TransportError::Network("request cancelled".into())),
             duration,
+            Some("cancelled"),
         );
     }
 
@@ -7377,7 +7381,11 @@ impl RequestTelemetry for ApiTelemetry {
                     failed: error.is_some(),
                 });
         }
-        self.record_request_outcome(attempt, status, error, duration);
+        // Successful headers leave the physical attempt open for the response stream.
+        let physical_outcome =
+            (error.is_some() || status.is_some_and(|status| status.as_u16() >= 400))
+                .then_some("failed");
+        self.record_request_outcome(attempt, status, error, duration, physical_outcome);
     }
 }
 
@@ -7388,15 +7396,16 @@ impl ApiTelemetry {
         status: Option<HttpStatusCode>,
         error: Option<&TransportError>,
         duration: Duration,
+        physical_outcome: Option<&str>,
     ) {
         if let Some(context) = &self.model_request {
             context.dispatched.store(false, Ordering::Release);
             if let Some(timing) = &context.timing {
                 timing.mark_model_request_attempt_ended();
-                if error.is_some() || status.is_some_and(|status| status.as_u16() >= 400) {
-                    let physical_attempt = if attempt == 0 { context.identity.physical_attempt_id.clone() }
-                        else { format!("{}:http-{attempt}", context.identity.physical_attempt_id) };
-                    timing.record_model_attempt_outcome(&physical_attempt, "failed", false, None);
+                if let Some(outcome) = physical_outcome
+                    && let Some(identity) = self.physical_transport_identity(attempt)
+                {
+                    timing.record_model_attempt_outcome(&identity.physical_attempt_id, outcome, false, None);
                 }
             }
             if error.is_some() {

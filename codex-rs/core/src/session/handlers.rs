@@ -510,13 +510,19 @@ async fn inter_agent_communication(
     admission: Option<super::MailboxAdmission>,
 ) {
     let trigger_turn = communication.trigger_turn;
-    let (ack, validation_origin) = match admission {
-        Some(admission) => (Some(admission.ack), admission.validation_origin),
-        None => (None, None),
+    let (ack, validation_origin, task_message) = match admission {
+        Some(admission) => (
+            Some(admission.ack),
+            admission.validation_origin,
+            admission.task_message,
+        ),
+        None => (None, None, None),
     };
+    let followup_wake = task_message.as_ref()
+        .and_then(crate::agent::control::MailboxTaskMessage::followup_wake);
     let result = sess
         .input_queue
-        .enqueue_mailbox_communication_with_origin(communication, validation_origin)
+        .enqueue_mailbox_communication_with_origin(communication, validation_origin, task_message)
         .await;
     let accepted = matches!(&result, Ok(true));
     // Acknowledge queue admission before scheduling a turn, which can itself
@@ -528,7 +534,7 @@ async fn inter_agent_communication(
         return;
     }
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
-    if trigger_turn {
+    if trigger_turn && followup_wake.as_ref().is_none_or(|wake| wake.can_start()) {
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
             .await;
     }
@@ -867,13 +873,19 @@ pub(super) async fn shutdown_unpublished_session(sess: &Arc<Session>) {
     }
 }
 
-/// Runtime teardown result. A timed-out history flush leaves its stalled write
-/// owned; persistence retirement queues behind that same write.
+/// Handoff from the bounded runtime observer to the retained persistence owner.
 struct RuntimeShutdown {
     error: Option<CodexErr>,
-    mandatory_error: Option<String>,
+    observation: super::ShutdownObservation,
+    abort: Result<Option<tokio::task::JoinHandle<()>>, String>,
+    snapshot_pending: bool,
     tool_history_flush_timed_out: bool,
 }
+
+const TERMINAL_SHUTDOWN_PENDING: &str =
+    "turn finalization did not complete before the shutdown deadline; accepted history writes remain owned, but durability is unconfirmed";
+const PERSISTENCE_SHUTDOWN_PENDING: &str =
+    "thread persistence shutdown remains owned and pending; durability is unconfirmed";
 
 async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
     sess.services.model_client.retire_transport_cache();
@@ -884,14 +896,15 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
     cancel_startup_work(sess).await;
     // The abort waiter and finalizer keep their own session ownership when the
     // shutdown observation expires. Accepted writes must not be cancelled.
-    let abort = sess.terminal_tasks.spawn({
+    let mut abort = sess.terminal_tasks.spawn({
         let sess = Arc::clone(sess);
         async move { sess.abort_all_tasks(TurnAbortReason::SessionShutdown).await }
     });
-    let abort_incomplete = !matches!(
-        tokio::time::timeout_at(terminal_deadline, abort).await,
-        Ok(Ok(()))
-    );
+    let abort = match tokio::time::timeout_at(terminal_deadline, &mut abort).await {
+        Ok(Ok(())) => Ok(None),
+        Ok(Err(error)) => Err(format!("shutdown abort task failed: {error}")),
+        Err(_) => Ok(Some(abort)),
+    };
     sess.services.turn_environments.shutdown();
     sess.terminal_tasks.close();
     let terminal_incomplete = tokio::time::timeout_at(terminal_deadline, async {
@@ -900,12 +913,14 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
     })
     .await
     .is_err();
-    if abort_incomplete || terminal_incomplete {
+    let terminal_pending =
+        admission_incomplete || matches!(&abort, Ok(Some(_))) || terminal_incomplete;
+    if terminal_pending {
         warn!("timed out waiting for turn terminal finalization during session shutdown");
     }
     // Match unpublished cleanup only after the admission/producer barrier has
     // actually drained. On uncertain finalization retain the conservative order.
-    let (snapshot, processes, code_mode) = if admission_incomplete || abort_incomplete || terminal_incomplete {
+    let (snapshot, processes, code_mode) = if terminal_pending || abort.is_err() {
         let snapshot = tokio::time::timeout_at(
             terminal_deadline,
             sess.services.turn_environments.finish_shutdown(),
@@ -930,10 +945,11 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
         );
         (snapshot, processes, code_mode)
     };
-    if snapshot.is_err() {
+    let snapshot_pending = snapshot.is_err();
+    if snapshot_pending {
         warn!("timed out waiting for remote snapshot cleanup during session shutdown");
     }
-    if let Err(err) = code_mode {
+    if let Err(err) = &code_mode {
         warn!("failed to shutdown code mode session: {err}");
     }
     // Accepted cleanup can remain owned and pending; do not turn that into a
@@ -952,35 +968,88 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
                 .to_string(),
         )),
     };
-    let mut mandatory_errors = Vec::new();
-    if admission_incomplete || abort_incomplete || terminal_incomplete {
-        mandatory_errors.push("turn finalization did not complete before the shutdown deadline; accepted history writes remain owned, but durability is unconfirmed".to_string());
+    let mut failures = Vec::new();
+    if let Err(error) = &abort {
+        failures.push(error.clone());
     }
     if let Err(error) = processes {
-        mandatory_errors.push(error);
+        failures.push(error);
     }
-    let mandatory_error = (!mandatory_errors.is_empty()).then(|| mandatory_errors.join("; "));
-    let error = persistence_error.or_else(|| mandatory_error.clone().map(CodexErr::Fatal));
+    if let Err(error) = code_mode {
+        failures.push(format!("failed to shutdown code mode session: {error}"));
+    }
+    let observation = if !failures.is_empty() {
+        super::ShutdownObservation::Failed(failures.join("; "))
+    } else if terminal_pending {
+        super::ShutdownObservation::Pending(TERMINAL_SHUTDOWN_PENDING)
+    } else if snapshot_pending {
+        super::ShutdownObservation::Pending("remote snapshot cleanup remains pending")
+    } else if tool_history_flush_timed_out {
+        super::ShutdownObservation::Pending(PERSISTENCE_SHUTDOWN_PENDING)
+    } else {
+        super::ShutdownObservation::Complete
+    };
+    let error = persistence_error.or_else(|| match &observation {
+        super::ShutdownObservation::Failed(error) => Some(CodexErr::Fatal(error.clone())),
+        super::ShutdownObservation::Pending(message) if terminal_pending => {
+            Some(CodexErr::Fatal((*message).to_string()))
+        }
+        _ => None,
+    });
     RuntimeShutdown {
         error,
-        mandatory_error,
+        observation,
+        abort,
+        snapshot_pending,
         tool_history_flush_timed_out,
     }
 }
 
 async fn shutdown_thread_persistence(
     sess: &Arc<Session>,
-    tool_history_flush_timed_out: bool,
+    runtime: RuntimeShutdown,
 ) -> Result<(), String> {
+    let RuntimeShutdown {
+        mut observation,
+        abort,
+        snapshot_pending,
+        tool_history_flush_timed_out,
+        ..
+    } = runtime;
+    let runtime_failure = match &observation {
+        super::ShutdownObservation::Failed(error) => Some(error.clone()),
+        _ => None,
+    };
     let live_thread = sess.live_thread().cloned();
     // Never close the writer underneath accepted commits. This owner must be
     // outside terminal_tasks: it waits for that tracker itself to drain.
     let owner = sess.persistence_tasks.spawn({
         let sess = Arc::clone(sess);
         async move {
+            // The bounded runtime observer may have timed out acquiring the
+            // admission gate. Join it here before the last producer drain.
+            sess.begin_shutdown().await;
+            // TaskTracker quiescence does not prove that the abort task ran
+            // successfully. Join the exact handle left by the observer.
+            let abort_result = match abort {
+                Ok(Some(abort)) => abort.await.map_err(|error| {
+                    format!("shutdown abort task failed: {error}")
+                }),
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = abort_result {
+                // We cannot prove the turn was stopped; do not close its writer.
+                *sess.persistence_retirement_result.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(error.clone()));
+                return Err(error);
+            }
             sess.terminal_tasks.wait().await;
             sess.wait_for_ordered_history_commits().await;
+            let mut snapshot_pending = snapshot_pending;
+            let mut background_append_result = None;
             let mut history_retired = false;
+            let mut rollout_checkpointed = false;
             let mut retry_delay = Duration::from_secs(1);
             loop {
                 // A returned shutdown error is not process-tree confirmation.
@@ -992,6 +1061,18 @@ async fn shutdown_thread_persistence(
                     retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
                     continue;
                 }
+                if snapshot_pending {
+                    sess.services.turn_environments.finish_shutdown().await;
+                    snapshot_pending = false;
+                }
+                // A native cleanup receipt says nothing about the canonical
+                // command End. Wait for the ordered append, not the shared tool
+                // completion memo or either live event send.
+                if background_append_result.is_none() {
+                    background_append_result = Some(
+                        sess.services.unified_exec_manager.wait_for_background_terminal_appends().await,
+                    );
+                }
                 // Do not close the thread writer while a retryable history
                 // checkpoint can still require its durable rollout barrier.
                 let history = if history_retired {
@@ -1001,28 +1082,64 @@ async fn shutdown_thread_persistence(
                         .map_err(|error| format!("completed-tool history checkpoint failed: {error}"))
                 };
                 history_retired = history.is_ok();
-                let result = match history {
-                    Err(error) => Err(error),
-                    Ok(()) => match live_thread.as_ref() {
-                        Some(thread) => thread.shutdown().await.map_err(|error| error.to_string()),
-                        None => Ok(()),
-                    },
-                };
-                if result.is_ok() {
+                let writer_retirement = async {
+                    history?;
+                    let Some(thread) = live_thread.as_ref() else {
+                        return Ok(());
+                    };
+                    if !rollout_checkpointed
+                        && matches!(background_append_result.as_ref(), Some(Ok(())))
+                    {
+                        // The canonical append acknowledges acceptance, not stable
+                        // storage. Flush it before retiring the real writer.
+                        sess.flush_rollout_with_durability(/*durable*/ true).await
+                            .map_err(|error| format!("final rollout checkpoint failed: {error}"))?;
+                        rollout_checkpointed = true;
+                    }
+                    thread.shutdown().await.map_err(|error| error.to_string())
+                }.await;
+                if writer_retirement.is_ok() {
                     let storage_ownership = sess._storage_ownership.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner).take();
                     drop(storage_ownership);
                 }
+                let append_result = background_append_result.as_ref()
+                    .expect("background terminal append wait precedes writer retirement");
+                let is_retired = writer_retirement.is_ok();
+                let result = match (append_result, writer_retirement) {
+                    (Err(append), Err(writer)) => Err(format!("{append}; {writer}")),
+                    (Err(append), Ok(())) => Err(append.clone()),
+                    (Ok(()), result) => result,
+                };
+                if is_retired {
+                    // Writer shutdown cannot recover a missing append or
+                    // erase a genuine runtime cleanup failure.
+                    let result = match (result, runtime_failure.as_ref()) {
+                        (Ok(()), Some(error)) => Err(error.clone()),
+                        (Err(error), Some(runtime)) => Err(format!("{runtime}; {error}")),
+                        (result, None) => result,
+                    };
+                    let result = if result.is_ok() {
+                        match sess.rollout_durability_error.lock().await.as_ref() {
+                            Some(error) => Err(format!("session persistence unconfirmed: {error}")),
+                            None => Ok(()),
+                        }
+                    } else {
+                        result
+                    };
+                    if result.is_ok() {
+                        // Only a positive producer/append/writer receipt releases
+                        // the generation's session resource locks.
+                        sess.services.agent_control.registry().resource_locks.release_session(&sess);
+                    }
+                    *sess.persistence_retirement_result.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
+                    return result;
+                }
                 *sess.persistence_retirement_result.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
-                match result {
-                    Ok(()) => {
-                        // No status/timeout shortcut: the same owner has joined
-                        // terminal producers, ordered commits and writer retirement.
-                        sess.services.agent_control.registry().resource_locks.release_session(&sess);
-                        return Ok(());
-                    }
-                    Err(error) => warn!(%error, "owned thread persistence shutdown failed; retaining ownership for retry"),
+                if let Err(error) = result {
+                    warn!(%error, "owned thread persistence shutdown failed; retaining ownership for retry");
                 }
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
@@ -1033,19 +1150,34 @@ async fn shutdown_thread_persistence(
     // Retirement queues behind a history flush that already timed out; waiting
     // on that same stalled writer again only delays the pending report. The
     // owner keeps running either way and drain waiters still observe it.
-    let observation = if tool_history_flush_timed_out {
+    let store_observation = |observation| {
+        *sess.shutdown_observation.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observation);
+    };
+    // Preserve the handoff before later event delivery, even if the session
+    // loop fails after the retained owner starts.
+    store_observation(observation.clone());
+    let timeout = if tool_history_flush_timed_out {
         Duration::ZERO
     } else {
         TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT
     };
-    match tokio::time::timeout(observation, owner).await {
+    let result = match tokio::time::timeout(timeout, owner).await {
         Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err(
-            "thread persistence shutdown remains owned and pending; durability is unconfirmed"
-                .to_string(),
-        ),
-    }
+        Ok(Err(error)) => {
+            let error = format!("thread persistence shutdown owner failed: {error}");
+            observation = super::ShutdownObservation::Failed(error.clone());
+            Err(error)
+        }
+        Err(_) => {
+            if matches!(observation, super::ShutdownObservation::Complete) {
+                observation = super::ShutdownObservation::Pending(PERSISTENCE_SHUTDOWN_PENDING);
+            }
+            Err(PERSISTENCE_SHUTDOWN_PENDING.to_string())
+        }
+    };
+    store_observation(observation);
+    result
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
@@ -1053,13 +1185,8 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     finish_shutdown(sess, sub_id, runtime).await
 }
 
-async fn finish_shutdown(sess: &Arc<Session>, sub_id: String, runtime: RuntimeShutdown) -> bool {
-    let RuntimeShutdown {
-        error: runtime_error,
-        mandatory_error,
-        tool_history_flush_timed_out,
-    } = runtime;
-    if let Some(error) = runtime_error {
+async fn finish_shutdown(sess: &Arc<Session>, sub_id: String, mut runtime: RuntimeShutdown) -> bool {
+    if let Some(error) = runtime.error.take() {
         sess.send_event_raw(Event {
             id: sub_id.clone(),
             msg: EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
@@ -1086,7 +1213,7 @@ async fn finish_shutdown(sess: &Arc<Session>, sub_id: String, runtime: RuntimeSh
 
     // Gracefully flush and shutdown thread persistence on session end so later
     // durable-state reads do not race with the background writer.
-    if let Err(e) = shutdown_thread_persistence(sess, tool_history_flush_timed_out).await {
+    if let Err(e) = shutdown_thread_persistence(sess, runtime).await {
         warn!("failed to shutdown thread persistence: {e}");
         let event = Event {
             id: sub_id.clone(),
@@ -1098,11 +1225,6 @@ async fn finish_shutdown(sess: &Arc<Session>, sub_id: String, runtime: RuntimeSh
         sess.send_event_raw(event).await;
     }
 
-    *sess
-        .persistence_shutdown_result
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(mandatory_error.map_or(Ok(()), Err));
     let event = Event {
         id: sub_id,
         msg: EventMsg::ShutdownComplete,
@@ -1337,25 +1459,16 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        let RuntimeShutdown {
-            error: runtime_error,
-            mandatory_error,
-            tool_history_flush_timed_out,
-        } = shutdown_session_runtime(&sess).await;
-        if let Some(error) = runtime_error {
+        let mut runtime = shutdown_session_runtime(&sess).await;
+        if let Some(error) = runtime.error.take() {
             warn!(
                 "completed-tool history was not durable when the submission channel closed: {error}"
             );
         }
         sess.emit_thread_stop_lifecycle().await;
-        if let Err(err) = shutdown_thread_persistence(&sess, tool_history_flush_timed_out).await {
+        if let Err(err) = shutdown_thread_persistence(&sess, runtime).await {
             warn!("failed to shutdown thread persistence after submission channel closed: {err}");
         }
-        *sess
-            .persistence_shutdown_result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(mandatory_error.map_or(Ok(()), Err));
     }
     // ShutdownComplete can precede accepted late terminal producers. Close only
     // after those owners finish, so listeners drain their ordered final events

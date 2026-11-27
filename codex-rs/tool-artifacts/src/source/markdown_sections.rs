@@ -115,6 +115,6 @@ pub(super) fn sections(
             recovery_chunk_bytes: None,
         });
     }
-    sections.extend(super::code_sections::outline_sections(&headings));
+    sections.extend(super::code_sections::outline_sections(headings.iter()));
     (Instant::now() < deadline).then_some(sections)
 }

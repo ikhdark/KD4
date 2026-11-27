@@ -109,9 +109,19 @@ For a diagnostic backend launch, set `CODEX_ROLLOUT_WRITER_OPEN_TIMING=1`
 and `CODEX_RUNTIME_OBSERVATIONS=1`, with
 `CODEX_RUNTIME_OBSERVATIONS_DIR` pointing to an existing absolute directory.
 The [runtime observations journal](../protocol/src/timing/observations.rs)
-emits one `rollout_writer_open_summary` per returned append writer-open
-attempt, not one row per record. A cancelled attempt need not emit a summary.
-Rows identify the rollout by its normalized path hash, not its path or contents.
+admits one `rollout_writer_open_summary` per returned append writer-open
+attempt while the bounded lane is available, not one row per record. Queue
+admission confirms neither append nor durability; count only rows in the journal.
+A cancelled attempt need not emit a summary. A runtime-async gap marks a lost
+tail when the writer can report it; writer failure or process exit can also leave
+an unconfirmed tail. Rows identify the rollout by its normalized path hash, not
+its path or contents.
+
+`CODEX_RUNTIME_OBSERVATIONS=1` also captures the exact index record stream
+observed during reconstruction, without requiring writer-open timing. The
+`reload_rollout_observed` row uses the same bounded admission and confirms
+neither an atomic snapshot nor durable storage. An absent row is not evidence
+that no reconstruction occurred.
 
 The summary reports elapsed nanoseconds for the owner, lock acquisition,
 preflight and final writer materialization. Preflight sub-totals measure payload

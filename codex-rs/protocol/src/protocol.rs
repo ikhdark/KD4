@@ -32,6 +32,7 @@ use crate::dynamic_tools::DynamicToolCallOutputContentItem;
 use crate::dynamic_tools::DynamicToolCallRequest;
 use crate::dynamic_tools::DynamicToolResponse;
 use crate::dynamic_tools::DynamicToolSpec;
+use crate::items::HistoricalAgentCompletion;
 use crate::items::TurnItem;
 use crate::mcp::CallToolResult;
 use crate::mcp::RequestId;
@@ -3626,6 +3627,27 @@ pub struct SurfacedToolResult {
     pub canonical_message: Option<String>,
 }
 
+/// Disposition recorded by the retired task completion gate, independent of
+/// whether execution finished successfully.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyTaskCompletionStatus {
+    Passed,
+    Partial,
+    Blocked,
+}
+
+/// Historical diagnostics only. These fields do not drive live completion.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct LegacyTaskCompletionGate {
+    pub status: LegacyTaskCompletionStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub evidence_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnCompleteEvent {
     pub turn_id: String,
@@ -5626,6 +5648,7 @@ impl<'de> Deserialize<'de> for RolloutLine {
                         .ok_or_else(|| D::Error::custom("missing command stdout alias target"))?;
                     item.insert("stdout".into(), Value::String(output.to_owned()));
                 }
+                migrate_v1_collab_agent_completion(fields).map_err(D::Error::custom)?;
             }
             _ => {
                 return Err(D::Error::custom(format!(
@@ -5638,6 +5661,61 @@ impl<'de> Deserialize<'de> for RolloutLine {
             .map_err(D::Error::custom)?;
         Ok(Self { timestamp, item })
     }
+}
+
+// Paginated v1 rollouts stored the retired terminal wrapper in
+// item_completed. Normalize its lifecycle status, but carry the archived
+// payload on the item so forks and snapshots can serialize it independently.
+fn migrate_v1_collab_agent_completion(
+    fields: &mut serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    if fields.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return Ok(());
+    }
+    let Some(item) = fields
+        .get_mut("payload")
+        .and_then(Value::as_object_mut)
+        .filter(|payload| payload.get("type").and_then(Value::as_str) == Some("item_completed"))
+        .and_then(|payload| payload.get_mut("item"))
+        .and_then(Value::as_object_mut)
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("CollabAgentToolCall"))
+    else {
+        return Ok(());
+    };
+    let Some(states) = item.get_mut("agents_states").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+
+    let mut historical_completions = serde_json::Map::new();
+    for (thread_id, state) in states {
+        let Some(historical) = state
+            .as_object()
+            .filter(|fields| fields.len() == 1)
+            .and_then(|fields| fields.get("terminal_with_completion"))
+        else {
+            continue;
+        };
+        let Ok(completion) = HistoricalAgentCompletion::deserialize(historical) else {
+            // Keep the original unknown-variant error for unsupported wrapper
+            // contents; the rollout reader treats it as fatal, not a skipped row.
+            continue;
+        };
+        let status = serde_json::to_value(completion.execution_status())
+            .map_err(|error| error.to_string())?;
+        historical_completions.insert(thread_id.clone(), historical.clone());
+        *state = status;
+    }
+
+    if !historical_completions.is_empty() {
+        if item.contains_key("historical_agent_completions") {
+            return Err("v1 collaboration item mixes original and normalized completion data".into());
+        }
+        item.insert(
+            "historical_agent_completions".into(),
+            Value::Object(historical_completions),
+        );
+    }
+    Ok(())
 }
 
 fn migrate_rollout_v0(fields: &mut serde_json::Map<String, Value>) -> Result<(), String> {

@@ -40,7 +40,7 @@ impl ToolExecutor<ToolInvocation> for CompareArtifactsHandler {
         let source = json!({
             "type":"object", "additionalProperties":false,
             "properties": {
-                "artifact_id":{"type":"string"}, "canonical_sha256":{"type":"string"},
+                "artifact_id":{"type":"string"}, "canonical_sha256":{"type":["string","null"],"description":"Null if an incomplete raw command log has no known digest."},
                 "canonical_bytes":{"type":"integer","minimum":0},
                 "retained_bytes":{"type":"integer","minimum":0},
                 "capture_complete":{"type":"boolean"},

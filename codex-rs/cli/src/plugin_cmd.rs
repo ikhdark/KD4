@@ -138,7 +138,8 @@ pub async fn run_plugin_add(
         &plugins_input,
         &marketplace_name,
         &plugin_name,
-    )?;
+    )
+    .await?;
     let outcome = manager
         .install_plugin(
             &plugins_input.config_layer_stack,
@@ -203,7 +204,8 @@ pub async fn run_plugin_list(
         ..
     } = load_plugin_command_context(overrides).await?;
     let outcome = manager
-        .list_marketplaces_for_config(&plugins_input, &[], /*include_openai_curated*/ true)
+        .list_marketplaces_for_config_async(&plugins_input, /*include_openai_curated*/ true)
+        .await
         .context("failed to list marketplace plugins")?;
     ensure_configured_marketplace_snapshots_loaded(
         codex_home.as_path(),
@@ -639,7 +641,7 @@ fn parse_plugin_selection(
     }
 }
 
-fn find_marketplace_for_plugin(
+async fn find_marketplace_for_plugin(
     manager: &PluginsManager,
     codex_home: &std::path::Path,
     plugins_input: &PluginsConfigInput,
@@ -647,7 +649,8 @@ fn find_marketplace_for_plugin(
     plugin_name: &str,
 ) -> Result<ConfiguredMarketplace> {
     let outcome = manager
-        .list_marketplaces_for_config(plugins_input, &[], /*include_openai_curated*/ true)
+        .list_marketplaces_for_config_async(plugins_input, /*include_openai_curated*/ true)
+        .await
         .context("failed to list marketplace plugins")?;
     ensure_configured_marketplace_snapshots_loaded(
         codex_home,

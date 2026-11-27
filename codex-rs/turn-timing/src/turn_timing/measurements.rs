@@ -99,7 +99,11 @@ impl Capture {
     }
 
     pub(super) fn finish(&mut self, attempt: &str, at_ms: u64, outcome: &str, progress: bool, usage: Option<&TokenUsage>) {
-        if let Some(row) = self.attempts.get_mut(attempt) {
+        // A request owner can outlive the physical attempt, for example during
+        // retry backoff. Its later drop cannot revise an observed terminal row.
+        if let Some(row) = self.attempts.get_mut(attempt)
+            && row["outcome"].is_null()
+        {
             row["end_time"] = json!(at_ms as f64 / 1000.0);
             row["outcome"] = json!(outcome);
             row["native_actionable_output_observed"] = json!(progress);
@@ -190,11 +194,21 @@ impl Capture {
                     if let Some(value) = annotation.get(from) { attempt[to] = value.clone(); }
                 }
                 if let Some(mut packet) = annotation.get("modelTimeAttribution").cloned()
-                    && let Some(mut segment) = packet.as_object_mut().and_then(|packet| packet.remove("requestSpan")) {
-                    segment["start_time"] = attempt["start_time"].clone();
-                    segment["end_time"] = attempt["end_time"].clone();
-                    packet["segments"] = json!([segment]);
-                    attempt["model_time_attribution"] = packet;
+                    && let Some(fields) = packet.as_object_mut()
+                    && let Some(segment) = fields.get("requestSpan")
+                {
+                    let segment_fields = match segment {
+                        Value::Object(fields) => Some(fields.clone()),
+                        Value::Null => Some(serde_json::Map::new()),
+                        _ => None,
+                    };
+                    if let Some(mut segment) = segment_fields {
+                        segment.insert("start_time".into(), attempt["start_time"].clone());
+                        segment.insert("end_time".into(), attempt["end_time"].clone());
+                        fields.remove("requestSpan");
+                        fields.insert("segments".into(), Value::Array(vec![Value::Object(segment)]));
+                        attempt["model_time_attribution"] = packet;
+                    }
                 }
             }
             if attempt["recovery_induced"] == true {
@@ -745,6 +759,12 @@ impl TurnTimingState {
                 if let Some(unnecessary) = row.get("unnecessary") {
                     if !unnecessary.is_boolean() || !text(row.get("necessityEvidenceRef")) {
                         return Err("necessity labels require a boolean and necessityEvidenceRef".into());
+                    }
+                }
+                if let Some(attribution) = row.get("modelTimeAttribution") {
+                    let fields = attribution.as_object().ok_or("modelTimeAttribution must be an object")?;
+                    if fields.get("requestSpan").is_some_and(|span| !span.is_object() && !span.is_null()) {
+                        return Err("modelTimeAttribution.requestSpan must be an object or null".into());
                     }
                 }
                 row["samplingRequestId"] = json!(if next { "next" } else { &id });

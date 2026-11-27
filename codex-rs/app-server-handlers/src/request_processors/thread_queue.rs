@@ -33,6 +33,7 @@ fn parse_thread_id_for_request(thread_id: &str) -> Result<ThreadId, JSONRPCError
         .map_err(|err| invalid_request(format!("invalid thread id: {err}")))
 }
 
+use codex_app_server_protocol_projection::ThreadHistoryBuilder;
 use codex_app_server_protocol_types::QueuedSubmission;
 use codex_app_server_protocol_types::ThreadQueueAddParams;
 use codex_app_server_protocol_types::ThreadQueueAddResponse;
@@ -60,6 +61,8 @@ const MAX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 // Retry identities survive consumption for the latest 100 accepted submissions,
 // further bounded by MAX_QUEUE_BYTES. Pending submissions are never evicted.
 const MAX_ACCEPTED_SUBMISSIONS: usize = 100;
+// A rolled-back entry needs only its retry identities, never its prompt.
+const MAX_ROLLED_BACK_SUBMISSIONS: usize = 100;
 
 /// Separate from the wire DTO: this payload is versioned and includes admission
 /// recovery state. A pending start keeps the prompt until core accepts it.
@@ -73,6 +76,8 @@ struct Queue {
     pending_start: Option<PendingStart>,
     #[serde(default)]
     accepted: Vec<AcceptedSubmission>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rolled_back: Vec<RolledBackSubmission>,
     /// Immutable execution inputs; submissions retain original UI/idempotency input.
     #[serde(default)]
     execution_inputs: HashMap<String, Vec<V2UserInput>>,
@@ -105,6 +110,35 @@ struct AcceptedSubmission {
     turn_id: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RolledBackSubmission {
+    queued_submission_id: String,
+    client_user_message_id: Option<String>,
+    turn_id: String,
+}
+
+impl RolledBackSubmission {
+    fn retry_error(&self) -> JSONRPCErrorError {
+        let mut error = invalid_request(
+            "the queued submission's turn was rolled back and will not start; to send it again, add a new queue submission with a new clientUserMessageId",
+        );
+        error.data = Some(serde_json::json!({
+            "reason": "submissionRolledBack",
+            "queuedSubmissionId": &self.queued_submission_id,
+            "turnId": &self.turn_id,
+        }));
+        error
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingInputOutcome {
+    NotRecorded,
+    Recorded,
+    RolledBack,
+}
+
 impl Default for Queue {
     fn default() -> Self {
         Self {
@@ -114,6 +148,7 @@ impl Default for Queue {
             paused: false,
             pending_start: None,
             accepted: Vec::new(),
+            rolled_back: Vec::new(),
             execution_inputs: HashMap::new(),
             task_observations: HashMap::new(),
         }
@@ -124,6 +159,22 @@ impl Queue {
     fn encode_with_budget(&mut self, max_bytes: usize) -> Result<String, JSONRPCErrorError> {
         let payload = serde_json::to_string(&*self).map_err(queue_error)?;
         let mut bytes = payload.len();
+        // Prefer retaining existing accepted receipts when trimming compact
+        // rollback identities. Dropping the last identity also omits the field.
+        let mut evicted_rolled_back = 0;
+        for rolled_back in &self.rolled_back {
+            if bytes <= max_bytes {
+                break;
+            }
+            bytes -= serde_json::to_vec(rolled_back).map_err(queue_error)?.len()
+                + if self.rolled_back.len() - evicted_rolled_back > 1 {
+                    1
+                } else {
+                    br#","rolledBack":[]"#.len()
+                };
+            evicted_rolled_back += 1;
+        }
+        self.rolled_back.drain(..evicted_rolled_back);
         let mut evicted = 0;
         for accepted in &self.accepted {
             if bytes <= max_bytes {
@@ -148,7 +199,7 @@ impl Queue {
         if bytes > max_bytes {
             return Err(invalid_params("thread queue exceeds its storage limit"));
         }
-        if evicted == 0 {
+        if evicted == 0 && evicted_rolled_back == 0 {
             Ok(payload)
         } else {
             // Pending prompts are encoded at most twice, not once per receipt.
@@ -183,10 +234,35 @@ impl Queue {
         Ok((item, added))
     }
 
+    fn rolled_back_submission(&self, submission_id: &str) -> Option<&RolledBackSubmission> {
+        self.rolled_back
+            .iter()
+            .find(|outcome| outcome.queued_submission_id == submission_id)
+    }
+
+    fn retire_rolled_back_submission(&mut self, submission: QueuedSubmission, turn_id: String) {
+        self.rolled_back.push(RolledBackSubmission {
+            queued_submission_id: submission.id,
+            client_user_message_id: submission.client_user_message_id,
+            turn_id,
+        });
+        if self.rolled_back.len() > MAX_ROLLED_BACK_SUBMISSIONS {
+            self.rolled_back.remove(0);
+        }
+    }
+
     fn existing_submission(
         &self,
         params: &ThreadQueueAddParams,
     ) -> Result<Option<QueuedSubmission>, JSONRPCErrorError> {
+        if let Some(client_id) = &params.client_user_message_id
+            && let Some(outcome) = self
+                .rolled_back
+                .iter()
+                .find(|outcome| outcome.client_user_message_id.as_ref() == Some(client_id))
+        {
+            return Err(outcome.retry_error());
+        }
         if let Some(client_id) = &params.client_user_message_id
             && let Some(existing) = self
                 .submissions
@@ -724,30 +800,40 @@ impl ThreadQueueRequestProcessor {
             Some(thread) => thread.durable_input_recorded(&pending.turn_id).await.map_err(queue_error)?,
             None => None,
         };
-        let accepted = if let Some(recorded) = live_receipt {
-            recorded
+        let outcome = if let Some(recorded) = live_receipt {
+            if recorded {
+                PendingInputOutcome::Recorded
+            } else {
+                PendingInputOutcome::NotRecorded
+            }
         } else {
             if let Some(thread) = &thread {
                 thread.flush_rollout().await.map_err(queue_error)?;
             }
             let history = self
-            .thread_store
-            .read_thread(codex_thread_store::ReadThreadParams {
-                thread_id: id,
-                include_archived: false,
-                include_history: true,
-            })
-            .await
-            .map_err(queue_error)?;
-            history
-            .history
-            .as_ref()
-            .is_some_and(|history| pending_input_recorded(&history.items, &pending.turn_id))
+                .thread_store
+                .read_thread(codex_thread_store::ReadThreadParams {
+                    thread_id: id,
+                    include_archived: false,
+                    include_history: true,
+                })
+                .await
+                .map_err(queue_error)?;
+            if let Some(history) = history.history {
+                // A rollback needs a full history projection. Do not run that
+                // reducer on the request executor or move the queue owner.
+                let turn_id = pending.turn_id.clone();
+                tokio::task::spawn_blocking(move || pending_input_outcome(&history.items, &turn_id))
+                    .await
+                    .map_err(queue_error)?
+            } else {
+                PendingInputOutcome::NotRecorded
+            }
         };
         // Accepted input belongs to history even while the turn is running.
         // Without that evidence, worker installation is not enough to release
         // custody: it may still be starting or recording the prompt.
-        if !accepted {
+        if outcome == PendingInputOutcome::NotRecorded {
             let live = self.thread_state_manager.thread_state(id).await;
             if live.lock().await.in_progress_turn_id() == Some(pending.turn_id.as_str()) {
                 return Ok(());
@@ -762,25 +848,30 @@ impl ThreadQueueRequestProcessor {
         let pending = queue.pending_start.take().ok_or_else(|| {
             internal_error("pending thread queue start disappeared during recovery")
         })?;
-        if accepted
+        if outcome != PendingInputOutcome::NotRecorded
             && let Some(index) = queue
                 .submissions
                 .iter()
                 .position(|item| item.id == pending.submission_id)
         {
             let submission = queue.submissions.remove(index);
-            queue.accepted.push(AcceptedSubmission {
-                submission,
-                turn_id: pending.turn_id,
-            });
-            if queue.accepted.len() > MAX_ACCEPTED_SUBMISSIONS {
-                queue.accepted.remove(0);
+            if outcome == PendingInputOutcome::RolledBack {
+                queue.retire_rolled_back_submission(submission, pending.turn_id);
+            } else {
+                queue.accepted.push(AcceptedSubmission {
+                    submission,
+                    turn_id: pending.turn_id,
+                });
+                if queue.accepted.len() > MAX_ACCEPTED_SUBMISSIONS {
+                    queue.accepted.remove(0);
+                }
             }
         }
-        // Never silently replay an unaccepted start or resume after process death.
-        queue.paused |= !accepted || !origin_present;
+        // Never silently replay a rolled-back or unaccepted start, or resume
+        // after process death.
+        queue.paused |= outcome != PendingInputOutcome::Recorded || !origin_present;
         self.save(id, queue).await?;
-        if accepted {
+        if outcome != PendingInputOutcome::NotRecorded {
             self.remove_origin(id, &pending.submission_id);
         }
         let processor = self.clone();
@@ -1143,6 +1234,9 @@ impl ThreadQueueRequestProcessor {
         }
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
+        if let Some(outcome) = selected.and_then(|selected| queue.rolled_back_submission(selected)) {
+            return Err(outcome.retry_error());
+        }
         if queue.pending_start.is_some() {
             return Err(invalid_request("a queued submission is still starting"));
         }
@@ -1251,6 +1345,9 @@ impl ThreadQueueRequestProcessor {
                     pending.turn_id.clone_from(&response.turn.id);
                     self.save(id, &mut queue).await?;
                     self.recover(id, &mut queue).await?;
+                    if let Some(outcome) = queue.rolled_back_submission(&item.id) {
+                        return Err(outcome.retry_error());
+                    }
                     if queue.pending_start.is_none()
                         && !queue.accepted.iter().any(|receipt| receipt.submission.id == item.id)
                     {
@@ -1347,13 +1444,8 @@ impl ThreadQueueRequestProcessor {
         {
             return Ok(());
         }
-        self.origins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear_thread(id);
-        // This runs before the listener forwards every interrupted or failed
-        // turn. Without queued prompts there is nothing to protect: skip the
-        // lock file, queue write, and change notification.
+        // Without queued prompts or capabilities there is nothing to protect:
+        // skip the lock file, queue write, and change notification.
         let has_queued = match db.read_thread_queue(id).await {
             Ok(Some(payload)) => match serde_json::from_str::<Queue>(&payload) {
                 Ok(queue) => !queue.submissions.is_empty() || queue.pending_start.is_some(),
@@ -1363,16 +1455,30 @@ impl ThreadQueueRequestProcessor {
             Ok(None) => false,
             Err(_) => true,
         };
-        if !has_queued {
+        if !has_queued && !self.has_origins(id) {
             return Ok(());
         }
-        self
-            .mutate(id, |queue| {
-                let changed = !queue.paused;
+
+        let admission = self.lock(id).await?;
+        // Retire the current origins under the same admission as recovery and
+        // the pause. A later explicit start can replace them only after our
+        // durable mutation, and recovery must already see them retired.
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear_thread(id);
+        self.mutate_locked(id, admission, |queue| {
+            // Preserve pause intent when preflight saw queued work, even if
+            // recovery removed the last entry. An empty, origins-only cleanup
+            // still avoids creating a paused queue record.
+            let changed = !queue.paused
+                && (has_queued || !queue.submissions.is_empty() || queue.pending_start.is_some());
+            if changed {
                 queue.paused = true;
-                Ok(((), changed))
-            })
-            .await
+            }
+            Ok(((), changed))
+        })
+        .await
     }
 
     pub(super) fn input_recorded(&self, id: ThreadId) {
@@ -1458,6 +1564,65 @@ async fn publish_queue_change(
             .await;
     }
     *published_revision = revision;
+}
+
+fn pending_input_outcome(items: &[RolloutItem], turn_id: &str) -> PendingInputOutcome {
+    use codex_app_server_protocol_types::ThreadItem;
+    use codex_protocol::items::TurnItem;
+
+    if !items.iter().any(|item| {
+        matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)))
+    }) {
+        return if pending_input_recorded(items, turn_id) {
+            PendingInputOutcome::Recorded
+        } else {
+            PendingInputOutcome::NotRecorded
+        };
+    }
+
+    // Use the history reducer's exact suffix removal, including implicit
+    // user-turn boundaries and legacy mirrors, instead of counting lifecycle
+    // events. Removal alone is not evidence the pending input was recorded.
+    let mut history = ThreadHistoryBuilder::new();
+    let mut outcome = PendingInputOutcome::NotRecorded;
+    let mut removed_owner = false;
+    for item in items {
+        match item {
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => {
+                let changes = history.handle_rollout_item_with_changes(item);
+                if changes.removed_turn_ids.iter().any(|id| id == turn_id) {
+                    removed_owner = true;
+                    if outcome == PendingInputOutcome::Recorded {
+                        outcome = PendingInputOutcome::RolledBack;
+                    }
+                }
+            }
+            RolloutItem::EventMsg(EventMsg::UserMessage(_))
+                if history.has_active_turn() && history.active_turn_id() == Some(turn_id) =>
+            {
+                let changes = history.handle_rollout_item_with_changes(item);
+                if changes.changed_items.iter().any(|change| {
+                    change.turn_id == turn_id
+                        && matches!(&change.item, ThreadItem::UserMessage { .. })
+                }) {
+                    outcome = PendingInputOutcome::Recorded;
+                }
+            }
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                if event.turn_id == turn_id && matches!(&event.item, TurnItem::UserMessage(_)) =>
+            {
+                // An exact scoped completion is proof without a lifecycle
+                // marker, except when the owner is known to have been removed.
+                // A late scoped event cannot recreate that owner.
+                if !removed_owner || history.contains_turn(turn_id) {
+                    outcome = PendingInputOutcome::Recorded;
+                }
+                history.handle_rollout_item(item);
+            }
+            _ => history.handle_rollout_item(item),
+        }
+    }
+    outcome
 }
 
 // A TurnStarted record alone says nothing about recoverable input ownership.

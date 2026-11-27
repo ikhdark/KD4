@@ -40,6 +40,7 @@ impl ExternalAgentConfigRequestProcessor {
             return result;
         };
         let mut sources = None;
+        let mut invalid_source_message: Option<String> = None;
         let cwd = item.cwd.clone().filter(|cwd| !cwd.as_os_str().is_empty());
         let mut selected = std::collections::HashSet::new();
         for group in &details.plugins {
@@ -62,12 +63,24 @@ impl ExternalAgentConfigRequestProcessor {
             let mut pending_group = group.clone();
             pending_group.plugin_names = remaining;
             let group = &pending_group;
+            if let Some(message) = &invalid_source_message {
+                group_failure(&mut result, &item, group, message.clone());
+                continue;
+            }
             if sources.is_none() {
                 let home = self.codex_home.clone();
                 let selection = item.clone();
                 sources = Some(match tokio::task::spawn_blocking(move || files::plugin_sources(&home, &selection)).await {
                     Ok(Ok(sources)) => sources,
-                    Ok(Err(err)) => { group_failure(&mut result, &item, group, err.to_string()); continue; },
+                    Ok(Err(err)) => {
+                        let message = err.to_string();
+                        // Invalid data invalidates the whole item's lookup, not just this group.
+                        if err.kind() == std::io::ErrorKind::InvalidData {
+                            invalid_source_message = Some(message.clone());
+                        }
+                        group_failure(&mut result, &item, group, message);
+                        continue;
+                    },
                     Err(err) => { group_failure(&mut result, &item, group, format!("marketplace source lookup failed: {err}")); continue; },
                 });
             }

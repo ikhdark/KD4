@@ -25,6 +25,9 @@ use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
 
+use crate::agent::AgentRegistry;
+use crate::agent::control::FollowupTurn;
+use crate::agent::control::FollowupWake;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
@@ -75,8 +78,14 @@ const GRACEFUL_INTERRUPTION_TIMEOUT: Duration =
 const FORCED_INTERRUPTION_TIMEOUT: Duration = Duration::from_secs(1);
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 
-/// Unsettled targets in failed-turn order; a true entry is owned by a Stop.
-pub(crate) type FailedTurnStops = indexmap::IndexMap<String, bool>;
+/// Unsettled targets in failed-turn order; an in-flight entry is owned by a Stop.
+pub(crate) type FailedTurnStops = indexmap::IndexMap<String, FailedTurnStop>;
+
+pub(crate) struct FailedTurnStop {
+    in_flight: bool,
+    followup_owner: Arc<FollowupTurn>,
+    include_spawn_branch: bool,
+}
 
 /// Only a confirmed Stop consumes its exact target. Drop releases the claim
 /// after cancellation, discovery failure or unconfirmed interrupt delivery.
@@ -84,6 +93,7 @@ struct FailedTurnStopClaim<'a> {
     remembered: &'a std::sync::Mutex<FailedTurnStops>,
     turn_id: &'a str,
     needs_retry: bool,
+    include_spawn_branch: bool,
 }
 
 impl Drop for FailedTurnStopClaim<'_> {
@@ -92,10 +102,11 @@ impl Drop for FailedTurnStopClaim<'_> {
             .remembered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.needs_retry {
-            if let Some(in_flight) = targets.get_mut(self.turn_id) {
-                *in_flight = false;
-            }
+        let Some(target) = targets.get_mut(self.turn_id) else {
+            return;
+        };
+        if self.needs_retry || (target.include_spawn_branch && !self.include_spawn_branch) {
+            target.in_flight = false;
         } else {
             targets.shift_remove(self.turn_id);
         }
@@ -379,14 +390,21 @@ enum WorkerJoinFailure {
 enum TerminalSchedule {
     Started(Arc<TurnTerminalCoordinator>),
     AlreadyRunning(Arc<TurnTerminalCoordinator>),
+    StartupInterrupted,
     NotFound,
+}
+
+#[derive(Clone, Copy)]
+enum OwnedInterrupt<'a> {
+    Followup(&'a Arc<FollowupWake>),
+    SpawnBranch { registry: &'a AgentRegistry, root: codex_protocol::ThreadId },
 }
 
 impl TerminalSchedule {
     fn coordinator(&self) -> Option<&Arc<TurnTerminalCoordinator>> {
         match self {
             Self::Started(coordinator) | Self::AlreadyRunning(coordinator) => Some(coordinator),
-            Self::NotFound => None,
+            Self::StartupInterrupted | Self::NotFound => None,
         }
     }
 
@@ -407,7 +425,10 @@ struct TerminalFinalization {
     permit: Option<TurnTerminalPermit>,
     worker_failure_reported: bool,
     selected_terminal_event: Option<EventMsg>,
+    paired_lifecycle_gap: Option<String>,
     published_terminal_event: Option<EventMsg>,
+    terminal_dispatch_source: Option<EventMsg>,
+    terminal_dispatch_owner: Option<crate::agent::task_coordinator::TerminalDispatchOwner>,
     terminal_post_dispatch_completed: bool,
     terminal_lifecycle_dispatched: bool,
     restart_for_pending_input: bool,
@@ -426,10 +447,10 @@ impl Drop for WorkerDoneNotifier {
     }
 }
 
-async fn wait_for_worker_done(task: &RunningTask) {
+async fn wait_for_worker_done(done: &Notify, worker_done: &AtomicBool) {
     loop {
-        let notified = task.done.notified();
-        if task.worker_done.load(Ordering::Acquire) {
+        let notified = done.notified();
+        if worker_done.load(Ordering::Acquire) {
             return;
         }
         notified.await;
@@ -438,9 +459,12 @@ async fn wait_for_worker_done(task: &RunningTask) {
 
 async fn abort_worker_and_wait(task: &RunningTask) {
     task.worker_abort_handle.abort();
-    if tokio::time::timeout(FORCED_INTERRUPTION_TIMEOUT, wait_for_worker_done(task))
-        .await
-        .is_err()
+    if tokio::time::timeout(
+        FORCED_INTERRUPTION_TIMEOUT,
+        wait_for_worker_done(&task.done, &task.worker_done),
+    )
+    .await
+    .is_err()
     {
         // Tokio cannot interrupt synchronous code. Tool admission is already
         // sealed, so this worker must not hold terminal publication hostage.
@@ -458,20 +482,60 @@ async fn drain_auxiliary_tasks(tasks: &mut tokio::task::JoinSet<()>) {
     }
 }
 
-async fn quiesce_turn_auxiliary_tasks(task: &mut RunningTask, deadline: tokio::time::Instant) {
+async fn wait_for_turn_tasks(task: &mut RunningTask, wait_for_worker: bool) {
+    let done = &task.done;
+    let worker_done = &task.worker_done;
+    tokio::join!(
+        async {
+            if wait_for_worker {
+                wait_for_worker_done(done, worker_done).await;
+            }
+        },
+        drain_auxiliary_tasks(&mut task.auxiliary_tasks),
+    );
+}
+
+async fn quiesce_turn_tasks(task: &mut RunningTask, wait_for_worker: bool) {
     task.auxiliary_cancellation_token.cancel();
-    if tokio::time::timeout_at(deadline, drain_auxiliary_tasks(&mut task.auxiliary_tasks))
+    if tokio::time::timeout(
+        GRACEFUL_INTERRUPTION_TIMEOUT,
+        wait_for_turn_tasks(task, wait_for_worker),
+    )
+    .await
+    .is_ok()
+    {
+        return;
+    }
+
+    // Both owners cross the same deadline. Send every needed abort before
+    // waiting for any forced confirmation; accounting and persistence follow.
+    let force_worker = wait_for_worker && !task.worker_done.load(Ordering::Acquire);
+    if force_worker {
+        task.turn_context.paired_lifecycle().seal();
+        task.worker_abort_handle.abort();
+    }
+    if !task.auxiliary_tasks.is_empty() {
+        task.auxiliary_tasks.abort_all();
+    }
+    let forced_deadline = tokio::time::Instant::now() + FORCED_INTERRUPTION_TIMEOUT;
+
+    if force_worker {
+        warn!(
+            "task {} didn't complete gracefully after {}ms",
+            task.turn_context.sub_id,
+            GRACEFUL_INTERRUPTION_TIMEOUT.as_millis()
+        );
+    }
+    if tokio::time::timeout_at(forced_deadline, wait_for_turn_tasks(task, wait_for_worker))
         .await
         .is_err()
     {
-        task.auxiliary_tasks.abort_all();
-        if tokio::time::timeout(
-            FORCED_INTERRUPTION_TIMEOUT,
-            drain_auxiliary_tasks(&mut task.auxiliary_tasks),
-        )
-        .await
-        .is_err()
-        {
+        // Tokio cannot interrupt synchronous code. Tool admission is already
+        // sealed, so unconfirmed shutdown must not hold terminalization hostage.
+        if wait_for_worker && !task.worker_done.load(Ordering::Acquire) {
+            warn!(turn_id = %task.turn_context.sub_id, "turn worker has not stopped after forced cancellation");
+        }
+        if !task.auxiliary_tasks.is_empty() {
             warn!(turn_id = %task.turn_context.sub_id, "turn auxiliary tasks have not stopped after forced cancellation");
         }
     }
@@ -697,6 +761,7 @@ impl Session {
             .transfer_pending_input_to_turn_state(
                 &self.active_turn,
                 &turn_state,
+                pending_work_start,
                 /*select_validation_origin*/ pending_work_start && regular && child,
             )
             .await
@@ -708,6 +773,13 @@ impl Session {
                 "turn start reservation was lost before task installation".to_string(),
             ));
         };
+        // The queue snapshot may have lost its sole wake after reservation.
+        // Roll back the taskless owner, keeping every admitted input available.
+        if pending_work_start && !selected.has_start_work {
+            self.recover_cancelled_taskless_placeholder(&turn_state).await;
+            startup_guard.disarm();
+            return Err(CodexErr::TurnAborted);
+        }
         // Root lookup must not hold the child's active-turn or queue locks.
         // If cancellation removes the reservation during lookup, the final
         // identity check below drops this provisional context without a write.
@@ -764,6 +836,18 @@ impl Session {
                 if self.shutting_down.load(Ordering::Acquire) {
                     break 'install Err(CodexErr::InvalidRequest("the thread is shutting down".into()));
                 }
+                // Last check after every await: a revoked wake cannot install
+                // a worker or publish speculative validation. A winning
+                // installation publishes its exact association before unlock.
+                let _wake_install = if let Some(wake) = selected.followup_wake.as_ref() {
+                    let Some(guard) = wake.install(&turn_context.sub_id) else {
+                        break 'install Err(CodexErr::TurnAborted);
+                    };
+                    turn_context.bind_incoming_followup(Arc::clone(wake));
+                    Some(guard)
+                } else {
+                    None
+                };
                 let task_cancellation_token = cancellation_token.child_token();
                 let lifecycle_token_usage = token_usage_at_turn_start.clone();
                 let (start_tx, start_rx) = oneshot::channel::<()>();
@@ -812,11 +896,19 @@ impl Session {
                 let worker_abort_handle = worker_handle.abort_handle();
                 let supervisor_session = Arc::clone(self);
                 let supervisor_turn_id = turn_context.sub_id.clone();
+                let usage_telemetry = turn_context.session_telemetry.clone();
+                self.services.agent_control.task_coordinator()
+                    .begin_task_usage(self.thread_id, &turn_context);
                 let supervisor_handle = tokio::spawn(
                     async move {
                         supervisor_session
                             .on_task_finished(&supervisor_turn_id, worker_handle.await)
                             .await;
+                        supervisor_session.services.agent_control.task_coordinator()
+                            .finish_task_usage(
+                                supervisor_session.thread_id, &supervisor_turn_id,
+                                /*worker_stopped*/ true, &usage_telemetry,
+                            ).await;
                     }
                     .instrument(task_span.clone()),
                 );
@@ -980,8 +1072,16 @@ impl Session {
     /// if the session is currently idle.
     pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id(
         self: &Arc<Self>,
-        sub_id: String,
+        mut sub_id: String,
     ) {
+        while self.try_start_pending_work(sub_id).await {
+            // Do not assign another legitimate wake the revoked reservation's
+            // identity. Its mailbox FIFO and provenance are selected afresh.
+            sub_id = uuid::Uuid::new_v4().to_string();
+        }
+    }
+
+    async fn try_start_pending_work(self: &Arc<Self>, sub_id: String) -> bool {
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
@@ -989,10 +1089,10 @@ impl Session {
             || self.session_start_suspended.load(Ordering::Acquire)
         {
             tracing::debug!(target: "codex_input_custody", phase = "pending_wake_blocked", thread_id = %self.thread_id, hook_suspended = self.session_start_suspended.load(Ordering::Acquire), "input custody boundary");
-            return;
+            return false;
         }
         if !self.input_queue.has_pending_turn_start_work().await {
-            return;
+            return false;
         }
 
         // All turn-start paths reserve the active slot while holding the same
@@ -1008,7 +1108,7 @@ impl Session {
             || self.session_start_suspended.load(Ordering::Acquire)
             || !self.input_queue.has_pending_turn_start_work().await
         {
-            return;
+            return false;
         }
 
         let turn_state = {
@@ -1019,7 +1119,7 @@ impl Session {
                     .shutting_down
                     .load(std::sync::atomic::Ordering::Acquire)
             {
-                return;
+                return false;
             }
             let active_turn = active_turn.insert(ActiveTurn::default());
             Arc::clone(&active_turn.turn_state)
@@ -1048,6 +1148,7 @@ impl Session {
         if matches!(result, Err(CodexErr::AgentLimitReached { .. })) {
             self.schedule_pending_work_capacity_retry(retry_turn_id, retry_version, retry_source);
         }
+        matches!(result, Err(CodexErr::TurnAborted))
     }
 
     fn schedule_pending_work_capacity_retry(
@@ -1128,21 +1229,125 @@ impl Session {
         Ok(matched)
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "A taskless cancellation must recover input before releasing the reservation"
-    )]
+    pub(crate) async fn followup_wake_for_active_turn(
+        &self,
+        turn_id: &str,
+        child: codex_protocol::ThreadId,
+        registry: &Arc<AgentRegistry>,
+    ) -> Arc<FollowupWake> {
+        let active = self.active_turn.lock().await;
+        let owner = active.as_ref().and_then(|turn| turn.task.as_ref())
+            .filter(|task| task.turn_context.sub_id == turn_id)
+            .map(|task| task.turn_context.followup_owner());
+        if let Some(owner) = &owner {
+            registry.remember_followup_turn(self.thread_id, turn_id, owner);
+        }
+        FollowupWake::new(owner, registry, self.thread_id, child)
+    }
+
+    /// A Stop can still address this turn while another outcome owns its
+    /// terminal event. Revoke the exact wakes without replacing that outcome.
+    fn stop_followups_of_terminalizing_turn(self: &Arc<Self>, turn_id: &str) {
+        let Some(owner) = self.services.agent_control.registry()
+            .followup_turn(self.thread_id, turn_id)
+        else {
+            return;
+        };
+        if !owner.seal() {
+            return;
+        }
+        let turn_id = turn_id.to_owned();
+        let session = Arc::clone(self);
+        self.terminal_tasks.spawn(async move {
+            let (_, warning, needs_retry) = session.interrupt_agents_owned_by_turn(
+                &turn_id,
+                &owner,
+                /*include_spawn_branch*/ false,
+                "Cancellation was requested for the follow-ups of this terminalizing turn.",
+            ).await;
+            if needs_retry {
+                session.remember_owned_stop_target(&turn_id, &owner, /*include_spawn_branch*/ false);
+            }
+            if let Some(message) = warning {
+                session.send_event_raw(codex_protocol::protocol::Event {
+                    id: turn_id,
+                    msg: EventMsg::Warning(WarningEvent { message }),
+                }).await;
+            }
+        });
+    }
+
+    pub(crate) async fn interrupt_followup_turn(
+        self: &Arc<Self>,
+        turn_id: &str,
+        wake: &Arc<FollowupWake>,
+    ) -> bool {
+        self.schedule_turn_terminal_with_owner(
+            Some(turn_id),
+            TurnTerminalOutcome::Aborted(TurnAbortReason::Interrupted),
+            Some(OwnedInterrupt::Followup(wake)),
+        ).await.matched()
+    }
+
+    pub(crate) async fn interrupt_spawn_owned_agent(
+        self: &Arc<Self>,
+        registry: &AgentRegistry,
+        root: codex_protocol::ThreadId,
+    ) -> bool {
+        self.schedule_turn_terminal_with_owner(
+            None,
+            TurnTerminalOutcome::Aborted(TurnAbortReason::Interrupted),
+            Some(OwnedInterrupt::SpawnBranch { registry, root }),
+        ).await.matched()
+    }
+
     fn schedule_turn_terminal<'a>(
         self: &'a Arc<Self>,
         expected_turn_id: Option<&'a str>,
         outcome: TurnTerminalOutcome,
     ) -> BoxFuture<'a, TerminalSchedule> {
+        self.schedule_turn_terminal_with_owner(expected_turn_id, outcome, None)
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "A taskless cancellation must recover input before releasing the reservation"
+    )]
+    fn schedule_turn_terminal_with_owner<'a>(
+        self: &'a Arc<Self>,
+        expected_turn_id: Option<&'a str>,
+        outcome: TurnTerminalOutcome,
+        owner: Option<OwnedInterrupt<'a>>,
+    ) -> BoxFuture<'a, TerminalSchedule> {
         Box::pin(async move {
             let (task, turn_state, permit, coordinator) = {
                 let mut active = self.active_turn.lock().await;
+                let spawn_owned = match owner {
+                    Some(OwnedInterrupt::SpawnBranch { registry, root }) => {
+                        // Discovery may predate a real follow-up start. Do not
+                        // deliver the legacy branch interrupt to its successor.
+                        if registry.has_followup_started(root) {
+                            return TerminalSchedule::NotFound;
+                        }
+                        true
+                    }
+                    _ => false,
+                };
                 let Some(active_turn) = active.as_mut() else {
+                    if spawn_owned {
+                        self.cancel_mcp_startup().await;
+                        return TerminalSchedule::StartupInterrupted;
+                    }
                     return TerminalSchedule::NotFound;
                 };
+                if let Some(OwnedInterrupt::Followup(wake)) = owner
+                    && (!wake.is_direct_child()
+                        || !active_turn.task.as_ref().is_some_and(|task| {
+                            task.turn_context.owns_incoming_followup(wake)
+                        }))
+                {
+                    return TerminalSchedule::NotFound;
+                }
                 match active_turn.terminal.as_ref().cloned() {
                     Some(coordinator) => {
                         if expected_turn_id.is_some_and(|turn_id| coordinator.turn_id() != turn_id)
@@ -1158,13 +1363,27 @@ impl Session {
                         } else {
                             coordinator.try_claim()
                         };
+                        let user_interrupt = outcome.abort_reason() == Some(TurnAbortReason::Interrupted)
+                            && !self.shutting_down.load(Ordering::Acquire);
                         let Some(permit) = permit else {
+                            if user_interrupt {
+                                self.stop_followups_of_terminalizing_turn(coordinator.turn_id());
+                            }
                             return TerminalSchedule::AlreadyRunning(coordinator);
                         };
                         let Some(task) = active_turn.task.take() else {
+                            if user_interrupt {
+                                self.stop_followups_of_terminalizing_turn(coordinator.turn_id());
+                            }
                             return TerminalSchedule::AlreadyRunning(coordinator);
                         };
                         coordinator.seal_tool_call_acceptance(&task.turn_context.turn_timing_state);
+                        if user_interrupt || matches!(&outcome, TurnTerminalOutcome::WorkerJoinFailed(_))
+                            || matches!(&outcome, TurnTerminalOutcome::ReturnedError(error)
+                                if failed_turn_stops_agents(&error.to_error_event(None), &outcome))
+                        {
+                            task.turn_context.followup_owner().seal();
+                        }
                         self.terminal_interaction_pending
                             .store(true, Ordering::Release);
                         (
@@ -1175,7 +1394,11 @@ impl Session {
                         )
                     }
                     None => {
-                        if expected_turn_id.is_none() && active_turn.task.is_none() {
+                        // A legacy spawn-branch discovery does not identify a
+                        // turn reservation. It may have been made by a valid
+                        // successor wake after discovery; exact follow-up
+                        // revocation already fences its own installation.
+                        if !spawn_owned && expected_turn_id.is_none() && active_turn.task.is_none() {
                             // Claim a taskless interruption under the same lock
                             // used for installation, without leaving a gap in
                             // which this reservation could become a running task.
@@ -1189,6 +1412,7 @@ impl Session {
                             if !recovered {
                                 self.notify_taskless_turn_cleared();
                             }
+                            return TerminalSchedule::StartupInterrupted;
                         }
                         return TerminalSchedule::NotFound;
                     }
@@ -1210,6 +1434,11 @@ impl Session {
             let terminal_turn_id = coordinator.turn_id().to_string();
             let finalizer_coordinator = Arc::clone(&coordinator);
             let session = Arc::clone(self);
+            let terminal_dispatch_owner = task.turn_context.agent_task_binding.get()
+                .and_then(Option::as_ref).map(|binding| {
+                    self.services.agent_control.task_coordinator()
+                        .own_terminal_dispatch(binding.clone(), terminal_turn_id.clone())
+                });
             self.terminal_tasks.spawn(
                 async move {
                     let mut finalization = TerminalFinalization {
@@ -1221,7 +1450,10 @@ impl Session {
                         permit: Some(permit),
                         worker_failure_reported: false,
                         selected_terminal_event: None,
+                        paired_lifecycle_gap: None,
                         published_terminal_event: None,
+                        terminal_dispatch_source: None,
+                        terminal_dispatch_owner,
                         terminal_post_dispatch_completed: false,
                         terminal_lifecycle_dispatched: false,
                         restart_for_pending_input: false,
@@ -1250,27 +1482,43 @@ impl Session {
                     // Returned store failures, unlike panics, also retain the exact
                     // published event. Retry after releasing interaction/capacity;
                     // never sample a successor turn or publish another terminal event.
+                    let turn_context = finalization.task.turn_context.as_ref();
                     if !finalization.terminal_post_dispatch_completed
-                        && let Some(event) = finalization.published_terminal_event.as_ref()
+                        && let Some(event) = finalization.terminal_dispatch_source.as_ref()
                     {
                         for delay_ms in [100_u64, 500, 2_000] {
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             let dispatched = tokio::time::timeout(
                                 Duration::from_secs(5),
-                                session.finish_terminal_event_dispatch(
-                                    finalization.task.turn_context.as_ref(), event,
-                                ),
-                            ).await.unwrap_or(false);
+                                AssertUnwindSafe(session.finish_terminal_event_dispatch(turn_context, event))
+                                    .catch_unwind(),
+                            ).await.is_ok_and(|result| result.unwrap_or(false));
                             if dispatched {
                                 finalization.terminal_post_dispatch_completed = true;
                                 break;
                             }
                         }
                         if !finalization.terminal_post_dispatch_completed {
+                            session.park_terminal_event_dispatch(turn_context, event).await;
                             warn!(turn_id = %terminal_turn_id,
-                                "terminal reconciliation remains pending; original event retained in rollout");
+                                "terminal dispatch retries exhausted; retained obligations remain recoverable");
                         }
                     }
+                    if finalization.terminal_dispatch_owner.is_none()
+                        && let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref)
+                    {
+                        // Binding can be initialized after the claim, then an
+                        // early error can fence status before either finalizer
+                        // reaches terminal publication.
+                        session.services.agent_control.task_coordinator()
+                            .finish_terminal_dispatch(binding.attempt_id, &terminal_turn_id);
+                    }
+                    drop(finalization.terminal_dispatch_owner.take());
+                    session.services.agent_control.task_coordinator()
+                        .finish_task_usage(
+                            session.thread_id, &terminal_turn_id,
+                            /*worker_stopped*/ false, &turn_context.session_telemetry,
+                        ).await;
                 }
                 .instrument(finalizer_span),
             );
@@ -1406,9 +1654,28 @@ impl Session {
     async fn publish_terminal_outcome(
         &self,
         finalization: &mut TerminalFinalization,
-        event: EventMsg,
+        mut event: EventMsg,
     ) -> bool {
         let turn_context = Arc::clone(&finalization.task.turn_context);
+        if let Some(gap) = &finalization.paired_lifecycle_gap {
+            let timing = match &mut event {
+                EventMsg::TurnComplete(event) => &mut event.timing,
+                EventMsg::TurnAborted(event) => &mut event.timing,
+                _ => unreachable!("terminal publication only accepts terminal events"),
+            };
+            timing
+                .get_or_insert_with(Default::default)
+                .completion_assessment
+                .get_or_insert_with(Default::default)
+                .verification_gaps
+                .push(gap.clone());
+        }
+        if finalization.terminal_dispatch_owner.is_none()
+            && let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref)
+        {
+            finalization.terminal_dispatch_owner = Some(self.services.agent_control.task_coordinator()
+                .own_terminal_dispatch(binding.clone(), turn_context.sub_id.clone()));
+        }
         // Only a retry can have an earlier append from this terminal owner.
         let recovering_publication = finalization.selected_terminal_event.is_some();
         // Preserve the original outcome even if publication panics before live acceptance.
@@ -1416,20 +1683,25 @@ impl Session {
             .selected_terminal_event
             .get_or_insert(event)
             .clone();
+        let was_published = finalization.published_terminal_event.is_some();
         let published_event = self
             .publish_terminal_event(
                 turn_context.as_ref(),
                 event,
                 &mut finalization.published_terminal_event,
+                &mut finalization.terminal_dispatch_source,
                 recovering_publication,
             )
             .await;
-        tracing::info!(target: "codex_task_observation", schema_version = 1,
-            thread_id = %self.thread_id, turn_id = %turn_context.sub_id,
-            phase = "terminal_published", clock = "unix_wall_ms",
-            at_unix_ms = chrono::Utc::now().timestamp_millis(),
-            "task boundary observation");
-        // The live event and status transition must precede successor admission.
+        if !was_published && finalization.published_terminal_event.is_some() {
+            tracing::info!(target: "codex_task_observation", schema_version = 1,
+                thread_id = %self.thread_id, turn_id = %turn_context.sub_id,
+                phase = "terminal_published", clock = "unix_wall_ms",
+                at_unix_ms = chrono::Utc::now().timestamp_millis(),
+                "task boundary observation");
+        }
+        // Settle the live publication attempt and status transition before
+        // successor admission. A refused send cannot hold admission forever.
         // Do not acquire task_start_gate here: a replacement holds it while
         // waiting for this coordinator. Optional post-dispatch work stays outside.
         let cleared_active_turn = self.detach_terminal_turn(finalization).await;
@@ -1468,55 +1740,36 @@ impl Session {
             finalization.task.cancellation_token.cancel();
         }
 
-        if finalization.abort_reason == Some(TurnAbortReason::Interrupted) {
-            // Request the owned child subtree's cancellation before any history
-            // checkpoint can stall. Reparented/detached and earlier-turn children
-            // are outside this turn's ownership fence.
-            self.interrupt_turn_owned_agents(&turn_context, false).await;
+        // Descendant interrupt delivery may await discovery or a warning
+        // append. Poll it alongside quiescence so it cannot delay escalation.
+        let interrupted = finalization.abort_reason == Some(TurnAbortReason::Interrupted);
+        tokio::join!(
+            quiesce_turn_tasks(&mut finalization.task, requires_abort_cleanup),
+            async {
+                if interrupted {
+                    // Reparented/detached and earlier-turn children are
+                    // outside this turn's ownership fence.
+                    self.interrupt_turn_owned_agents(&turn_context, false).await;
+                }
+            },
+        );
+        if finalization.abort_reason.is_some() {
+            self.settle_paired_lifecycle(finalization).await;
         }
-
-        // Auxiliary work and the sampling worker receive cancellation together
-        // and share one grace period, rather than each delaying interruption.
-        let interruption_deadline = tokio::time::Instant::now() + GRACEFUL_INTERRUPTION_TIMEOUT;
-        quiesce_turn_auxiliary_tasks(&mut finalization.task, interruption_deadline).await;
         self.services
             .command_execution
             .finish_turn_before_terminal(&turn_context.sub_id)
             .await;
 
-        if requires_abort_cleanup
-            && tokio::time::timeout_at(
-                interruption_deadline,
-                wait_for_worker_done(&finalization.task),
-            )
-            .await
-            .is_err()
-        {
-            warn!(
-                "task {} didn't complete gracefully after {}ms",
-                turn_context.sub_id,
-                GRACEFUL_INTERRUPTION_TIMEOUT.as_millis()
-            );
-            abort_worker_and_wait(&finalization.task).await;
-        }
-
         // Settle request counts before abort/lifecycle observers can close the
         // actor's metric scope. No persistence or extension callback is awaited.
-        let recovered_usage = self.settle_observed_model_usage(turn_context.as_ref()).await;
-        let unaccounted = turn_context
-            .turn_timing_state
-            .unaccounted_model_request_count();
-        if unaccounted != 0 {
-            let replace_last = !turn_context.turn_timing_state.latest_dispatched_model_usage_observed();
-            self.record_missing_model_usage(turn_context.as_ref(), unaccounted, replace_last)
-                .await;
-        }
+        let usage_changed = self.settle_terminal_task_usage(&turn_context).await;
         if requires_abort_cleanup {
             Arc::clone(&finalization.task.task)
                 .abort(Arc::clone(self), Arc::clone(&turn_context))
                 .await;
         }
-        if unaccounted != 0 || recovered_usage != 0 {
+        if usage_changed {
             self.send_token_count_event(turn_context.as_ref()).await;
         }
 
@@ -1817,14 +2070,6 @@ impl Session {
         {
             refusals.apply_to(timing.completion_assessment.get_or_insert_with(Default::default));
         }
-        // Publishing the terminal status lets watchers seal immediately, so the
-        // seal's input must exist before the terminal event is built.
-        if let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref) {
-            self.services
-                .agent_control
-                .task_coordinator()
-                .note_terminal_assessment(binding.attempt_id, timing.completion_assessment.as_ref());
-        }
         if finalization
             .permit
             .as_ref()
@@ -1936,10 +2181,7 @@ impl Session {
         .await
         {
             Ok(Ok(subtree)) => {
-                let children = subtree
-                    .into_iter()
-                    .filter(|id| *id != self.thread_id)
-                    .collect();
+                let children = subtree.into_keys().collect();
                 for (thread_id, outcome) in
                     collect_failed_turn_interrupts(children, deadline, |id| async move {
                         if matches!(
@@ -1970,23 +2212,29 @@ impl Session {
                 queued.push(author);
             }
         }
-        if !running.is_empty() || unlisted {
-            self.remember_failed_turn_stop_target(&turn_context.sub_id);
+        let followup_work = turn_context.followup_owner().has_work();
+        if !running.is_empty() || unlisted || followup_work {
+            self.remember_failed_turn_stop_target(turn_context);
         }
-        if running.is_empty() && queued.is_empty() && !unlisted {
+        if running.is_empty() && queued.is_empty() && !unlisted && !followup_work {
             return;
         }
         let mut message =
             "This turn ended on an error, so it will not read results from agents.".to_string();
         if !running.is_empty() {
             message.push_str(&format!(
-                " Agents it started or reused keep running until their current work is done: {}. No new agent work is started. Each result is stored with its task assignment and delivered with your next message; after a restart it is not delivered again, so read it with get_agent_task or list_agents. A stop request for this thread stops them.",
+                " Agents it started or reused keep running until their current work is done: {}. The failure does not request new agent work. Each result is stored with its task assignment and delivered with your next message; after a restart it is not delivered again, so read it with get_agent_task or list_agents. A stop request for this thread stops them.",
                 crate::session::turn_execution::bounded_path_list(&running)
             ));
         }
         if unlisted {
             message.push_str(
                 " Not every agent could be listed in time; any still running were left running, and a stop request for this thread stops them.",
+            );
+        }
+        if followup_work {
+            message.push_str(
+                " Previously requested follow-ups may still run. A stop request for this turn revokes their pending wakes and targets only their associated running turns.",
             );
         }
         if !queued.is_empty() {
@@ -1999,12 +2247,26 @@ impl Session {
             .await;
     }
 
-    fn remember_failed_turn_stop_target(&self, turn_id: &str) {
+    fn remember_failed_turn_stop_target(&self, turn: &TurnContext) {
+        self.remember_owned_stop_target(&turn.sub_id, &turn.followup_owner(), /*include_spawn_branch*/ true);
+    }
+
+    fn remember_owned_stop_target(
+        &self,
+        turn_id: &str,
+        followup_owner: &Arc<FollowupTurn>,
+        include_spawn_branch: bool,
+    ) {
         self.agents_left_running_by_failed_turn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(turn_id.to_owned())
-            .or_insert(false);
+            .and_modify(|target| target.include_spawn_branch |= include_spawn_branch)
+            .or_insert_with(|| FailedTurnStop {
+                in_flight: false,
+                followup_owner: Arc::clone(followup_owner),
+                include_spawn_branch,
+            });
     }
 
     /// Stop request for agents that a failed turn left running. With a turn
@@ -2015,32 +2277,37 @@ impl Session {
         expected_turn_id: Option<&str>,
     ) -> bool {
         let remembered = &self.agents_left_running_by_failed_turn;
-        let turn_id = {
+        let (turn_id, followup_owner, include_spawn_branch) = {
             let mut targets = remembered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let target = match expected_turn_id {
-                Some(expected) => targets.get_full_mut(expected).map(|(_, id, claim)| (id, claim)),
+                Some(expected) => targets.get_full_mut(expected).map(|(_, id, target)| (id, target)),
                 None => targets.last_mut(),
             };
-            let Some((turn_id, in_flight)) = target else {
+            let Some((turn_id, target)) = target else {
                 return false;
             };
-            if *in_flight {
+            if target.in_flight {
                 return true;
             }
-            *in_flight = true;
-            turn_id.clone()
+            target.in_flight = true;
+            let owner = Arc::clone(&target.followup_owner);
+            owner.seal();
+            (turn_id.clone(), owner, target.include_spawn_branch)
         };
         let mut claim = FailedTurnStopClaim {
             remembered,
             turn_id: &turn_id,
             needs_retry: true,
+            include_spawn_branch,
         };
         let (_, message, needs_retry) = self
             .interrupt_agents_owned_by_turn(
                 &turn_id,
-                "A stop was requested after this thread's turn ended on an error.",
+                &followup_owner,
+                include_spawn_branch,
+                "A stop was requested for agents owned by this turn.",
             )
             .await;
         claim.needs_retry = needs_retry;
@@ -2063,6 +2330,8 @@ impl Session {
         let (interrupted, message, needs_retry) = self
             .interrupt_agents_owned_by_turn(
                 &turn_context.sub_id,
+                &turn_context.followup_owner(),
+                /*include_spawn_branch*/ true,
                 if failed {
                     "This turn ended on an error, so it will not read results from agents."
                 } else {
@@ -2071,7 +2340,7 @@ impl Session {
             )
             .await;
         if failed && needs_retry {
-            self.remember_failed_turn_stop_target(&turn_context.sub_id);
+            self.remember_failed_turn_stop_target(turn_context);
         }
         if let Some(message) = message {
             self.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
@@ -2083,8 +2352,11 @@ impl Session {
     async fn interrupt_agents_owned_by_turn(
         &self,
         turn_id: &str,
+        followup_owner: &FollowupTurn,
+        include_spawn_branch: bool,
         lead: &str,
     ) -> (Vec<String>, Option<String>, bool) {
+        followup_owner.seal();
         let control = &self.services.agent_control;
         let label = |thread_id: codex_protocol::ThreadId| {
             control
@@ -2098,44 +2370,72 @@ impl Session {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         let mut interrupted = Vec::new();
         let mut unconfirmed = Vec::new();
-        match tokio::time::timeout_at(
+        let mut exact = std::collections::HashMap::<_, Vec<_>>::new();
+        for (child, child_turn, wake) in followup_owner.started_wakes() {
+            exact.entry(child).or_default().push((child_turn, wake));
+        }
+        let discovery = tokio::time::timeout_at(
             deadline,
             control.list_turn_owned_agent_subtree(self.thread_id, turn_id),
-        )
-        .await
-        {
-            Ok(Ok(subtree)) => {
-                let children = subtree
-                    .into_iter()
-                    .filter(|id| *id != self.thread_id)
-                    .collect();
-                for (thread_id, outcome) in
-                    collect_failed_turn_interrupts(children, deadline, |id| async move {
-                        if !matches!(
-                            control.get_status(id).await,
-                            crate::agent::AgentStatus::PendingInit
-                                | crate::agent::AgentStatus::Running
-                        ) {
-                            return "not_running";
+        );
+        // Exact follow-ups don't depend on graph I/O. A slow or failed legacy
+        // discovery must not consume their delivery budget.
+        let exact_delivery = collect_failed_turn_interrupts(
+            exact.keys().copied().collect(),
+            deadline,
+            |id| {
+                let targets = &exact[&id];
+                async move {
+                    let mut failed = false;
+                    for (child_turn, wake) in targets {
+                        match control.interrupt_followup_turn(id, child_turn, wake).await {
+                            Ok(true) => return "enqueued",
+                            Ok(false) => {}
+                            Err(_) => failed = true,
                         }
-                        if control.interrupt_agent(id).await.is_ok() {
-                            "enqueued"
-                        } else {
-                            "failed"
-                        }
-                    })
-                    .await
-                {
-                    match outcome {
-                        "enqueued" => interrupted.push(label(thread_id)),
-                        "not_running" => {}
-                        _ => unconfirmed.push(format!("{} ({outcome})", label(thread_id))),
+                    }
+                    if failed { "failed" } else { "not_running" }
+                }
+            },
+        );
+        let spawn_delivery = async {
+            if !include_spawn_branch {
+                return Ok(Vec::new());
+            }
+            let subtree = match discovery.await {
+                Ok(Ok(subtree)) => subtree,
+                Ok(Err(_)) => return Err("descendant discovery failed"),
+                Err(_) => return Err("descendant discovery timed out; children were not enumerated"),
+            };
+            let children = subtree.keys().copied().collect();
+            Ok(collect_failed_turn_interrupts(children, deadline, |id| {
+                let root = subtree[&id];
+                async move {
+                    if !matches!(
+                        control.get_status(id).await,
+                        crate::agent::AgentStatus::PendingInit | crate::agent::AgentStatus::Running
+                    ) {
+                        return "not_running";
+                    }
+                    match control.interrupt_spawn_owned_agent(id, root).await {
+                        Ok(true) => "enqueued",
+                        Ok(false) => "not_running",
+                        Err(_) => "failed",
                     }
                 }
+            }).await)
+        };
+        let (exact_outcomes, spawn_outcomes) = tokio::join!(exact_delivery, spawn_delivery);
+        let spawn_outcomes = spawn_outcomes.unwrap_or_else(|failure| {
+            unconfirmed.push(failure.to_string());
+            Vec::new()
+        });
+        for (thread_id, outcome) in exact_outcomes.into_iter().chain(spawn_outcomes) {
+            match outcome {
+                "enqueued" => interrupted.push(label(thread_id)),
+                "not_running" => {}
+                _ => unconfirmed.push(format!("{} ({outcome})", label(thread_id))),
             }
-            Ok(Err(_)) => unconfirmed.push("descendant discovery failed".to_string()),
-            Err(_) => unconfirmed
-                .push("descendant discovery timed out; children were not enumerated".to_string()),
         }
         let mut queued = Vec::new();
         for author in self.input_queue.pending_mailbox_authors().await {
@@ -2170,13 +2470,45 @@ impl Session {
         (interrupted, Some(message), needs_retry)
     }
 
+    async fn settle_terminal_task_usage(&self, turn_context: &TurnContext) -> bool {
+        let recovered = self.settle_observed_model_usage(turn_context).await;
+        let unaccounted = turn_context.turn_timing_state.unaccounted_model_request_count();
+        if unaccounted != 0 {
+            let replace_last = !turn_context.turn_timing_state.latest_dispatched_model_usage_observed();
+            self.record_missing_model_usage(turn_context, unaccounted, replace_last).await;
+        }
+        unaccounted != 0 || recovered != 0
+    }
+
+    async fn settle_paired_lifecycle(&self, finalization: &mut TerminalFinalization) {
+        let turn_context = &finalization.task.turn_context;
+        let gap = turn_context
+            .paired_lifecycle()
+            .settle(
+                self,
+                &turn_context.sub_id,
+                FORCED_INTERRUPTION_TIMEOUT,
+                finalization.selected_terminal_event.is_some(),
+            )
+            .await;
+        if let Some(gap) = gap
+            && finalization.paired_lifecycle_gap.as_ref() != Some(&gap)
+        {
+            warn!(turn_id = %turn_context.sub_id, "{gap}");
+            finalization.paired_lifecycle_gap = Some(gap);
+        }
+    }
+
     async fn finalize_turn_terminal_fail_safe(
         self: &Arc<Self>,
         finalization: &mut TerminalFinalization,
     ) {
         let turn_context = Arc::clone(&finalization.task.turn_context);
+        turn_context.paired_lifecycle().seal();
         finalization.task.cancellation_token.cancel();
         abort_worker_and_wait(&finalization.task).await;
+        self.settle_paired_lifecycle(finalization).await;
+        self.settle_terminal_task_usage(&turn_context).await;
         self.services
             .command_execution
             .finish_turn(&turn_context.sub_id)

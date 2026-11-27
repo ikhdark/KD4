@@ -580,6 +580,32 @@ fn migrate_config_toml(value: TomlValue, path: &Path) -> io::Result<TomlValue> {
     migrate_config_toml_for_source(value, &path.display().to_string())
 }
 
+// Preserve TOML value equality except that unchanged NaNs must not trigger a
+// migration or replace a formatted item. Compare NaN bits to retain the sign.
+fn migration_values_equal(left: &TomlValue, right: &TomlValue) -> bool {
+    match (left, right) {
+        (TomlValue::Float(left), TomlValue::Float(right)) if left.is_nan() && right.is_nan() => {
+            left.to_bits() == right.to_bits()
+        }
+        (TomlValue::Array(left), TomlValue::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| migration_values_equal(left, right))
+        }
+        (TomlValue::Table(left), TomlValue::Table(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| migration_values_equal(left, right))
+                })
+        }
+        _ => left == right,
+    }
+}
+
 /// Apply the loader's migrations before semantic edits, preserving unrelated
 /// document formatting. Callers must hold the config writer lock.
 pub fn migrate_config_document(
@@ -589,7 +615,7 @@ pub fn migrate_config_document(
     let original: TomlValue = toml::from_str(&document.to_string())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let migrated = migrate_config_toml(original.clone(), path)?;
-    if original == migrated {
+    if migration_values_equal(&original, &migrated) {
         return Ok(false);
     }
     let canonical = toml::to_string(&migrated)
@@ -622,7 +648,8 @@ fn reconcile_migrated_table(
         document.remove(key);
     }
     for (key, value) in migrated {
-        if original.get(key) == Some(value) {
+        let before = original.get(key);
+        if before.is_some_and(|before| migration_values_equal(before, value)) {
             continue;
         }
         let replacement = canonical.get(key).ok_or_else(|| {
@@ -631,8 +658,7 @@ fn reconcile_migrated_table(
                 format!("migrated config entry `{key}` was not serialized"),
             )
         })?;
-        if let (Some(TomlValue::Table(before)), TomlValue::Table(after)) =
-            (original.get(key), value)
+        if let (Some(TomlValue::Table(before)), TomlValue::Table(after)) = (before, value)
             && let Some(table) = document.get_mut(key).and_then(toml_edit::Item::as_table_like_mut)
             && let Some(canonical_table) = replacement.as_table_like()
         {

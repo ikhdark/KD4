@@ -14,9 +14,13 @@ use std::io;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 const SESSION_IMPORT_LEDGER_FILE: &str = "external_agent_session_imports.json";
 const SESSION_IMPORT_LEDGER_LOCK_FILE: &str = "external_agent_session_imports.lock";
+const SESSION_IMPORT_LEDGER_DETECT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+const SESSION_IMPORT_LEDGER_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SESSION_HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +137,21 @@ impl ImportedExternalAgentSessionLedger {
 pub(super) fn load_import_ledger(
     codex_home: &Path,
 ) -> io::Result<ImportedExternalAgentSessionLedger> {
-    with_import_ledger_lock(codex_home, None, || load_import_ledger_unlocked(codex_home))
+    // Dropping the detect RPC does not stop its blocking worker. Bound retries
+    // without treating a locked ledger as missing or weakening the writer lock.
+    let mut wait_started = None;
+    let _lock = lock_import_ledger_file(codex_home, || {
+        if wait_started.get_or_insert_with(Instant::now).elapsed()
+            >= SESSION_IMPORT_LEDGER_DETECT_LOCK_TIMEOUT
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for the external agent session import ledger lock",
+            ));
+        }
+        Ok(())
+    })?;
+    load_import_ledger_unlocked(codex_home)
 }
 
 fn load_import_ledger_unlocked(
@@ -165,20 +183,16 @@ fn save_import_ledger_unlocked(
     write_bytes_atomically_preserving_permissions(&paths.write_path, raw.as_bytes())
 }
 
-fn with_import_ledger_lock<T>(
-    codex_home: &Path,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
-    operation: impl FnOnce() -> io::Result<T>,
-) -> io::Result<T> {
-    let _lock = lock_import_ledger_file(codex_home, cancellation)?;
-    operation()
-}
-
 pub(super) fn lock_import_ledger(
     codex_home: &Path,
     cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> io::Result<SessionImportLedgerGuard> {
-    let lock_file = lock_import_ledger_file(codex_home, cancellation)?;
+    let lock_file = lock_import_ledger_file(codex_home, || {
+        if let Some(cancellation) = cancellation {
+            super::super::files::check_cancel(cancellation)?;
+        }
+        Ok(())
+    })?;
     let ledger = load_import_ledger_unlocked(codex_home)?;
     Ok(SessionImportLedgerGuard {
         _lock_file: lock_file,
@@ -189,7 +203,7 @@ pub(super) fn lock_import_ledger(
 
 fn lock_import_ledger_file(
     codex_home: &Path,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    mut check_before_attempt: impl FnMut() -> io::Result<()>,
 ) -> io::Result<File> {
     fs::create_dir_all(codex_home)?;
     let lock_path = codex_home.join(SESSION_IMPORT_LEDGER_LOCK_FILE);
@@ -200,10 +214,12 @@ fn lock_import_ledger_file(
         .write(true)
         .open(lock_path)?;
     loop {
-        if let Some(cancellation) = cancellation { super::super::files::check_cancel(cancellation)?; }
+        check_before_attempt()?;
         match fs2::FileExt::try_lock_exclusive(&lock_file) {
             Ok(()) => return Ok(lock_file),
-            Err(err) if err.raw_os_error() == fs2::lock_contended_error().raw_os_error() => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(err) if err.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                std::thread::sleep(SESSION_IMPORT_LEDGER_LOCK_RETRY_INTERVAL);
+            }
             Err(err) => return Err(err),
         }
     }

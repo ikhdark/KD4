@@ -329,23 +329,7 @@ async fn hydrate_remote_plugin_local_versions(
             .into_iter()
             .map(|(id, remote_id)| {
                 let id = PluginId::parse(&id).ok()?;
-                let version = store.active_plugin_version(&id)?;
-                if let Some(stored_remote_id) = store.remote_plugin_id(&id).ok()?
-                    && Some(stored_remote_id) != remote_id
-                {
-                    return None;
-                }
-                let root = store.plugin_root(&id, &version);
-                let manifest = codex_core_plugins::manifest::load_plugin_manifest(root.as_path())?;
-                if manifest.name != id.plugin_name() {
-                    return None;
-                }
-                // Legacy cache entries can omit manifest.version; their validated cache
-                // directory still records the version materialized by the installer.
-                manifest.version.or_else(|| {
-                    (version != codex_core_plugins::store::DEFAULT_PLUGIN_VERSION)
-                        .then_some(version)
-                })
+                store.committed_remote_local_version(&id, remote_id.as_deref())
             })
             .collect::<Vec<_>>()
     })

@@ -19,7 +19,12 @@ use crate::exec_policy::ExecApprovalRequest;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::ExecServerEnvConfig;
+use crate::session::BackgroundCommandAppendReceipt;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
+use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolCallSource;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::orchestrator::ToolOrchestrator;
@@ -30,9 +35,11 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 
 use crate::tools::sandboxing::same_exec_authorization_envelope;
+use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::tools::tool_dispatch_trace::active_tool_dispatch_timing;
 use crate::tools::tool_dispatch_trace::mark_exec_process_exited;
 use crate::tools::tool_dispatch_trace::mark_exec_process_spawned;
+use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
 use crate::turn_timing::TurnLocalPhase;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
@@ -101,6 +108,9 @@ const UNIFIED_EXEC_PAGER: &str = "powershell.exe -NoLogo -NoProfile -NonInteract
 const UNIFIED_EXEC_PAGER: &str = "cat";
 const INITIAL_OUTPUT_QUIET_PERIOD: Duration = Duration::from_millis(250);
 const INTERRUPT: &str = "\u{3}";
+// Failure confirmation can take longer than a foreground tool can wait. The
+// session terminal tracker keeps that work owned after a structured handback.
+const FAILURE_HANDBACK_GRACE: Duration = Duration::from_secs(2);
 /// Headroom reserved inside a nested call's budget for returning the result
 /// through dispatch and transport to the runtime wrapper.
 ///
@@ -318,6 +328,35 @@ struct PreparedProcessHandles {
     search_exit_one_is_no_match: bool,
     tty: bool,
     validation_launch: bool,
+    terminal_tasks: Option<tokio_util::task::TaskTracker>,
+}
+
+struct FailureOutputContext {
+    call_id: String,
+    hook_command: String,
+    hook_cwd: Option<PathUri>,
+    tty: bool,
+}
+
+impl FailureOutputContext {
+    fn for_exec(context: &UnifiedExecContext, request: &ExecCommandRequest) -> Self {
+        Self {
+            call_id: context.call_id.clone(),
+            hook_command: request.hook_command.clone(),
+            hook_cwd: (!request.turn_environment.environment.is_remote())
+                .then(|| request.cwd.clone()),
+            tty: request.tty,
+        }
+    }
+
+    fn for_stdin(handles: &PreparedProcessHandles) -> Self {
+        Self {
+            call_id: handles.call_id.clone(),
+            hook_command: handles.hook_command.clone(),
+            hook_cwd: handles.hook_cwd.clone(),
+            tty: handles.tty,
+        }
+    }
 }
 
 struct InitialExecCommandGuard {
@@ -339,12 +378,298 @@ pub(super) struct PendingProcessRegistration {
     cleanup_owners: Arc<PendingProcessCleanupOwners>,
     primary_process: Option<Arc<UnifiedExecProcess>>,
     initial_exec_command_active: Option<Arc<AtomicBool>>,
-    pending_startup_completion: Option<(PathUri, Arc<tokio::sync::Mutex<HeadTailBuffer>>, Instant)>,
+    pending_startup_completion: Option<PendingStartupCompletion>,
+    runtime: tokio::runtime::Handle,
     observation_deadline: Option<Instant>,
     committed: bool,
 }
 
-pub(super) type PendingProcessCleanupOwners = std::sync::Mutex<Vec<Arc<PendingProcessCleanup>>>;
+enum StartupBegin {
+    LiveOnly,
+    Appending(tokio::task::JoinHandle<std::io::Result<()>>),
+    Accepted,
+    Unconfirmed { observed: bool, message: String },
+}
+
+struct PendingStartupCompletion {
+    begin: StartupBegin,
+    turn: Arc<TurnContext>,
+    call_id: String,
+    command: Vec<String>,
+    cwd: PathUri,
+    transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
+    started_at: Instant,
+    tty: bool,
+    source: ToolCallSource,
+    tracker: Option<SharedTurnDiffTracker>,
+    timing: Option<Arc<ToolDispatchTiming>>,
+}
+
+impl PendingStartupCompletion {
+    async fn observe_begin_append(&mut self) {
+        if let StartupBegin::Appending(append) = &mut self.begin {
+            self.begin = match append.await {
+                Ok(Ok(())) => StartupBegin::Accepted,
+                Ok(Err(error)) => StartupBegin::Unconfirmed {
+                    observed: true,
+                    message: format!("startup Begin rollout append failed: {error}"),
+                },
+                Err(error) => StartupBegin::Unconfirmed {
+                    observed: false,
+                    message: format!("startup Begin rollout append outcome is unknown: {error}"),
+                },
+            };
+        }
+    }
+
+    async fn finish_abandoned(
+        mut self,
+        session: Arc<Session>,
+        process: Arc<UnifiedExecProcess>,
+        append: BackgroundTerminalAppend,
+    ) {
+        self.observe_begin_append().await;
+        match self.begin {
+            StartupBegin::Accepted => {}
+            StartupBegin::Unconfirmed { observed, message } => {
+                append.settle(Some((observed, message)));
+                return;
+            }
+            StartupBegin::LiveOnly | StartupBegin::Appending(_) => return,
+        }
+        let record_append = |receipt| append.record(receipt);
+        let emit = emit_exec_end_for_unified_exec(
+            session,
+            self.turn,
+            self.call_id,
+            self.command,
+            self.cwd,
+            Some(append.process_id.to_string()),
+            self.transcript,
+            String::new(),
+            Some(process.as_ref()),
+            self.tty,
+            false,
+            Some("unified exec startup was abandoned before registration".to_string()),
+            false,
+            self.started_at.elapsed(),
+            self.source,
+            self.tracker,
+            None,
+            Some(&record_append),
+        );
+        // Preserve the original Begin's dispatch identity without taking on
+        // the promoted watcher's command-execution ledger responsibilities.
+        let result = match self.timing {
+            Some(timing) => scope_tool_dispatch_timing(timing, emit).await,
+            None => emit.await,
+        };
+        if let Err(error) = result {
+            append.record_unknown(error.to_string());
+        }
+    }
+}
+
+pub(super) type PendingProcessCleanupOwners = std::sync::Mutex<Vec<PendingProcessOwner>>;
+
+pub(super) enum PendingProcessOwner {
+    Startup(Arc<PendingProcessCleanup>),
+    BackgroundAppend(BackgroundAppendPending),
+    BackgroundAppendFailure {
+        owner: TerminalAppendOwner,
+        was_observed: bool,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerminalAppendOwner {
+    ExitWatcher,
+    AbandonedStartup,
+}
+
+pub(super) struct BackgroundAppendPending {
+    process_id: u32,
+    incarnation: Uuid,
+    owner: TerminalAppendOwner,
+    native_termination_confirmed: Option<tokio::sync::oneshot::Sender<()>>,
+    settled: CancellationToken,
+}
+
+/// Owns the exact watched terminal even after its poll/termination entry is removed.
+pub(super) struct BackgroundTerminalAppend {
+    owners: std::sync::Weak<PendingProcessCleanupOwners>,
+    process_id: u32,
+    incarnation: Uuid,
+    owner: TerminalAppendOwner,
+    native_termination: tokio::sync::oneshot::Receiver<()>,
+    settled: CancellationToken,
+}
+
+impl BackgroundTerminalAppend {
+    fn enroll(
+        owners: &Arc<PendingProcessCleanupOwners>,
+        process_id: u32,
+        incarnation: Uuid,
+    ) -> Result<Self, UnifiedExecError> {
+        let mut retained = owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if retained
+            .iter()
+            .filter(|owner| matches!(owner, PendingProcessOwner::BackgroundAppend(pending)
+                if pending.owner == TerminalAppendOwner::ExitWatcher))
+            .count()
+            >= MAX_UNIFIED_EXEC_PROCESSES
+        {
+            // Bound even watchers whose process was removed while their
+            // live send is blocked. Writer retirement only waits for append.
+            return Err(UnifiedExecError::process_failed(
+                "background command terminal finalizers are still pending".to_string(),
+            ));
+        }
+        Ok(Self::register(
+            owners,
+            &mut retained,
+            process_id,
+            incarnation,
+            TerminalAppendOwner::ExitWatcher,
+        ))
+    }
+
+    fn register(
+        owners: &Arc<PendingProcessCleanupOwners>,
+        retained: &mut Vec<PendingProcessOwner>,
+        process_id: u32,
+        incarnation: Uuid,
+        owner: TerminalAppendOwner,
+    ) -> Self {
+        let (confirmed, native_termination) = tokio::sync::oneshot::channel();
+        let settled = CancellationToken::new();
+        retained.push(PendingProcessOwner::BackgroundAppend(BackgroundAppendPending {
+            process_id,
+            incarnation,
+            owner,
+            native_termination_confirmed: (owner == TerminalAppendOwner::ExitWatcher)
+                .then_some(confirmed),
+            settled: settled.clone(),
+        }));
+        Self {
+            owners: Arc::downgrade(owners),
+            process_id,
+            incarnation,
+            owner,
+            native_termination,
+            settled,
+        }
+    }
+
+    pub(super) async fn wait_for_confirmed_termination(&mut self) -> bool {
+        (&mut self.native_termination).await.is_ok()
+    }
+
+    pub(super) fn record(&self, receipt: BackgroundCommandAppendReceipt) {
+        let failure = match receipt {
+            BackgroundCommandAppendReceipt::Accepted | BackgroundCommandAppendReceipt::NotRequired => None,
+            BackgroundCommandAppendReceipt::Failed(error) => Some((true, error)),
+        };
+        self.settle(failure);
+    }
+
+    pub(super) fn record_unknown(&self, reason: String) {
+        self.settle(Some((false, reason)));
+    }
+
+    fn settle(&self, failure: Option<(bool, String)>) {
+        let Some(owners) = self.owners.upgrade() else {
+            return;
+        };
+        let mut retained = owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.settled.is_cancelled() {
+            return;
+        }
+        if let Some((was_observed, error)) = failure {
+            let process_id = self.process_id;
+            let incarnation = self.incarnation;
+            let phase = match self.owner {
+                TerminalAppendOwner::ExitWatcher => "terminal rollout append",
+                TerminalAppendOwner::AbandonedStartup => "startup command rollout custody",
+            };
+            let outcome = if was_observed { "failed" } else { "is unknown" };
+            let message = format!("process {process_id} ({incarnation}) {phase} {outcome}: {error}");
+            // Keep one example per owner and failure class for the shutdown
+            // result. Log each abandoned startup's exact failure separately.
+            let first = !retained.iter().any(|entry| matches!(
+                entry,
+                PendingProcessOwner::BackgroundAppendFailure { owner, was_observed: previous, .. }
+                    if *owner == self.owner && *previous == was_observed
+            ));
+            if first || self.owner == TerminalAppendOwner::AbandonedStartup {
+                tracing::warn!(%message);
+            }
+            if first {
+                retained.push(PendingProcessOwner::BackgroundAppendFailure {
+                    owner: self.owner,
+                    was_observed,
+                    message,
+                });
+            }
+        }
+        self.settled.cancel();
+    }
+}
+
+impl Drop for BackgroundTerminalAppend {
+    fn drop(&mut self) {
+        if !self.settled.is_cancelled() {
+            let reason = match self.owner {
+                TerminalAppendOwner::ExitWatcher => "exit watcher ended without an append receipt",
+                TerminalAppendOwner::AbandonedStartup => {
+                    "abandoned startup finalizer ended without an append receipt"
+                }
+            };
+            self.record_unknown(reason.to_string());
+        }
+        let Some(owners) = self.owners.upgrade() else {
+            return;
+        };
+        owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|owner| !matches!(
+                owner,
+                PendingProcessOwner::BackgroundAppend(pending)
+                    if pending.process_id == self.process_id
+                        && pending.incarnation == self.incarnation
+                        && pending.owner == self.owner
+            ));
+    }
+}
+
+fn note_background_termination(
+    owners: &PendingProcessCleanupOwners,
+    process_id: u32,
+    process: &UnifiedExecProcess,
+) {
+    let incarnation = process.incarnation();
+    let mut retained = owners
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(confirmed) = retained.iter_mut().find_map(|owner| match owner {
+        PendingProcessOwner::BackgroundAppend(pending)
+            if pending.process_id == process_id
+                && pending.incarnation == incarnation
+                && pending.owner == TerminalAppendOwner::ExitWatcher =>
+        {
+            pending.native_termination_confirmed.take()
+        }
+        _ => None,
+    }) {
+        let _ = confirmed.send(());
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct PendingProcessCleanup {
@@ -392,6 +717,7 @@ impl PendingProcessRegistration {
             primary_process: None,
             initial_exec_command_active: None,
             pending_startup_completion: None,
+            runtime: tokio::runtime::Handle::current(),
             observation_deadline: None,
             committed: false,
         }
@@ -460,6 +786,43 @@ impl PendingProcessRegistration {
         }
     }
 
+    fn retain_cleanup(&self, confirm_primary_termination: bool) -> Arc<PendingProcessCleanup> {
+        let mut cleanup = self.cleanup_payload();
+        if confirm_primary_termination
+            && let Some(primary) = cleanup.primary_process.as_ref()
+        {
+            for pending in &mut cleanup.processes {
+                if Arc::ptr_eq(primary, &pending.process) {
+                    pending.requires_confirmed_termination = true;
+                }
+            }
+        }
+        let cleanup = Arc::new(cleanup);
+        // Retain custody before scheduling; session shutdown can find this exact
+        // payload even if the runtime no longer runs its original task.
+        self.cleanup_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PendingProcessOwner::Startup(Arc::clone(&cleanup)));
+        cleanup
+    }
+
+    fn register_startup_append(
+        &self,
+        owners: &mut Vec<PendingProcessOwner>,
+        process: &UnifiedExecProcess,
+    ) -> BackgroundTerminalAppend {
+        // Admission already happened. Its exact debt must survive even if
+        // the separate, bounded promoted-watcher population is full.
+        BackgroundTerminalAppend::register(
+            &self.cleanup_owners,
+            owners,
+            self.process_id,
+            process.incarnation(),
+            TerminalAppendOwner::AbandonedStartup,
+        )
+    }
+
     async fn cleanup(&mut self) -> Result<(), String> {
         assert!(!self.committed, "cannot clean up a committed registration");
         if let Some(active) = self.initial_exec_command_active.as_ref() {
@@ -493,13 +856,37 @@ impl Drop for PendingProcessRegistration {
         if let Some(active) = self.initial_exec_command_active.as_ref() {
             active.store(false, Ordering::Release);
         }
+        let startup = self
+            .pending_startup_completion
+            .take()
+            .filter(|startup| !matches!(&startup.begin, StartupBegin::LiveOnly));
         let cleanup = Arc::new(self.cleanup_payload());
-        // Retain custody before scheduling: a rejected termination or cancelled
-        // runtime task leaves this exact payload available to session shutdown.
-        self.cleanup_owners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(Arc::clone(&cleanup));
+        let abandoned = {
+            // Publish both debts together, before either owner can be
+            // reconciled by shutdown or schedule an asynchronous operation.
+            let mut owners = self
+                .cleanup_owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            owners.push(PendingProcessOwner::Startup(Arc::clone(&cleanup)));
+            startup.map(|startup| {
+                let process = cleanup
+                    .primary_process
+                    .as_ref()
+                    .expect("command Begin follows attached process");
+                let append = self.register_startup_append(&mut owners, process);
+                (startup, Arc::clone(process), append)
+            })
+        };
+        if let Some((startup, process, append)) = abandoned {
+            // Writer retirement waits for the append receipt, not the live
+            // channels or the completion of this detached task.
+            self.runtime.spawn(startup.finish_abandoned(
+                Arc::clone(&self.session),
+                process,
+                append,
+            ));
+        }
         if tokio::runtime::Handle::try_current().is_ok() {
             self.session
                 .terminal_tasks
@@ -601,7 +988,10 @@ async fn run_pending_process_cleanup(cleanup: Arc<PendingProcessCleanup>) {
                 owners
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|owner| !Arc::ptr_eq(owner, &cleanup));
+                    .retain(|owner| !matches!(
+                        owner,
+                        PendingProcessOwner::Startup(pending) if Arc::ptr_eq(pending, &cleanup)
+                    ));
             }
             return;
         }
@@ -689,44 +1079,119 @@ async fn cleanup_pending_process_registration(
     Ok(())
 }
 
+// Keep a short command on the direct path: there is no live session to poll,
+// but its already-accepted Begin still has exactly one End owner. Start that
+// owner before waiting, so timing out cannot interrupt event persistence.
 #[allow(clippy::too_many_arguments)]
-async fn emit_failed_initial_exec_end_if_unstored(
-    process_started_alive: bool,
-    process: Option<&Arc<UnifiedExecProcess>>,
+fn start_direct_completion(
+    registration: &mut PendingProcessRegistration,
     context: &UnifiedExecContext,
     request: &ExecCommandRequest,
     cwd: PathUri,
     transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
     fallback_output: String,
-    message: String,
+    classified_search: bool,
+    failure: Option<String>,
     wall_time: Duration,
-) -> codex_protocol::error::Result<()> {
-    if process_started_alive {
-        return Ok(());
-    }
-
-    emit_exec_end_for_unified_exec(
-        Arc::clone(&context.session),
-        Arc::clone(&context.turn),
-        context.call_id.clone(),
-        request.command_for_safety.clone(),
-        cwd,
-        Some(request.process_id.to_string()),
-        transcript,
-        fallback_output,
-        process.map(Arc::as_ref),
-        request.tty,
-        false,
-        Some(message),
-        false,
-        wall_time,
-        context.source.clone(),
-        context.tracker.clone(),
-        None,
-    )
-    .await
+    drain_relay: bool,
+) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+    let process = registration
+        .primary_process
+        .as_ref()
+        .expect("completion follows an attached process and accepted command Begin")
+        .clone();
+    let cleanup = registration.retain_cleanup(failure.is_some());
+    registration.committed = true;
+    let session = Arc::clone(&context.session);
+    let turn = Arc::clone(&context.turn);
+    let call_id = context.call_id.clone();
+    let command = request.command_for_safety.clone();
+    let process_id = request.process_id.to_string();
+    let tty = request.tty;
+    let source = context.source.clone();
+    let tracker = context.tracker.clone();
+    let timing = active_tool_dispatch_timing();
+    let (completed, completion) = tokio::sync::oneshot::channel();
+    context.session.terminal_tasks.spawn(async move {
+        if drain_relay {
+            let started_at = Instant::now();
+            wait_for_process_output_drain(&process.output_drained_token()).await;
+            if let Some(timing) = timing.as_ref() {
+                timing.record_timer_wait(ToolLifecycleTimerWait {
+                    wait_kind: "initial_process_output_drain".to_string(),
+                    effective_timeout_ms: Some(
+                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ),
+                    wake_reason: ToolLifecycleWakeReason::Completed,
+                    ..Default::default()
+                });
+            }
+        }
+        let emit = emit_exec_end_for_unified_exec(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            call_id,
+            command,
+            cwd,
+            Some(process_id),
+            transcript,
+            fallback_output,
+            Some(process.as_ref()),
+            tty,
+            classified_search,
+            failure,
+            false,
+            wall_time,
+            source,
+            tracker,
+            None,
+            None,
+        );
+        // Preserve the accepted Begin's dispatch execution identity. Passing it
+        // as a registered watcher execution id would incorrectly touch the ledger.
+        let result = match timing {
+            Some(timing) => scope_tool_dispatch_timing(timing, emit).await,
+            None => emit.await,
+        }
+        .map_err(|error| error.to_string());
+        if let Err(Err(message)) = completed.send(result) {
+            // A caller that already yielded cannot report a late durability
+            // failure. The session remains the owner of that failure.
+            session
+                .send_event(
+                    turn.as_ref(),
+                    codex_protocol::protocol::EventMsg::Error(
+                        codex_protocol::protocol::ErrorEvent {
+                            message,
+                            codex_error_info: Some(codex_protocol::protocol::CodexErrorInfo::Other),
+                        },
+                    ),
+                )
+                .await;
+        }
+        run_pending_process_cleanup(cleanup).await;
+    });
+    completion
 }
 
+async fn wait_for_direct_completion(
+    completion: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    bound: Instant,
+) -> Option<Result<(), String>> {
+    tokio::time::timeout_at(bound, completion)
+        .await
+        .ok()
+        .map(|result| {
+            result.unwrap_or_else(|_| {
+                Err("direct command completion owner closed before finalization".into())
+            })
+        })
+}
+
+fn failure_handback_bound(nested_deadline: Option<std::time::Instant>) -> Instant {
+    let local = Instant::now() + FAILURE_HANDBACK_GRACE;
+    nested_poll_bound(nested_deadline).map_or(local, |bound| bound.min(local))
+}
 
 async fn finish_exited_process_result(
     process: Option<&Arc<UnifiedExecProcess>>,
@@ -734,25 +1199,26 @@ async fn finish_exited_process_result(
     duration: Duration,
     hard_deadline: Option<Instant>,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+    // A failure already carries the owner's bounded observations. In
+    // particular do not wait again after its output has been acknowledged.
     if let Some(process) = process
         && match &result {
             Ok(response) => response.process_exited,
-            Err(_) => process.has_exited(),
+            Err(
+                UnifiedExecError::ProcessFailedWithOutput { .. }
+                | UnifiedExecError::ToolHistoryPersistence { .. },
+            ) => false,
+            Err(_) => process.has_exited() && !process.shutdown_is_pending(),
         }
     {
-        let resumable_output = match &mut result {
-            Ok(response) => Some(response),
-            Err(UnifiedExecError::ProcessFailedWithOutput { output, .. }) => Some(output.as_mut()),
-            Err(UnifiedExecError::ToolHistoryPersistence { output: Some(output), .. }) => Some(output.as_mut()),
-            _ => None,
-        }.filter(|response| response.process_id.is_some());
         let completion = match hard_deadline {
-            Some(bound) if resumable_output.is_some() =>
-            {
+            Some(bound) => {
                 match tokio::time::timeout_at(bound, process.wait_for_terminal_completion()).await {
                     Ok(completion) => completion,
                     Err(_) => {
-                        if let Some(response) = resumable_output {
+                        if let Ok(response) = &mut result
+                            && response.process_id.is_some()
+                        {
                             let notice = "Process exited; completion bookkeeping is pending. Poll the retained session; do not rerun the command.";
                             // The handler and its caller both finish an exited
                             // process; the second bounded wait must not repeat it.
@@ -772,20 +1238,20 @@ async fn finish_exited_process_result(
                     }
                 }
             }
-            _ => process.wait_for_terminal_completion().await,
+            None => {
+                match tokio::time::timeout_at(
+                    failure_handback_bound(None),
+                    process.wait_for_terminal_completion(),
+                )
+                .await
+                {
+                    Ok(completion) => completion,
+                    Err(_) => return result,
+                }
+            }
         };
         if let Err(message) = completion {
-            if matches!(
-                &result,
-                Err(UnifiedExecError::ToolHistoryPersistence { .. })
-            ) {
-                return result;
-            }
-            let observed = match result {
-                Ok(response) => Some(Box::new(response)),
-                Err(UnifiedExecError::ProcessFailedWithOutput { output, .. }) => Some(output),
-                Err(_) => None,
-            };
+            let observed = result.ok().map(Box::new);
             return Err(UnifiedExecError::ToolHistoryPersistence {
                 message,
                 exit_code: process.exit_code().unwrap_or(-1),
@@ -799,117 +1265,157 @@ async fn finish_exited_process_result(
 }
 
 impl UnifiedExecProcessManager {
-    pub(super) async fn fail_process_with_message(
+    async fn fail_process_with_message(
         &self,
         process_id: u32,
         process: &Arc<UnifiedExecProcess>,
         message: String,
+        metadata: FailureOutputContext,
+        terminal_tasks: Option<&tokio_util::task::TaskTracker>,
+        bound: Instant,
     ) -> UnifiedExecError {
         let started = Instant::now();
-        let message = process.failure_message().unwrap_or(message);
-        let (message, cleanup_confirmed) = match process.fail_and_terminate(message.clone()).await {
-            Ok(()) => (message, true),
-            Err(error) => {
-                tracing::warn!(
-                    process_id,
-                    %error,
-                    "retaining unified exec process because termination was not confirmed"
-                );
-                (
-                    format!("{message}; process termination was not confirmed: {error}"),
-                    false,
-                )
+        if let Some(tasks) = terminal_tasks {
+            let cleanup = {
+                // Serialize only the transfer to a tracked owner, never the
+                // termination operation. Ordinary output polls do not retry it.
+                let _owner_gate = self
+                    .pending_cleanup_owners
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if process.termination_was_requested() {
+                    None
+                } else {
+                    process.request_cancellation();
+                    let process = Arc::clone(process);
+                    let failure = message.clone();
+                    let owners = Arc::clone(&self.pending_cleanup_owners);
+                    Some(tasks.spawn(async move {
+                        let result = process.fail_and_terminate(failure).await;
+                        if result.is_ok() {
+                            note_background_termination(&owners, process_id, &process);
+                        }
+                        result
+                    }))
+                }
+            };
+            if let Some(cleanup) = cleanup {
+                let _ = tokio::time::timeout_at(bound, cleanup).await;
             }
-        };
-        self.process_failure_output(process_id, process, message, cleanup_confirmed, started)
+        }
+        self.process_failure_output(process_id, process, message, metadata, started, bound)
             .await
     }
 
-    // Project the owner's cleanup disposition without retrying termination or
-    // manufacturing an exit. In particular cancellation already spent its bound.
     async fn process_failure_output(
         &self,
         process_id: u32,
         process: &Arc<UnifiedExecProcess>,
-        message: String,
-        cleanup_confirmed: bool,
+        mut message: String,
+        metadata: FailureOutputContext,
         started: Instant,
+        bound: Instant,
     ) -> UnifiedExecError {
-        let (call_id, hook_command, tool_cwd, tty) = {
-            let store = self.process_store.lock().await;
-            store
-                .processes
-                .get(&process_id)
-                .filter(|entry| Arc::ptr_eq(&entry.process, process))
-                .map(|entry| {
-                    (
-                        entry.call_id.clone(),
-                        Some(entry.hook_command.clone()),
-                        entry.hook_cwd.clone(),
-                        entry.tty,
-                    )
-                })
-                .unwrap_or_default()
+        // Observe terminal publication before taking the final snapshot, not
+        // after consuming any bytes. A pending publisher retains its own work.
+        let terminal_error = if process.has_exited() && !process.shutdown_is_pending() {
+            tokio::time::timeout_at(bound, process.wait_for_terminal_completion())
+                .await
+                .ok()
+                .and_then(Result::err)
+        } else {
+            None
         };
-        let snapshot = process.snapshot_tool_output(tty).await;
-        let raw_output_artifact = process.raw_output_artifact().await;
-        // Failure is another delivery, not permission to replay the cumulative
-        // transcript. Acquire in the same store/buffer order as normal commit.
-        let handles = process.output_handles();
-        let mut store = self.process_store.lock().await;
-        let mut buffer = handles.output_buffer.lock().await;
-        buffer.collect_pending_output();
-        let lag_marker = buffer.pending_output().filter(|output| output.lagged_chunks() > 0)
-            .map(|output| lagged_output_marker(output.lagged_chunks())).unwrap_or_default();
-        let (mut raw_output, _) = buffer.projected_pending_output(process.output_is_closed(), &lag_marker);
-        let stream_ranges = buffer.pending_stream_ranges();
-        raw_output.extend_from_slice(format!("\n{message}").as_bytes());
+        let process_output = tokio::time::timeout_at(bound, process.snapshot_tool_output(metadata.tty))
+            .await
+            .ok();
+        let raw_output_artifact = tokio::time::timeout_at(bound, process.raw_output_artifact())
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| process.try_raw_output_artifact());
         let process_exited = process.has_exited();
-        let output = ExecCommandToolOutput {
+        let capabilities = process.session_capabilities(metadata.tty);
+        match capabilities.shutdown {
+            Some(crate::tools::context::ExecShutdownStatus::ShutdownUncertain) => {
+                let cause = process.shutdown_error().unwrap_or_else(|| "outcome is uncertain".into());
+                message.push_str(&format!("; process termination was not confirmed: {cause}"));
+            }
+            Some(crate::tools::context::ExecShutdownStatus::CancellationRequested) => {
+                message.push_str("; process termination has not been confirmed; poll the retained session");
+            }
+            _ => {}
+        }
+        let mut output = ExecCommandToolOutput {
             stream_chunks: None,
-            stream_ranges,
+            stream_ranges: None,
             environment_receipt: process.environment_receipt(),
             output_ranges: None,
-            process_output: Some(snapshot),
+            process_output,
             error: Some(message.clone()),
             validation: process.validation(),
-            event_call_id: call_id,
+            event_call_id: metadata.call_id,
             chunk_id: generate_chunk_id(),
             wall_time: started.elapsed(),
-            raw_output,
+            raw_output: format!("\n{message}").into_bytes(),
             truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(8_000),
             max_output_tokens: None,
             quiet_on_success: false,
-            process_id: (!cleanup_confirmed).then_some(process_id),
-            session_capabilities: Some(process.session_capabilities(tty)),
+            process_id: Some(process_id),
+            session_capabilities: Some(capabilities),
             exit_code: process_exited.then(|| process.exit_code()).flatten(),
             process_exited,
             search_no_match: false,
             original_token_count: None,
-            hook_command,
-            tool_cwd,
+            hook_command: Some(metadata.hook_command),
+            tool_cwd: metadata.hook_cwd,
             raw_output_artifact,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
         };
-        buffer.acknowledge_pending_output();
-        drop(buffer);
-        if cleanup_confirmed {
-            let removed = {
-                let is_same_process = store
-                    .processes
-                    .get(&process_id)
-                    .is_some_and(|entry| Arc::ptr_eq(&entry.process, process));
-                if is_same_process {
-                    let removed = store.remove(process_id);
-                    store.remember_finished(process_id, &output);
-                    removed
-                } else {
-                    None
-                }
+        let handles = process.output_handles();
+        // If either lock contends until the handback bound, report no newly
+        // consumed bytes. Neither the worker nor a timed-out poll acknowledges
+        // bytes. No suspension follows a successful commit.
+        let commit = async {
+            let mut store = self.process_store.lock().await;
+            let matches = store.processes.get(&process_id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.process, process));
+            if !matches {
+                output.process_id = None;
+                return;
+            }
+            let mut buffer = handles.output_buffer.lock().await;
+            buffer.collect_pending_output();
+            let lag_marker = buffer.pending_output()
+                .filter(|pending| pending.lagged_chunks() > 0)
+                .map(|pending| lagged_output_marker(pending.lagged_chunks()))
+                .unwrap_or_default();
+            let (mut raw_output, output_ranges) =
+                buffer.projected_pending_output(process.output_is_closed(), &lag_marker);
+            raw_output.extend_from_slice(&output.raw_output);
+            output.raw_output = raw_output;
+            output.output_ranges = output_ranges;
+            output.stream_ranges = buffer.pending_stream_ranges();
+            buffer.acknowledge_pending_output();
+            if output.process_exited
+                && output.process_output.as_ref().is_some_and(|snapshot| snapshot.output_closed)
+                && Self::process_can_retire(process, &buffer)
+            {
+                store.remove(process_id);
+                output.process_id = None;
+                store.remember_finished(process_id, &output);
+            }
+        };
+        let _ = tokio::time::timeout_at(bound, commit).await;
+        if let Some(error) = terminal_error {
+            return UnifiedExecError::ToolHistoryPersistence {
+                message: error,
+                exit_code: output.exit_code.unwrap_or(-1),
+                duration: output.wall_time,
+                event_call_id: Some(output.event_call_id.clone()),
+                output: Some(Box::new(output)),
             };
-            drop(store);
-            drop(removed);
         }
         UnifiedExecError::ProcessFailedWithOutput {
             message,
@@ -1065,90 +1571,71 @@ impl UnifiedExecProcessManager {
                 &event_delivery,
             ) => result,
         };
-        if let Some((cwd, transcript, started_at)) = registration.pending_startup_completion.take()
-            && let Err(error) = &result
+        let failure_bound = failure_handback_bound(context.source.nested_deadline());
+        if let Err(error) = &result
+            && let Some(startup) = registration.pending_startup_completion.take()
         {
-            // Startup has published a command item, but no exit watcher owns its
-            // completion yet. The existing cancellation boundary also closes it.
-            if let Err(persistence_error) = emit_failed_initial_exec_end_if_unstored(
-                false,
-                registration.primary_process.as_ref(),
+            // Begin was accepted, but registration never assigned an exit
+            // watcher. Hand its unique End and cleanup to the session tracker.
+            let completion = start_direct_completion(
+                &mut registration,
                 context,
                 &request,
-                cwd,
-                transcript,
+                startup.cwd,
+                startup.transcript,
                 String::new(),
-                error.to_string(),
-                started_at.elapsed(),
-            )
-            .await
-            {
+                false,
+                Some(error.to_string()),
+                startup.started_at.elapsed(),
+                false,
+            );
+            if let Some(Err(persistence_error)) = wait_for_direct_completion(completion, failure_bound).await {
                 result = Err(UnifiedExecError::process_failed(format!(
                     "{error}; failed to persist command completion: {persistence_error}"
                 )));
             }
-        }
-        if cancelled && registration.committed {
-            match self
-                .terminate_unpublished_processes_for_call_ids(std::slice::from_ref(
-                    &context.call_id,
-                ))
-                .await
-            {
-                Ok(terminated_processes) => {
-                    if terminated_processes > 0 {
-                        mark_exec_process_exited();
-                    }
-                    // Cancellation already settled cleanup. Preserve the same
-                    // producer's log rather than reducing the outcome to text.
-                    if let Some(process) = registration.primary_process.as_ref() {
-                        let mut error = self.process_failure_output(
-                            request.process_id, process, "unified exec cancelled".into(),
-                            true, request_started_at,
-                        ).await;
-                        if let UnifiedExecError::ProcessFailedWithOutput { output, .. } = &mut error {
-                            output.event_call_id = context.call_id.clone();
-                            output.hook_command = Some(request.hook_command.clone());
-                            output.tool_cwd = (!request.turn_environment.environment.is_remote())
-                                .then(|| request.cwd.clone());
-                        }
-                        result = Err(error);
-                    }
-                }
-                Err(error) => {
-                    let message = format!("unified exec cancellation cleanup failed: {error}");
-                    // `commit` requires an attached primary process; keep the
-                    // plain failure only as a defensive fallback.
-                    result = Err(match registration.primary_process.as_ref() {
-                        Some(process) => {
-                            self.process_failure_output(
-                                request.process_id,
-                                process,
-                                message,
-                                /*cleanup_confirmed*/ false,
-                                request_started_at,
-                            )
-                            .await
-                        }
-                        None => UnifiedExecError::process_failed(message),
-                    });
+        } else if cancelled && registration.committed {
+            if let Some(process) = registration.primary_process.as_ref() {
+                result = Err(self
+                    .fail_process_with_message(
+                        request.process_id,
+                        process,
+                        "unified exec cancelled".into(),
+                        FailureOutputContext::for_exec(context, &request),
+                        Some(&context.session.terminal_tasks),
+                        failure_bound,
+                    )
+                    .await);
+                if process.has_exited() {
+                    mark_exec_process_exited();
                 }
             }
         } else if !registration.committed {
-            let process_was_attached = registration.primary_process.is_some();
-            if let Err(error) = registration.cleanup().await {
-                if let Err(UnifiedExecError::ToolHistoryPersistence { message, .. }) = &mut result {
-                    message.push_str(&format!("; unified exec startup cleanup failed: {error}"));
-                } else {
-                    let original_error = result.as_ref().err().map(ToString::to_string);
-                    let cleanup_error = format!("unified exec startup cleanup failed: {error}");
-                    return Err(UnifiedExecError::process_failed(match original_error {
-                        Some(original_error) => format!("{original_error}; {cleanup_error}"),
-                        None => cleanup_error,
-                    }));
+            // No Begin obligation remains. If provisional shutdown or its
+            // bookkeeping cannot finish soon, Drop hands it to its tracked owner.
+            let cleanup = tokio::time::timeout_at(failure_bound, registration.cleanup()).await;
+            let cleanup_error = match cleanup {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("unified exec startup cleanup failed: {error}")),
+                Err(_) => Some("unified exec startup cleanup remains pending; do not rerun automatically".into()),
+            };
+            if let Some(cleanup_error) = cleanup_error {
+                match &mut result {
+                    Err(UnifiedExecError::ToolHistoryPersistence { message, .. }) => {
+                        message.push_str(&format!("; {cleanup_error}"));
+                    }
+                    _ => {
+                        let message = result
+                            .as_ref()
+                            .err()
+                            .map_or_else(|| cleanup_error.clone(), |error| format!("{error}; {cleanup_error}"));
+                        result = Err(UnifiedExecError::process_failed(message));
+                    }
                 }
             }
-            if cancelled && process_was_attached {
+            if cancelled
+                && registration.primary_process.as_ref().is_some_and(|process| process.has_exited())
+            {
                 mark_exec_process_exited();
             }
         }
@@ -1222,14 +1709,49 @@ impl UnifiedExecProcessManager {
         )
         .with_captured_environment(&request.turn_environment);
         let event_delivery_guard = event_delivery.lock().await;
-        emitter
-            .begin(event_ctx)
-            .await
-            .map_err(|error| UnifiedExecError::process_failed(error.to_string()))?;
+        let item = emitter.unified_exec_startup_item(event_ctx);
+        let (event, append) = context
+            .session
+            .prepare_unified_exec_command_start(&context.turn, item);
+        // Install custody before the first await. Dropping this call can no
+        // longer drop the exact ordered receipt, even before it is observed.
+        let startup = registration.pending_startup_completion.insert(PendingStartupCompletion {
+            begin: append.map_or(StartupBegin::LiveOnly, StartupBegin::Appending),
+            turn: Arc::clone(&context.turn),
+            call_id: context.call_id.clone(),
+            command: request.command_for_safety.clone(),
+            cwd: cwd.clone(),
+            transcript: Arc::clone(&transcript),
+            started_at: Instant::now(),
+            tty: request.tty,
+            source: context.source.clone(),
+            tracker: context.tracker.clone(),
+            timing: active_tool_dispatch_timing(),
+        });
+        startup.observe_begin_append().await;
+        if let StartupBegin::Unconfirmed { observed, message } = &startup.begin {
+            let observed = *observed;
+            let message = message.clone();
+            let append = {
+                let mut owners = registration
+                    .cleanup_owners
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registration.register_startup_append(&mut owners, &process)
+            };
+            append.settle(Some((observed, message.clone())));
+            registration.pending_startup_completion = None;
+            return Err(UnifiedExecError::process_failed(message));
+        }
+        context
+            .session
+            .dispatch_unified_exec_command_start(&context.turn, event, || {
+                startup.begin = StartupBegin::Accepted;
+            })
+            .await;
 
         let start = Instant::now();
-        registration.pending_startup_completion =
-            Some((cwd.clone(), Arc::clone(&transcript), start));
+        startup.started_at = start;
         drop(event_delivery_guard);
         start_streaming_output(&process, context, Arc::clone(&transcript))?;
         // Persist live sessions before the initial yield wait so handler cancellation cannot
@@ -1329,60 +1851,31 @@ impl UnifiedExecProcessManager {
         if process.has_exited() {
             mark_exec_process_exited();
         }
-        if !process_started_alive {
-            if validation_process {
-                context
-                    .turn
-                    .turn_timing_state
-                    .record_executed_validation_duration(executor_started_at.elapsed());
-            }
-            let output_drain_started_at = Instant::now();
-            wait_for_process_output_drain(&process.output_drained_token()).await;
-            if let Some(timing) = active_tool_dispatch_timing() {
-                timing.record_timer_wait(ToolLifecycleTimerWait {
-                    wait_kind: "initial_process_output_drain".to_string(),
-                    effective_timeout_ms: Some(
-                        u64::try_from(output_drain_started_at.elapsed().as_millis())
-                            .unwrap_or(u64::MAX),
-                    ),
-                    wake_reason: ToolLifecycleWakeReason::Completed,
-                    ..Default::default()
-                });
-            }
+        if !process_started_alive && validation_process {
+            context
+                .turn
+                .turn_timing_state
+                .record_executed_validation_duration(executor_started_at.elapsed());
         }
         drop(tool_execution_timing_guard);
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let text = String::from_utf8_lossy(&collected).into_owned();
         let chunk_id = generate_chunk_id();
-        if let Some(message) = process.failure_message() {
-            let event_delivery_guard = event_delivery.lock().await;
-            let persistence_result = emit_failed_initial_exec_end_if_unstored(
-                process_started_alive,
-                Some(&process),
-                context,
-                request,
-                cwd.clone(),
-                Arc::clone(&transcript),
-                text.clone(),
-                message.clone(),
-                wall_time,
-            )
-            .await;
-            registration.pending_startup_completion = None;
-            drop(event_delivery_guard);
-            let process_error = self
-                .fail_process_with_message(request.process_id, &process, message)
-                .await;
-            persistence_result.map_err(|error| UnifiedExecError::ToolHistoryPersistence {
-                message: error.to_string(),
-                exit_code: -1,
-                duration: wall_time,
-                event_call_id: Some(context.call_id.clone()),
-                output: None,
-            })?;
-            return Err(process_error);
+        let failure = process.failure_message();
+        if process_started_alive && let Some(message) = failure.as_ref() {
+            return Err(self
+                .fail_process_with_message(
+                    request.process_id,
+                    &process,
+                    message.clone(),
+                    FailureOutputContext::for_exec(context, request),
+                    Some(&context.session.terminal_tasks),
+                    failure_handback_bound(context.source.nested_deadline()),
+                )
+                .await);
         }
+        let mut completion_pending = false;
         let process_id = request.process_id;
         let (response_process_id, exit_code, process_exited) = if process_started_alive {
             match self.refresh_process_state(process_id, &process).await {
@@ -1405,39 +1898,34 @@ impl UnifiedExecProcessManager {
                 }
             }
         } else {
-            // Short-lived command: emit the completed command item immediately
-            // using the same helper as the background watcher.
             let exit_code = process.exit_code();
-            let event_delivery_guard = event_delivery.lock().await;
-            tool_history_error = emit_exec_end_for_unified_exec(
-                Arc::clone(&context.session),
-                Arc::clone(&context.turn),
-                context.call_id.clone(),
-                request.command_for_safety.clone(),
-                cwd.clone(),
-                Some(process_id.to_string()),
-                Arc::clone(&transcript),
+            let classified_search = request.attempt_key.is_search_no_match(exit_code)
+                || (!validation_process
+                    && crate::tools::shell_output_summary::ends_with_native_search(
+                        &request.hook_command,
+                    ));
+            let startup = registration
+                .pending_startup_completion
+                .take()
+                .expect("a direct process still owns its accepted Begin");
+            let completion = start_direct_completion(
+                registration,
+                context,
+                request,
+                startup.cwd,
+                startup.transcript,
                 text.clone(),
-                Some(process.as_ref()),
-                request.tty,
-                request.attempt_key.is_search_no_match(exit_code)
-                    || (!validation_process
-                        && crate::tools::shell_output_summary::ends_with_native_search(
-                            &request.hook_command,
-                        )),
-                None,
-                false,
+                failure.is_none() && classified_search,
+                failure.clone(),
                 wall_time,
-                context.source.clone(),
-                context.tracker.clone(),
-                None,
-            )
-            .await
-            .err();
-            registration.pending_startup_completion = None;
-            drop(event_delivery_guard);
+                true,
+            );
+            match wait_for_direct_completion(completion, deadline).await {
+                Some(result) => tool_history_error = result.err(),
+                None => completion_pending = true,
+            }
 
-            if tool_history_error.is_none() {
+            if tool_history_error.is_none() && failure.is_none() {
                 process.check_for_sandbox_denial_with_text(&text).await?;
             }
             (None, exit_code, true)
@@ -1445,18 +1933,27 @@ impl UnifiedExecProcessManager {
 
         let original_token_count = approx_token_count(&text);
         let response = ExecCommandToolOutput {
-            stream_chunks: None,
-            process_output: if process_exited && response_process_id.is_none() {
-                Some(process.snapshot_tool_output(request.tty).await)
+            stream_chunks: if !process_started_alive {
+                tokio::time::timeout_at(deadline, process.stream_chunks(stream_ranges.as_ref(), request.tty))
+                    .await
+                    .ok()
+                    .flatten()
             } else {
                 None
             },
-            error: None,
+            process_output: if !process_started_alive {
+                tokio::time::timeout_at(deadline, process.snapshot_tool_output(request.tty))
+                    .await
+                    .ok()
+            } else {
+                None
+            },
+            error: failure.clone(),
             validation: process.validation(),
             environment_receipt: process.environment_receipt(),
             event_call_id: context.call_id.clone(),
             chunk_id,
-            wall_time,
+            wall_time: start.elapsed(),
             raw_output: collected,
             output_ranges,
             stream_ranges,
@@ -1481,10 +1978,13 @@ impl UnifiedExecProcessManager {
                 Some(bound) => tokio::time::timeout_at(bound, process.raw_output_artifact())
                     .await
                     .ok()
-                    .flatten(),
+                    .flatten()
+                    .or_else(|| process.try_raw_output_artifact()),
                 None => process.raw_output_artifact().await,
             },
-            repair_notice: None,
+            repair_notice: completion_pending.then(|| {
+                "Process exited; command completion is still being recorded. Do not rerun the command.".into()
+            }),
             pending_deferred_completions: Vec::new(),
         };
 
@@ -1506,12 +2006,23 @@ impl UnifiedExecProcessManager {
 
         if let Some(error) = tool_history_error {
             return Err(UnifiedExecError::ToolHistoryPersistence {
-                message: error.to_string(),
+                message: error,
                 exit_code: response.exit_code.unwrap_or(-1),
                 duration: response.wall_time,
                 event_call_id: Some(response.event_call_id.clone()),
                 output: Some(Box::new(response)),
             });
+        }
+        // Direct output has no store consumer or replay cursor. Return the
+        // captured response even when its tracked End has not persisted yet.
+        if !process_started_alive {
+            return match failure {
+                Some(message) => Err(UnifiedExecError::ProcessFailedWithOutput {
+                    message,
+                    output: Box::new(response),
+                }),
+                None => Ok(response),
+            };
         }
         let mut response =
             finish_exited_process_result(Some(&process), Ok(response), start.elapsed(), poll_bound)
@@ -1859,7 +2370,10 @@ impl UnifiedExecProcessManager {
                             .fail_process_with_message(
                                 process_id,
                                 process,
-                                "stdin delivery was not confirmed before the yield deadline; the write was not retried".to_string(),
+                                "stdin delivery was not confirmed before the yield deadline; do not resend automatically".to_string(),
+                                FailureOutputContext::for_stdin(&prepared_handles),
+                                prepared_handles.terminal_tasks.as_ref(),
+                                failure_handback_bound(request.nested_deadline),
                             )
                             .await);
                     }
@@ -1867,16 +2381,24 @@ impl UnifiedExecProcessManager {
                 match write {
                     Ok(()) => {}
                     Err(err) => {
-                        let status = self.refresh_process_state(process_id, process).await;
-                        if matches!(status, ProcessStatus::Exited { .. }) {
+                        let bound = failure_handback_bound(request.nested_deadline);
+                        let status = tokio::time::timeout_at(bound, self.refresh_process_state(process_id, process)).await.ok();
+                        if matches!(status, Some(ProcessStatus::Exited { .. })) {
                             input_error = Some(match err {
                                 UnifiedExecError::StdinClosed => "Input was not delivered because stdin closed. The process exit does not acknowledge this interaction.".to_string(),
                                 error => format!("Input delivery was not acknowledged: {error}. Delivery is uncertain; do not resend automatically. The process exit is independent."),
                             });
-                            status_after_write = Some(status);
+                            status_after_write = status;
                         } else if let UnifiedExecError::ProcessFailed { message } = err {
                             return Err(self
-                                .fail_process_with_message(process_id, process, message)
+                                .fail_process_with_message(
+                                    process_id,
+                                    process,
+                                    format!("{message}; input delivery may be uncertain; do not resend automatically"),
+                                    FailureOutputContext::for_stdin(&prepared_handles),
+                                    prepared_handles.terminal_tasks.as_ref(),
+                                    bound,
+                                )
                                 .await);
                         } else {
                             return Err(err);
@@ -1886,6 +2408,7 @@ impl UnifiedExecProcessManager {
             }
         }
 
+        let failure_metadata = FailureOutputContext::for_stdin(&prepared_handles);
         let PreparedProcessHandles {
             process,
             output_buffer,
@@ -1901,6 +2424,7 @@ impl UnifiedExecProcessManager {
             search_exit_one_is_no_match,
             tty,
             validation_launch,
+            terminal_tasks,
             ..
         } = prepared_handles;
 
@@ -1944,7 +2468,14 @@ impl UnifiedExecProcessManager {
         let chunk_id = generate_chunk_id();
         if let Some(message) = process.failure_message() {
             return Err(self
-                .fail_process_with_message(process_id, &process, message)
+                .fail_process_with_message(
+                    process_id,
+                    &process,
+                    message,
+                    failure_metadata,
+                    terminal_tasks.as_ref(),
+                    failure_handback_bound(request.nested_deadline),
+                )
                 .await);
         }
 
@@ -2294,10 +2825,9 @@ impl UnifiedExecProcessManager {
             cancellation_token,
             ..
         } = entry.process.output_handles();
-        let pause_state = entry
-            .session
-            .upgrade()
-            .map(|session| session.subscribe_elicitation_pause_state());
+        let session = entry.session.upgrade();
+        let pause_state = session.as_ref().map(|session| session.subscribe_elicitation_pause_state());
+        let terminal_tasks = session.as_ref().map(|session| session.terminal_tasks.clone());
 
         Ok(PreparedProcessHandles {
             process: Arc::clone(&entry.process),
@@ -2314,6 +2844,7 @@ impl UnifiedExecProcessManager {
             search_exit_one_is_no_match: entry.search_exit_one_is_no_match,
             tty: entry.tty,
             validation_launch: entry.validation_launch,
+            terminal_tasks,
         })
     }
 
@@ -2369,14 +2900,10 @@ impl UnifiedExecProcessManager {
         };
         let classified_search = entry.search_exit_one_is_no_match;
         {
-            let mut store = self.process_store.lock().await;
-            let reserved = store.reserved_process_slots.remove(&process_id);
-            debug_assert!(reserved, "process capacity must be reserved before launch");
-            // Private launches retain their original process identity. At the
-            // live-store boundary the manager binds the output/replay identity.
+            let store = self.process_store.lock().await;
+            // Bind the exact output/replay identity before ledger promotion, but
+            // keep the reservation provisional until the watcher can own its End.
             process.bind_managed_incarnation(store.process_id_history.incarnation(process_id));
-            store.processes.insert(process_id, entry);
-            process_id_reservation.transfer_to_store();
         }
 
         if let Err(error) = context
@@ -2393,53 +2920,46 @@ impl UnifiedExecProcessManager {
             )
             .await
         {
-            let termination_error = process.terminate_confirmed().await.err();
-            if termination_error.is_none() {
-                self.release_process_id(process_id).await;
-            } else {
-                // The command ledger rejected this incarnation. Transfer its
-                // existing charge back to provisional custody, not a usable
-                // stored command and not an uncharged cleanup vector.
-                let mut store = self.process_store.lock().await;
-                if store
-                    .processes
-                    .get(&process_id)
-                    .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process))
-                {
-                    store.processes.remove(&process_id);
-                    store.reserved_process_ids.insert(process_id);
-                    store.reserved_process_slots.insert(process_id);
-                }
-            }
-            let message = match termination_error {
-                Some(termination_error) => format!(
-                    "{error}; additionally failed to terminate the untracked process: {termination_error}"
-                ),
-                None => error,
-            };
-            return Err(UnifiedExecError::process_failed(message));
+            // The accepted Begin and provisional process belong to the tracked
+            // startup owner when ledger promotion cannot finish.
+            return Err(UnifiedExecError::process_failed(error));
         }
 
-        registration.pending_startup_completion = None;
-        spawn_exit_watcher(
-            Arc::clone(&process),
-            Arc::clone(&context.session),
-            Arc::clone(&context.turn),
-            context.call_id.clone(),
-            command.to_vec(),
-            cwd,
-            process_id,
-            command_execution_id,
-            parent_tool_execution_id,
-            transcript,
-            started_at,
-            context.source.clone(),
-            context.tracker.clone(),
-            tool_dispatch_timing,
-            tty,
-            classified_search,
-            validation_started_at,
-        );
+        {
+            let mut store = self.process_store.lock().await;
+            let append = BackgroundTerminalAppend::enroll(
+                &self.pending_cleanup_owners,
+                process_id,
+                process.incarnation(),
+            )?;
+            // There is no await between enrolling the exact End and making the
+            // live entry visible to pollers, pruning, or any cleanup route.
+            registration.pending_startup_completion = None;
+            spawn_exit_watcher(
+                Arc::clone(&process),
+                Arc::clone(&context.session),
+                Arc::clone(&context.turn),
+                context.call_id.clone(),
+                command.to_vec(),
+                cwd,
+                process_id,
+                command_execution_id,
+                parent_tool_execution_id,
+                transcript,
+                started_at,
+                context.source.clone(),
+                context.tracker.clone(),
+                tool_dispatch_timing,
+                tty,
+                classified_search,
+                validation_started_at,
+                append,
+            );
+            let reserved = store.reserved_process_slots.remove(&process_id);
+            debug_assert!(reserved, "process capacity must be reserved before launch");
+            store.processes.insert(process_id, entry);
+            process_id_reservation.transfer_to_store();
+        }
         registration.commit().await;
         Ok(())
     }
@@ -2519,7 +3039,10 @@ impl UnifiedExecProcessManager {
         pending_spawns: &PendingSpawnRegistration,
     ) -> Result<Arc<UnifiedExecProcess>, UnifiedExecError> {
         let spawn_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("process_spawn");
-        if codex_protocol::timing::observations::enabled() {
+        if let Some(dispatch) = active_tool_dispatch_timing()
+            && let Some(timing) = dispatch.turn_timing_state()
+            && timing.runtime_async_observations_enabled()
+        {
             let effective_env = request.env.iter().collect::<std::collections::BTreeMap<_, _>>();
             let command = codex_conversation::operation_history::digest(serde_json::json!({
                 "command":request.command, "cwd":request.cwd, "environment":effective_env,
@@ -2528,15 +3051,13 @@ impl UnifiedExecProcessManager {
                 "permissions":request.permission_profile,
                 "private_desktop":request.windows_sandbox_private_desktop,
                 "workspace_roots":request.windows_sandbox_workspace_roots}));
-            if let Some(dispatch) = active_tool_dispatch_timing()
-                && let Some(timing) = dispatch.turn_timing_state() {
-                timing.observe_runtime("command_prepared", &dispatch.execution_id().0,
-                    serde_json::json!({"command_sha256":command, "configuration_sha256":configuration,
-                        "process_handle":process_id,
-                        "identity_scope":"prepared_host_command_arguments_cwd_environment_and_policy",
-                        "input_state_complete":false,
-                        "remote_final_environment_complete":!environment.is_remote()}));
-            }
+            // This sample precedes spawn but is not a durability gate.
+            timing.observe_runtime_queued("command_prepared", &dispatch.execution_id().0,
+                serde_json::json!({"command_sha256":command, "configuration_sha256":configuration,
+                    "process_handle":process_id,
+                    "identity_scope":"prepared_host_command_arguments_cwd_environment_and_policy",
+                    "input_state_complete":false,
+                    "remote_final_environment_complete":!environment.is_remote()}));
         }
         let spawn_timing = active_tool_dispatch_timing()
             .and_then(|timing| timing.turn_timing_state())
@@ -3344,7 +3865,7 @@ impl UnifiedExecProcessManager {
 
         let termination_results = futures::future::join_all(processes.into_iter().map(
             |(process_id, process)| async move {
-                let result = process.terminate_confirmed().await;
+                let result = self.terminate_stored_process(process_id, &process).await;
                 (process_id, process, result)
             },
         ))
@@ -3375,7 +3896,12 @@ impl UnifiedExecProcessManager {
             .pending_cleanup_owners
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .iter()
+            .filter_map(|owner| match owner {
+                PendingProcessOwner::Startup(cleanup) => Some(Arc::clone(cleanup)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         if !pending.is_empty() {
             failures.push("cancelled startup cleanup remains owned and pending".to_string());
         }
@@ -3391,6 +3917,57 @@ impl UnifiedExecProcessManager {
             }
         }
         if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
+    }
+
+    async fn terminate_stored_process(
+        &self,
+        process_id: u32,
+        process: &UnifiedExecProcess,
+    ) -> Result<(), UnifiedExecError> {
+        process.terminate_confirmed().await?;
+        note_background_termination(&self.pending_cleanup_owners, process_id, process);
+        Ok(())
+    }
+
+    /// Run only after admission, startup cleanup and native termination have
+    /// drained. A writer retirement observer may time out independently.
+    pub(crate) async fn wait_for_background_terminal_appends(&self) -> Result<(), String> {
+        loop {
+            let pending = {
+                let retained = self.pending_cleanup_owners
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let pending = retained
+                    .iter()
+                    .filter_map(|owner| match owner {
+                        PendingProcessOwner::BackgroundAppend(pending)
+                            if !pending.settled.is_cancelled() =>
+                        {
+                            Some(pending.settled.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if pending.is_empty() {
+                    let failures = retained
+                        .iter()
+                        .filter_map(|owner| match owner {
+                            PendingProcessOwner::BackgroundAppendFailure { message, .. } => {
+                                Some(message.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    return if failures.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(failures.join("; "))
+                    };
+                }
+                pending
+            };
+            futures::future::join_all(pending.iter().map(CancellationToken::cancelled)).await;
+        }
     }
 
     /// Terminates retained processes whose originating tool calls never published a durable
@@ -3428,7 +4005,7 @@ impl UnifiedExecProcessManager {
 
         let results = futures::future::join_all(targets.iter().map(
             |(process_id, call_id, process)| async move {
-                process.terminate_confirmed().await.map_err(|error| format!(
+                self.terminate_stored_process(*process_id, process).await.map_err(|error| format!(
                     "process {process_id} for unpublished call {call_id} did not confirm termination: {error}"
                 ))
             },
@@ -3605,7 +4182,7 @@ impl UnifiedExecProcessManager {
 
         // Root exit does not imply output custody has finished. The same
         // termination owner also aborts remaining readers/finalization.
-        if process.terminate_confirmed().await.is_err() {
+        if self.terminate_stored_process(process_id, &process).await.is_err() {
             return false;
         }
         if retain_for_poll {

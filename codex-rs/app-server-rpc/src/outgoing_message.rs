@@ -224,6 +224,7 @@ pub struct OutgoingMessageSender {
     active_connections: Arc<Mutex<HashMap<ConnectionId, ActiveConnection>>>,
     dynamic_tool_owners: Mutex<HashMap<ThreadId, ConnectionId>>,
     request_id_to_callback: Arc<StdMutex<HashMap<RequestId, PendingCallbackEntry>>>,
+    request_publication_stopped: CancellationToken,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
     /// disconnect cleanup all get handled.
@@ -446,6 +447,15 @@ struct PendingCallbackEntry {
     connection_ids: HashSet<ConnectionId>,
     /// Successful initial or replay publication, shared across fanout owners.
     delivered_connection_ids: HashSet<ConnectionId>,
+}
+
+impl PendingCallbackEntry {
+    /// Returns whether no published recipient remains.
+    fn retain_published_recipients(&mut self) -> bool {
+        self.connection_ids
+            .retain(|connection_id| self.delivered_connection_ids.contains(connection_id));
+        self.connection_ids.is_empty()
+    }
 }
 
 struct PendingCallbackRegistration {
@@ -727,6 +737,7 @@ impl OutgoingMessageSender {
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             dynamic_tool_owners: Mutex::new(HashMap::new()),
             request_id_to_callback: Arc::new(StdMutex::new(HashMap::new())),
+            request_publication_stopped: CancellationToken::new(),
             request_contexts: Mutex::new(HashMap::new()),
             component_notification_cache: Mutex::new(ComponentNotificationCache::default()),
             analytics_events_client,
@@ -1202,6 +1213,29 @@ impl OutgoingMessageSender {
 
 
 
+    /// Stop standalone cleanup from issuing or replaying server requests.
+    /// Keep callbacks only for peers whose request publication already committed.
+    pub fn stop_server_request_publication(&self) {
+        let unpublished = {
+            // Initial publication and replay both commit under this same fence.
+            // Do not stop the output lane: retained work still owes terminal output.
+            let mut callbacks = self
+                .request_id_to_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.request_publication_stopped.cancel();
+            callbacks
+                .extract_if(|_, entry| entry.retain_published_recipients())
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>()
+        };
+        for entry in unpublished {
+            let _ = entry.callback.send(Err(internal_error(
+                ALL_AUTHORIZED_CONNECTION_SENDS_FAILED_ERROR,
+            )));
+        }
+    }
+
     fn next_request_id(&self) -> std::result::Result<RequestId, JSONRPCErrorError> {
         self.next_server_request_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -1246,6 +1280,9 @@ impl OutgoingMessageSender {
                 LEGACY_EXEC_COMMAND_APPROVAL_EMISSION_ERROR,
             )));
             return Ok((outgoing_message_id, rx_approve));
+        }
+        if self.request_publication_stopped.is_cancelled() {
+            return Err(internal_error(ALL_AUTHORIZED_CONNECTION_SENDS_FAILED_ERROR));
         }
         let request = request.request_with_id(outgoing_message_id.clone());
         let explicit_recipients = connection_ids.is_some();
@@ -1310,6 +1347,9 @@ impl OutgoingMessageSender {
                 .request_id_to_callback
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.request_publication_stopped.is_cancelled() {
+                return Err(internal_error(ALL_AUTHORIZED_CONNECTION_SENDS_FAILED_ERROR));
+            }
             request_id_to_callback.insert(
                 id,
                 PendingCallbackEntry {
@@ -1339,6 +1379,7 @@ impl OutgoingMessageSender {
             let permit = tokio::select! {
                 biased;
                 _ = settlement.cancelled() => break,
+                _ = self.request_publication_stopped.cancelled() => break,
                 _ = self.delivery_shutdown.cancelled() => {
                     send_error = Some("request delivery was cancelled by shutdown");
                     break;
@@ -1364,6 +1405,9 @@ impl OutgoingMessageSender {
                 .request_id_to_callback
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.request_publication_stopped.is_cancelled() {
+                break;
+            }
             let Some(entry) = callbacks.get_mut(&outgoing_message_id) else {
                 break;
             };
@@ -1395,13 +1439,7 @@ impl OutgoingMessageSender {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let no_remaining_recipient = request_id_to_callback
                 .get_mut(&outgoing_message_id)
-                .is_some_and(|entry| {
-                    let delivered_connection_ids = &entry.delivered_connection_ids;
-                    entry
-                        .connection_ids
-                        .retain(|connection_id| delivered_connection_ids.contains(connection_id));
-                    entry.connection_ids.is_empty()
-                });
+                .is_some_and(PendingCallbackEntry::retain_published_recipients);
             let undelivered_entry = no_remaining_recipient
                 .then(|| request_id_to_callback.remove(&outgoing_message_id))
                 .flatten();
@@ -1422,6 +1460,9 @@ impl OutgoingMessageSender {
         thread_id: ThreadId,
         _experimental_api_enabled: bool,
     ) {
+        if self.request_publication_stopped.is_cancelled() {
+            return;
+        }
         let observation = codex_protocol::timing::observations::Span::start(
             "request_replay", &thread_id.to_string(), "", &connection_id.0.to_string(),
             serde_json::json!({"scope":"eligible_pending_requests_not_dynamic_tool_reexecution"}));
@@ -1468,6 +1509,7 @@ impl OutgoingMessageSender {
         for (request_id, settlement) in request_ids {
             let permit = tokio::select! {
                 biased;
+                _ = self.request_publication_stopped.cancelled() => return,
                 _ = target_closed.cancelled() => return,
                 _ = settlement.cancelled() => continue,
                 _ = self.delivery_shutdown.cancelled() => {
@@ -1501,6 +1543,9 @@ impl OutgoingMessageSender {
                 .request_id_to_callback
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.request_publication_stopped.is_cancelled() {
+                return;
+            }
             let Some(entry) = request_id_to_callback.get_mut(&request_id) else {
                 continue;
             };
@@ -2043,6 +2088,57 @@ impl OutgoingMessageSender {
         }
     }
 
+    /// Settle terminal broadcast admission within a caller's existing deadline.
+    /// The caller can hold generation custody until this returns. A failed
+    /// admission only retires routes captured before the send.
+    pub async fn send_terminal_broadcast_until(
+        &self,
+        notification: ServerNotification,
+        deadline: tokio::time::Instant,
+    ) {
+        tracing::trace!(targeted_connections = 0, "app-server event: {notification}");
+        let observation = notification_route_observation(&[], &notification);
+        let mut failure_targets = None;
+        let failure = tokio::select! {
+            biased;
+            _ = self.delivery_shutdown.cancelled() => Some("delivery shutdown"),
+            _ = tokio::time::sleep_until(deadline) => Some("notification admission timed out"),
+            failure = async {
+                failure_targets = Some(self.active_connections.lock().await.values()
+                    .map(|route| (Arc::clone(&route.initialized), route.delivery_failure.clone()))
+                    .collect::<Vec<_>>());
+                let Ok(permit) = self.notification_sender().reserve().await else {
+                    return Some("notification lane closed");
+                };
+                if self.delivery_shutdown.is_cancelled() {
+                    return Some("delivery shutdown");
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Some("notification admission timed out");
+                }
+                permit.send(OutgoingEnvelope::Broadcast {
+                    message: OutgoingMessage::AppServerNotification(notification),
+                });
+                None
+            } => failure,
+        };
+        if let Some(reason) = failure {
+            let route_snapshot_available = failure_targets.is_some();
+            // No second await or lookup by connection ID after failure.
+            for (initialized, delivery_failure) in failure_targets.into_iter().flatten() {
+                initialized.store(false, Ordering::Release);
+                delivery_failure.cancel();
+            }
+            warn!(reason, route_snapshot_available, "failed to enqueue terminal broadcast");
+        }
+        if let Some(observation) = observation {
+            observation.finish(
+                if failure.is_none() { "enqueued" } else { "delivery_failed" },
+                serde_json::json!({"broadcast":true}),
+            );
+        }
+    }
+
     // Keep the timed fanout state out of callers that dispatch many notification variants.
     // Only allocation is eager; tracing, deadlines, locks and delivery still begin on poll.
     pub fn send_server_notification_to_connections<'a>(
@@ -2055,28 +2151,7 @@ impl OutgoingMessageSender {
                 targeted_connections = connection_ids.len(),
                 "app-server event: {notification}"
             );
-            let observation = codex_protocol::timing::observations::enabled().then(|| {
-                let (thread, turn, output, source) = match &notification {
-                    ServerNotification::AgentMessageDelta(delta) => (
-                        delta.thread_id.as_str(),
-                        delta.turn_id.as_str(),
-                        delta.item_id.as_str(),
-                        delta.source_occurrence.as_deref(),
-                    ),
-                    _ => ("", "", "", None),
-                };
-                codex_protocol::timing::observations::Span::start(
-                    "notification_route",
-                    thread,
-                    turn,
-                    output,
-                    serde_json::json!({
-                        "target_connections":connection_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
-                        "broadcast":connection_ids.is_empty(),
-                        "source_occurrence":source,
-                    }),
-                )
-            });
+            let observation = notification_route_observation(connection_ids, &notification);
             let outgoing_message = OutgoingMessage::AppServerNotification(notification);
             let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
             if connection_ids.is_empty() {
@@ -2570,6 +2645,34 @@ impl OutgoingMessageSender {
         }
         enqueued
     }
+}
+
+fn notification_route_observation(
+    connection_ids: &[ConnectionId],
+    notification: &ServerNotification,
+) -> Option<codex_protocol::timing::observations::Span> {
+    codex_protocol::timing::observations::enabled().then(|| {
+        let (thread, turn, output, source) = match notification {
+            ServerNotification::AgentMessageDelta(delta) => (
+                delta.thread_id.as_str(),
+                delta.turn_id.as_str(),
+                delta.item_id.as_str(),
+                delta.source_occurrence.as_deref(),
+            ),
+            _ => ("", "", "", None),
+        };
+        codex_protocol::timing::observations::Span::start(
+            "notification_route",
+            thread,
+            turn,
+            output,
+            serde_json::json!({
+                "target_connections":connection_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+                "broadcast":connection_ids.is_empty(),
+                "source_occurrence":source,
+            }),
+        )
+    })
 }
 
 fn turn_enqueue_outcome(

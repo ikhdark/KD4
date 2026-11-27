@@ -115,6 +115,7 @@ use super::ThreadReadParams;
 use super::ThreadReadResponse;
 use super::ThreadResumeInitialTurnsPageParams;
 use super::ThreadResumeParams;
+use super::THREAD_SHUTDOWN_TIMEOUT;
 use super::ThreadResumeResponse;
 use super::ThreadRollbackParams;
 use super::ThreadSearchParams;
@@ -124,7 +125,6 @@ use super::ThreadSetNameParams;
 use super::ThreadSetNameResponse;
 use super::ThreadShellCommandParams;
 use super::ThreadShellCommandResponse;
-use super::ThreadShutdownResult;
 use super::ThreadSortKey;
 use super::ThreadSourceKind;
 use super::ThreadStartParams;
@@ -165,6 +165,7 @@ use super::project_trust_key;
 use super::resolve_root_git_project_for_trust;
 use super::resolve_runtime_workspace_roots;
 use super::resolve_thread_status;
+use super::retry_owned_thread_retirement;
 use super::resolve_turn_environment_selections;
 use super::send_thread_token_usage_update_to_connection;
 use super::set_thread_status_and_interrupt_stale_turns;
@@ -910,11 +911,16 @@ impl ThreadRequestProcessor {
     }
 
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
-        self.thread_manager.cleanup_absent_thread_with(thread_id, || async {
+        self.thread_manager
+            .cleanup_absent_thread_with(thread_id, || self.cleanup_retired_thread_state(thread_id))
+            .await;
+    }
+
+    async fn cleanup_retired_thread_state(&self, thread_id: ThreadId) {
         if let Some(queue) = &self.thread_queue_processor {
             queue.retire_thread(thread_id).await;
         }
-        self.pending_thread_unloads.finish(&thread_id).await;
+        // Only the task owning an unload may release its closing marker.
         self.outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
@@ -924,7 +930,6 @@ impl ThreadRequestProcessor {
         self.thread_watch_manager
             .remove_thread(&thread_id.to_string())
             .await;
-        }).await;
     }
 
     async fn rollback_failed_resumed_thread(
@@ -944,10 +949,18 @@ impl ThreadRequestProcessor {
             .thread_manager
             .rollback_resumed_thread_spawn(thread_id, thread)
             .await;
-        let thread_id_still_loaded =
-            !rollback_succeeded && self.thread_manager.get_thread(thread_id).await.is_ok();
-        if should_finalize_failed_thread_setup(rollback_succeeded, thread_id_still_loaded) {
+        let still_loaded = if rollback_succeeded {
+            None
+        } else {
+            self.thread_manager.get_thread(thread_id).await.ok()
+        };
+        if should_finalize_failed_thread_setup(rollback_succeeded, still_loaded.is_some()) {
             self.finalize_thread_teardown(thread_id).await;
+        } else if still_loaded
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, thread))
+        {
+            warn!("skipping app-server cleanup for failed resume {thread_id}: retirement is unconfirmed");
         } else {
             warn!(
                 "skipping app-server cleanup for failed resume {thread_id}: a different thread instance is loaded under that id"
@@ -988,28 +1001,49 @@ impl ThreadRequestProcessor {
         Ok(ThreadUnsubscribeResponse { status })
     }
 
+    async fn retire_subtree_thread_runtime(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+    ) -> Result<bool, CodexErr> {
+        self.thread_manager
+            .retire_thread_with_cleanup(
+                thread_id,
+                expected_thread,
+                THREAD_SHUTDOWN_TIMEOUT,
+                /*allow_confirmed_loop_failure*/ false,
+                |_, replacement_present| async move {
+                    if !replacement_present {
+                        self.cleanup_retired_thread_state(thread_id).await;
+                    }
+                },
+            )
+            .await
+    }
+
     async fn prepare_thread_for_archive(
         &self,
         thread_id: ThreadId,
     ) -> Result<(), JSONRPCErrorError> {
         if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
-            match wait_for_thread_shutdown(&thread).await {
-                ThreadShutdownResult::Complete => {}
-                ThreadShutdownResult::SubmitFailed | ThreadShutdownResult::TimedOut => {
-                    return Err(internal_error(format!(
-                        "thread {thread_id} writer did not quiesce; archive was not performed"
-                    )));
-                }
+            let retired = self.retire_subtree_thread_runtime(thread_id, &thread).await;
+            if !matches!(retired, Ok(true)) {
+                return Err(internal_error(format!(
+                    "thread {thread_id} writer did not quiesce; archive was not performed"
+                )));
             }
-            self.thread_manager.remove_thread(&thread_id).await;
+        } else {
+            self.finalize_thread_teardown(thread_id).await;
         }
-        self.finalize_thread_teardown(thread_id).await;
         Ok(())
     }
 
-    pub(super) async fn quiesce_thread_for_removal(&self, thread_id: ThreadId) -> Result<(), JSONRPCErrorError> {
+    pub(super) async fn quiesce_thread_for_removal(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<(), JSONRPCErrorError> {
         if let Ok(conversation) = self.thread_manager.get_thread(thread_id).await
-            && wait_for_thread_shutdown(&conversation).await != ThreadShutdownResult::Complete
+            && wait_for_thread_shutdown(&conversation).await.is_err()
         {
             return Err(internal_error(format!(
                 "thread {thread_id} shutdown or persistence retirement is unconfirmed; deletion was not performed"
@@ -1019,9 +1053,20 @@ impl ThreadRequestProcessor {
     }
 
     pub(super) async fn prepare_thread_for_removal(&self, thread_id: ThreadId) {
-        // Every loaded member was quiesced before the irreversible store commit.
-        self.thread_manager.remove_thread(&thread_id).await;
-        self.finalize_thread_teardown(thread_id).await;
+        // The deletion caller still holds the subtree publication fence from
+        // before quiescence through this post-commit cleanup. A loaded member
+        // can have disappeared but cannot have been replaced across the commit.
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            if !retry_owned_thread_retirement(thread_id, || {
+                self.retire_subtree_thread_runtime(thread_id, &thread)
+            })
+            .await
+            {
+                warn!(%thread_id, "preserving unexpected replacement during committed thread teardown");
+            }
+        } else {
+            self.finalize_thread_teardown(thread_id).await;
+        }
     }
 
     fn listener_task_context(&self) -> ListenerTaskContext {
@@ -2079,12 +2124,20 @@ impl ThreadRequestProcessor {
                         project_id: project_update.clone(),
                         ..Default::default()
                     };
-                    let updated_thread = processor
+                    let update_result = processor
                         .thread_manager
                         .update_thread_metadata(thread_uuid, patch, /*include_archived*/ true)
-                        .await
-                        .map_err(|err| core_thread_write_error("update thread metadata", err))?;
-                    if let Some(project_id) = project_update.as_ref()
+                        .await;
+                    let committed_project_id = match &update_result {
+                        Ok(updated_thread) => {
+                            project_update.as_ref().map(|_| &updated_thread.project_id)
+                        }
+                        // The requested project field is in the committed SQLite patch
+                        // even if the compatibility write has no receipt.
+                        Err(CodexErr::GitCompatibilityPending { .. }) => project_update.as_ref(),
+                        Err(_) => None,
+                    };
+                    if let Some(project_id) = committed_project_id
                         && previous_project_id.as_ref() != Some(project_id)
                     {
                         processor
@@ -2097,7 +2150,8 @@ impl ThreadRequestProcessor {
                             ))
                             .await;
                     }
-                    Ok::<_, JSONRPCErrorError>(updated_thread)
+                    update_result
+                        .map_err(|err| core_thread_write_error("update thread metadata", err))
                 }
                 .instrument(tracing::Span::current()),
             )
@@ -2466,7 +2520,6 @@ impl ThreadRequestProcessor {
         let store_sort_direction = sort_direction.unwrap_or(SortDirection::Desc);
         let (allowed_sources, source_kind_filter) = compute_source_filters(source_kinds);
         let mut cursor_obj = cursor;
-        let mut last_cursor = cursor_obj.clone();
         let mut remaining = requested_page_size;
         let mut search_results = Vec::with_capacity(requested_page_size);
         let mut next_cursor = None;
@@ -2486,13 +2539,20 @@ impl ThreadRequestProcessor {
                     search_term: search_term.clone(),
                 })
                 .await
-                .map_err(|error| {
+                .map_err(thread_store_list_error)
+                .and_then(|page| {
+                    ensure_thread_page_cursor_advances(
+                        cursor_obj.as_deref(),
+                        page.next_cursor.as_deref(),
+                    )?;
+                    Ok(page)
+                })
+                .inspect_err(|_| {
                     if let Some(started) = observed_at {
                         tracing::trace!(target: "codex_storage_search", stage = "thread_search",
                             success = false, store_search_calls, returned_rows = 0_u64,
                             elapsed_us = started.elapsed().as_micros() as u64);
                     }
-                    thread_store_list_error(error)
                 })?;
 
             for result in page.items {
@@ -2521,11 +2581,6 @@ impl ThreadRequestProcessor {
             let Some(cursor_val) = next_cursor.clone() else {
                 break;
             };
-            if last_cursor.as_ref() == Some(&cursor_val) {
-                next_cursor = None;
-                break;
-            }
-            last_cursor = Some(cursor_val.clone());
             cursor_obj = Some(cursor_val);
         }
 
@@ -4212,19 +4267,31 @@ impl ThreadRequestProcessor {
             thread_summary.session_id = existing_thread.session_configured().session_id.to_string();
             let instruction_sources = existing_thread.legacy_instruction_sources().await;
 
-            let (listener_command_tx, listener_generation, resume_history_is_seeded, history_generation) = {
+            let (
+                listener_command_tx,
+                listener_cancellation,
+                listener_generation,
+                resume_history_is_seeded,
+                history_generation,
+            ) = {
                 let thread_state = thread_state.lock().await;
+                let route = if thread_state.listener_matches(&existing_thread) {
+                    thread_state.listener_command_route()
+                } else {
+                    None
+                };
+                let Some((listener_command_tx, cancellation)) = route else {
+                    return Err(internal_error(format!(
+                        "failed to enqueue running thread resume for thread {existing_thread_id}: thread listener is not running"
+                    )));
+                };
                 (
-                    thread_state.listener_command_tx(),
+                    listener_command_tx,
+                    cancellation,
                     thread_state.listener_generation,
                     thread_state.resume_history_is_seeded_for_current_listener(),
                     thread_state.turn_index_history_generation(),
                 )
-            };
-            let Some(listener_command_tx) = listener_command_tx else {
-                return Err(internal_error(format!(
-                    "failed to enqueue running thread resume for thread {existing_thread_id}: thread listener is not running"
-                )));
             };
             let include_turns = !params.exclude_turns;
             let history_items = if include_turns || !resume_history_is_seeded {
@@ -4267,11 +4334,18 @@ impl ThreadRequestProcessor {
                     initial_turns_page: params.initial_turns_page.clone(),
                 }),
             );
-            if listener_command_tx.send(command).await.is_err() {
+            let admitted = tokio::select! {
+                biased;
+                _ = listener_cancellation.cancelled() => false,
+                result = listener_command_tx.send(command) => result.is_ok(),
+            };
+            if !admitted {
                 return Err(internal_error(format!(
                     "failed to enqueue running thread resume for thread {existing_thread_id}: thread listener command channel is closed"
                 )));
             }
+            // The listener owns the terminal outcome from here, including if
+            // retirement wins before the queued command can be dequeued.
             return Ok(RunningThreadResumeResult::Handled);
         }
         Ok(RunningThreadResumeResult::NotRunning)
@@ -5048,7 +5122,6 @@ impl ThreadRequestProcessor {
             relation_filter,
         } = filters;
         let mut cursor_obj = cursor;
-        let mut last_cursor = cursor_obj.clone();
         let mut remaining = requested_page_size;
         let mut items = Vec::with_capacity(requested_page_size);
         let mut next_cursor: Option<String> = None;
@@ -5116,7 +5189,14 @@ impl ThreadRequestProcessor {
                     relation_filter,
                 })
                 .await
-                .map_err(thread_store_list_error);
+                .map_err(thread_store_list_error)
+                .and_then(|page| {
+                    ensure_thread_page_cursor_advances(
+                        cursor_obj.as_deref(),
+                        page.next_cursor.as_deref(),
+                    )?;
+                    Ok(page)
+                });
             if let Some(observation) = observation {
                 observation.finish(if page.is_ok() { "completed" } else { "error" }, serde_json::Value::Null);
             }
@@ -5156,13 +5236,6 @@ impl ThreadRequestProcessor {
             let Some(cursor_val) = next_cursor.clone() else {
                 break;
             };
-            // Break if our pagination would reuse the same cursor again; this avoids
-            // an infinite loop when filtering drops everything on the page.
-            if last_cursor.as_ref() == Some(&cursor_val) {
-                next_cursor = None;
-                break;
-            }
-            last_cursor = Some(cursor_val.clone());
             cursor_obj = Some(cursor_val);
         }
 
@@ -5668,6 +5741,18 @@ fn conversation_summary_rollout_path_read_error(
     }
 }
 
+fn ensure_thread_page_cursor_advances(
+    request: Option<&str>,
+    continuation: Option<&str>,
+) -> Result<(), JSONRPCErrorError> {
+    // A repeated cursor is not exhaustion. Reject it even on a full page so
+    // clients cannot mistake it for a usable continuation.
+    if continuation.is_some() && request == continuation {
+        return Err(internal_error("thread pagination did not advance"));
+    }
+    Ok(())
+}
+
 pub(super) fn core_thread_write_error(operation: &str, err: CodexErr) -> JSONRPCErrorError {
     match err {
         CodexErr::ThreadNotFound(thread_id) => thread_invalid_request(
@@ -5676,6 +5761,28 @@ pub(super) fn core_thread_write_error(operation: &str, err: CodexErr) -> JSONRPC
         ),
         CodexErr::InvalidRequest(message) => invalid_request(message),
         CodexErr::UnsupportedOperation(message) => method_not_found(message),
+        CodexErr::GitCompatibilityPending {
+            thread_id,
+            intent_id,
+            outcome_unknown,
+        } => {
+            let message = if outcome_unknown {
+                "Thread metadata committed; Git compatibility write outcome is unknown."
+            } else {
+                "Thread metadata committed; Git compatibility write is pending."
+            };
+            let mut error = internal_error(message);
+            error.data = Some(serde_json::json!({
+                "reason": "gitCompatibilityPending",
+                "threadId": thread_id.to_string(),
+                // Keep the full SQLite i64 exact even for JavaScript clients.
+                "intentId": intent_id.to_string(),
+                "outcomeUnknown": outcome_unknown,
+                "metadataCommitted": true,
+                "retryable": false,
+            }));
+            error
+        }
         err => internal_error(format!("failed to {operation}: {err}")),
     }
 }

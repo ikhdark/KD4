@@ -3167,6 +3167,18 @@ enum CancelledHandlerSettlement {
     Unresolved { call_id: String },
 }
 
+async fn observe_cancelled_process_before_deadline<T>(
+    deadline: TokioInstant,
+    observation: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if TokioInstant::now() >= deadline {
+        return None;
+    }
+    let observed = tokio::time::timeout_at(deadline, observation).await.ok()?;
+    // A ready observation can win the timeout poll after the deadline.
+    (TokioInstant::now() < deadline).then_some(observed)
+}
+
 async fn supervise_cancelled_dispatch_cleanup(
     mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>>,
     policy: CancelledDispatchCleanupPolicy,
@@ -3277,12 +3289,18 @@ async fn supervise_cancelled_dispatch_cleanup(
     }
 
     if owns_unified_exec_processes {
-        let cleanup = session
-            .services
-            .unified_exec_manager
-            .terminate_unpublished_processes_for_call_ids(std::slice::from_ref(&call_id));
-        let result = tokio::time::timeout_at(cleanup_until, cleanup).await
-            .unwrap_or_else(|_| Err("process termination exceeded the runtime cleanup deadline; processes may survive".into()));
+        let manager = &session.services.unified_exec_manager;
+        let timeout_error =
+            "process termination exceeded the runtime cleanup deadline; processes may survive";
+        let result = if TokioInstant::now() < cleanup_until {
+            let cleanup =
+                manager.terminate_unpublished_processes_for_call_ids(std::slice::from_ref(&call_id));
+            tokio::time::timeout_at(cleanup_until, cleanup)
+                .await
+                .unwrap_or_else(|_| Err(timeout_error.into()))
+        } else {
+            Err(timeout_error.into())
+        };
         match result {
             Ok(terminated_processes) => {
                 if terminated_processes > 0 {
@@ -3296,23 +3314,36 @@ async fn supervise_cancelled_dispatch_cleanup(
             Err(error) => {
                 timing.record_exec_cleanup_state(false, true);
                 effects.uncertain_effects.push(error.clone());
-                let surviving = session
-                    .services
-                    .unified_exec_manager
-                    .list_processes()
-                    .await
-                    .into_iter()
-                    .filter(|process| process.item_id == call_id)
-                    .map(|process| process.process_id)
-                    .collect::<Vec<_>>();
-                for process_id in &surviving {
-                    let Ok(process_id) = process_id.parse::<u32>() else { continue };
-                    if let Some(incarnation) = session.services.unified_exec_manager
-                        .process_incarnation(process_id).await
-                    {
-                        live_operations.push(serde_json::json!({"tool":"write_stdin", "arguments":{
-                            "session_id":process_id,"incarnation":incarnation,"chars":""
-                        }}));
+                // Distinguish an unavailable snapshot from an observed empty one.
+                let surviving =
+                    observe_cancelled_process_before_deadline(cleanup_until, manager.list_processes())
+                        .await
+                        .map(|processes| {
+                            processes
+                                .into_iter()
+                                .filter(|process| process.item_id == call_id)
+                                .map(|process| process.process_id)
+                                .collect::<Vec<_>>()
+                        });
+                if let Some(surviving) = &surviving {
+                    for process_id in surviving {
+                        let Ok(process_id) = process_id.parse::<u32>() else {
+                            continue;
+                        };
+                        match observe_cancelled_process_before_deadline(
+                            cleanup_until,
+                            manager.process_incarnation(process_id),
+                        )
+                        .await
+                        {
+                            Some(Some(incarnation)) => {
+                                live_operations.push(serde_json::json!({"tool":"write_stdin", "arguments":{
+                                    "session_id":process_id,"incarnation":incarnation,"chars":""
+                                }}));
+                            }
+                            Some(None) => {}
+                            None => break,
+                        }
                     }
                 }
                 recovery.push(serde_json::json!({

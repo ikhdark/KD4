@@ -40,6 +40,8 @@ pub fn environment_file_system_sandbox<'a>(
 /// dispatch. Contributors should clone only the fields they need to retain beyond that call.
 #[derive(Debug, Clone)]
 pub struct TurnInputContext {
+    /// Host cutoff for this contribution; leave time to return partial results.
+    pub contribution_deadline: std::time::Instant,
     /// Stable host-owned turn identifier.
     pub turn_id: String,
     /// User input submitted for this turn.

@@ -1,4 +1,5 @@
 use crate::FunctionCallError;
+use crate::session::BackgroundCommandAppendReceipt;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -45,7 +46,9 @@ pub(crate) struct ToolEventCtx<'a> {
     pub runtime_tool_call_id: Option<&'a str>,
     pub execution_id: Option<&'a str>,
     pub observed_exit_code: Option<Option<i32>>,
+    legacy_shell_search_no_match: bool,
     pub output_metadata: Option<&'a codex_protocol::items::CommandExecutionOutputMetadata>,
+    pub record_background_append: Option<&'a (dyn Fn(BackgroundCommandAppendReceipt) + Sync)>,
 }
 
 impl<'a> ToolEventCtx<'a> {
@@ -66,8 +69,15 @@ impl<'a> ToolEventCtx<'a> {
             runtime_tool_call_id: None,
             execution_id: None,
             observed_exit_code: None,
+            legacy_shell_search_no_match: false,
             output_metadata: None,
+            record_background_append: None,
         }
+    }
+
+    pub(super) fn with_legacy_shell_search_no_match(mut self, search_no_match: bool) -> Self {
+        self.legacy_shell_search_no_match = search_no_match;
+        self
     }
 
     pub fn with_call_source(mut self, source: &'a ToolCallSource) -> Self {
@@ -140,37 +150,47 @@ pub(crate) async fn emit_exec_command_begin(
     interaction_input: Option<String>,
     process_id: Option<&str>,
 ) {
-    ctx.session
-        .emit_turn_item_started(
-            ctx.turn,
-            &TurnItem::CommandExecution(CommandExecutionItem {
-                environment: ctx
-                    .patch_environment
-                    .map(super::super::session::turn_context::TurnEnvironment::provenance),
-                output_metadata: None,
-                id: ctx.call_id.to_string(),
-                process_id: process_id.map(str::to_owned),
-                parent_call_id: ctx.parent_call_id.map(str::to_owned),
-                parent_cell_id: ctx.parent_cell_id.map(str::to_owned),
-                runtime_tool_call_id: ctx.runtime_tool_call_id.map(str::to_owned),
-                execution_id: ctx.execution_id.map(str::to_owned).or_else(|| {
-                    active_tool_dispatch_timing().map(|timing| timing.execution_id().0.clone())
-                }),
-                command: command.to_vec(),
-                cwd: cwd.clone(),
-                parsed_cmd: parsed_cmd.to_vec(),
-                source,
-                interaction_input,
-                status: CommandExecutionStatus::InProgress,
-                stdout: None,
-                stderr: None,
-                aggregated_output: None,
-                exit_code: None,
-                duration: None,
-                formatted_output: None,
-            }),
-        )
-        .await;
+    let item = exec_command_begin_item(
+        ctx, command, cwd, parsed_cmd, source, interaction_input, process_id,
+    );
+    ctx.session.emit_turn_item_started(ctx.turn, &item).await;
+}
+
+fn exec_command_begin_item(
+    ctx: ToolEventCtx<'_>,
+    command: &[String],
+    cwd: &PathUri,
+    parsed_cmd: &[ParsedCommand],
+    source: ExecCommandSource,
+    interaction_input: Option<String>,
+    process_id: Option<&str>,
+) -> TurnItem {
+    TurnItem::CommandExecution(CommandExecutionItem {
+        environment: ctx
+            .patch_environment
+            .map(super::super::session::turn_context::TurnEnvironment::provenance),
+        output_metadata: None,
+        id: ctx.call_id.to_string(),
+        process_id: process_id.map(str::to_owned),
+        parent_call_id: ctx.parent_call_id.map(str::to_owned),
+        parent_cell_id: ctx.parent_cell_id.map(str::to_owned),
+        runtime_tool_call_id: ctx.runtime_tool_call_id.map(str::to_owned),
+        execution_id: ctx.execution_id.map(str::to_owned).or_else(|| {
+            active_tool_dispatch_timing().map(|timing| timing.execution_id().0.clone())
+        }),
+        command: command.to_vec(),
+        cwd: cwd.clone(),
+        parsed_cmd: parsed_cmd.to_vec(),
+        source,
+        interaction_input,
+        status: CommandExecutionStatus::InProgress,
+        stdout: None,
+        stderr: None,
+        aggregated_output: None,
+        exit_code: None,
+        duration: None,
+        formatted_output: None,
+    })
 }
 // Concrete, allocation-free emitter: avoid trait objects and boxed futures.
 pub(crate) enum ToolEmitter {
@@ -484,6 +504,31 @@ impl ToolEmitter {
         self.emit(ctx, ToolEventStage::Begin).await
     }
 
+    pub(crate) fn unified_exec_startup_item(&self, mut ctx: ToolEventCtx<'_>) -> TurnItem {
+        let Self::UnifiedExec {
+            captured_environment,
+            command,
+            cwd,
+            source,
+            parsed_cmd,
+            process_id,
+            ..
+        } = self
+        else {
+            unreachable!("only unified exec startup separates append from live delivery");
+        };
+        ctx.patch_environment = captured_environment.as_ref();
+        exec_command_begin_item(
+            ctx,
+            command,
+            cwd,
+            parsed_cmd,
+            *source,
+            None,
+            process_id.as_deref(),
+        )
+    }
+
     fn format_exec_output_for_model(
         &self,
         output: &ExecToolCallOutput,
@@ -725,18 +770,20 @@ async fn emit_exec_stage(
             output,
             formatted_output,
         }) => {
+            let exit_code = ctx.observed_exit_code.unwrap_or(Some(output.exit_code));
             let exec_result = ExecCommandResult {
                 stdout: output.stdout.text.clone(),
                 stderr: output.stderr.text.clone(),
                 aggregated_output: output.aggregated_output.text.clone(),
-                exit_code: ctx.observed_exit_code.unwrap_or(Some(output.exit_code)),
+                exit_code,
                 duration: output.duration,
                 formatted_output: formatted_output.unwrap_or_else(|| {
                     format_exec_output_str(&output, ctx.turn.model_info.truncation_policy.into())
                 }),
                 status: if !failed
                     && !output.timed_out
-                    && (ctx.observed_exit_code.unwrap_or(Some(output.exit_code)) == Some(0)
+                    && (exit_code == Some(0)
+                        || (exit_code == Some(1) && ctx.legacy_shell_search_no_match)
                         || ctx
                             .output_metadata
                             .is_some_and(|metadata| metadata.search_no_match))
@@ -800,37 +847,39 @@ async fn emit_exec_end(
                 .invalidate_repository_revision(&ctx.turn.sub_id, revision).await;
         }
     }
-    ctx.session
-        .emit_turn_item_completed(
-            ctx.turn,
-            TurnItem::CommandExecution(CommandExecutionItem {
-                environment: ctx
-                    .patch_environment
-                    .map(super::super::session::turn_context::TurnEnvironment::provenance),
-                id: ctx.call_id.to_string(),
-                process_id: exec_input.process_id.map(str::to_owned),
-                output_metadata: ctx.output_metadata.cloned(),
-                parent_call_id: ctx.parent_call_id.map(str::to_owned),
-                parent_cell_id: ctx.parent_cell_id.map(str::to_owned),
-                runtime_tool_call_id: ctx.runtime_tool_call_id.map(str::to_owned),
-                execution_id: ctx.execution_id.map(str::to_owned).or_else(|| {
-                    active_tool_dispatch_timing().map(|timing| timing.execution_id().0.clone())
-                }),
-                command: exec_input.command.to_vec(),
-                cwd: exec_input.cwd.clone(),
-                parsed_cmd: exec_input.parsed_cmd.to_vec(),
-                source: exec_input.source,
-                interaction_input: exec_input.interaction_input.map(str::to_owned),
-                status: exec_result.status.into(),
-                stdout: Some(exec_result.stdout),
-                stderr: Some(exec_result.stderr),
-                aggregated_output: Some(exec_result.aggregated_output),
-                exit_code: exec_result.exit_code,
-                duration: Some(exec_result.duration),
-                formatted_output: Some(exec_result.formatted_output),
-            }),
-        )
-        .await;
+    let item = TurnItem::CommandExecution(CommandExecutionItem {
+        environment: ctx
+            .patch_environment
+            .map(super::super::session::turn_context::TurnEnvironment::provenance),
+        id: ctx.call_id.to_string(),
+        process_id: exec_input.process_id.map(str::to_owned),
+        output_metadata: ctx.output_metadata.cloned(),
+        parent_call_id: ctx.parent_call_id.map(str::to_owned),
+        parent_cell_id: ctx.parent_cell_id.map(str::to_owned),
+        runtime_tool_call_id: ctx.runtime_tool_call_id.map(str::to_owned),
+        execution_id: ctx.execution_id.map(str::to_owned).or_else(|| {
+            active_tool_dispatch_timing().map(|timing| timing.execution_id().0.clone())
+        }),
+        command: exec_input.command.to_vec(),
+        cwd: exec_input.cwd.clone(),
+        parsed_cmd: exec_input.parsed_cmd.to_vec(),
+        source: exec_input.source,
+        interaction_input: exec_input.interaction_input.map(str::to_owned),
+        status: exec_result.status.into(),
+        stdout: Some(exec_result.stdout),
+        stderr: Some(exec_result.stderr),
+        aggregated_output: Some(exec_result.aggregated_output),
+        exit_code: exec_result.exit_code,
+        duration: Some(exec_result.duration),
+        formatted_output: Some(exec_result.formatted_output),
+    });
+    if let Some(record_append) = ctx.record_background_append {
+        ctx.session
+            .emit_background_command_completed(ctx.turn, item, record_append)
+            .await;
+    } else {
+        ctx.session.emit_turn_item_completed(ctx.turn, item).await;
+    }
     Ok(())
 }
 

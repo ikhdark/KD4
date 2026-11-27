@@ -976,6 +976,46 @@ impl ExecCommandHandler {
                 &cancellation_token,
             )
             .await;
+        let exec_result = match (super::nested_failure_return_bound(context.source.nested_deadline()), exec_result) {
+            (Some(bound), Err(UnifiedExecError::ProcessFailedWithOutput { mut output, .. })) => {
+                // Finite nested launches always register a watcher. In the
+                // failure path that watcher owns completion, the final process
+                // artifact and repository observation. Re-entering those owners
+                // here can strand bytes the manager has already acknowledged.
+                output.max_output_tokens = max_output_tokens;
+                output.truncation_policy = turn.model_info.truncation_policy.into();
+                output.quiet_on_success = quiet_on_success;
+                output.raw_output_artifact.get_or_insert(raw_output_artifact);
+                if let Some(notice) = repair_notice {
+                    output.repair_notice = Some(match output.repair_notice.take() {
+                        Some(receipt) => format!("{notice}\n{receipt}"),
+                        None => notice,
+                    });
+                }
+                attach_powershell_failure_advisory(&mut output, shell_type, is_powershell_script);
+                if !environment_is_remote && let Some(native_cwd) = native_cwd.as_ref() {
+                    let _ = super::bounded_failure_read(
+                        Some(bound),
+                        attach_missing_rg_path_advisory(&mut output, native_cwd.as_path(), &turn),
+                    )
+                    .await;
+                }
+                super::retain_nested_failure_output(&mut output, &session, &turn, &call_id, false);
+                record_nested_failure_cleanup_state(&session, process_id, output.process_id.is_some(), bound).await;
+                return Ok(boxed_tool_output(*output));
+            }
+            (Some(bound), Err(UnifiedExecError::ToolHistoryPersistence { message, output, .. })) => {
+                // The registered watcher already recorded the real exit. Do
+                // not substitute an attempt-key update or treat failure to
+                // publish it durably as an execution success.
+                record_nested_failure_cleanup_state(&session, process_id, false, bound).await;
+                return Err(FunctionCallError::Fatal(
+                    super::preserve_durability_failure_output(message, output, &session, &turn, Some(&call_id))
+                        .await,
+                ));
+            }
+            (_, result) => result,
+        };
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         session
             .services
@@ -1186,8 +1226,9 @@ impl ExecCommandHandler {
                     super::preserve_durability_failure_output(
                         message,
                         output,
-                        &turn.config.codex_home,
-                        &session.thread_id.to_string(),
+                        &session,
+                        &turn,
+                        None,
                     )
                     .await,
                 ))
@@ -1336,6 +1377,25 @@ impl CoreToolRuntime for ExecCommandHandler {
         result: &dyn crate::tools::context::ToolOutput,
     ) -> Option<PostToolUsePayload> {
         post_unified_exec_tool_use_payload(invocation, result)
+    }
+}
+
+async fn record_nested_failure_cleanup_state(
+    session: &crate::session::Session,
+    process_id: u32,
+    background_process_expected: bool,
+    bound: tokio::time::Instant,
+) {
+    if let Ok(running) = super::bounded_failure_read(
+        Some(bound),
+        session.services.command_execution.running_process(process_id),
+    )
+    .await
+    {
+        crate::tools::tool_dispatch_trace::record_exec_cleanup_state(
+            background_process_expected,
+            running.is_some(),
+        );
     }
 }
 

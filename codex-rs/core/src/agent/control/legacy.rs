@@ -56,23 +56,38 @@ impl AgentControl {
                 .send_op_to_instance(agent_id, &thread, Op::Shutdown {})
                 .await
         };
-        thread.wait_until_drained().await?;
+        if Self::is_v2_resident_thread(&thread) {
+            let retirement = thread.retire_stopped_generation().await?;
+            state
+                .remove_stopped_thread_if_same(agent_id, &thread, &retirement, || {
+                    self.state.release_spawned_thread(agent_id);
+                })
+                .await?;
+            if let crate::codex_thread::StoppedThreadRetirement::ConfirmedAfterLoopFailure(failure) =
+                retirement
+            {
+                // Safe to release the generation, but explicit shutdown still
+                // reports the loop failure to the caller.
+                return Err(CodexErr::Fatal(failure.to_string()));
+            }
+        } else {
+            thread.wait_until_drained().await?;
 
-        // Shutdown acknowledgement is bounded, but accepted terminal work can
-        // outlive it. Retain the registered worker until that owner drains too.
-        thread.codex.session.terminal_tasks.wait().await;
-        thread
-            .codex
-            .session
-            .wait_for_ordered_history_commits()
-            .await;
+            // Shutdown acknowledgement is bounded, but accepted terminal work can
+            // outlive it. Retain the registered worker until that owner drains too.
+            thread.codex.session.terminal_tasks.wait().await;
+            thread
+                .codex
+                .session
+                .wait_for_ordered_history_commits()
+                .await;
 
-        state
-            .remove_thread_if_same_with_cleanup(&agent_id, &thread, || {
-                self.forget_v2_residency(agent_id);
-                self.state.release_spawned_thread(agent_id);
-            })
-            .await;
+            state
+                .remove_thread_if_same_with_cleanup(&agent_id, &thread, || {
+                    self.state.release_spawned_thread(agent_id);
+                })
+                .await;
+        }
 
         match (flush_error, shutdown_result) {
             (None, result) => result,

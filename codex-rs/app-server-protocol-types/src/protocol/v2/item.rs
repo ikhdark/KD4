@@ -20,6 +20,7 @@ use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::CollabAgentToolCallStatus as CoreCollabAgentToolCallStatus;
 use codex_protocol::items::CommandExecutionStatus as CoreCommandExecutionStatus;
 use codex_protocol::items::DynamicToolCallStatus as CoreDynamicToolCallStatus;
+use codex_protocol::items::HistoricalAgentCompletion as CoreHistoricalAgentCompletion;
 use codex_protocol::items::McpToolCallStatus as CoreMcpToolCallStatus;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 
@@ -30,6 +31,8 @@ use codex_protocol::parse_command::ParsedCommand as CoreParsedCommand;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
+use codex_protocol::protocol::LegacyTaskCompletionGate as CoreLegacyTaskCompletionGate;
+use codex_protocol::protocol::LegacyTaskCompletionStatus as CoreLegacyTaskCompletionStatus;
 use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 use codex_protocol::protocol::ReviewDecision as CoreReviewDecision;
 use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
@@ -540,25 +543,34 @@ impl From<CoreTurnItem> for ThreadItem {
                     .duration
                     .and_then(|duration| i64::try_from(duration.as_millis()).ok()),
             },
-            CoreTurnItem::CollabAgentToolCall(call) => ThreadItem::CollabAgentToolCall {
-                id: call.id,
-                tool: call.tool.into(),
-                status: call.status.into(),
-                sender_thread_id: call.sender_thread_id.to_string(),
-                receiver_thread_ids: call
-                    .receiver_thread_ids
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-                prompt: call.prompt,
-                model: call.model,
-                reasoning_effort: call.reasoning_effort,
-                agents_states: call
-                    .agents_states
-                    .into_iter()
-                    .map(|(thread_id, status)| (thread_id.to_string(), status.into()))
-                    .collect(),
-            },
+            CoreTurnItem::CollabAgentToolCall(call) => {
+                let mut historical = call.historical_agent_completions.unwrap_or_default();
+                ThreadItem::CollabAgentToolCall {
+                    id: call.id,
+                    tool: call.tool.into(),
+                    status: call.status.into(),
+                    sender_thread_id: call.sender_thread_id.to_string(),
+                    receiver_thread_ids: call
+                        .receiver_thread_ids
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                    prompt: call.prompt,
+                    model: call.model,
+                    reasoning_effort: call.reasoning_effort,
+                    agents_states: call
+                        .agents_states
+                        .into_iter()
+                        .map(|(thread_id, status)| {
+                            let state = match historical.remove(&thread_id) {
+                                Some(completion) => completion.into(),
+                                None => status.into(),
+                            };
+                            (thread_id.to_string(), state)
+                        })
+                        .collect(),
+                }
+            }
             CoreTurnItem::SubAgentActivity(activity) => ThreadItem::SubAgentActivity {
                 id: activity.id,
                 kind: activity.kind.into(),
@@ -876,6 +888,10 @@ pub enum CollabAgentStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct CollabAgentState {
+    /// Recorded v1 gate result, independent of the execution lifecycle status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub completion: Option<HistoricalTaskCompletionGate>,
     /// Execution scheduling cause, independent of lifecycle and task acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -890,6 +906,60 @@ pub struct CollabAgentState {
     pub last_agent_message: Option<String>,
 }
 
+/// Disposition of the retired v1 task completion gate.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum HistoricalTaskCompletionStatus {
+    Passed,
+    Partial,
+    Blocked,
+}
+
+/// Historical diagnostics, not a live acceptance decision.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct HistoricalTaskCompletionGate {
+    pub status: HistoricalTaskCompletionStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub evidence_path: Option<String>,
+}
+
+impl From<CoreLegacyTaskCompletionGate> for HistoricalTaskCompletionGate {
+    fn from(value: CoreLegacyTaskCompletionGate) -> Self {
+        Self {
+            status: match value.status {
+                CoreLegacyTaskCompletionStatus::Passed => HistoricalTaskCompletionStatus::Passed,
+                CoreLegacyTaskCompletionStatus::Partial => HistoricalTaskCompletionStatus::Partial,
+                CoreLegacyTaskCompletionStatus::Blocked => HistoricalTaskCompletionStatus::Blocked,
+            },
+            reasons: value.reasons,
+            evidence_path: value.evidence_path,
+        }
+    }
+}
+
+impl From<CoreHistoricalAgentCompletion> for CollabAgentState {
+    fn from(value: CoreHistoricalAgentCompletion) -> Self {
+        Self {
+            completion: Some(value.completion.into()),
+            stop_cause: None,
+            status: if value.error.is_some() {
+                CollabAgentStatus::Errored
+            } else {
+                CollabAgentStatus::Completed
+            },
+            message: value.error.or_else(|| value.last_agent_message.clone()),
+            surfaced_result: value.surfaced_result,
+            last_agent_message: value.last_agent_message,
+        }
+    }
+}
+
 impl From<CoreAgentStatus> for CollabAgentState {
     fn from(value: CoreAgentStatus) -> Self {
         match value {
@@ -897,6 +967,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 last_agent_message,
                 stop_cause,
             } => Self {
+                completion: None,
                 stop_cause: Some(stop_cause),
                 status: CollabAgentStatus::Completed,
                 message: last_agent_message.clone(),
@@ -904,6 +975,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 last_agent_message,
             },
             CoreAgentStatus::PendingInit => Self {
+                completion: None,
                 stop_cause: None,
                 status: CollabAgentStatus::PendingInit,
                 message: None,
@@ -911,6 +983,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 last_agent_message: None,
             },
             CoreAgentStatus::Running => Self {
+                completion: None,
                 stop_cause: None,
                 status: CollabAgentStatus::Running,
                 message: None,
@@ -918,6 +991,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 last_agent_message: None,
             },
             CoreAgentStatus::Interrupted => Self {
+                completion: None,
                 stop_cause: None,
                 status: CollabAgentStatus::Interrupted,
                 message: None,
@@ -930,6 +1004,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                     status: CollabAgentStatus::Completed,
                     message,
                     surfaced_result: None,
+                    completion: None,
                     stop_cause: None,
                     last_agent_message,
                 }
@@ -943,11 +1018,13 @@ impl From<CoreAgentStatus> for CollabAgentState {
                     status: CollabAgentStatus::Completed,
                     message,
                     surfaced_result: Some(surfaced_result),
+                    completion: None,
                     stop_cause: None,
                     last_agent_message,
                 }
             }
             CoreAgentStatus::Errored(message) => Self {
+                completion: None,
                 stop_cause: None,
                 status: CollabAgentStatus::Errored,
                 message: Some(message),
@@ -955,6 +1032,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 last_agent_message: None,
             },
             CoreAgentStatus::Shutdown => Self {
+                completion: None,
                 stop_cause: None,
                 status: CollabAgentStatus::Shutdown,
                 message: None,
@@ -962,6 +1040,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 last_agent_message: None,
             },
             CoreAgentStatus::NotFound => Self {
+                completion: None,
                 stop_cause: None,
                 status: CollabAgentStatus::NotFound,
                 message: None,

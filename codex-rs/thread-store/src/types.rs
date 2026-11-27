@@ -546,11 +546,51 @@ impl GitInfoPatch {
     }
 }
 
+/// Source of a present field in a thread Git metadata patch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadGitInfoOrigin {
+    /// Explicit caller request, including intentional field clears.
+    #[default]
+    Explicit,
+    /// Git facts captured at creation or in a newly accepted live append.
+    LiveObservation,
+    /// Historical Git facts that can fill missing metadata, not replace a known value.
+    HistoricalFill,
+}
+
+/// Origins are tracked separately because a coalesced patch can mix live and historical facts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThreadGitInfoOrigins {
+    /// Source of the commit SHA patch, if present.
+    pub sha: ThreadGitInfoOrigin,
+    /// Source of the branch patch, if present.
+    pub branch: ThreadGitInfoOrigin,
+    /// Source of the origin URL patch, if present.
+    pub origin_url: ThreadGitInfoOrigin,
+}
+
+impl ThreadGitInfoOrigins {
+    /// Use the same source for each present Git field.
+    pub const fn all(origin: ThreadGitInfoOrigin) -> Self {
+        Self {
+            sha: origin,
+            branch: origin,
+            origin_url: origin,
+        }
+    }
+
+    fn is_explicit(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Patch for thread metadata.
 ///
-/// Every field is literal: `None` leaves that field unchanged, while `Some`
-/// applies the supplied value. Fields whose value may itself be cleared use an
-/// inner `Option`, where `Some(None)` clears the field.
+/// `None` leaves a field unchanged; fields whose value may itself be cleared
+/// use an inner `Option`, where `Some(None)` clears the field. Git fields
+/// additionally carry their update authority in [`Self::git_info_origin`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ThreadMetadataPatch {
     /// Replacement user-facing thread name.
@@ -627,6 +667,9 @@ pub struct ThreadMetadataPatch {
     pub first_user_message: Option<String>,
     /// Git metadata patch.
     pub git_info: Option<GitInfoPatch>,
+    /// Origins of the present Git fields. Older callers default to explicit requests.
+    #[serde(default, skip_serializing_if = "ThreadGitInfoOrigins::is_explicit")]
+    pub git_info_origin: ThreadGitInfoOrigins,
     /// Initial project assignment supplied with thread creation.
     #[serde(
         default,
@@ -640,8 +683,9 @@ impl ThreadMetadataPatch {
     /// Merges another patch into this one using field-presence semantics.
     ///
     /// Omitted fields in `next` leave the current patch unchanged. Present fields replace the
-    /// current value, including clear requests like `Some(None)`. Nested patches use the same
-    /// semantics. Recency advances compose by maximum so coalescing cannot lose an advance.
+    /// current value, including clear requests like `Some(None)`. Git fields carry the origin
+    /// of the retained value, and a historical fill cannot displace a live or explicit fact.
+    /// Recency advances compose by maximum so coalescing cannot lose an advance.
     pub fn merge(&mut self, next: Self) {
         if next.name.is_some() {
             self.name = next.name;
@@ -710,13 +754,49 @@ impl ThreadMetadataPatch {
             self.first_user_message = next.first_user_message;
         }
         if let Some(git_info) = next.git_info {
-            self.git_info
-                .get_or_insert_with(GitInfoPatch::default)
-                .merge(git_info);
+            self.merge_git_info(git_info, next.git_info_origin);
         }
         if next.project_id.is_some() {
             self.project_id = next.project_id;
         }
+    }
+
+    pub(crate) fn merge_git_info(&mut self, next: GitInfoPatch, origins: ThreadGitInfoOrigins) {
+        fn merge_field(
+            current: &mut ClearableField<String>,
+            current_origin: &mut ThreadGitInfoOrigin,
+            next: ClearableField<String>,
+            next_origin: ThreadGitInfoOrigin,
+        ) {
+            if next.is_some()
+                && (next_origin != ThreadGitInfoOrigin::HistoricalFill
+                    || current.is_none()
+                    || *current_origin == ThreadGitInfoOrigin::HistoricalFill)
+            {
+                *current = next;
+                *current_origin = next_origin;
+            }
+        }
+
+        let current = self.git_info.get_or_insert_with(GitInfoPatch::default);
+        merge_field(
+            &mut current.sha,
+            &mut self.git_info_origin.sha,
+            next.sha,
+            origins.sha,
+        );
+        merge_field(
+            &mut current.branch,
+            &mut self.git_info_origin.branch,
+            next.branch,
+            origins.branch,
+        );
+        merge_field(
+            &mut current.origin_url,
+            &mut self.git_info_origin.origin_url,
+            next.origin_url,
+            origins.origin_url,
+        );
     }
 
     pub fn is_empty(&self) -> bool {

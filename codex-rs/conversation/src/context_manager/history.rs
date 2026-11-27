@@ -1231,10 +1231,12 @@ impl ContextManager {
 
     pub fn reserved_tool_call_ids(&self) -> std::collections::HashSet<String> {
         let mut ids = self.tool_history.reserved_call_ids();
+        // Historical shell calls can own their item ID even without a result.
+        // Reserve that key before routing a new call with a reused provider ID.
         ids.extend(
             self.items
                 .iter()
-                .filter_map(crate::tool_occurrence::identity)
+                .filter_map(crate::tool_occurrence::history_identity)
                 .map(|(_, _, id)| id.to_string()),
         );
         ids

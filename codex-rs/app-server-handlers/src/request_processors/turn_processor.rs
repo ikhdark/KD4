@@ -1745,45 +1745,59 @@ impl TurnRequestProcessor {
         let (thread_uuid, thread) = self.load_thread(&thread_id).await?;
 
         if is_startup_interrupt {
-            let observation = codex_protocol::timing::observations::Span::start(
-                "cancel_startup", &thread_id, "", &request_id.request_id.to_string(),
-                serde_json::json!({"connection_id":request_id.connection_id.0,
-                    "boundary":"startup_installation_fence_not_unbounded_cleanup"}));
-            let active_turn = {
-                let state = self.thread_state_manager.thread_state(thread_uuid).await;
-                state.lock().await.in_progress_turn_id().map(str::to_owned)
-            };
-            let pending_turn = self.thread_state_manager.cancel_pending_turn_starts(thread_uuid).await;
-            let target = pending_turn.or(active_turn);
-            if let Some(target) = target.as_deref() {
-                // Co-record revocation before reporting Stop. Recovery must not
-                // resurrect accepted initial input from this cancelled start.
-                thread.cancel_start_input_receipts(target).await.map_err(|error| {
-                    internal_error(format!("failed to persist startup cancellation: {error}"))
-                })?;
-            }
-            // Wait only for the installation fence, not for unbounded cleanup.
-            // Older preparations carry the revoked token even if not yet in core.
-            thread.wait_for_startup_cancellation().await.map_err(|error| {
-                internal_error(format!("failed to fence startup interrupt: {error}"))
-            })?;
-            if let Some(target) = target {
-                let interrupted = thread.interrupt_turn_if_active(&target).await.map_err(|error| {
-                    internal_error(format!("failed to interrupt startup turn: {error}"))
-                })?;
-                if !interrupted && thread.active_turn_id().await.is_none() {
-                    thread
-                        .interrupt_agents_left_running_by_failed_turn(Some(&target))
-                        .await;
-                }
-            } else {
-                // No turn to stop: Stop still reaches agents that a turn which
-                // ended on an error left running.
-                thread.interrupt_agents_left_running_by_failed_turn(None).await;
-            }
-            queue.pause_with_result(thread_uuid).await?;
-            observation.finish("fenced_and_queue_paused", serde_json::Value::Null);
-            return Ok(Some(TurnInterruptResponse {}));
+            let thread_state_manager = self.thread_state_manager.clone();
+            let request_id = request_id.clone();
+            let queue = queue.clone();
+            // Own revocation and queue settlement together. Disconnect can
+            // drop the ACK waiter, but must not interrupt an accepted Stop.
+            return self
+                .background_tasks
+                .spawn(
+                    async move {
+                        let observation = codex_protocol::timing::observations::Span::start(
+                            "cancel_startup", &thread_id, "", &request_id.request_id.to_string(),
+                            serde_json::json!({"connection_id":request_id.connection_id.0,
+                                "boundary":"startup_installation_fence_not_unbounded_cleanup"}));
+                        let active_turn = {
+                            let state = thread_state_manager.thread_state(thread_uuid).await;
+                            state.lock().await.in_progress_turn_id().map(str::to_owned)
+                        };
+                        let pending_turn = thread_state_manager.cancel_pending_turn_starts(thread_uuid).await;
+                        let target = pending_turn.or(active_turn);
+                        if let Some(target) = target.as_deref() {
+                            // Co-record revocation before reporting Stop. Recovery must not
+                            // resurrect accepted initial input from this cancelled start.
+                            thread.cancel_start_input_receipts(target).await.map_err(|error| {
+                                internal_error(format!("failed to persist startup cancellation: {error}"))
+                            })?;
+                        }
+                        // Wait only for the installation fence, not for unbounded cleanup.
+                        // Older preparations carry the revoked token even if not yet in core.
+                        thread.wait_for_startup_cancellation().await.map_err(|error| {
+                            internal_error(format!("failed to fence startup interrupt: {error}"))
+                        })?;
+                        if let Some(target) = target {
+                            let interrupted = thread.interrupt_turn_if_active(&target).await.map_err(|error| {
+                                internal_error(format!("failed to interrupt startup turn: {error}"))
+                            })?;
+                            if !interrupted && thread.active_turn_id().await.is_none() {
+                                thread
+                                    .interrupt_agents_left_running_by_failed_turn(Some(&target))
+                                    .await;
+                            }
+                        } else {
+                            // No turn to stop: Stop still reaches agents that a turn which
+                            // ended on an error left running.
+                            thread.interrupt_agents_left_running_by_failed_turn(None).await;
+                        }
+                        queue.pause_with_result(thread_uuid).await?;
+                        observation.finish("fenced_and_queue_paused", serde_json::Value::Null);
+                        Ok(Some(TurnInterruptResponse {}))
+                    }
+                    .in_current_span(),
+                )
+                .await
+                .map_err(|error| internal_error(format!("startup interrupt task failed: {error}")))?;
         }
 
         // Record active-turn interrupts so we can reply when the terminal event arrives.
@@ -2127,6 +2141,10 @@ async fn consume_bug_classification_stream(
             }
         };
         match event {
+            ResponseEvent::Created => {
+                // Provider acknowledgement proves dispatch, not completion.
+                receipt.dispatched = Some(true);
+            }
             ResponseEvent::OutputItemDone(item) => {
                 receipt.dispatched = Some(true);
                 if matches!(item, ResponseItem::Reasoning { .. }) {
@@ -2151,6 +2169,11 @@ async fn consume_bug_classification_stream(
                 receipt.terminal_observed = true;
                 completed = true;
                 break;
+            }
+            progress if progress.advances_model_response() => {
+                // Fresh streams can report output before a Created event. This
+                // establishes dispatch without counting a completed item.
+                receipt.dispatched = Some(true);
             }
             _ => {}
         }

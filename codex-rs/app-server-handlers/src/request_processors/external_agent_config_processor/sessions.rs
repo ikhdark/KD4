@@ -128,12 +128,28 @@ use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::{MultiAgentVersion, ThreadHistoryMode};
-use codex_rollout::{StateDbHandle, is_persisted_rollout_item};
-use codex_thread_store::{AppendThreadItemsParams, CreateThreadParams, DeleteThreadParams, ThreadMetadataPatch, ThreadPersistenceMetadata, ThreadStore, ThreadStoreError, UpdateThreadMetadataParams};
+use codex_rollout::is_persisted_rollout_item;
+use codex_thread_store::{AppendThreadItemsParams, CreateThreadParams, LocalThreadStore, ThreadMetadataPatch, ThreadPersistenceMetadata, ThreadStore, ThreadStoreError, UpdateThreadMetadataParams};
 
 impl ExternalAgentConfigRequestProcessor {
+    pub(super) fn durable_session_import_store(&self) -> Option<&LocalThreadStore> {
+        self.thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+            .filter(|store| store.supports_durable_session_import())
+    }
+
     pub(super) async fn import_session_item(&self, item: ExternalAgentConfigMigrationItem) -> ExternalAgentConfigImportTypeResult {
         let mut result = ExternalAgentConfigImportTypeResult { item_type: item.item_type, successes: Vec::new(), failures: Vec::new() };
+        let Some(thread_store) = self.durable_session_import_store() else {
+            result.failures.push(failure(
+                &item,
+                "session_prepare",
+                "the selected thread store does not support durable external session imports".to_string(),
+                None,
+            ));
+            return result;
+        };
         let cancellation = self.shutdown.child_token();
         let _permit = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -209,9 +225,21 @@ impl ExternalAgentConfigRequestProcessor {
                 },
             };
             let persisted = if pending.recovery_required {
-                self.persist_or_recover_session(pending.imported_thread_id, pending.session).await
+                self.persist_or_recover_session(
+                    thread_store,
+                    pending.imported_thread_id,
+                    &pending.source_content_sha256,
+                    pending.session,
+                )
+                .await
             } else {
-                self.persist_session(pending.imported_thread_id, pending.session).await
+                self.persist_session(
+                    thread_store,
+                    pending.imported_thread_id,
+                    &pending.source_content_sha256,
+                    pending.session,
+                )
+                .await
             };
             let persisted = match persisted {
                 Ok(persisted) => persisted,
@@ -258,41 +286,41 @@ impl ExternalAgentConfigRequestProcessor {
 
     async fn persist_or_recover_session(
         &self,
+        thread_store: &LocalThreadStore,
         thread_id: ThreadId,
+        content_sha256: &str,
         session: ImportedExternalAgentSession,
     ) -> Result<PersistedSession, String> {
-        match self.thread_store.read_thread(codex_thread_store::ReadThreadParams {
+        match thread_store.read_thread(codex_thread_store::ReadThreadParams {
             thread_id,
             include_archived: true,
             include_history: true,
         }).await {
-            Err(ThreadStoreError::ThreadNotFound { .. }) => self.persist_session(thread_id, session).await,
+            Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                match thread_store.reserved_import_thread_is_absent(thread_id).await {
+                    Ok(true) => {
+                        self.persist_session(thread_store, thread_id, content_sha256, session)
+                            .await
+                    }
+                    Ok(false) => Err(format!("reserved import thread {thread_id} was not readable but has existing storage; it was preserved and no replacement was created")),
+                    Err(err) => Err(format!("failed to establish absence of reserved import thread {thread_id}: {err}; no replacement was created")),
+                }
+            },
             Err(err) => Err(format!("failed to inspect reserved import thread {thread_id}: {err}; no replacement was created")),
             Ok(thread) => {
                 let history = thread.history.ok_or_else(|| format!("reserved import thread {thread_id} has no readable history; it was preserved"))?;
-                let expected = session.rollout_items.iter().filter(|item| is_persisted_rollout_item(item, ThreadHistoryMode::Legacy)).collect::<Vec<_>>();
-                // The recorder emits SessionMeta before the staged import batch.
-                // Later user appends and metadata edits are deliberately permitted.
-                let actual = match history.items.as_slice() {
-                    [RolloutItem::SessionMeta(_), items @ ..] => items,
-                    items => items,
-                };
-                let conflict = || format!("reserved import thread {thread_id} is incomplete or its imported history changed; it was preserved and no duplicate was created");
-                if expected.is_empty() || actual.len() < expected.len() {
-                    return Err(conflict());
-                }
-                for (actual, expected) in actual.iter().zip(expected) {
-                    // RolloutItem intentionally has no PartialEq contract.
-                    let actual = serde_json::to_value(actual).map_err(|err| format!("failed to inspect reserved import thread {thread_id}: {err}"))?;
-                    let expected = serde_json::to_value(expected).map_err(|err| format!("failed to inspect imported history: {err}"))?;
-                    if actual != expected {
-                        return Err(conflict());
-                    }
-                }
+                ensure_session_recovery_proof(
+                    thread_store,
+                    thread_id,
+                    content_sha256,
+                    &session.rollout_items,
+                    &history.items,
+                )
+                .await?;
                 // A crash can precede the original durability barrier. Reopen via
                 // the existing exclusive writer lease, sync, then release only the
                 // writer acquired here. Never delete or replace recovered data.
-                self.thread_store.resume_thread(codex_thread_store::ResumeThreadParams {
+                thread_store.resume_thread(codex_thread_store::ResumeThreadParams {
                     thread_id,
                     rollout_path: thread.rollout_path,
                     history: Some(std::sync::Arc::new(history.items)),
@@ -302,8 +330,34 @@ impl ExternalAgentConfigRequestProcessor {
                         model_provider: thread.model_provider,
                     },
                 }).await.map_err(|err| format!("failed to acquire reserved import thread {thread_id} for durability: {err}; it was preserved"))?;
-                let durable = self.thread_store.flush_thread_durable(thread_id).await;
-                let released = self.thread_store.discard_thread(thread_id).await;
+                // The earlier inspection was not under the writer lease. Recheck
+                // the exact opened rollout before certifying it, for example if
+                // another owner truncated history before we acquired the writer.
+                let rechecked = async {
+                    let current = ThreadStore::load_history(
+                        thread_store,
+                        codex_thread_store::LoadThreadHistoryParams {
+                            thread_id,
+                            include_archived: true,
+                        },
+                    )
+                    .await
+                    .map_err(|err| format!("failed to recheck reserved import thread {thread_id}: {err}"))?;
+                    ensure_session_recovery_proof(
+                        thread_store,
+                        thread_id,
+                        content_sha256,
+                        &session.rollout_items,
+                        &current.items,
+                    )
+                    .await
+                }
+                .await;
+                if let Err(err) = rechecked {
+                    return Err(preserve_failed_import(thread_store, thread_id, err).await);
+                }
+                let durable = thread_store.flush_thread_durable(thread_id).await;
+                let released = thread_store.discard_thread(thread_id).await;
                 if let Err(err) = durable {
                     return Err(format!("failed to sync reserved import thread {thread_id}: {err}; writer release: {released:?}; it was preserved"));
                 }
@@ -315,7 +369,9 @@ impl ExternalAgentConfigRequestProcessor {
 
     async fn persist_session(
         &self,
+        thread_store: &LocalThreadStore,
         thread_id: ThreadId,
+        content_sha256: &str,
         session: ImportedExternalAgentSession,
     ) -> Result<PersistedSession, String> {
         let ImportedExternalAgentSession {
@@ -396,58 +452,67 @@ impl ExternalAgentConfigRequestProcessor {
             ..Default::default()
         };
 
-        self.thread_store
+        thread_store
             .create_thread(create_params)
             .await
             .map_err(|err| format!("failed to import session: {err}"))?;
         if !rollout_items.is_empty()
-            && let Err(err) = self
-                .thread_store
+            && let Err(err) = thread_store
                 .append_items(AppendThreadItemsParams {
                     thread_id,
                     items: rollout_items,
                 })
                 .await
         {
-            return Err(self
-                .rollback_failure(thread_id, format!("failed to import session: {err}"))
-                .await);
+            let failure = format!("failed to import session: {err}");
+            return Err(match thread_store.rollback_created_thread(thread_id).await {
+                Ok(()) => failure,
+                Err(cleanup_error) => format!(
+                    "{failure}; failed to roll back imported session: failed to roll back local imported session: {cleanup_error}"
+                ),
+            });
         }
 
-        if let Err(err) = self
-            .thread_store
-            .update_thread_metadata(UpdateThreadMetadataParams {
-                thread_id,
-                patch: metadata,
-                include_archived: false,
-            })
+        // A metadata commit error may leave a durable receipt. From this point
+        // forward, release the live writer on failure but do not roll back.
+        if let Err(err) = thread_store
+            .commit_imported_session_metadata(
+                UpdateThreadMetadataParams {
+                    thread_id,
+                    patch: metadata,
+                    include_archived: false,
+                },
+                content_sha256,
+            )
             .await
         {
-            return Err(self
-                .rollback_failure(
-                    thread_id,
-                    format!("failed to update imported session: {err}"),
-                )
-                .await);
+            return Err(preserve_failed_import(
+                thread_store,
+                thread_id,
+                format!("failed to update imported session {thread_id}: {err}"),
+            )
+            .await);
         }
-        if let Err(err) = self.thread_store.persist_thread(thread_id).await {
-            return Err(self
-                .rollback_failure(
-                    thread_id,
-                    format!("failed to persist imported session: {err}"),
-                )
-                .await);
+        if let Err(err) = thread_store.persist_thread(thread_id).await {
+            return Err(preserve_failed_import(
+                thread_store,
+                thread_id,
+                format!("failed to persist imported session {thread_id}: {err}"),
+            )
+            .await);
         }
-        if let Err(err) = self.thread_store.flush_thread_durable(thread_id).await {
-            let released = self.thread_store.discard_thread(thread_id).await;
-            return Err(format!(
-                "failed to durably persist imported session {thread_id}: {err}; writer release: {released:?}; the reserved thread was preserved for retry"
-            ));
+        if let Err(err) = thread_store.flush_thread_durable(thread_id).await {
+            return Err(preserve_failed_import(
+                thread_store,
+                thread_id,
+                format!("failed to durably persist imported session {thread_id}: {err}"),
+            )
+            .await);
         }
-        let shutdown_warning = match self.thread_store.shutdown_thread(thread_id).await {
+        let shutdown_warning = match thread_store.shutdown_thread(thread_id).await {
             Ok(()) => None,
             Err(err) => {
-                let discard_error = match self.thread_store.discard_thread(thread_id).await {
+                let discard_error = match thread_store.discard_thread(thread_id).await {
                     Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => None,
                     Err(discard_error) => Some(discard_error),
                 };
@@ -464,69 +529,58 @@ impl ExternalAgentConfigRequestProcessor {
             shutdown_warning,
         })
     }
-
-    async fn rollback_failure(&self, thread_id: ThreadId, failure: String) -> String {
-        match self.rollback_session(thread_id).await {
-            Ok(()) => failure,
-            Err(cleanup_error) => {
-                format!("{failure}; failed to roll back imported session: {cleanup_error}")
-            }
-        }
-    }
-
-    async fn rollback_session(&self, thread_id: ThreadId) -> Result<(), String> {
-        rollback_imported_session(
-            self.thread_store.as_ref(),
-            self.state_db.as_ref(),
-            thread_id,
-        )
-        .await
-    }
 }
 
-async fn rollback_imported_session(
-    thread_store: &dyn ThreadStore,
-    state_db: Option<&StateDbHandle>,
+async fn ensure_session_recovery_proof(
+    thread_store: &LocalThreadStore,
     thread_id: ThreadId,
+    content_sha256: &str,
+    expected: &[RolloutItem],
+    actual: &[RolloutItem],
 ) -> Result<(), String> {
-    if let Some(local_store) = thread_store
-        .as_any()
-        .downcast_ref::<codex_thread_store::LocalThreadStore>()
-    {
-        // MessageProcessor constructs the local store and importer with the same state DB.
-        // Keep staged files and that DB's commit under the existing cancellation-safe owner.
-        return local_store
-            .rollback_created_thread(thread_id)
-            .await
-            .map_err(|err| format!("failed to roll back local imported session: {err}"));
+    let expected = expected
+        .iter()
+        .filter(|item| is_persisted_rollout_item(item, ThreadHistoryMode::Legacy))
+        .collect::<Vec<_>>();
+    // The recorder emits SessionMeta before the imported batch. Later
+    // user appends and metadata edits are deliberately permitted.
+    let actual = match actual {
+        [RolloutItem::SessionMeta(_), items @ ..] => items,
+        items => items,
+    };
+    let conflict = || format!("reserved import thread {thread_id} is incomplete or its imported history changed; it was preserved and no duplicate was created");
+    if expected.is_empty() || actual.len() < expected.len() {
+        return Err(conflict());
     }
-    let discard_result = thread_store.discard_thread(thread_id).await;
-    match thread_store
-        .delete_thread(DeleteThreadParams { thread_id })
-        .await
-    {
-        Ok(()) => {}
-        Err(ThreadStoreError::ThreadNotFound { .. }) => match discard_result {
-            Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
-            Err(err) => return Err(format!("failed to discard live writer: {err}")),
-        },
-        Err(delete_error) => {
-            return match discard_result {
-                Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {
-                    Err(format!("failed to delete durable thread: {delete_error}"))
-                }
-                Err(discard_error) => Err(format!(
-                    "failed to discard live writer: {discard_error}; failed to delete durable thread: {delete_error}"
-                )),
-            };
+    for (actual, expected) in actual.iter().zip(expected) {
+        // RolloutItem intentionally has no PartialEq contract.
+        let actual = serde_json::to_value(actual)
+            .map_err(|err| format!("failed to inspect reserved import thread {thread_id}: {err}"))?;
+        let expected = serde_json::to_value(expected)
+            .map_err(|err| format!("failed to inspect imported history: {err}"))?;
+        if actual != expected {
+            return Err(conflict());
         }
     }
-    if let Some(state_db) = state_db {
-        state_db.delete_thread(thread_id).await.map_err(|err| {
-            format!("failed to delete imported thread state for {thread_id}: {err}")
-        })?;
+    // Matching history does not prove the metadata committed. Never
+    // replay the original patch for a recovered thread.
+    let has_receipt = thread_store
+        .has_imported_session_metadata_receipt(thread_id, content_sha256)
+        .await
+        .map_err(|err| format!("failed to inspect the import metadata receipt for reserved thread {thread_id}: {err}; it was preserved"))?;
+    if !has_receipt {
+        return Err(format!("session import conflict: reserved thread {thread_id} has matching history but no durable import metadata receipt; it was preserved and no duplicate was created"));
     }
     Ok(())
+}
+
+async fn preserve_failed_import(
+    thread_store: &LocalThreadStore,
+    thread_id: ThreadId,
+    failure: String,
+) -> String {
+    let released = thread_store.discard_thread(thread_id).await;
+    format!("{failure}; writer release: {released:?}; the reserved thread was preserved for retry")
 }
 
 struct PersistedSession {

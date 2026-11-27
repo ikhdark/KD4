@@ -350,9 +350,13 @@ pub(crate) fn run_git_output_with_input(
         control.check()?;
         check_git_output_limits(&stdout, &stderr, stdout_limit)?;
         if let Some(status) = child.child.try_wait()? {
+            control.check()?;
             break status;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        let remaining = control.deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            std::thread::sleep(Duration::from_millis(5).min(remaining));
+        }
     };
     read_git_output(stdout, stderr, status, stdout_limit)
 }
@@ -371,8 +375,12 @@ impl Drop for SyncGitChild {
             let _ = self.child.kill();
             // Bound the cleanup observer too; the Job retains kill-on-close.
             let deadline = Instant::now() + Duration::from_secs(5);
-            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
+            while Instant::now() < deadline && self.child.try_wait().ok().flatten().is_none() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
             }
         }
     }

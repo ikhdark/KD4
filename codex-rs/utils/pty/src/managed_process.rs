@@ -28,6 +28,7 @@ pub const WINDOWS_PROCESS_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const WINDOWS_CREATE_SUSPENDED: u32 = winapi::um::winbase::CREATE_SUSPENDED;
 
 static MANAGED_ROOT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MANAGED_ROOT_RELEASED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static NEXT_MANAGED_ROOT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_RECLAIMER_ID: AtomicU64 = AtomicU64::new(1);
 static ADMISSION_RECLAIMERS: OnceLock<Mutex<Vec<(u64, AdmissionReclaimer)>>> = OnceLock::new();
@@ -213,6 +214,9 @@ impl Drop for AdmissionReservation {
             observer.record("released", Some(self.id), None, false)
         });
         drop(observer);
+        if remaining == MANAGED_ROOT_LIMIT - 1 {
+            MANAGED_ROOT_RELEASED.notify_waiters();
+        }
         if let Some(observation) = observation {
             observation.emit();
         }
@@ -245,6 +249,8 @@ impl Drop for ManagedRootAdmissionReclaimerGuard {
     }
 }
 
+/// The eviction hook can be dropped when a native slot opens or the reclaim
+/// deadline expires. An eviction already handed off must have its own owner.
 pub fn install_managed_root_admission_reclaimer(
     retire_zero_lease_mcp_generations: ManagedRootReclaimHook,
     evict_one_eligible_task: ManagedRootReclaimHook,
@@ -307,6 +313,17 @@ fn reclaimable_reservation(
     }
 }
 
+async fn wait_for_managed_root_capacity() {
+    loop {
+        let released = MANAGED_ROOT_RELEASED.notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        if MANAGED_ROOT_COUNT.load(Ordering::Acquire) < MANAGED_ROOT_LIMIT {
+            return;
+        }
+        released.await;
+    }
+}
 
 impl ManagedRootProcess {
     /// True only for the admission cap refusal before a new root is spawned.
@@ -408,9 +425,25 @@ impl ManagedRootProcess {
                 return Ok(root);
             }
             for reclaimer in reclaimers {
-                (reclaimer.evict_one_eligible_task)().await;
-                if let Some(root) = reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)? {
-                    return Ok(root);
+                let eviction = (reclaimer.evict_one_eligible_task)();
+                tokio::pin!(eviction);
+                loop {
+                    // Durable retirement can keep waiting after actual native cleanup.
+                    // Keep polling the same eviction if another launch takes the slot.
+                    let eviction_finished = tokio::select! {
+                        biased;
+                        () = wait_for_managed_root_capacity() => false,
+                        () = &mut eviction => true,
+                    };
+                    if let Some(root) =
+                        reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)?
+                    {
+                        return Ok(root);
+                    }
+                    if eviction_finished {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
             }
 

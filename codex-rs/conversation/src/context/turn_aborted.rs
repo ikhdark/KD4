@@ -1,5 +1,6 @@
 use super::ContextualUserFragment;
-use codex_protocol::models::{ContentItem, ResponseItem};
+use codex_protocol::models::{ContentItem, ResponseItem, SearchToolCallParams};
+use codex_tools::TOOL_SEARCH_TOOL_NAME;
 
 pub fn append_retained_work(notice: &mut String, checkpoint: Option<&str>, plan: Option<&str>) {
     if let Some(checkpoint) = checkpoint {
@@ -39,19 +40,40 @@ impl TurnAborted {
         let paired = crate::tool_occurrence::pairs(history);
         let mut calls = Vec::new();
         for (index, item) in history.iter().enumerate().rev() {
-            match item {
+            let result = paired[index];
+            let (call_id, name, recorded_result) = match item {
                 ResponseItem::FunctionCall { call_id, name, .. }
                 | ResponseItem::CustomToolCall { call_id, name, .. } => {
-                    calls.push(serde_json::json!({
-                        "call_id": codex_utils_string::truncate_middle_chars(call_id, 160),
-                        "tool": codex_utils_string::truncate_middle_chars(name, 80),
-                        "recorded_result": paired[index].is_some(),
-                    }));
-                    if calls.len() == 32 {
-                        break;
-                    }
+                    (call_id.as_str(), name.as_str(), result.is_some())
                 }
-                _ => {}
+                // Match router admission: malformed searches are recorded but not dispatched.
+                ResponseItem::ToolSearchCall {
+                    call_id: Some(call_id),
+                    execution,
+                    arguments,
+                    ..
+                } if execution == "client"
+                    && <SearchToolCallParams as serde::Deserialize>::deserialize(arguments)
+                        .is_ok() =>
+                {
+                    let recorded_result = result.is_some_and(|output| {
+                        matches!(
+                            &history[output],
+                            ResponseItem::ToolSearchOutput { execution, .. }
+                                if execution == "client"
+                        )
+                    });
+                    (call_id.as_str(), TOOL_SEARCH_TOOL_NAME, recorded_result)
+                }
+                _ => continue,
+            };
+            calls.push(serde_json::json!({
+                "call_id": codex_utils_string::truncate_middle_chars(call_id, 160),
+                "tool": codex_utils_string::truncate_middle_chars(name, 80),
+                "recorded_result": recorded_result,
+            }));
+            if calls.len() == 32 {
+                break;
             }
         }
         if !calls.is_empty() {

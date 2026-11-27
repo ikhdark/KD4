@@ -53,6 +53,26 @@ struct FsWatchState {
     next_reservation_id: u64,
 }
 
+impl FsWatchState {
+    fn remove_pending_reservation(&mut self, key: &WatchKey, id: u64) {
+        if matches!(
+            self.entries.get(key),
+            Some(WatchEntry::Pending { reservation_id, .. }) if *reservation_id == id
+        ) {
+            self.entries.remove(key);
+        }
+    }
+
+    fn remove_cancelled_pending(&mut self) {
+        self.entries.retain(|_, entry| {
+            !matches!(
+                entry,
+                WatchEntry::Pending { cancellation, .. } if cancellation.is_cancelled()
+            )
+        });
+    }
+}
+
 enum WatchEntry {
     Pending { reservation_id: u64, cancellation: CancellationToken },
     Active(ActiveWatchEntry),
@@ -92,6 +112,7 @@ impl Drop for NativeWatchHandles {
 
 struct PendingReservation {
     manager: FsWatchManager,
+    cancellation: CancellationToken,
     key: WatchKey,
     id: u64,
     armed: bool,
@@ -102,11 +123,13 @@ impl Drop for PendingReservation {
         if !self.armed {
             return;
         }
-        let manager = self.manager.clone();
-        let key = self.key.clone();
-        let id = self.id;
-        // This also covers cancellation while blocking setup is still running.
-        drop(tokio::spawn(async move { manager.remove_pending_reservation(&key, id).await; }));
+        // Publish cancellation synchronously, even if the owning runtime is
+        // stopping. The next admission removes abandoned pending entries
+        // before counting capacity or rejecting a reused key.
+        self.cancellation.cancel();
+        if let Ok(mut state) = self.manager.state.try_lock() {
+            state.remove_pending_reservation(&self.key, self.id);
+        }
     }
 }
 
@@ -169,6 +192,7 @@ impl FsWatchManager {
         let cancellation = rpc_gate.cancellation_token().child_token();
         let reservation_id = {
             let mut state = self.state.lock().await;
+            state.remove_cancelled_pending();
             let reservation_id = state.next_reservation_id;
             let reservation = rpc_gate.try_commit(|| {
                 let limit = if state.entries.len() >= FS_WATCHES_PER_SERVER {
@@ -217,6 +241,7 @@ impl FsWatchManager {
 
         let mut reservation = PendingReservation {
             manager: self.clone(),
+            cancellation: cancellation.clone(),
             key: watch_key.clone(),
             id: reservation_id,
             armed: true,
@@ -413,15 +438,10 @@ impl FsWatchManager {
     }
 
     async fn remove_pending_reservation(&self, watch_key: &WatchKey, reservation_id: u64) {
-        let mut state = self.state.lock().await;
-        if matches!(
-            state.entries.get(watch_key),
-            Some(WatchEntry::Pending {
-                reservation_id: current, ..
-            }) if *current == reservation_id
-        ) {
-            state.entries.remove(watch_key);
-        }
+        self.state
+            .lock()
+            .await
+            .remove_pending_reservation(watch_key, reservation_id);
     }
 
 

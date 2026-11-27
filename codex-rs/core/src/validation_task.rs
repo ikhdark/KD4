@@ -376,7 +376,9 @@ pub(crate) async fn policy_attempt_not_started(ctx: &ToolCtx) {
 async fn persist_policy_checkpoint(session: &Session, turn: &std::sync::Arc<TurnContext>) -> Result<(), String> {
     session.services.agent_control.persist_root_validation_checkpoint(turn).await?;
     let item = turn.to_turn_context_item_async().await;
-    session.persist_rollout_items_durable(&[
+    // This checkpoint gates an external effect and is read again on resume.
+    // Readable bytes alone are not enough to publish its admission.
+    session.persist_rollout_items_then_sync(&[
         codex_protocol::protocol::RolloutItem::TurnContext(item),
     ]).await.map_err(|error| format!("validation admission checkpoint failed before launch: {error}"))
 }

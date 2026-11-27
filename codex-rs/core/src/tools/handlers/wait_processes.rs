@@ -135,7 +135,7 @@ impl ToolExecutor<ToolInvocation> for WaitProcessesHandler {
         );
         ToolSpec::Function(ResponsesApiTool {
             name: "wait_processes".into(),
-            description: "Observe process exit/failure for 1–64 distinct existing exec_command handles. mode any returns after the first settled outcome (including unavailable handles); all (default) waits for every outcome. Nonzero exits and stale/missing handles are independent outcomes, never fail-fast errors that erase siblings. timeout_ms is one total monotonic deadline for the group, not per process; nested caller deadlines can shorten it. Returns status completed, timed_out, deadline_exceeded or cancelled and ordered per-process outcomes (exited, failed, unavailable, pending, timed_out or cancelled). completed describes the wait, not command success; inspect each exit_code/succeeded. This tool never writes input, terminates processes, acknowledges/consumes output, or retires handles. Cancelling or dropping the wait closes only its subscriptions. Collect unread output afterward with ordinary write_stdin using each original handle.".into(),
+            description: "Observe process exit/failure for 1–64 distinct existing exec_command handles. mode any returns after the first settled outcome (including unavailable handles); all (default) waits for every outcome. Nonzero exits and stale/missing handles are independent outcomes, never fail-fast errors that erase siblings. timeout_ms is one total monotonic observation budget for the group, not per process; nested caller deadlines can shorten it. A synchronous history lookup already in progress may overrun the deadline, but late results are not accepted. After a timely any result, ready siblings are included only within the same deadline; unobserved siblings remain pending. Returns status completed, timed_out, deadline_exceeded or cancelled and ordered per-process outcomes (exited, failed, unavailable, pending, timed_out or cancelled). completed describes the wait, not command success; inspect each exit_code/succeeded. This tool never writes input, terminates processes, acknowledges/consumes output, or retires handles. Cancelling or dropping the wait closes only its subscriptions. Collect unread output afterward with ordinary write_stdin using each original handle.".into(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
@@ -265,19 +265,34 @@ impl ToolExecutor<ToolInvocation> for WaitProcessesHandler {
                     _ = invocation.cancellation_token.cancelled() => break "cancelled",
                     _ = tokio::time::sleep_until(deadline) => break timeout_status,
                     next = pending.next() => {
+                        // A ready poll can spend the remaining budget scanning
+                        // cold history synchronously, without yielding to the timer.
+                        if Instant::now() >= deadline {
+                            break timeout_status;
+                        }
                         let Some((index, value)) = next else { break "completed" };
                         let settled = value["status"] != "timed_out";
                         outcomes[index] = Some(value);
-                        if settled && matches!(args.mode, Mode::Any) {
-                            // Include all immediately ready siblings without
-                            // extending the winning observation's lifetime.
-                            while let Some(Some((index, value))) = pending.next().now_or_never() {
+                        if !settled {
+                            break timeout_status;
+                        }
+                        if pending.is_empty() {
+                            break "completed";
+                        }
+                        if matches!(args.mode, Mode::Any) {
+                            // Keep the timely winner and any timely ready siblings,
+                            // but do not start another poll or accept a late result
+                            // after the original group deadline.
+                            while Instant::now() < deadline {
+                                let Some(Some((index, value))) = pending.next().now_or_never() else {
+                                    break;
+                                };
+                                if Instant::now() >= deadline {
+                                    break;
+                                }
                                 outcomes[index] = Some(value);
                             }
                             break "completed";
-                        }
-                        if !settled {
-                            break timeout_status;
                         }
                     }
                 }

@@ -300,7 +300,7 @@ fn upgrade_configured_git_marketplace(
         ref_name,
         sparse_paths: &marketplace.sparse_paths,
     };
-    activate_marketplace_root(&destination, staged_dir, || {
+    activate_marketplace_root(&destination, &marketplace.name, staged_dir, || {
         ensure_configured_git_marketplace_unchanged(reload_config, marketplace)?;
         // Profiles and non-user layers own their source settings. The installed
         // metadata above already records the revision without creating a user override.

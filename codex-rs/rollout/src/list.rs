@@ -250,8 +250,11 @@ struct FilesByUpdatedAtVisitor {
 impl RolloutFileVisitor for FilesByUpdatedAtVisitor {
     async fn visit(&mut self, _ts: OffsetDateTime, id: Uuid, path: PathBuf) -> ControlFlow<()> {
         let updated_at = file_modified_time(&path).await.unwrap_or(None);
-        if !self.desc_anchor.is_some_and(|anchor| {
-            anchor.should_skip(updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), id, false)
+        // When an mtime cannot be used as the public cursor, only the
+        // hydrated summary can determine its effective key. Keep that row.
+        if !updated_at.is_some_and(|ts| {
+            (0..=9999).contains(&ts.year())
+                && self.desc_anchor.is_some_and(|anchor| anchor.should_skip(ts, id, false))
         }) {
             self.candidates.push(ThreadCandidate {
                 path,
@@ -385,57 +388,7 @@ pub async fn get_threads_in_root(
     sort_key: ThreadSortKey,
     config: ThreadListConfig<'_>,
 ) -> io::Result<ThreadsPage> {
-    if !tokio::fs::try_exists(&root).await? {
-        return Ok(ThreadsPage {
-            items: Vec::new(),
-            next_cursor: None,
-            num_scanned_files: 0,
-            reached_scan_cap: false,
-        });
-    }
-
-    if sort_key == ThreadSortKey::RecencyAt {
-        return get_threads_in_root_by_summary(root, page_size, cursor, sort_key, config, false)
-            .await;
-    }
-
-    let anchor = cursor.cloned();
-
-    let provider_matcher = config
-        .model_providers
-        .and_then(|filters| ProviderMatcher::new(filters, config.default_provider));
-
-    let result = match config.layout {
-        ThreadListLayout::NestedByDate => {
-            traverse_directories_for_paths(
-                root.clone(),
-                page_size,
-                anchor,
-                sort_key,
-                config.allowed_sources,
-                provider_matcher.as_ref(),
-                config.cwd_filters,
-                config.default_provider,
-                config.include_empty_preview,
-            )
-            .await?
-        }
-        ThreadListLayout::Flat => {
-            traverse_flat_paths(
-                root.clone(),
-                page_size,
-                anchor,
-                sort_key,
-                config.allowed_sources,
-                provider_matcher.as_ref(),
-                config.cwd_filters,
-                config.default_provider,
-                config.include_empty_preview,
-            )
-            .await?
-        }
-    };
-    Ok(result)
+    get_threads_in_root_by_summary(root, page_size, cursor, sort_key, config, false).await
 }
 
 pub async fn get_threads_in_root_ascending(
@@ -522,8 +475,14 @@ async fn get_threads_in_root_by_summary(
         return Ok(selection.finish(scanned_files));
     }
 
+    // Preserve early anchor pruning for the descending UpdatedAt fast path.
+    let desc_anchor = if sort_key == ThreadSortKey::UpdatedAt && !ascending {
+        anchor
+    } else {
+        None
+    };
     let mut candidates =
-        collect_updated_candidates(&root, config.layout, &mut scanned_files, None).await?;
+        collect_updated_candidates(&root, config.layout, &mut scanned_files, desc_anchor).await?;
     // For UpdatedAt with representable mtimes the physical key cannot be changed
     // by summary hydration. Missing/unrepresentable mtimes still use the full
     // summary sort. The stored mtimes are UTC, so an RFC3339 round trip preserves
@@ -533,17 +492,23 @@ async fn get_threads_in_root_by_summary(
             .iter()
             .all(|candidate| candidate.updated_at.and_then(format_rfc3339).is_some())
     {
-        candidates.retain(|candidate| {
-            !candidate.updated_at.is_some_and(|ts| {
-                anchor.is_some_and(|anchor| anchor.should_skip(ts, candidate.id, ascending))
-            })
-        });
-        candidates.sort_unstable_by_key(|candidate| {
-            (candidate.updated_at, candidate.id, candidate.ordinal)
-        });
-        if !ascending {
-            candidates.reverse();
-        }
+        let candidates = prepare_listing_candidates(candidates, move |candidates| {
+            candidates.retain(|candidate| {
+                !candidate.updated_at.is_some_and(|ts| {
+                    anchor.is_some_and(|anchor| anchor.should_skip(ts, candidate.id, ascending))
+                })
+            });
+            if ascending {
+                candidates.sort_unstable_by_key(|candidate| {
+                    (candidate.updated_at, candidate.id, candidate.ordinal)
+                });
+            } else {
+                candidates.sort_unstable_by_key(|candidate| {
+                    (Reverse(candidate.updated_at), Reverse(candidate.id), candidate.ordinal)
+                });
+            }
+        })
+        .await?;
         let mut items = Vec::with_capacity(page_size.min(candidates.len()));
         let mut more_matches_available = false;
         for candidate in candidates {
@@ -644,10 +609,15 @@ impl SummaryPageSelection<'_, '_> {
     }
 
     fn sort_items(&mut self) {
-        self.keyed_items
-            .sort_unstable_by_key(|(key, ordinal, _)| (*key, *ordinal));
-        if !self.ascending {
-            self.keyed_items.reverse();
+        if self.ascending {
+            self.keyed_items
+                .sort_unstable_by_key(|(key, ordinal, _)| (*key, *ordinal));
+        } else if self.sort_key == ThreadSortKey::UpdatedAt {
+            self.keyed_items
+                .sort_unstable_by_key(|(key, ordinal, _)| (Reverse(*key), *ordinal));
+        } else {
+            self.keyed_items
+                .sort_unstable_by_key(|(key, ordinal, _)| (Reverse(*key), Reverse(*ordinal)));
         }
     }
 
@@ -679,102 +649,6 @@ impl RolloutFileVisitor for SummaryPageSelection<'_, '_> {
         let updated_at = file_modified_time(&path).await.unwrap_or(None);
         self.consider(path, updated_at, ordinal).await;
         ControlFlow::Continue(())
-    }
-}
-
-/// Load thread file paths from disk using directory traversal.
-///
-/// Directory layout: `~/.codex/sessions/YYYY/MM/DD/rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl`
-/// Returned newest (based on sort key) first.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
-)]
-async fn traverse_directories_for_paths(
-    root: PathBuf,
-    page_size: usize,
-    anchor: Option<Cursor>,
-    sort_key: ThreadSortKey,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
-    default_provider: &str,
-    include_empty_preview: bool,
-) -> io::Result<ThreadsPage> {
-    match sort_key {
-        ThreadSortKey::CreatedAt => {
-            traverse_directories_for_paths_created(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                cwd_filters,
-                default_provider,
-                include_empty_preview,
-                false,
-            )
-            .await
-        }
-        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => {
-            traverse_directories_for_paths_updated(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                cwd_filters,
-                default_provider,
-                include_empty_preview,
-            )
-            .await
-        }
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
-)]
-async fn traverse_flat_paths(
-    root: PathBuf,
-    page_size: usize,
-    anchor: Option<Cursor>,
-    sort_key: ThreadSortKey,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
-    default_provider: &str,
-    include_empty_preview: bool,
-) -> io::Result<ThreadsPage> {
-    match sort_key {
-        ThreadSortKey::CreatedAt => {
-            traverse_flat_paths_created(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                cwd_filters,
-                default_provider,
-                include_empty_preview,
-                false,
-            )
-            .await
-        }
-        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => {
-            traverse_flat_paths_updated(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                cwd_filters,
-                default_provider,
-                include_empty_preview,
-            )
-            .await
-        }
     }
 }
 
@@ -835,79 +709,6 @@ async fn traverse_directories_for_paths_created(
     })
 }
 
-/// Walk the rollout directory tree to collect files by updated_at, then sort by
-/// file mtime (updated_at) and apply pagination/filtering in that order.
-///
-/// Because updated_at is not encoded in filenames, this path must scan all
-/// file metadata, then sort and filter by the anchor cursor.
-///
-/// NOTE: This can be optimized in the future if we store additional state on disk
-/// to cache updated_at timestamps.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
-)]
-async fn traverse_directories_for_paths_updated(
-    root: PathBuf,
-    page_size: usize,
-    anchor: Option<Cursor>,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
-    default_provider: &str,
-    include_empty_preview: bool,
-) -> io::Result<ThreadsPage> {
-    let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
-    let mut scanned_files = 0usize;
-    let mut more_matches_available = false;
-
-    let mut candidates = collect_updated_candidates(
-        &root,
-        ThreadListLayout::NestedByDate,
-        &mut scanned_files,
-        anchor.as_ref().map(ListingAnchor::from_cursor),
-    )
-    .await?;
-    candidates.sort_unstable_by_key(|candidate| {
-        let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        (Reverse(ts), Reverse(candidate.id), candidate.ordinal)
-    });
-
-    for candidate in candidates {
-        if items.len() == page_size {
-            more_matches_available = true;
-            break;
-        }
-
-        let updated_at_fallback = candidate.updated_at.and_then(format_rfc3339);
-        if let Some(item) = build_thread_item(
-            candidate.path,
-            allowed_sources,
-            provider_matcher,
-            cwd_filters,
-            updated_at_fallback,
-            default_provider,
-            include_empty_preview,
-        )
-        .await
-        {
-            items.push(item);
-        }
-    }
-
-    let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::UpdatedAt)
-    } else {
-        None
-    };
-    Ok(ThreadsPage {
-        items,
-        next_cursor: next,
-        num_scanned_files: scanned_files,
-        reached_scan_cap: false,
-    })
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
@@ -933,11 +734,14 @@ async fn traverse_flat_paths_created(
         ascending,
     };
     walk_flat_rollout_files(&root, &mut scanned_files, &mut files).await?;
-    files.paths.sort_unstable_by_key(|(key, _)| *key);
-    if ascending {
-        files.paths.reverse();
-    }
-    for (_, path) in files.paths {
+    let paths = prepare_listing_candidates(files.paths, move |paths| {
+        paths.sort_unstable_by_key(|(key, _)| *key);
+        if ascending {
+            paths.reverse();
+        }
+    })
+    .await?;
+    for (_, path) in paths {
         if items.len() == page_size {
             more_matches_available = true;
             break;
@@ -974,71 +778,6 @@ async fn traverse_flat_paths_created(
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
-)]
-async fn traverse_flat_paths_updated(
-    root: PathBuf,
-    page_size: usize,
-    anchor: Option<Cursor>,
-    allowed_sources: &[SessionSource],
-    provider_matcher: Option<&ProviderMatcher<'_>>,
-    cwd_filters: Option<&[PathBuf]>,
-    default_provider: &str,
-    include_empty_preview: bool,
-) -> io::Result<ThreadsPage> {
-    let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
-    let mut scanned_files = 0usize;
-    let mut more_matches_available = false;
-
-    let mut candidates = collect_updated_candidates(
-        &root,
-        ThreadListLayout::Flat,
-        &mut scanned_files,
-        anchor.as_ref().map(ListingAnchor::from_cursor),
-    )
-    .await?;
-    candidates.sort_unstable_by_key(|candidate| {
-        let ts = candidate.updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        (Reverse(ts), Reverse(candidate.id), candidate.ordinal)
-    });
-
-    for candidate in candidates {
-        if items.len() == page_size {
-            more_matches_available = true;
-            break;
-        }
-
-        let updated_at_fallback = candidate.updated_at.and_then(format_rfc3339);
-        if let Some(item) = build_thread_item(
-            candidate.path,
-            allowed_sources,
-            provider_matcher,
-            cwd_filters,
-            updated_at_fallback,
-            default_provider,
-            include_empty_preview,
-        )
-        .await
-        {
-            items.push(item);
-        }
-    }
-
-    let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::UpdatedAt)
-    } else {
-        None
-    };
-    Ok(ThreadsPage {
-        items,
-        next_cursor: next,
-        num_scanned_files: scanned_files,
-        reached_scan_cap: false,
-    })
-}
-
 /// Pagination cursor token format: an RFC3339 timestamp with an optional thread ID tie-breaker.
 pub fn parse_cursor(token: &str) -> Option<Cursor> {
     let (timestamp, id) = match token.rsplit_once('|') {
@@ -1060,22 +799,9 @@ pub fn parse_cursor(token: &str) -> Option<Cursor> {
 }
 
 fn build_next_cursor(items: &[ThreadItem], sort_key: ThreadSortKey) -> Option<Cursor> {
-    let last = items.last()?;
-    let file_name = last.path.file_name()?.to_string_lossy();
-    let (created_ts, id) = parse_timestamp_uuid_from_filename(&file_name)?;
-    let ts = match sort_key {
-        ThreadSortKey::CreatedAt => created_ts,
-        ThreadSortKey::UpdatedAt => {
-            let updated_at = last.updated_at.as_deref()?;
-            OffsetDateTime::parse(updated_at, &Rfc3339).ok()?
-        }
-        ThreadSortKey::RecencyAt => {
-            let recency_at = last.recency_at.as_deref().or(last.updated_at.as_deref())?;
-            OffsetDateTime::parse(recency_at, &Rfc3339).ok()?
-        }
-    };
+    let (timestamp, id) = thread_item_sort_key(items.last()?, sort_key)?;
     Some(Cursor::with_thread_id(
-        ts,
+        timestamp,
         ThreadId::from_string(&id.to_string()).ok()?,
     ))
 }
@@ -1140,6 +866,15 @@ async fn build_thread_item(
     {
         return None;
     }
+    thread_item_from_summary(path, summary, updated_at, include_empty_preview)
+}
+
+fn thread_item_from_summary(
+    path: PathBuf,
+    summary: HeadTailSummary,
+    updated_at: Option<String>,
+    include_empty_preview: bool,
+) -> Option<ThreadItem> {
     // A damaged metadata payload can still leave a filename identity and
     // useful history. Do not fabricate missing creation-only metadata.
     if (summary.saw_session_meta && (include_empty_preview || summary.preview.is_some()))
@@ -1196,21 +931,48 @@ async fn build_thread_item(
 /// metadata/preview extraction as list operations without scanning the whole
 /// sessions tree.
 pub async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem> {
+    read_single_thread_item(path, /*include_empty_preview*/ false)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Read the full summary for a known thread file even before its first preview.
+pub async fn read_thread_item_from_rollout_including_empty_preview(
+    path: PathBuf,
+) -> Option<ThreadItem> {
+    try_read_thread_item_from_rollout_including_empty_preview(path)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Read the summary for a resolved rollout, retaining failures from the summary scan.
+///
+/// A successful scan without a summary is distinct from an error. Recoverable
+/// records and an empty preview keep the same projection as the lenient reader.
+pub async fn try_read_thread_item_from_rollout_including_empty_preview(
+    path: PathBuf,
+) -> io::Result<Option<ThreadItem>> {
+    read_single_thread_item(path, /*include_empty_preview*/ true).await
+}
+
+async fn read_single_thread_item(
+    path: PathBuf,
+    include_empty_preview: bool,
+) -> io::Result<Option<ThreadItem>> {
     let updated_at = file_modified_time(&path)
         .await
         .ok()
         .flatten()
         .and_then(format_rfc3339);
-    build_thread_item(
+    let summary = read_head_summary(&path, HEAD_RECORD_LIMIT, /*default_provider*/ "").await?;
+    Ok(thread_item_from_summary(
         path,
-        &[],
-        /*provider_matcher*/ None,
-        /*cwd_filters*/ None,
+        summary,
         updated_at,
-        /*default_provider*/ "",
-        /*include_empty_preview*/ false,
-    )
-    .await
+        include_empty_preview,
+    ))
 }
 
 /// Refresh an indexed thread's preview without replaying its settings/history.
@@ -1392,6 +1154,25 @@ struct ThreadCandidate {
     ordinal: usize,
 }
 
+// Keep aggregate catalog sorting out of the request executor without copying
+// the catalog. For small catalogs, avoid a blocking-task hop.
+async fn prepare_listing_candidates<T: Send + 'static>(
+    mut candidates: Vec<T>,
+    prepare: impl FnOnce(&mut Vec<T>) + Send + 'static,
+) -> io::Result<Vec<T>> {
+    const INLINE_CANDIDATES: usize = 256;
+    if candidates.len() <= INLINE_CANDIDATES {
+        prepare(&mut candidates);
+        return Ok(candidates);
+    }
+    tokio::task::spawn_blocking(move || {
+        prepare(&mut candidates);
+        candidates
+    })
+    .await
+    .map_err(io::Error::other)
+}
+
 async fn collect_updated_candidates(
     root: &Path,
     layout: ThreadListLayout,
@@ -1501,6 +1282,7 @@ async fn read_head_summary(
         return Ok(summary);
     }
     let mut summary = HeadTailSummary::default();
+    let mut canonical_session_id = None;
     let mut settings_reducer = PersistedThreadSettingsReducer::default();
     let mut metadata_accumulator = RolloutMetadataAccumulator::default();
     let extraction_cache_guard =
@@ -1540,21 +1322,21 @@ async fn read_head_summary(
                             summary.model_provider = session_meta_line.meta.model_provider.clone();
                             summary.thread_id = Some(session_meta_line.meta.id);
                             summary.cwd = Some(session_meta_line.meta.cwd.clone());
-                            summary.git_branch = session_meta_line
-                                .git
-                                .as_ref()
-                                .and_then(|git| git.branch.clone());
-                            summary.git_sha = session_meta_line
-                                .git
-                                .as_ref()
-                                .and_then(|git| git.commit_hash.as_ref().map(|sha| sha.0.clone()));
-                            summary.git_origin_url = session_meta_line
-                                .git
-                                .as_ref()
-                                .and_then(|git| git.repository_url.clone());
                             summary.cli_version = Some(session_meta_line.meta.cli_version.clone());
                             summary.created_at = Some(session_meta_line.meta.timestamp.clone());
+                            canonical_session_id = Some(session_meta_line.meta.session_id);
                             summary.saw_session_meta = true;
+                        }
+                        // The first record owns creation identity. Later Git
+                        // snapshots for that same session replace the full tuple,
+                        // including explicit clears. Missing Git is not a clear.
+                        if summary.thread_id == Some(session_meta_line.meta.id)
+                            && canonical_session_id == Some(session_meta_line.meta.session_id)
+                            && let Some(git) = &session_meta_line.git
+                        {
+                            summary.git_branch = git.branch.clone();
+                            summary.git_sha = git.commit_hash.as_ref().map(|sha| sha.0.clone());
+                            summary.git_origin_url = git.repository_url.clone();
                         }
                     }
                     RolloutItem::ToolManifest(_) => {}

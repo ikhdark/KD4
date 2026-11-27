@@ -21,10 +21,12 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::tools::command_output_artifact::capture::CapturedShellOutput;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::apply_granted_turn_permissions;
@@ -751,7 +753,7 @@ async fn run_exec_like_with_exit_code_inner(
     }
 
     let source = ExecCommandSource::Agent;
-    let emitter = crate::tools::events::ToolEmitter::shell(
+    let emitter = ToolEmitter::shell(
         safety_command.clone(),
         exec_params.cwd.clone(),
         source,
@@ -911,6 +913,53 @@ async fn run_exec_like_with_exit_code_inner(
         turn.turn_timing_state
             .record_executed_validation_duration(duration);
     }
+    shell_events
+        .spawn_completion(ShellExecutionCompletion {
+            out,
+            raw_capture,
+            max_output_tokens,
+            quiet_on_success,
+            attempt_key,
+            hook_command: req.hook_command,
+            shell_type,
+            is_powershell_script,
+            repair_notice,
+        })
+        .await
+        .map_err(|error| FunctionCallError::Fatal(error.to_string()))?
+}
+
+struct ShellExecutionCompletion {
+    out: Result<ExecToolCallOutput, ToolError>,
+    raw_capture: Option<CapturedShellOutput>,
+    max_output_tokens: Option<usize>,
+    quiet_on_success: bool,
+    attempt_key: Option<CommandAttemptKey>,
+    hook_command: String,
+    shell_type: Option<ShellType>,
+    is_powershell_script: bool,
+    repair_notice: Option<String>,
+}
+
+async fn finish_shell_execution(
+    completion: ShellExecutionCompletion,
+    publication: &ShellEventPublication,
+    emitter: ToolEmitter,
+) -> Result<RunExecLikeResult, FunctionCallError> {
+    let ShellExecutionCompletion {
+        out,
+        raw_capture,
+        max_output_tokens,
+        quiet_on_success,
+        attempt_key,
+        hook_command,
+        shell_type,
+        is_powershell_script,
+        repair_notice,
+    } = completion;
+    let session = &publication.session;
+    let turn = &publication.turn;
+    let tracker = &publication.tracker;
     let source_capture_truncated = match &out {
         Ok(output) => output.aggregated_output.truncated,
         Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
@@ -944,7 +993,7 @@ async fn run_exec_like_with_exit_code_inner(
             output,
             turn.model_info.truncation_policy.into(),
             max_output_tokens,
-            Some(req.hook_command.as_str()),
+            Some(hook_command.as_str()),
         )
     });
     let post_tool_use_response = model_projection
@@ -1051,7 +1100,15 @@ async fn run_exec_like_with_exit_code_inner(
     } else {
         shell_tool_outcome(&out)
     };
-    let finish_result = shell_events.finish(out).await;
+    let finish_result = emitter
+        .finish(
+            publication
+                .context()
+                .with_legacy_shell_search_no_match(search_no_match),
+            out,
+            /*applied_patch_delta*/ None,
+        )
+        .await;
     let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
     session
         .services
@@ -1146,7 +1203,7 @@ async fn run_exec_like_with_exit_code_inner(
         post_tool_use_response,
         sampling_request_signal: shell_sampling_signal(
             attempt_key.as_ref(),
-            req.hook_command.as_str(),
+            hook_command.as_str(),
             if search_no_match { Some(0) } else { exit_code },
             canonical_output.as_deref(),
         ),
@@ -1164,7 +1221,7 @@ async fn run_exec_like_with_exit_code_inner(
 }
 
 // Own the item separately from the abortable shell handler. Native process
-// custody and the tool result remain with the existing execution owners.
+// custody stays with its existing owner until the orchestration result returns.
 struct ShellEventPublication {
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -1172,7 +1229,7 @@ struct ShellEventPublication {
     call_id: String,
     call_source: ToolCallSource,
     execution_id: Option<String>,
-    emitter: Option<crate::tools::events::ToolEmitter>,
+    emitter: Option<ToolEmitter>,
     started: bool,
     runtime: tokio::runtime::Handle,
 }
@@ -1209,14 +1266,19 @@ impl ShellEventPublication {
         receipt.await.map_err(|error| FunctionCallError::Fatal(error.to_string()))?
     }
 
-    async fn finish(mut self, result: Result<ExecToolCallOutput, ToolError>) -> Result<String, FunctionCallError> {
+    fn spawn_completion(
+        mut self,
+        completion: ShellExecutionCompletion,
+    ) -> tokio::task::JoinHandle<Result<RunExecLikeResult, FunctionCallError>> {
         let emitter = self.emitter.take().expect("started shell emitter");
         let in_flight = crate::session::DurableHistoryCommitInFlight::begin(&self.session);
         let runtime = self.runtime.clone();
+        // Transfer the confirmed result before any accounting or artifact await.
+        // Dropping the handler's join detaches this sole terminal publisher.
         runtime.spawn(async move {
             let _in_flight = in_flight;
-            emitter.finish(self.context(), result, /*applied_patch_delta*/ None).await
-        }).await.map_err(|error| FunctionCallError::Fatal(error.to_string()))?
+            finish_shell_execution(completion, &self, emitter).await
+        })
     }
 }
 

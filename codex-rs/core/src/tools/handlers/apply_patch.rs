@@ -1267,7 +1267,10 @@ async fn publish_settled_change(session: &Session, turn: &TurnContext, receipt: 
                     .send_inter_agent_communication(
                         thread_id,
                         communication,
-                        AgentCommunicationContext::new(AgentCommunicationKind::Message, session.thread_id),
+                        AgentCommunicationContext::new(
+                            AgentCommunicationKind::SettledSourceAdvisory,
+                            session.thread_id,
+                        ),
                     )
                     .await
                     .map_err(|e| e.to_string())

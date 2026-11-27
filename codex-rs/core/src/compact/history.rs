@@ -302,7 +302,7 @@ fn unpaired_compaction_outputs<'a>(
         .iter()
         .enumerate()
         .filter_map(|(offset, item)| {
-            let (kind, call, id) = crate::tool_occurrence::identity(item)?;
+            let (kind, call, id) = crate::tool_occurrence::history_identity(item)?;
             (!call && pairs[start + offset].is_none()).then_some((kind, id))
         })
         .collect()
@@ -326,7 +326,7 @@ pub(super) fn compaction_summary_items(items: &[ResponseItem]) -> Vec<ResponseIt
                 || is_compaction_summary_item(item)
                 || crate::tool_history::phase_checkpoint_ids(item).is_some())
                 && !pairs[*index].is_some_and(|paired| *index < end && paired >= end)
-                && !crate::tool_occurrence::identity(item)
+                && !crate::tool_occurrence::history_identity(item)
                     .is_some_and(|(kind, call, id)| call && unpaired.contains(&(kind, id)))
         })
         .map(|(_, item)| item.clone())
@@ -351,7 +351,7 @@ fn unresolved_compaction_start(items: &[ResponseItem]) -> usize {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, item)| {
-                    let (kind, call, id) = crate::tool_occurrence::identity(item)?;
+                    let (kind, call, id) = crate::tool_occurrence::history_identity(item)?;
                     (call && unpaired.contains(&(kind, id))).then_some(index)
                 }),
         )
@@ -360,19 +360,8 @@ fn unresolved_compaction_start(items: &[ResponseItem]) -> usize {
 }
 
 fn compaction_call_id(item: &ResponseItem) -> Option<&str> {
-    match item {
-        ResponseItem::FunctionCall { call_id, .. }
-        | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id),
-        ResponseItem::LocalShellCall {
-            call_id: Some(call_id),
-            ..
-        }
-        | ResponseItem::ToolSearchCall {
-            call_id: Some(call_id),
-            ..
-        } => Some(call_id),
-        _ => None,
-    }
+    let (_, is_call, call_id) = crate::tool_occurrence::history_identity(item)?;
+    is_call.then_some(call_id)
 }
 
 pub(super) fn compaction_output_call_id(item: &ResponseItem) -> Option<&str> {

@@ -166,6 +166,7 @@ impl Session {
         {
             let owned_section_ids = contributor.world_state_section_ids();
             let input = WorldStateContributionInput {
+                contribution_deadline: deadline.into_std(),
                 thread_id: self.thread_id(),
                 turn_id: turn_context.sub_id.as_str(),
                 environments: &environments,

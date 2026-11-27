@@ -331,17 +331,30 @@ async fn upload_openai_file_contents_with_pool(
             }
         };
         let mut retries = 0;
+        let upload_timed_out = || OpenAiFileError::SignedUploadRequest { category: "deadline" };
         loop {
-            let response = codex_http_client::with_dispatch_guard(
-                auth.dispatch_guard(),
-                request.send(),
+            if Instant::now() >= upload_deadline {
+                return Err(upload_timed_out());
+            }
+            let response = tokio::time::timeout_at(
+                upload_deadline,
+                codex_http_client::with_dispatch_guard(auth.dispatch_guard(), request.send()),
             )
-            .await;
+            .await
+            .map_err(|_| upload_timed_out())?;
+            if Instant::now() >= upload_deadline {
+                return Err(upload_timed_out());
+            }
             let (error, retryable, server_advice) = match response {
                 Ok(mut response) => {
                     let status = response.status();
                     let server_advice = blob_upload_retry_after(response.headers());
-                    while let Ok(Some(_)) = response.chunk().await {}
+                    // Preserve an admitted HTTP status even if the best-effort
+                    // drain cannot finish within the original upload budget.
+                    let _ = tokio::time::timeout_at(upload_deadline, async {
+                        while let Ok(Some(_)) = response.chunk().await {}
+                    })
+                    .await;
                     if status.is_success() {
                         break;
                     }

@@ -200,7 +200,7 @@ fn complete_tool_receipt_indices(
     receipt_index: &ToolReceiptIndex,
     index: usize,
 ) -> Option<Vec<usize>> {
-    crate::tool_occurrence::identity(&items[index])?;
+    crate::tool_occurrence::history_identity(&items[index])?;
     let counterpart = receipt_index.get(index).copied().flatten()?;
     let mut group = vec![index, counterpart];
     group.sort_unstable();

@@ -4163,32 +4163,39 @@ async fn build_extension_turn_input_items(
         })
         .collect::<Vec<_>>();
 
+    let turn_id = turn_context.sub_id.to_string();
+    let user_input = user_input.to_vec();
+    let bound_selected_capability_roots = step_context.selected_capability_roots.clone();
+    let ready_selected_capability_roots = step_context
+        .selected_capability_roots
+        .iter()
+        .map(|root| root.selected_root().clone())
+        .collect();
+    let file_system_sandboxes = step_context
+        .environments
+        .turn_environments
+        .iter()
+        .map(|environment| codex_extension_api::EnvironmentFileSystemSandbox {
+            environment_id: environment.environment_id.clone(),
+            sandbox: turn_context
+                .file_system_sandbox_context(/*additional_permissions*/ None, environment.cwd()),
+        })
+        .collect();
+
+    let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
     let input = TurnInputContext {
-        turn_id: turn_context.sub_id.to_string(),
-        user_input: user_input.to_vec(),
+        contribution_deadline: deadline.into_std(),
+        turn_id,
+        user_input,
         environments,
-        bound_selected_capability_roots: step_context.selected_capability_roots.clone(),
-        ready_selected_capability_roots: step_context
-            .selected_capability_roots
-            .iter()
-            .map(|root| root.selected_root().clone())
-            .collect(),
-        file_system_sandboxes: step_context
-            .environments
-            .turn_environments
-            .iter()
-            .map(|environment| codex_extension_api::EnvironmentFileSystemSandbox {
-                environment_id: environment.environment_id.clone(),
-                sandbox: turn_context
-                    .file_system_sandbox_context(/*additional_permissions*/ None, environment.cwd()),
-            })
-            .collect(),
+        bound_selected_capability_roots,
+        ready_selected_capability_roots,
+        file_system_sandboxes,
     };
 
     // Contributors are independent read-only DAG leaves. FuturesOrdered polls
     // them concurrently while preserving registration order in the result.
     let mut pending = FuturesOrdered::new();
-    let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
     let session_extension_data = &sess.services.session_extension_data;
     let thread_extension_data = &sess.services.thread_extension_data;
     let turn_extension_data = turn_context.extension_data.as_ref();

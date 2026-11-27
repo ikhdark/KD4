@@ -1,3 +1,5 @@
+use crate::agent::control::FollowupWake;
+use crate::agent::control::MailboxTaskMessage;
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
@@ -60,6 +62,7 @@ pub(crate) enum TurnInput {
 pub(crate) struct MailboxInput {
     pub(super) communication: InterAgentCommunication,
     may_start_turn: bool,
+    followup_wake: Option<Arc<FollowupWake>>,
     recorded: Arc<AtomicBool>,
 }
 
@@ -68,12 +71,14 @@ impl MailboxInput {
         Self {
             may_start_turn: communication.trigger_turn,
             communication,
+            followup_wake: None,
             recorded: Arc::default(),
         }
     }
 
     fn can_start_turn(&self) -> bool {
         self.may_start_turn && !self.is_recorded()
+            && self.followup_wake.as_ref().is_none_or(|wake| wake.can_start())
     }
 
     pub(super) fn is_recorded(&self) -> bool {
@@ -147,6 +152,8 @@ struct UserIntentState {
 }
 
 pub(crate) struct TransferredStartupInput {
+    pub(crate) has_start_work: bool,
+    pub(crate) followup_wake: Option<Arc<FollowupWake>>,
     pub(crate) validation_origin: Option<(String, String)>,
 }
 
@@ -335,21 +342,29 @@ impl InputQueue {
     pub(crate) async fn enqueue_mailbox_communication(
         self: &Arc<Self>,
         communication: InterAgentCommunication,
+        task_message: Option<MailboxTaskMessage>,
     ) -> Result<bool, codex_protocol::error::CodexErr> {
-        self.enqueue_mailbox_communication_with_origin(communication, /*validation_origin*/ None)
-            .await
+        self.enqueue_mailbox_communication_with_origin(
+            communication,
+            /*validation_origin*/ None,
+            task_message,
+        )
+        .await
     }
 
     pub(super) async fn enqueue_mailbox_communication_with_origin(
         self: &Arc<Self>,
         communication: InterAgentCommunication,
         validation_origin: Option<(String, String)>,
+        task_message: Option<MailboxTaskMessage>,
     ) -> Result<bool, codex_protocol::error::CodexErr> {
         // Parked and live sends both retain admission custody if the observer
         // leaves between durable publication and in-memory insertion.
         let queue = Arc::clone(self);
         tokio::spawn(async move {
-            queue.admit_mailbox_communication(communication, validation_origin).await
+            queue
+                .admit_mailbox_communication(communication, validation_origin, task_message)
+                .await
         })
         .await
         .map_err(io::Error::other)?
@@ -359,6 +374,7 @@ impl InputQueue {
         &self,
         mut communication: InterAgentCommunication,
         validation_origin: Option<(String, String)>,
+        task_message: Option<MailboxTaskMessage>,
     ) -> Result<bool, codex_protocol::error::CodexErr> {
         if let Some(progress) = &communication.progress
             && (communication.trigger_turn || communication.id.is_none()
@@ -471,13 +487,18 @@ impl InputQueue {
             }
             compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
         }
-        let trigger_turn = communication.trigger_turn;
+        let mut mail = MailboxInput::new(communication);
+        // Commit preview and retain the exact wake lease at fresh admission,
+        // before publishing the mail or acknowledging it. Duplicates and
+        // superseded progress never reach this commit.
+        mail.followup_wake = task_message.and_then(MailboxTaskMessage::accept);
+        let can_start_turn = mail.can_start_turn();
         mailbox.bytes += bytes;
-        mailbox.pending_mails.push_back((MailboxInput::new(communication), bytes));
+        mailbox.pending_mails.push_back((mail, bytes));
         drop(mailbox);
         self.agent_activity_tx
             .send_replace(InputQueueActivity::Mailbox);
-        if trigger_turn {
+        if can_start_turn {
             self.activity_tx.send_replace(InputQueueActivity::Mailbox);
         }
         Ok(true)
@@ -922,6 +943,7 @@ impl InputQueue {
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
         expected_turn_state: &Arc<Mutex<TurnState>>,
+        pending_work_start: bool,
         select_validation_origin: bool,
     ) -> Option<TransferredStartupInput> {
         let active = active_turn.lock().await;
@@ -949,28 +971,47 @@ impl InputQueue {
         if let Some(mailbox) = mailbox.as_mut() {
             self.transfer_mailbox_prefix(mailbox, &mut input);
         }
-        // Only the first eligible input in the batch actually transferred can
-        // delegate a scope. Unstamped eligible mail and independent input
-        // still take their FIFO place; later mail cannot speak for them.
-        let validation_origin = if select_validation_origin {
-            mailbox.as_ref().and_then(|mailbox| {
-                input.iter()
-                    .find_map(|item| match item {
-                        TurnInput::InterAgentCommunication(mail) if mail.can_start_turn() => Some(
-                            mail.id.as_ref().and_then(|id| mailbox.validation_origins.get(id)),
-                        ),
-                        TurnInput::UserInput { content, .. } if !content.is_empty() => Some(None),
-                        TurnInput::ResponseItem(_) => Some(None),
-                        _ => None,
-                    })
-                    .flatten()
-                    .cloned()
-            })
-        } else {
-            None
+        let mut selected = TransferredStartupInput {
+            has_start_work: false,
+            followup_wake: None,
+            validation_origin: None,
         };
+        if pending_work_start {
+            // Select wake authority and validation provenance together. Only
+            // the first eligible transferred input can delegate scope; a
+            // passive response still cuts off provenance as before.
+            let mut select_origin = select_validation_origin;
+            for item in input.iter() {
+                match item {
+                    TurnInput::InterAgentCommunication(mail) if mail.can_start_turn() => {
+                        selected.has_start_work = true;
+                        selected.followup_wake = mail.followup_wake.clone();
+                        if select_origin {
+                            selected.validation_origin = mailbox.as_ref().and_then(|mailbox| {
+                                mail.id.as_ref().and_then(|id| mailbox.validation_origins.get(id))
+                            }).cloned();
+                        }
+                        break;
+                    }
+                    TurnInput::UserInput { content, .. } if !content.is_empty() => {
+                        selected.has_start_work = true;
+                        break;
+                    }
+                    TurnInput::ResponseItem(_) => select_origin = false,
+                    _ => {}
+                }
+            }
+            // A trigger behind a bounded FIFO prefix can still wake the child
+            // to drain that prefix. It does not confer validation provenance.
+            if !selected.has_start_work && let Some(mail) = mailbox.as_ref().and_then(|mailbox| {
+                mailbox.pending_mails.iter().map(|(mail, _)| mail).find(|mail| mail.can_start_turn())
+            }) {
+                selected.has_start_work = true;
+                selected.followup_wake = mail.followup_wake.clone();
+            }
+        }
         turn_state.pending_input = input;
-        Some(TransferredStartupInput { validation_origin })
+        Some(selected)
     }
 
     /// Called under the startup admission lock, immediately before worker

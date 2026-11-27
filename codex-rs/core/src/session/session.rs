@@ -787,9 +787,10 @@ pub(crate) struct Session {
     /// Writer retirement can outlive the loop's bounded shutdown observation.
     pub(crate) persistence_tasks: tokio_util::task::TaskTracker,
     pub(crate) persistence_retirement_result: std::sync::Mutex<Option<Result<(), String>>>,
-    /// Mandatory result, read only after session-loop termination. A successful
-    /// shutdown barrier covers the already accepted terminal record as well.
-    pub(crate) persistence_shutdown_result: std::sync::Mutex<Option<Result<(), String>>>,
+    /// The submission loop exits after its bounded observation, without
+    /// waiting for terminal work that can still outlive the observation.
+    pub(super) submission_loop_termination: OnceLock<SessionLoopTermination>,
+    pub(crate) shutdown_observation: std::sync::Mutex<Option<ShutdownObservation>>,
     /// Only another real durable barrier may clear a failed checkpoint.
     pub(crate) rollout_durability_error: tokio::sync::Mutex<Option<String>>,
     /// Admission stays closed while the prior turn is between terminal claim and the
@@ -2050,7 +2051,8 @@ impl Session {
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
                 persistence_tasks: tokio_util::task::TaskTracker::new(),
                 persistence_retirement_result: Default::default(),
-                persistence_shutdown_result: Default::default(),
+                submission_loop_termination: Default::default(),
+                shutdown_observation: Default::default(),
                 rollout_durability_error: Default::default(),
                 terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
                 agents_left_running_by_failed_turn: Default::default(),

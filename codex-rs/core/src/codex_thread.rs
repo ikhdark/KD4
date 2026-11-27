@@ -197,6 +197,13 @@ pub struct CodexThreadSettingsOverrides {
     pub personality: Option<Personality>,
 }
 
+/// A generation can be safe to replace even though its loop did not exit cleanly.
+pub(crate) enum StoppedThreadRetirement {
+    Orderly,
+    ConfirmedAfterDeadline,
+    ConfirmedAfterLoopFailure(&'static str),
+}
+
 pub struct CodexThread {
     pub(crate) codex: Codex,
     pub(crate) session_source: SessionSource,
@@ -275,37 +282,77 @@ impl CodexThread {
     /// confirm retirement.
     pub fn session_loop_failure(&self) -> Option<&'static str> {
         self.codex
-            .session_loop_termination
+            .submission_loop_termination()
             .peek()
             .and_then(|termination| termination.as_ref().err().copied())
+    }
+
+    /// Confirm orderly shutdown including the exact generation's accepted
+    /// owners and, for V2 residency, the durable writer retirement barrier.
+    #[doc(hidden)]
+    pub async fn wait_for_orderly_retirement(&self) -> CodexResult<()> {
+        self.confirm_orderly_retirement().await.map(|_| ())
+    }
+
+    pub(crate) async fn confirm_orderly_retirement(&self) -> CodexResult<StoppedThreadRetirement> {
+        self.request_shutdown().await?;
+        let receipt = self.confirm_orderly_drain().await?;
+        crate::agent::control::AgentControl::confirm_stopped_v2_residency(self)?;
+        Ok(receipt)
     }
 
     /// Wait for actual accepted owners, not just the bounded loop observer.
     /// Callers retiring a runtime must retain its identity/capacity until this
     /// completes. Cancelling this observer does not cancel any of the owners.
     pub async fn wait_until_drained(&self) -> CodexResult<()> {
-        self.codex
-            .session_loop_termination
-            .clone()
-            .await
-            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
-        self.codex.session.terminal_tasks.wait().await;
-        self.codex.session.wait_for_ordered_history_commits().await;
-        self.codex.session.persistence_tasks.wait().await;
-        match self
-            .codex
-            .session
-            .persistence_retirement_result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
-            Some(result) => result.map_err(CodexErr::Fatal),
-            None if self.codex.session.live_thread().is_some() => Err(CodexErr::Fatal(
-                "thread persistence retirement was not confirmed".to_string(),
-            )),
-            None => Ok(()),
+        self.confirm_orderly_drain().await.map(|_| ())
+    }
+
+    async fn confirm_orderly_drain(&self) -> CodexResult<StoppedThreadRetirement> {
+        self.codex.submission_loop_termination().await
+            .map_err(|failure| CodexErr::Fatal(failure.to_string()))?;
+        self.confirm_retirement().await.map_err(CodexErr::Fatal)
+    }
+
+    /// Replacement needs a positive retirement receipt, not a successful loop
+    /// join by itself. Keep the abnormal outcome distinct from an orderly drain.
+    pub(crate) async fn retire_stopped_generation(&self) -> CodexResult<StoppedThreadRetirement> {
+        self.request_shutdown().await?;
+        let termination = self.codex.submission_loop_termination().await;
+        let confirmation = self.confirm_retirement().await;
+        match termination {
+            Ok(()) => confirmation.map_err(CodexErr::Fatal),
+            Err(failure) => confirmation
+                .map(|_| StoppedThreadRetirement::ConfirmedAfterLoopFailure(failure))
+                .map_err(|reason| CodexErr::Fatal(format!(
+                    "{failure}; stopped thread retirement is unconfirmed: {reason}"
+                ))),
         }
+    }
+
+    async fn confirm_retirement(&self) -> Result<StoppedThreadRetirement, String> {
+        use crate::session::ShutdownObservation;
+
+        let session = &self.codex.session;
+        // A failed loop can exit before it hands off shutdown at all.
+        // Closed/empty trackers and an absent writer are not receipts.
+        let observed = session.shutdown_observation()
+            .ok_or_else(|| "no confirmed runtime teardown".to_string())?;
+        let receipt = match observed {
+            ShutdownObservation::Complete => StoppedThreadRetirement::Orderly,
+            ShutdownObservation::Pending(_) => StoppedThreadRetirement::ConfirmedAfterDeadline,
+            ShutdownObservation::Failed(error) => return Err(error),
+        };
+        if !session.terminal_tasks.is_closed() || !session.persistence_tasks.is_closed() {
+            return Err("no confirmed runtime teardown".to_string());
+        }
+        session.terminal_tasks.wait().await;
+        session.wait_for_ordered_history_commits().await;
+        session.persistence_tasks.wait().await;
+        session.retirement_result()
+            .ok_or_else(|| "thread persistence retirement was not confirmed".to_string())??;
+        session.check_retirement_durability()?;
+        Ok(receipt)
     }
 
     pub(crate) async fn emit_thread_resume_lifecycle(&self) {
@@ -379,6 +426,7 @@ impl CodexThread {
             /*client_user_message_id*/ None,
             execution_guard,
             /*validation_origin*/ None,
+            /*task_message*/ None,
         )
         .await
     }
@@ -397,6 +445,7 @@ impl CodexThread {
             client_user_message_id,
             execution_guard,
             /*validation_origin*/ None,
+            /*task_message*/ None,
         )
         .await
     }
@@ -651,7 +700,7 @@ impl CodexThread {
     pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
         let execution_guard = self.reserve_execution_guard(&sub.op).await?;
         self.submit_submission_with_execution_guard(
-            sub, execution_guard, /*validation_origin*/ None,
+            sub, execution_guard, /*validation_origin*/ None, /*task_message*/ None,
         )
         .await
     }
@@ -693,6 +742,7 @@ impl CodexThread {
             /*client_user_message_id*/ None,
             execution_guard,
             /*validation_origin*/ None,
+            /*task_message*/ None,
         )
         .await
     }
@@ -702,6 +752,7 @@ impl CodexThread {
         communication: InterAgentCommunication,
         execution_guard: Option<AgentExecutionGuard>,
         validation_origin: Option<(String, String)>,
+        task_message: Option<crate::agent::control::MailboxTaskMessage>,
     ) -> CodexResult<String> {
         self.submit_op_with_execution_guard(
             Op::InterAgentCommunication { communication },
@@ -709,6 +760,7 @@ impl CodexThread {
             /*client_user_message_id*/ None,
             execution_guard,
             validation_origin,
+            task_message,
         )
         .await
     }
@@ -732,6 +784,7 @@ impl CodexThread {
         client_user_message_id: Option<String>,
         execution_guard: Option<AgentExecutionGuard>,
         validation_origin: Option<(String, String)>,
+        task_message: Option<crate::agent::control::MailboxTaskMessage>,
     ) -> CodexResult<String> {
         let id = self.codex.reserve_turn_id();
         self.submit_submission_with_execution_guard(
@@ -743,6 +796,7 @@ impl CodexThread {
             },
             execution_guard,
             validation_origin,
+            task_message,
         )
         .await?;
         Ok(id)
@@ -757,6 +811,7 @@ impl CodexThread {
         sub: Submission,
         execution_guard: Option<AgentExecutionGuard>,
         validation_origin: Option<(String, String)>,
+        task_message: Option<crate::agent::control::MailboxTaskMessage>,
     ) -> CodexResult<()> {
         // Keep idle selection out until the receiver owns the pending input.
         // Capacity is reserved by the caller before taking this pin.
@@ -773,7 +828,7 @@ impl CodexThread {
             )?;
         let admission = self
             .codex
-            .enqueue_submission(sub, validation_origin)
+            .enqueue_submission(sub, validation_origin, task_message)
             .await?;
         // Once queued, cancellation of the sender must not revoke capacity
         // reserved for the receiver's pending operation.

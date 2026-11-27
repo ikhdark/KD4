@@ -55,7 +55,6 @@ use codex_analytics::now_unix_seconds;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
-use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseInputItem;
@@ -571,8 +570,8 @@ async fn run_compact_task_inner(
         return Err(error);
     }
     let mut analytics_details = CompactionAnalyticsDetails::default();
-    let mut compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
-    sess.emit_turn_item_started(&turn_context, &compaction_item)
+    let mut compaction_item = ContextCompactionItem::new();
+    sess.emit_compaction_started(&turn_context, &compaction_item)
         .await;
     // Keep the large compaction state machine off every enclosing turn and
     // thread-spawn future's stack, including forked child startup.
@@ -593,7 +592,7 @@ async fn run_compact_task_inner(
     .await;
     // The inner operation can fail before or after sampling/persistence. Close
     // the item at its owner boundary, including interruption and every `?` exit.
-    sess.emit_turn_item_completed_with_legacy_events(
+    sess.emit_compaction_completed(
         &turn_context,
         compaction_item,
         result.is_ok(),
@@ -631,7 +630,7 @@ async fn run_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
-    compaction_item: &mut TurnItem,
+    compaction_item: &mut ContextCompactionItem,
     emit_error_event: bool,
     recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
@@ -1102,15 +1101,13 @@ async fn run_compact_task_inner_impl(
     // Report what the replacement actually dropped. These values are already
     // computed above for analytics; carrying them on the completed item is what
     // lets a client say more than "context compacted".
-    if let TurnItem::ContextCompaction(item) = compaction_item {
-        item.tokens_before = analytics_details
-            .active_context_tokens_before
-            .or(Some(tokens_before));
-        item.tokens_after = Some(sess.get_total_token_usage().await);
-        item.omitted_image_count = Some(omitted_image_count);
-        item.retained_image_count = Some(retained_image_count);
-        item.omitted_text = Some(omitted_text);
-    }
+    compaction_item.tokens_before = analytics_details
+        .active_context_tokens_before
+        .or(Some(tokens_before));
+    compaction_item.tokens_after = Some(sess.get_total_token_usage().await);
+    compaction_item.omitted_image_count = Some(omitted_image_count);
+    compaction_item.retained_image_count = Some(retained_image_count);
+    compaction_item.omitted_text = Some(omitted_text);
     Ok(summary_text)
 }
 

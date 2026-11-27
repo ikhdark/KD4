@@ -16,6 +16,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SortDirection;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::RolloutRecorder;
 use codex_rollout::persisted_rollout_items;
 use serde::Deserialize;
 use serde::Serialize;
@@ -610,16 +611,28 @@ impl LocalThreadProjectionEntry {
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Bind and publish under live-recorders -> projections; all entry locks are acquired before the publication map locks"
+)]
 pub(super) async fn initialize_deferred(
     store: &LocalThreadStore,
     thread_id: ThreadId,
+    recorder: &RolloutRecorder,
     history: Option<Arc<Vec<RolloutItem>>>,
 ) -> ThreadStoreResult<()> {
-    let projection = projection_entry(store, thread_id).await;
+    let projection = {
+        let entries = store.live_recorders.lock().await;
+        if !entries
+            .get(&thread_id)
+            .is_some_and(|entry| entry.recorder.same_writer(recorder))
+        {
+            return Err(ThreadStoreError::ThreadNotFound { thread_id });
+        }
+        // Bind the entry before retirement can clear the maps or a replacement can register.
+        projection_entry(store, thread_id).await
+    };
     let _operation = projection.acquire_operation().await?;
-    // A new writer seed is not the snapshot authenticated by an earlier read.
-    *projection.source_version.lock().await = None;
-    *projection.gap_source_version.lock().await = None;
     let history = history.map(|history| {
         if history
             .iter()
@@ -636,10 +649,38 @@ pub(super) async fn initialize_deferred(
             history
         }
     });
-    *projection.state.lock().await = LocalThreadProjection {
+    let replacement = LocalThreadProjection {
         deferred_seed: Some(history.unwrap_or_else(|| Arc::new(Vec::new()))),
         ..Default::default()
     };
+    let previous = {
+        let mut source_version = projection.source_version.lock().await;
+        let mut gap_source_version = projection.gap_source_version.lock().await;
+        let mut state = projection.state.lock().await;
+
+        // Retirement can run while we wait for the entry. Validate both identities
+        // through publication without holding either map across entry work or I/O.
+        let entries = store.live_recorders.lock().await;
+        if !entries
+            .get(&thread_id)
+            .is_some_and(|entry| entry.recorder.same_writer(recorder))
+        {
+            return Err(ThreadStoreError::ThreadNotFound { thread_id });
+        }
+        let projections = store.projections.lock().await;
+        if !projections
+            .get(&thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &projection))
+        {
+            return Err(ThreadStoreError::ThreadNotFound { thread_id });
+        }
+        // A new writer seed is not the snapshot authenticated by an earlier read.
+        *source_version = None;
+        *gap_source_version = None;
+        std::mem::replace(&mut *state, replacement)
+    };
+    // A cached unloaded projection can be large; drop it outside the map locks.
+    drop(previous);
     Ok(())
 }
 

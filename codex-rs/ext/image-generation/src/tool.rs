@@ -1,6 +1,9 @@
 use std::collections::HashSet;
+use std::future::Future;
+use std::future::poll_fn;
 use std::io;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::Duration;
 
 use base64::Engine;
@@ -25,7 +28,6 @@ use codex_extension_api::ToolName;
 use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
-use codex_extension_api::TurnItemEmissionFuture;
 use codex_extension_api::TurnItemEmitter;
 use codex_extension_api::parse_tool_input_schema;
 use codex_extension_items::ExtensionItem;
@@ -64,7 +66,7 @@ const MAX_EDIT_IMAGES: usize = 5;
 const IMAGEGEN_DESCRIPTION: &str = include_str!("../imagegen_description.md");
 const IMAGE_GENERATION_CANCELLED_MESSAGE: &str = "image generation cancelled";
 const IMAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const DROPPED_IMAGE_COMPLETION_PUBLICATION_GRACE: Duration = Duration::from_secs(30);
+const DROPPED_IMAGE_COMPLETION_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct ImageGenerationTool {
@@ -114,48 +116,64 @@ fn extension_turn_item(item: ImageGenerationItem, legacy_event: EventMsg) -> Ext
     }
 }
 
-struct ImageCompletionPublication {
+struct ImageCompletion<F: Future + Send + 'static> {
     call_id: String,
-    pending: Option<TurnItemEmissionFuture<'static>>,
+    pending: Option<Pin<Box<F>>>,
 }
 
-impl Drop for ImageCompletionPublication {
+impl<F: Future + Send + 'static> Drop for ImageCompletion<F> {
     fn drop(&mut self) {
-        let Some(publication) = self.pending.take() else {
+        let Some(mut completion) = self.pending.take() else {
             return;
         };
-        // An emitter that panicked cannot be resumed.
+        // A future that panicked cannot be resumed.
         if std::thread::panicking() {
             return;
         }
-        // Core can abort dispatch after its cancellation cleanup deadline while
-        // the emitter is still publishing. That future may already have written
-        // the canonical item; move it, rather than emitting a second completion.
+
+        // Core can abort dispatch while local processing or publication is
+        // pending. Keep the same future: a save may already be in progress or
+        // the emitter may already have written the canonical item.
         let call_id = std::mem::take(&mut self.call_id);
+        let deadline = tokio::time::Instant::now() + DROPPED_IMAGE_COMPLETION_GRACE;
         tokio::spawn(async move {
-            if tokio::time::timeout(DROPPED_IMAGE_COMPLETION_PUBLICATION_GRACE, publication)
-                .await
-                .is_err()
-            {
-                tracing::warn!(%call_id, "image completion publication did not settle after dispatch was dropped");
+            // Timeout polls its inner future first. Do not start another phase
+            // on a poll after the deadline (including a delayed first poll).
+            let completion = poll_fn(|cx| {
+                if tokio::time::Instant::now() >= deadline {
+                    return Poll::Pending;
+                }
+                completion.as_mut().poll(cx)
+            });
+            if tokio::time::timeout_at(deadline, completion).await.is_err() {
+                tracing::warn!(%call_id, "image completion did not settle after dispatch was dropped");
             }
         });
     }
 }
 
-async fn publish_image_completion(emitter: &Arc<dyn TurnItemEmitter>, item: ImageGenerationItem) {
-    let call_id = item.id.clone();
-    let legacy_event = legacy_end_event(&item);
-    let item = extension_turn_item(item, legacy_event);
-    let emitter = Arc::clone(emitter);
-    let mut publication = ImageCompletionPublication {
+async fn run_image_completion<F: Future + Send + 'static>(
+    call_id: String,
+    completion: F,
+) -> F::Output {
+    let mut completion = ImageCompletion {
         call_id,
-        pending: Some(Box::pin(async move { emitter.emit_completed(item).await })),
+        pending: Some(Box::pin(completion)),
     };
-    if let Some(pending) = publication.pending.as_mut() {
-        pending.await;
-    }
-    publication.pending = None;
+    let result = completion
+        .pending
+        .as_mut()
+        .expect("image completion future is pending")
+        .await;
+    completion.pending = None;
+    result
+}
+
+async fn publish_image_completion(emitter: &dyn TurnItemEmitter, item: ImageGenerationItem) {
+    let legacy_event = legacy_end_event(&item);
+    emitter
+        .emit_completed(extension_turn_item(item, legacy_event))
+        .await;
 }
 
 impl ToolExecutor<ToolCall> for ImageGenerationTool {
@@ -244,47 +262,54 @@ impl ImageGenerationTool {
                     })
             })
             .await;
-        let response = match operation_result {
-            None => {
-                emit_failed_item(&call, &args.prompt).await;
-                return Err(cancelled_error());
-            }
-            Some(Err(message)) => {
-                emit_failed_item(&call, &args.prompt).await;
-                return Err(FunctionCallError::RespondToModel(message));
-            }
-            Some(Ok(result)) => result,
-        };
-        let mut usage = response.usage.unwrap_or_default();
-        usage.model = Some(IMAGE_MODEL.to_string());
-        let Some(data) = response.data.into_iter().next() else {
-            emit_failed_result(
-                &call.call_id,
-                &call.turn_item_emitter,
-                &args.prompt,
+        let operation_result = operation_result
+            .ok_or_else(cancelled_error)
+            .and_then(|result| result.map_err(FunctionCallError::RespondToModel));
+        let ToolCall {
+            call_id,
+            turn_item_emitter,
+            ..
+        } = call;
+        let save_root = self.save_root.clone();
+        let thread_id = self.thread_id.clone();
+
+        // The provider operation is already settled locally. Guard the entire
+        // local continuation, including the one terminal publication it selects.
+        run_image_completion(call_id.clone(), async move {
+            let emitter = turn_item_emitter.as_ref();
+            let response = match operation_result {
+                Ok(result) => result,
+                Err(error) => {
+                    emit_failed_result(&call_id, emitter, &args.prompt, None).await;
+                    return Err(error);
+                }
+            };
+            let mut usage = response.usage.unwrap_or_default();
+            usage.model = Some(IMAGE_MODEL.to_string());
+            let Some(data) = response.data.into_iter().next() else {
+                emit_failed_result(&call_id, emitter, &args.prompt, Some(usage)).await;
+                return Err(FunctionCallError::RespondToModel(
+                    "image generation returned no image data".into(),
+                ));
+            };
+            complete_image_generation(
+                &call_id,
+                emitter,
+                args.prompt,
+                data.b64_json,
+                save_root.as_ref(),
+                &thread_id,
                 Some(usage),
             )
-            .await;
-            return Err(FunctionCallError::RespondToModel(
-                "image generation returned no image data".into(),
-            ));
-        };
-        complete_image_generation(
-            &call.call_id,
-            &call.turn_item_emitter,
-            args.prompt,
-            data.b64_json,
-            self.save_root.as_ref(),
-            &self.thread_id,
-            Some(usage),
-        )
+            .await
+        })
         .await
     }
 }
 
 async fn complete_image_generation(
     call_id: &str,
-    emitter: &Arc<dyn TurnItemEmitter>,
+    emitter: &dyn TurnItemEmitter,
     prompt: String,
     result: String,
     save_root: Option<&AbsolutePathBuf>,
@@ -302,8 +327,8 @@ async fn complete_image_generation(
             return Err(FunctionCallError::RespondToModel(message));
         }
     };
-    // Once the provider returned image bytes, cancellation must not discard them.
-    // Finish any local write we start so cancellation cannot leave a partial artifact.
+    // After validation, preserve the returned bytes even if saving fails.
+    // Only report a saved path after the write has returned successfully.
     let (saved_path, delivery_hint) =
         persist_generated_image(LOCAL_FS.as_ref(), save_root, thread_id, call_id, bytes).await;
     let item = ImageGenerationItem {
@@ -379,13 +404,9 @@ fn image_history_requirement(payload: &ToolPayload) -> ConversationHistoryRequir
     }
 }
 
-async fn emit_failed_item(call: &ToolCall, prompt: &str) {
-    emit_failed_result(&call.call_id, &call.turn_item_emitter, prompt, None).await;
-}
-
 async fn emit_failed_result(
     call_id: &str,
-    emitter: &Arc<dyn TurnItemEmitter>,
+    emitter: &dyn TurnItemEmitter,
     prompt: &str,
     provider_usage: Option<ImageGenerationUsage>,
 ) {

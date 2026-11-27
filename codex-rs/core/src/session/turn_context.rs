@@ -369,6 +369,12 @@ impl Default for CurrentTurnTokenUsage {
 }
 
 impl TurnContext {
+    pub(crate) fn paired_lifecycle(&self) -> Arc<paired_lifecycle::PairedLifecycle> {
+        // Model-specific views share the same turn extension data.
+        self.extension_data
+            .get_or_init(paired_lifecycle::PairedLifecycle::default)
+    }
+
     pub(crate) fn claim_final_response_repair(&self) -> bool {
         !self
             .extension_data
@@ -534,7 +540,25 @@ fn same_turn_config_projection(left: &Config, right: &Config) -> bool {
         && left.features == right.features
 }
 
+/// Exact association is attached to the installed turn and shared by its
+/// model variants, not inferred from a reusable thread ID.
+struct InstalledFollowup(Arc<crate::agent::control::FollowupWake>);
+
 impl TurnContext {
+    pub(crate) fn followup_owner(&self) -> Arc<crate::agent::control::FollowupTurn> {
+        self.extension_data.get_or_init(crate::agent::control::FollowupTurn::default)
+    }
+
+    pub(crate) fn bind_incoming_followup(&self, wake: Arc<crate::agent::control::FollowupWake>) {
+        let previous = self.extension_data.insert(InstalledFollowup(wake));
+        debug_assert!(previous.is_none());
+    }
+
+    pub(crate) fn owns_incoming_followup(&self, wake: &Arc<crate::agent::control::FollowupWake>) -> bool {
+        self.extension_data.get::<InstalledFollowup>()
+            .is_some_and(|installed| Arc::ptr_eq(&installed.0, wake))
+    }
+
     pub(crate) async fn queue_post_tool_contexts(
         &self,
         call_id: &str,

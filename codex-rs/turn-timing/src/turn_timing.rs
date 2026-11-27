@@ -1635,9 +1635,43 @@ impl ToolClosureEntry {
     }
 }
 
+/// Readiness tallies for accepted entries only. The ledger still owns all
+/// entries and builds diagnostics from them when a snapshot is requested.
+#[derive(Clone, Copy, Debug, Default)]
+struct ToolClosurePending {
+    timing: usize,
+    terminal: usize,
+    persistence: usize,
+    delivery: usize,
+}
+
+impl ToolClosurePending {
+    fn for_entry(entry: &ToolClosureEntry) -> Self {
+        Self {
+            timing: usize::from(!entry.timing_paired),
+            terminal: usize::from(!entry.terminal),
+            persistence: usize::from(!entry.persisted),
+            delivery: usize::from(
+                !entry.persisted
+                    && (entry.identity.source != TurnTimingToolCallSource::CodeMode
+                        || entry.delivering_projection.is_some()),
+            ),
+        }
+    }
+
+    fn update(&mut self, previous: Self, entry: &ToolClosureEntry) {
+        let current = Self::for_entry(entry);
+        self.timing = self.timing - previous.timing + current.timing;
+        self.terminal = self.terminal - previous.terminal + current.terminal;
+        self.persistence = self.persistence - previous.persistence + current.persistence;
+        self.delivery = self.delivery - previous.delivery + current.delivery;
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ToolClosureLedger {
     entries: BTreeMap<ToolExecutionId, ToolClosureEntry>,
+    pending: ToolClosurePending,
     // Collision buckets reference the same immutable identity as entries.
     call_index: BTreeMap<u64, Vec<Arc<TurnTimingToolCallIdentity>>>,
     call_key_hasher: std::collections::hash_map::RandomState,
@@ -1723,36 +1757,49 @@ impl ToolClosureLedger {
             None => ToolClosureEntry::new(Arc::clone(&identity)),
         };
         self.call_index.entry(key).or_default().push(identity);
+        // Promoted orphans contribute their existing flags with the accepted identity.
+        self.pending.update(ToolClosurePending::default(), &entry);
         self.entries.insert(execution_id, entry);
         true
     }
 
     fn record_timing(&mut self, identity: TurnTimingToolCallIdentity, terminal: bool) {
         let execution_id = identity.execution_id.clone();
-        let entry = if let Some(entry) = self.entries.get_mut(&execution_id) {
-            entry
+        let (entry, accepted) = if let Some(entry) = self.entries.get_mut(&execution_id) {
+            (entry, true)
         } else {
-            self.orphan_calls
-                .entry(execution_id)
-                .or_insert_with(|| ToolClosureEntry::new(Arc::new(identity)))
+            (
+                self.orphan_calls
+                    .entry(execution_id)
+                    .or_insert_with(|| ToolClosureEntry::new(Arc::new(identity))),
+                false,
+            )
         };
+        let previous = accepted.then(|| ToolClosurePending::for_entry(entry));
         if entry.timing_paired {
             self.duplicate_timing_count = self.duplicate_timing_count.saturating_add(1);
         } else {
             entry.timing_paired = true;
         }
         entry.terminal |= terminal;
+        if let Some(previous) = previous {
+            self.pending.update(previous, entry);
+        }
     }
 
     fn record_persisted(&mut self, identity: TurnTimingToolCallIdentity) {
         let execution_id = identity.execution_id.clone();
-        let entry = if let Some(entry) = self.entries.get_mut(&execution_id) {
-            entry
+        let (entry, accepted) = if let Some(entry) = self.entries.get_mut(&execution_id) {
+            (entry, true)
         } else {
-            self.orphan_calls
-                .entry(execution_id)
-                .or_insert_with(|| ToolClosureEntry::new(Arc::new(identity)))
+            (
+                self.orphan_calls
+                    .entry(execution_id)
+                    .or_insert_with(|| ToolClosureEntry::new(Arc::new(identity))),
+                false,
+            )
         };
+        let previous = accepted.then(|| ToolClosurePending::for_entry(entry));
         if entry.persisted {
             self.duplicate_persistence_count = self.duplicate_persistence_count.saturating_add(1);
         } else {
@@ -1761,6 +1808,9 @@ impl ToolClosureLedger {
         // A durably persisted direct result is a terminal outcome even when a
         // failed task join prevented its dispatch guard from recording one.
         entry.terminal = true;
+        if let Some(previous) = previous {
+            self.pending.update(previous, entry);
+        }
     }
 
     fn record_nested_projection_persisted(&mut self, projection: &TurnTimingToolCallIdentity) {
@@ -1768,6 +1818,7 @@ impl ToolClosureLedger {
             entry.identity.source == TurnTimingToolCallSource::CodeMode
                 && entry.delivering_projection.as_ref() == Some(&projection.execution_id)
         }) {
+            let previous = ToolClosurePending::for_entry(entry);
             if entry.persisted {
                 self.duplicate_persistence_count =
                     self.duplicate_persistence_count.saturating_add(1);
@@ -1782,6 +1833,7 @@ impl ToolClosureLedger {
             // future before its timing guard could attach an explicit outcome
             // label.
             entry.terminal = true;
+            self.pending.update(previous, entry);
         }
     }
 
@@ -1802,7 +1854,9 @@ impl ToolClosureLedger {
                 && !entry.persisted
                 && entry.delivering_projection.is_none()
         }) {
+            let previous = ToolClosurePending::for_entry(entry);
             entry.delivering_projection = Some(projection_execution_id.clone());
+            self.pending.update(previous, entry);
         }
     }
 
@@ -1832,10 +1886,32 @@ impl ToolClosureLedger {
             // accepted call reached a terminal projection. A dropped dispatch
             // guard may have lost only the timing-pair bit; restoring that bit
             // must not erase duplicates, orphans, overflow, or missing output.
+            let previous = ToolClosurePending::for_entry(entry);
             entry.timing_paired = true;
+            self.pending.update(previous, entry);
             repaired = repaired.saturating_add(1);
         }
         repaired
+    }
+
+    fn lifecycle_closed(&self) -> bool {
+        self.orphan_calls.is_empty()
+            && self.pending.timing == 0
+            && self.pending.terminal == 0
+            && self.pending.persistence == 0
+    }
+
+    fn no_delivery_pending(&self) -> bool {
+        // After sealing, fully terminal direct calls cannot deliver a new
+        // projection for an unbound nested result. Return that evidence gap
+        // without marking it closed. Preserve the snapshot's u32 count
+        // comparisons for this early return (unlike full lifecycle closure).
+        let accepted = self.entries.len();
+        let minimum = accepted.min(u32::MAX as usize);
+        self.orphan_calls.is_empty()
+            && accepted - self.pending.timing >= minimum
+            && accepted - self.pending.terminal >= minimum
+            && self.pending.delivery == 0
     }
 
     fn snapshot(&self) -> TurnTimingToolClosure {
@@ -2434,7 +2510,7 @@ impl TurnTimingState {
         use codex_protocol::timing::observations;
         use codex_protocol::timing::process_monotonic_ns;
 
-        let observe = observations::enabled();
+        let observe = observations::runtime_async_enabled();
         let mut state = self.state();
         let cached = state.completed_snapshot.is_some();
         if !cached { state.measurements.performance.finish(); }
@@ -2446,7 +2522,7 @@ impl TurnTimingState {
         if let Some(start_ns) = started {
             let end_ns = process_monotonic_ns();
             drop(state);
-            let _ = observations::record(
+            let _ = observations::enqueue_runtime(
                 "terminal_state_complete",
                 thread_id,
                 turn_id,
@@ -2860,31 +2936,13 @@ impl TurnTimingState {
             let changed = self.tool_closure_changed.notified();
             {
                 let state = self.state();
-                if state.tool_call_acceptance_sealed {
-                    let snapshot = state.tool_closure.snapshot();
-                    let lifecycle_closed = snapshot.unresolved_calls.is_empty()
-                        && snapshot.orphan_calls.is_empty()
-                        && snapshot.timing_paired_count == snapshot.accepted_count
-                        && snapshot.terminal_count == snapshot.accepted_count
-                        && snapshot.persisted_count == snapshot.accepted_count;
-                    // After sealing, fully terminal direct calls cannot deliver a
-                    // new projection for an unbound nested result. Waiting cannot
-                    // repair that evidence gap; return it without marking it closed.
-                    let no_delivery_pending = snapshot.timing_paired_count == snapshot.accepted_count
-                        && snapshot.terminal_count == snapshot.accepted_count
-                        && snapshot.orphan_calls.is_empty()
-                        && state.queued_durable_tool_result_execution_ids.is_empty()
-                        && state.tool_closure.entries.values().all(|entry| {
-                            entry.persisted
-                                || (entry.identity.source == TurnTimingToolCallSource::CodeMode
-                                    && entry.delivering_projection.is_none())
-                        });
-                    if lifecycle_closed
-                        || no_delivery_pending
-                        || state.tool_result_persistence_barrier_failed
-                    {
-                        return snapshot;
-                    }
+                if state.tool_call_acceptance_sealed
+                    && (state.tool_result_persistence_barrier_failed
+                        || state.tool_closure.lifecycle_closed()
+                        || (state.queued_durable_tool_result_execution_ids.is_empty()
+                            && state.tool_closure.no_delivery_pending()))
+                {
+                    return state.tool_closure.snapshot();
                 }
             }
             changed.await;
@@ -3788,27 +3846,42 @@ impl TurnTimingState {
     pub fn prompt_token_calibration_with_estimator(
         &self, model: &str, usage: &TokenUsage, local: i64,
     ) -> Option<(u64, u64)> {
-        let state = self.state();
-        let request = state.model_requests.last()?;
         let input = usage.known_input()?;
-        if std::env::var_os("CODEX_KDR_COMPACTION_BUDGET_OBSERVE").as_deref() == Some(std::ffi::OsStr::new("1")) {
-            eprintln!("kdr_compaction_budget {}", serde_json::json!({
-                "phase": "calibration_gate", "completed": request.completed_ns.is_some(),
-                "primary": request.attempt_kind == TurnTimingAttemptKind::Primary,
-                "single_attempt": request.physical_attempt_ids.len() == 1,
-                "estimator_matches": request.estimator_model.as_deref() == Some(model),
-                "usage_matches": request.token_usage.as_ref().is_some_and(|usage| usage.input_tokens == input as u64),
-                "local_tokens": local, "measured_input": input,
-            }));
+        let (completed, primary, single_attempt, estimator_matches, usage_matches) = {
+            let state = self.state();
+            let request = state.model_requests.last()?;
+            (
+                request.completed_ns.is_some(),
+                request.attempt_kind == TurnTimingAttemptKind::Primary,
+                request.physical_attempt_ids.len() == 1,
+                request.estimator_model.as_deref() == Some(model),
+                request
+                    .token_usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.input_tokens == input as u64),
+            )
+        };
+        if std::env::var_os("CODEX_KDR_COMPACTION_BUDGET_OBSERVE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            use std::io::Write as _;
+
+            // Keep the ordered KDR receipt, but never hold turn timing state
+            // while writing stderr. A failed diagnostic sink cannot fail accounting.
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "kdr_compaction_budget {}",
+                serde_json::json!({
+                    "phase": "calibration_gate", "completed": completed,
+                    "primary": primary, "single_attempt": single_attempt,
+                    "estimator_matches": estimator_matches, "usage_matches": usage_matches,
+                    "local_tokens": local, "measured_input": input,
+                }),
+            );
         }
-        if request.completed_ns.is_none()
-            || request.attempt_kind != TurnTimingAttemptKind::Primary
-            || request.physical_attempt_ids.len() != 1
-            || request.estimator_model.as_deref() != Some(model)
-            || request.token_usage.as_ref()?.input_tokens != input as u64
-            || input <= 0 || local <= 0
-        { return None; }
-        Some((local as u64, input as u64))
+        (completed && primary && single_attempt && estimator_matches && usage_matches
+            && input > 0 && local > 0)
+            .then_some((local as u64, input as u64))
     }
 
     pub fn record_model_request_diagnostics_unavailable(

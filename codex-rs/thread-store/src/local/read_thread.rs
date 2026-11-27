@@ -7,8 +7,9 @@ use codex_protocol::protocol::SessionSource;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::find_thread_name_by_id;
 use codex_rollout::read_session_meta_line;
-use codex_rollout::read_thread_item_from_rollout;
+use codex_rollout::read_thread_item_from_rollout_including_empty_preview;
 use codex_rollout::read_thread_preview_from_rollout;
+use codex_rollout::try_read_thread_item_from_rollout_including_empty_preview;
 use codex_state::ThreadMetadata;
 
 use super::LocalThreadStore;
@@ -82,7 +83,12 @@ pub(super) async fn read_thread_with_payload_versions(
         }
     }
 
-    read_thread_from_resolved_rollout(store, params, payload_versions).await
+    let summary_read = if params.include_history {
+        RolloutSummaryRead::BestEffort
+    } else {
+        RolloutSummaryRead::ReportErrors
+    };
+    read_thread_from_resolved_rollout(store, params, payload_versions, summary_read).await
 }
 
 /// Returns the rollout path a summary read would report, with the same visibility and identity
@@ -104,6 +110,7 @@ pub(super) async fn read_thread_rollout_path(
             include_history: false,
         },
         None,
+        RolloutSummaryRead::BestEffort,
     )
     .await
     .map(|thread| thread.rollout_path)
@@ -132,6 +139,7 @@ async fn read_thread_from_resolved_rollout(
     store: &LocalThreadStore,
     params: ReadThreadParams,
     payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
+    summary_read: RolloutSummaryRead,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
     let path = resolve_rollout_path(
@@ -144,7 +152,7 @@ async fn read_thread_from_resolved_rollout(
     .map(|resolved| resolved.path)
     .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
-    let mut thread = read_thread_from_rollout_path(store, path).await?;
+    let mut thread = read_thread_from_rollout_path(store, path, summary_read).await?;
     if let Some(metadata) = read_sqlite_metadata(store, thread_id).await? {
         thread.name = sqlite_metadata_name(store, &metadata).await;
     }
@@ -212,7 +220,8 @@ pub(super) async fn read_thread_by_rollout_path_with_payload_versions(
     payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
 ) -> ThreadStoreResult<StoredThread> {
     let path = resolve_requested_rollout_path(store, rollout_path).await?;
-    let mut thread = read_thread_from_rollout_path(store, path).await?;
+    let mut thread =
+        read_thread_from_rollout_path(store, path, RolloutSummaryRead::BestEffort).await?;
     if !include_archived && thread.archived_at.is_some() {
         return Err(ThreadStoreError::InvalidRequest {
             message: format!("thread {} is archived", thread.thread_id),
@@ -334,13 +343,45 @@ async fn attach_history_if_requested(
     Ok(())
 }
 
+enum RolloutSummaryRead {
+    BestEffort,
+    ReportErrors,
+}
+
 async fn read_thread_from_rollout_path(
     store: &LocalThreadStore,
     path: std::path::PathBuf,
+    summary_read: RolloutSummaryRead,
 ) -> ThreadStoreResult<StoredThread> {
-    let Some(item) = read_thread_item_from_rollout(path.clone()).await else {
+    let item = match summary_read {
+        RolloutSummaryRead::BestEffort => {
+            read_thread_item_from_rollout_including_empty_preview(path.clone()).await
+        }
+        RolloutSummaryRead::ReportErrors => {
+            try_read_thread_item_from_rollout_including_empty_preview(path.clone())
+                .await
+                .map_err(|error| ThreadStoreError::Internal {
+                    message: format!("failed to read rollout summary {}: {error}", path.display()),
+                })?
+        }
+    };
+    let Some(item) = item else {
         return stored_thread_from_session_meta(store, path).await;
     };
+    if item.preview.is_none() && item.source.is_some() {
+        // Keep the legacy head-based fallback for creation facts before
+        // the first preview; only its Git projection comes from the full scan.
+        let mut thread = stored_thread_from_session_meta(store, path).await?;
+        if item.thread_id == Some(thread.thread_id) {
+            let git_info = git_info_from_parts(item.git_sha, item.git_branch, item.git_origin_url);
+            if git_info.is_some() || thread.git_info.as_ref().is_some_and(|git| {
+                git.commit_hash.is_some() || git.branch.is_some() || git.repository_url.is_some()
+            }) {
+                thread.git_info = git_info;
+            }
+        }
+        return Ok(thread);
+    }
     let archived = rollout_path_is_archived(store.config.codex_home.as_path(), path.as_path());
     let mut thread = stored_thread_from_rollout_item(
         item,

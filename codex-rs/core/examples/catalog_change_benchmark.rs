@@ -18,7 +18,8 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -49,26 +50,37 @@ impl Peer {
         state.epoch.store(1, Ordering::Release);
         let shared = Arc::clone(&state);
         let owner = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            while !shared.stopped.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        ensure!(requests.len() < 128, "bounded peer request limit");
-                        let shared = Arc::clone(&shared);
-                        requests.push(std::thread::spawn(move || serve(stream, &shared)));
+            std::thread::scope(|scope| {
+                let mut requests = Vec::new();
+                let mut result = (|| {
+                    while !shared.stopped.load(Ordering::Acquire) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                ensure!(requests.len() < 128, "bounded peer request limit");
+                                let shared = Arc::clone(&shared);
+                                requests.push(scope.spawn(move || serve(stream, &shared)));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(error) => return Err(error.into()),
+                    Ok(())
+                })();
+                if result.is_err() {
+                    drop(listener);
                 }
-            }
-            for request in requests {
-                request
-                    .join()
-                    .map_err(|_| anyhow!("peer request panicked"))??;
-            }
-            Ok(())
+                // Join every admitted request, retaining the first error in the original order.
+                for request in requests {
+                    let joined = match request.join() {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow!("peer request panicked")),
+                    };
+                    result = result.and(joined);
+                }
+                result
+            })
         });
         Ok(Self {
             state,
@@ -280,15 +292,19 @@ fn declaration(tools: &[ToolInfo]) -> Result<String> {
 
 async fn await_version(manager: &McpConnectionManager, expected: u64) -> Result<f64> {
     let start = Instant::now();
+    let deadline = start + Duration::from_secs(5);
     loop {
-        if version(manager.list_all_tools_snapshot().await.as_ref()) == Some(expected) {
-            return Ok(start.elapsed().as_secs_f64() * 1000.0);
+        ensure!(Instant::now() < deadline, "catalog {expected} did not refresh");
+        let snapshot = tokio::time::timeout_at(deadline, manager.list_all_tools_snapshot())
+            .await
+            .map_err(|_| anyhow!("catalog {expected} did not refresh"))?;
+        let matched = version(snapshot.as_ref()) == Some(expected);
+        let observed_at = Instant::now();
+        ensure!(observed_at < deadline, "catalog {expected} did not refresh");
+        if matched {
+            return Ok((observed_at - start).as_secs_f64() * 1000.0);
         }
-        ensure!(
-            start.elapsed() < Duration::from_secs(5),
-            "catalog {expected} did not refresh"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep_until((observed_at + Duration::from_millis(5)).min(deadline)).await;
     }
 }
 
@@ -343,9 +359,14 @@ async fn observe() -> Result<Value> {
         }
     });
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !peer.state.held.load(Ordering::Acquire) {
-        ensure!(Instant::now() < deadline, "in-flight call was not admitted");
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    loop {
+        let held = peer.state.held.load(Ordering::Acquire);
+        let observed_at = Instant::now();
+        ensure!(observed_at < deadline, "in-flight call was not admitted");
+        if held {
+            break;
+        }
+        tokio::time::sleep_until((observed_at + Duration::from_millis(5)).min(deadline)).await;
     }
     peer.state.version.store(2, Ordering::Release);
     let before = manager.tool_catalog_revision();

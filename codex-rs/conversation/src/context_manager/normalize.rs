@@ -4,6 +4,7 @@ use codex_protocol::models::ResponseItem;
 use uuid::Uuid;
 
 use crate::invariants::error_or_panic;
+use crate::tool_occurrence;
 use tracing::info;
 
 pub(super) const MISSING_TOOL_RESULT: &str = "Result unavailable. Execution outcome and side effects are unknown. Do not repeat a state-changing operation solely because its result is missing.";
@@ -20,14 +21,22 @@ fn missing_tool_result(call_id: &str) -> FunctionCallOutputPayload {
 }
 
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
-    let missing_outputs_to_insert = collect_missing_call_outputs(items, true);
+    let missing_outputs_to_insert = collect_missing_call_outputs(items, MissingOutputUse::Prompt);
     insert_items_after(items, missing_outputs_to_insert);
+
+    // Make the historical result key explicit on the replay copy. Never
+    // rewrite the stored item ID or add a dispatchable shell tool.
+    for item in items {
+        if let Some(call_id) = tool_occurrence::legacy_local_shell_item_id(item).map(str::to_owned) {
+            tool_occurrence::set_call_id(item, call_id);
+        }
+    }
 }
 
 /// For a hypothetical prompt: a call still executing legitimately has no output yet,
 /// which is only an invariant violation in a prompt that will actually be sent.
 pub(crate) fn pair_in_flight_calls_for_estimate(items: &mut std::sync::Arc<Vec<ResponseItem>>) {
-    let missing_outputs_to_insert = collect_missing_call_outputs(items, false);
+    let missing_outputs_to_insert = collect_missing_call_outputs(items, MissingOutputUse::Estimate);
     if !missing_outputs_to_insert.is_empty() {
         insert_items_after(std::sync::Arc::make_mut(items), missing_outputs_to_insert);
     }
@@ -57,17 +66,29 @@ fn insert_items_after(items: &mut Vec<ResponseItem>, mut insertions: Vec<(usize,
 }
 
 pub fn missing_call_outputs(items: &[ResponseItem]) -> Vec<ResponseItem> {
-    collect_missing_call_outputs(items, false)
+    collect_missing_call_outputs(items, MissingOutputUse::Durable)
         .into_iter()
         .map(|(_, output)| output)
         .collect()
 }
 
+enum MissingOutputUse {
+    Prompt,
+    Estimate,
+    Durable,
+}
+
 fn collect_missing_call_outputs(
     items: &[ResponseItem],
-    report_prompt_invariant_violations: bool,
+    usage: MissingOutputUse,
 ) -> Vec<(usize, ResponseItem)> {
-    let paired = crate::tool_occurrence::pairs(items);
+    let historical = !matches!(usage, MissingOutputUse::Durable);
+    let report_prompt_invariant_violations = matches!(usage, MissingOutputUse::Prompt);
+    let paired = if historical {
+        tool_occurrence::pairs(items)
+    } else {
+        tool_occurrence::explicit_pairs(items)
+    };
 
     // Collect synthetic outputs to insert immediately after their calls.
     // Store original call indexes in ascending order for a single merge pass.
@@ -123,13 +144,23 @@ fn collect_missing_call_outputs(
                     },
                 ));
             }
-            // LocalShellCall is represented in upstream streams by a FunctionCallOutput
+            // LocalShellCall uses a FunctionCallOutput, including in legacy replay.
             ResponseItem::LocalShellCall {
                 id,
-                call_id: Some(call_id),
+                call_id: explicit_id,
                 ..
             } if paired[idx].is_none() => {
-                if report_prompt_invariant_violations {
+                let identity = if historical {
+                    tool_occurrence::history_identity(item)
+                } else {
+                    tool_occurrence::identity(item)
+                };
+                let Some((_, _, call_id)) = identity else {
+                    continue;
+                };
+                // A missing historical result is unknown, not a violation of
+                // the live dispatch owner's output invariant.
+                if report_prompt_invariant_violations && explicit_id.is_some() {
                     error_or_panic(format!(
                         "Local shell call output is missing for call id: {call_id}"
                     ));
@@ -138,7 +169,7 @@ fn collect_missing_call_outputs(
                     idx,
                     ResponseItem::FunctionCallOutput {
                         id: synthetic_output_id("fco", id.as_deref()),
-                        call_id: call_id.clone(),
+                        call_id: call_id.to_owned(),
                         output: missing_tool_result(call_id),
                         internal_chat_message_metadata_passthrough: None,
                     },
@@ -166,7 +197,7 @@ fn synthetic_output_id(prefix: &str, item_id: Option<&str>) -> Option<ResponseIt
 }
 
 pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
-    let paired = crate::tool_occurrence::pairs(items);
+    let paired = tool_occurrence::pairs(items);
 
     // Find unmatched output occurrences before mutating their positions.
     let orphan_indexes: Vec<usize> = items

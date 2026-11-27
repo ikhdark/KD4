@@ -255,7 +255,7 @@ impl From<&CodexErr> for CodexErrKind {
             CodexErr::Sandbox(_) => CodexErrKind::Sandbox,
             CodexErr::UnsupportedOperation(_) => CodexErrKind::UnsupportedOperation,
             CodexErr::RefreshTokenFailed(_) => CodexErrKind::RefreshTokenFailed,
-            CodexErr::Fatal(_) => CodexErrKind::Fatal,
+            CodexErr::Fatal(_) | CodexErr::GitCompatibilityPending { .. } => CodexErrKind::Fatal,
             CodexErr::Io(_) => CodexErrKind::Io,
             CodexErr::Json(_) => CodexErrKind::Json,
             CodexErr::TokioJoin(_) => CodexErrKind::TokioJoin,

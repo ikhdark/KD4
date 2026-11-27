@@ -9,6 +9,8 @@ use crate::ExtensionData;
 
 /// Host state available while an extension contributes one sampling step's World State.
 pub struct WorldStateContributionInput<'a> {
+    /// Host cutoff for this contribution; leave time to return partial results.
+    pub contribution_deadline: std::time::Instant,
     pub thread_id: ThreadId,
     pub turn_id: &'a str,
     pub environments: &'a [TurnEnvironmentSelection],

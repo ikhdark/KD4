@@ -16,9 +16,11 @@ pub(super) use super::head_tail_buffer::omitted_output_marker;
 use super::head_tail_buffer::split_valid_utf8_prefix_with_max;
 use super::process::ProcessOutputChunk;
 use super::process::UnifiedExecProcess;
+use super::process_manager::BackgroundTerminalAppend;
 use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
 use crate::exec::OutputDeltaDecision;
 use crate::exec::OutputDeltaLimiter;
+use crate::session::BackgroundCommandAppendReceipt;
 use crate::session::session::Session;
 use crate::session::turn::reconcile_turn_progress_event_async;
 use crate::session::turn_context::TurnContext;
@@ -311,7 +313,9 @@ async fn emit_process_terminal_event(
     source: &ToolCallSource,
     tracker: Option<&SharedTurnDiffTracker>,
     execution_id: Option<&str>,
+    append: &BackgroundTerminalAppend,
 ) -> Result<(), String> {
+    let record_append = |receipt| append.record(receipt);
     let persistence_result = emit_exec_end_for_unified_exec(
         Arc::clone(session_ref),
         Arc::clone(turn_ref),
@@ -330,9 +334,11 @@ async fn emit_process_terminal_event(
         source.clone(),
         tracker.cloned(),
         execution_id,
+        Some(&record_append),
     )
     .await;
     if let Err(error) = &persistence_result {
+        append.record_unknown(error.to_string());
         // Completion describes the process that actually ran. Report the failed
         // durability barrier separately, then let the watcher finish cleanup.
         // The session also rejects model dispatch while this failure is pending.
@@ -358,7 +364,7 @@ impl Drop for ProcessOutputWaiterGuard {
 /// Spawn a background watcher that waits for the PTY to exit and then emits a
 /// single ExecCommandEnd event with the aggregated transcript.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_exit_watcher(
+pub(super) fn spawn_exit_watcher(
     process: Arc<UnifiedExecProcess>,
     session_ref: Arc<Session>,
     turn_ref: Arc<TurnContext>,
@@ -376,6 +382,7 @@ pub(crate) fn spawn_exit_watcher(
     tty: bool,
     classified_search: bool,
     validation_started_at: Option<Instant>,
+    mut append: BackgroundTerminalAppend,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
@@ -390,15 +397,26 @@ pub(crate) fn spawn_exit_watcher(
         let exit_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
         wait_for_sticky_lifecycle_signal(&exit_token).await;
         // An observation-channel failure wakes cleanup but is not exit evidence.
-        if !process.has_exited()
+        let (session_ref, memo_already_published) = if !process.has_exited()
             && let Err(error) = process.terminate_confirmed().await
         {
             terminal_completion.send_replace(Some(Err(format!(
                 "process observation failed and termination was not confirmed: {error}"
             ))));
-            // The manager retains the process owner for subsequent cleanup.
-            return;
-        }
+            // Keep the original caller memo and unique End producer, without
+            // self-retaining the manager that owns native-cleanup retries.
+            let weak_session = Arc::downgrade(&session_ref);
+            drop(session_ref);
+            if !append.wait_for_confirmed_termination().await {
+                return;
+            }
+            let Some(session_ref) = weak_session.upgrade() else {
+                return;
+            };
+            (session_ref, true)
+        } else {
+            (session_ref, false)
+        };
         let exit_observed_at = Instant::now();
         let duration = process
             .observed_lifetime()
@@ -513,6 +531,7 @@ pub(crate) fn spawn_exit_watcher(
             &source,
             tracker.as_ref(),
             Some(&parent_tool_execution_id.0),
+            &append,
         )
         .await;
         let delivered_at = Instant::now();
@@ -556,11 +575,13 @@ pub(crate) fn spawn_exit_watcher(
                 .release_failed_completion(process_id, &process)
                 .await;
         }
-        let previous_completion = terminal_completion.send_replace(Some(terminal_result));
-        debug_assert!(
-            previous_completion.is_none(),
-            "watcher completion is published once"
-        );
+        if !memo_already_published {
+            let previous_completion = terminal_completion.send_replace(Some(terminal_result));
+            debug_assert!(
+                previous_completion.is_none(),
+                "watcher completion is published once"
+            );
+        }
         let lifecycle = tool_dispatch_timing
             .as_ref()
             .map(|timing| timing.snapshot(delivered_at));
@@ -828,6 +849,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
     execution_id: Option<&str>,
+    record_background_append: Option<&(dyn Fn(BackgroundCommandAppendReceipt) + Sync)>,
 ) -> CodexResult<()> {
     // Public command lifetime uses the same process-owned host observations for
     // quick and background completion, not collection/drain/publication time.
@@ -965,6 +987,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     event_ctx.observed_exit_code = Some(exit_code);
     event_ctx.execution_id = execution_id;
     event_ctx.output_metadata = Some(&metadata);
+    event_ctx.record_background_append = record_background_append;
     let mut emitter = ToolEmitter::unified_exec(
         &command,
         cwd,

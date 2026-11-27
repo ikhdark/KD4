@@ -51,7 +51,8 @@ impl ExternalAgentConfigRequestProcessor {
         params: ExternalAgentConfigDetectParams,
     ) -> Result<ExternalAgentConfigDetectResponse, JSONRPCErrorError> {
         let home = self.codex_home.clone();
-        let mut items = tokio::task::spawn_blocking(move || files::detect(&home, params))
+        let detect_sessions = self.durable_session_import_store().is_some();
+        let mut items = tokio::task::spawn_blocking(move || files::detect(&home, params, detect_sessions))
             .await
             .map_err(|err| internal_error(format!("external-agent detection task failed: {err}")))?
             .map_err(|err| internal_error(err.to_string()))?;
@@ -201,13 +202,15 @@ impl ExternalAgentConfigRequestProcessor {
                 tracing::warn!(%import_id, error = %err, "failed to record external-agent import completion");
             }
         }
-        let _ = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT,
-            self.outgoing.send_server_notification(
+        let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
+        self.outgoing
+            .send_terminal_broadcast_until(
                 ServerNotification::ExternalAgentConfigImportCompleted(
                     ExternalAgentConfigImportCompletedNotification { import_id, item_type_results },
                 ),
-            ),
-        ).await;
+                delivery_deadline,
+            )
+            .await;
     }
 
     pub(crate) async fn read_import_histories(

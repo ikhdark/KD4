@@ -1,4 +1,5 @@
 use super::ConfiguredGitMarketplace;
+use crate::installed_marketplaces::lock_marketplace_publication;
 use codex_config::types::MarketplaceSourceType;
 use serde::Deserialize;
 use serde::Serialize;
@@ -81,6 +82,7 @@ pub(super) fn write_installed_marketplace_metadata(
 
 pub(super) fn activate_marketplace_root(
     destination: &Path,
+    marketplace_name: &str,
     staged_dir: TempDir,
     after_activate: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
@@ -98,8 +100,14 @@ pub(super) fn activate_marketplace_root(
         )
     })?;
 
+    // Declare private backup storage first so its cleanup runs after releasing
+    // publication. The caller already owns the operation lease; no Git work
+    // may occur under this shorter fence.
+    let backup_dir;
+    let _publication = lock_marketplace_publication(parent, marketplace_name)
+        .map_err(|err| format!("failed to lock marketplace publication: {err}"))?;
     if destination.exists() {
-        let backup_dir = tempfile::Builder::new()
+        backup_dir = tempfile::Builder::new()
             .prefix("marketplace-backup-")
             .tempdir_in(parent)
             .map_err(|err| {

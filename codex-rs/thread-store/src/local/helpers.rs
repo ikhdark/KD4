@@ -196,6 +196,83 @@ pub(super) async fn resolve_rollout_path(
     })
 }
 
+/// A pending append belongs to its original rollout, not whichever copy a
+/// directory search happens to find. Only consult the intent path, the current
+/// SQLite path with the same filename, and their deterministic home locations.
+pub(super) async fn resolve_git_compatibility_rollout_path(
+    codex_home: &Path,
+    intent_path: &Path,
+    indexed_path: &Path,
+    live_path: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    use std::io::Error;
+
+    let intent_path = codex_rollout::plain_rollout_path(intent_path);
+    let indexed_path = codex_rollout::plain_rollout_path(indexed_path);
+    let file_name = intent_path
+        .file_name()
+        .ok_or_else(|| Error::other("missing Git compatibility rollout filename"))?;
+    let active = codex_home.join(codex_rollout::SESSIONS_SUBDIR);
+    let archived = codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
+    let home = tokio::fs::canonicalize(codex_home).await?;
+    let active_root = canonical_rollout_root(&active, home.join(codex_rollout::SESSIONS_SUBDIR)).await?;
+    let archived_root = canonical_rollout_root(&archived, home.join(ARCHIVED_SESSIONS_SUBDIR)).await?;
+    let in_managed_layout = |path: &Path| {
+        path.starts_with(&active)
+            || path.starts_with(&archived)
+            || path.starts_with(&active_root)
+            || path.starts_with(&archived_root)
+    };
+    let mut candidates = vec![intent_path.clone()];
+    if indexed_path.file_name() == Some(file_name) {
+        candidates.push(indexed_path);
+    }
+    if in_managed_layout(&intent_path) {
+        candidates.push(archived.join(file_name));
+        if let Some((year, month, day)) = codex_rollout::rollout_date_parts(file_name) {
+            candidates.push(active.join(year).join(month).join(day).join(file_name));
+        }
+    }
+
+    let mut existing = HashSet::new();
+    for candidate in candidates {
+        let managed = in_managed_layout(&candidate);
+        if !managed && (candidate.starts_with(codex_home) || candidate.starts_with(&home)) {
+            // Never publish into staging or resurrect a staged deletion.
+            continue;
+        }
+        if let Some(path) = codex_rollout::try_existing_rollout_path(&candidate).await? {
+            let canonical = tokio::fs::canonicalize(path).await?;
+            let canonical_managed = canonical.starts_with(&active_root) || canonical.starts_with(&archived_root);
+            if (managed && !canonical_managed) || (canonical.starts_with(&home) && !canonical_managed) {
+                return Err(Error::other("Git compatibility rollout alias escapes its storage directory"));
+            }
+            existing.insert(codex_rollout::plain_rollout_path(&canonical));
+        }
+    }
+    if existing.len() != 1 {
+        return Err(Error::other("cannot identify a unique Git compatibility rollout"));
+    }
+    let path = existing.into_iter().next().expect("one existing rollout");
+    if let Some(live_path) = live_path {
+        let Some(current) = codex_rollout::try_existing_rollout_path(live_path).await? else {
+            return Err(Error::other("current writer rollout is not materialized"));
+        };
+        if path != codex_rollout::plain_rollout_path(&tokio::fs::canonicalize(current).await?) {
+            return Err(Error::other("Git compatibility rollout is not the current writer's file"));
+        }
+    }
+    Ok(path)
+}
+
+async fn canonical_rollout_root(path: &Path, missing: PathBuf) -> std::io::Result<PathBuf> {
+    match tokio::fs::canonicalize(path).await {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(missing),
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn matching_rollout_file_name(
     rollout_path: &Path,
     thread_id: ThreadId,

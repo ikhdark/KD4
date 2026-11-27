@@ -541,6 +541,9 @@ from openai_codex import (
 
 - `retry_on_overload(...)` retries transient overload errors with exponential backoff + jitter.
 - `is_retryable_error(exc)` checks if an exception is transient/overload-like.
+  Older local runtimes may report queue saturation before accepting a request
+  without structured error data. The SDK recognizes those responses; an explicit
+  `retryable: false` still prevents retry.
 
 ## Example
 

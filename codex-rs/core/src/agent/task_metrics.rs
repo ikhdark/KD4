@@ -10,6 +10,7 @@ use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::Assignment;
+use codex_agent_task_store::AttemptId;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::CONCURRENT_DRIFT_REASON;
 use codex_agent_task_store::CapabilityProfile;
@@ -668,7 +669,8 @@ impl TaskMetricRecorder {
 /// monotonic timestamps, so it can be dropped safely on restart without affecting task recovery.
 #[derive(Debug)]
 pub(crate) struct TaskMetricRuntime {
-    pub(super) minimum_attempt_ordinal: u8,
+    pub(super) attempt_id: AttemptId,
+    pub(super) terminal: bool,
     pub(super) usage_history_partial: bool,
     started_at: Instant,
     role: AgentRole,
@@ -679,11 +681,13 @@ pub(crate) struct TaskMetricRuntime {
 impl TaskMetricRuntime {
     pub(crate) fn new(
         assignment: &Assignment,
+        attempt_id: AttemptId,
         active_turns: u32,
         capacity: u32,
     ) -> Result<Self, MetricsError> {
         Ok(Self {
-            minimum_attempt_ordinal: 0,
+            attempt_id,
+            terminal: false,
             usage_history_partial: false,
             started_at: Instant::now(),
             role: assignment.role,

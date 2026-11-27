@@ -102,7 +102,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, item)| {
-                    let (kind, is_call, id) = crate::tool_occurrence::identity(item)?;
+                    let (kind, is_call, id) = crate::tool_occurrence::history_identity(item)?;
                     let ordinal = *occurrence_ids.entry((kind, id.to_owned())).or_insert_with(|| {
                         let ordinal = next_occurrence_id;
                         next_occurrence_id += 1;

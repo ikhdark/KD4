@@ -15,10 +15,12 @@ use crate::protocol::CollabAgentRef;
 use crate::protocol::ExecCommandSource;
 use crate::protocol::ExecCommandStatus;
 use crate::protocol::FileChange;
+use crate::protocol::LegacyTaskCompletionGate;
 use crate::protocol::PatchApplyStatus;
 use crate::protocol::ReviewOutputEvent;
 use crate::protocol::ReviewTarget;
 use crate::protocol::SubAgentActivityKind;
+use crate::protocol::SurfacedToolResult;
 use crate::user_input::ByteRange;
 use crate::user_input::TextElement;
 use crate::user_input::UserInput;
@@ -363,6 +365,39 @@ pub struct CollabAgentToolCallItem {
     pub reasoning_effort: Option<ReasoningEffortConfig>,
     #[serde(default)]
     pub agents_states: HashMap<ThreadId, AgentStatus>,
+    /// Original v1 terminal diagnostics, keyed by the same receiver IDs as
+    /// `agents_states`. Absent from live items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub historical_agent_completions: Option<HashMap<ThreadId, HistoricalAgentCompletion>>,
+}
+
+/// A retired v1 terminal wrapper, retained only as historical item data.
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+pub struct HistoricalAgentCompletion {
+    pub last_agent_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub surfaced_result: Option<SurfacedToolResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<String>,
+    pub completion: LegacyTaskCompletionGate,
+}
+
+impl HistoricalAgentCompletion {
+    pub(crate) fn execution_status(&self) -> AgentStatus {
+        if let Some(error) = &self.error {
+            AgentStatus::Errored(error.clone())
+        } else if let Some(surfaced_result) = &self.surfaced_result {
+            AgentStatus::CompletedWithSurface {
+                last_agent_message: self.last_agent_message.clone(),
+                surfaced_result: surfaced_result.clone(),
+            }
+        } else {
+            AgentStatus::Completed(self.last_agent_message.clone())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]

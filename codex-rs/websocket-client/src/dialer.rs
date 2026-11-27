@@ -40,6 +40,8 @@ const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 /// request, so thread identity and attestation headers stay per connection and only transport
 /// setup is shared. A stream is used at most once, kept briefly and checked for a peer close.
 const WARM_STREAM_MAX_AGE: Duration = Duration::from_secs(10);
+/// Refill is speculative and detached from the foreground dial's budget.
+const WARM_STREAM_REFILL_TIMEOUT: Duration = Duration::from_secs(10);
 const WARM_STREAMS_PER_KEY: usize = 1;
 /// `0` disables the pool; any other value or no value keeps it enabled.
 const WARM_STREAM_POOL_ENV: &str = "CODEX_WEBSOCKET_TRANSPORT_POOL";
@@ -117,6 +119,35 @@ fn warm_stream_is_quiet(stream: &mut Box<dyn AsyncIo>) -> bool {
     )
 }
 
+struct WarmRefill {
+    key: WarmStreamKey,
+    active: bool,
+}
+
+impl WarmRefill {
+    fn publish(mut self, warm: WarmStream) -> bool {
+        let mut pool = warm_streams();
+        let Some(slot) = pool.get_mut(&self.key) else {
+            return false;
+        };
+        slot.refilling = false;
+        self.active = false;
+        if slot.streams.len() >= WARM_STREAMS_PER_KEY {
+            return false;
+        }
+        slot.streams.push(warm);
+        true
+    }
+}
+
+impl Drop for WarmRefill {
+    fn drop(&mut self) {
+        if self.active && let Some(slot) = warm_streams().get_mut(&self.key) {
+            slot.refilling = false;
+        }
+    }
+}
+
 /// Replaces a used stream for the next dial of the same destination. Only the destination
 /// URI is copied; no request header reaches a warm stream.
 fn schedule_warm_refill(
@@ -140,23 +171,25 @@ fn schedule_warm_refill(
         }
         slot.refilling = true;
     }
+    // Move the reservation into the task before its first poll so even
+    // runtime shutdown releases the slot for a later successful dial.
+    let refill = WarmRefill { key: key.clone(), active: true };
     let tls_config = Arc::clone(tls_config);
     runtime.spawn(async move {
-        let stream = connect_routed_stream(&target, &tls_config, route, tcp_nodelay).await.ok();
-        {
-            let mut pool = warm_streams();
-            let slot = pool.entry(key.clone()).or_default();
-            slot.refilling = false;
-            match stream {
-                Some(stream) if slot.streams.len() < WARM_STREAMS_PER_KEY => {
-                    slot.streams.push(WarmStream {
-                        stream,
-                        ready_at: Instant::now(),
-                        _tls_config: tls_config,
-                    });
-                }
-                _ => return,
-            }
+        let Ok(Ok(stream)) = tokio::time::timeout(
+            WARM_STREAM_REFILL_TIMEOUT,
+            connect_routed_stream(&target, &tls_config, route, tcp_nodelay),
+        )
+        .await
+        else {
+            return;
+        };
+        if !refill.publish(WarmStream {
+            stream,
+            ready_at: Instant::now(),
+            _tls_config: tls_config,
+        }) {
+            return;
         }
         // Do not hold an unused socket past its age limit.
         tokio::time::sleep(WARM_STREAM_MAX_AGE).await;

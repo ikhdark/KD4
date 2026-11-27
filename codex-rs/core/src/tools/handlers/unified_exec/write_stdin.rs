@@ -156,10 +156,12 @@ impl WriteStdinHandler {
             step_context,
             payload,
             source,
+            call_id,
             cancellation_token,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
+        let failure_bound = super::nested_failure_return_bound(source.nested_deadline());
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -277,7 +279,7 @@ impl WriteStdinHandler {
                 Err(_) => return Err(stdin_failure(
                     &session, ToolFailureCode::Cancelled,
                     "process event subscription cancelled and closed; process and normal output are unchanged".into(),
-                    args.session_id, incarnation,
+                    args.session_id, incarnation, failure_bound,
                 ).await),
             }
                 .map_err(|message| FunctionCallError::RespondToModel(match &durable_error {
@@ -339,15 +341,20 @@ impl WriteStdinHandler {
                 .terminate_process_for_poll(args.session_id)
                 .await
         {
-            let status = session.services.unified_exec_manager
-                .process_status(args.session_id, incarnation).await.ok();
+            let status = super::bounded_failure_read(
+                failure_bound,
+                session.services.unified_exec_manager.process_status(args.session_id, incarnation),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
             let detail = status.as_ref().and_then(|status| status["shutdown_error"].as_str())
                 .unwrap_or("process owner did not provide confirmation");
             return Err(stdin_failure(
                 &session,
                 ToolFailureCode::UncertainEffects,
                 format!("shutdown uncertain: {detail}; owner and recovery handles retained; inspect the session before retrying"),
-                args.session_id, incarnation,
+                args.session_id, incarnation, failure_bound,
             ).await);
         }
         let yield_time_ms = owner_wait_yield_time_ms(
@@ -384,7 +391,7 @@ impl WriteStdinHandler {
                             &session,
                             ToolFailureCode::Cancelled,
                             "command wait cancelled; process state remains inspectable".to_string(),
-                            args.session_id, incarnation,
+                            args.session_id, incarnation, failure_bound,
                         ).await),
                 }
             } else if input_operation {
@@ -414,6 +421,70 @@ impl WriteStdinHandler {
                 break response;
             }
         };
+        use crate::unified_exec::UnifiedExecError;
+        let response = match (failure_bound, response) {
+            (Some(bound), Err(UnifiedExecError::ProcessFailedWithOutput { mut output, .. })) => {
+                // The manager returned the original observation, possibly
+                // after acknowledging bytes. Its registered watcher owns
+                // terminal ledger and cumulative artifact publication.
+                output.max_output_tokens = args.max_output_tokens;
+                output.truncation_policy = turn.model_info.truncation_policy.into();
+                output.quiet_on_success = args.quiet_on_success && args.chars.is_empty() && !args.terminate;
+                if wait_for_output {
+                    output.wall_time = passive_wait_started.elapsed();
+                }
+                if output.process_id.is_none() {
+                    let _ = super::bounded_failure_read(Some(bound), async {
+                        if let Some(cwd) = session.services.command_execution
+                            .process_local_cwd(args.session_id, incarnation).await
+                        {
+                            super::exec_command::attach_missing_rg_path_advisory(
+                                &mut output, &cwd, &turn,
+                            ).await;
+                        }
+                    }).await;
+                } else {
+                    output.raw_output_artifact.get_or_insert_with(|| {
+                        crate::tools::command_output_artifact::RawOutputArtifact::pending(
+                            turn.config.codex_home.as_path(), &session.thread_id.to_string(),
+                        )
+                    });
+                }
+                super::retain_nested_failure_output(&mut output, &session, &turn, &call_id, false);
+                if (!input_operation || input_dispatched)
+                    && (!args.chars.is_empty() || output.process_id.is_some())
+                    && !publish_failure_interaction(&session, &turn, bound, TerminalInteractionEvent {
+                        call_id: output.event_call_id.clone(),
+                        process_id: output.process_id.unwrap_or(args.session_id).to_string(),
+                        stdin: args.chars.clone(),
+                    }).await
+                {
+                    super::append_failure_notice(&mut output, unconfirmed_interaction_publication().into());
+                }
+                return Ok(boxed_tool_output(*output));
+            }
+            (Some(bound), Err(UnifiedExecError::ToolHistoryPersistence {
+                mut message, output, event_call_id, ..
+            })) => {
+                if input_dispatched
+                    && !args.chars.is_empty()
+                    && let Some(call_id) = event_call_id
+                    && !publish_failure_interaction(&session, &turn, bound, TerminalInteractionEvent {
+                        call_id,
+                        process_id: args.session_id.to_string(),
+                        stdin: args.chars.clone(),
+                    }).await
+                {
+                    message.push('\n');
+                    message.push_str(unconfirmed_interaction_publication());
+                }
+                return Err(FunctionCallError::Fatal(
+                    super::preserve_durability_failure_output(message, output, &session, &turn, Some(&call_id))
+                        .await,
+                ));
+            }
+            (_, response) => response,
+        };
         if let Err(crate::unified_exec::UnifiedExecError::ToolHistoryPersistence {
             event_call_id: Some(call_id),
             ..
@@ -437,10 +508,16 @@ impl WriteStdinHandler {
             Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
                 if args.chars.is_empty() && !args.terminate && !args.close_stdin =>
             {
-                match session.retained_process_result(process_id, incarnation).await {
-                    Ok(Some(result)) => return Ok(completed_process_output(result)),
-                    Ok(None) => {}
-                    Err(cause) => unreadable_history = Some(cause),
+                match super::bounded_failure_read(
+                    failure_bound,
+                    session.retained_process_result(process_id, incarnation),
+                )
+                .await
+                {
+                    Ok(Ok(Some(result))) => return Ok(completed_process_output(result)),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(cause)) => unreadable_history = Some(cause),
+                    Err(_) => unreadable_history = Some("nested handback deadline; receipt availability is unknown".into()),
                 }
                 Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
             }
@@ -465,8 +542,9 @@ impl WriteStdinHandler {
                     super::preserve_durability_failure_output(
                         message,
                         output,
-                        &turn.config.codex_home,
-                        &session.thread_id.to_string(),
+                        &session,
+                        &turn,
+                        None,
                     )
                     .await,
                 ));
@@ -476,7 +554,7 @@ impl WriteStdinHandler {
                     &session,
                     ToolFailureCode::InvalidInput,
                     format!("write_stdin failed: {err}"),
-                    args.session_id, incarnation,
+                    args.session_id, incarnation, failure_bound,
                 ).await);
             }
             Err(err) => {
@@ -489,7 +567,7 @@ impl WriteStdinHandler {
                     &session,
                     ToolFailureCode::UncertainEffects,
                     message,
-                    args.session_id, incarnation,
+                    args.session_id, incarnation, failure_bound,
                 ).await);
             }
         };
@@ -577,20 +655,57 @@ impl WriteStdinHandler {
     }
 }
 
+/// Transfer the original publication, not the input operation. Dropping this
+/// waiter cannot interrupt an accepted rollout write or replay stdin. The
+/// session's commit barrier retains publication ahead of turn terminalization.
+async fn publish_failure_interaction(
+    session: &Arc<crate::session::Session>,
+    turn: &Arc<crate::session::turn_context::TurnContext>,
+    bound: tokio::time::Instant,
+    interaction: TerminalInteractionEvent,
+) -> bool {
+    let commit = session.retain_tool_dispatch_commit();
+    let tasks = session.terminal_tasks.clone();
+    let session = Arc::clone(session);
+    let turn = Arc::clone(turn);
+    let publication = tasks.spawn(async move {
+        let _commit = commit;
+        session.send_event(&turn, EventMsg::TerminalInteraction(interaction)).await;
+    });
+    matches!(tokio::time::timeout_at(bound, publication).await, Ok(Ok(())))
+}
+
+fn unconfirmed_interaction_publication() -> &'static str {
+    "Terminal interaction event publication was not confirmed before handback. This says nothing about input delivery; do not resend input."
+}
+
 async fn stdin_failure(
     session: &crate::session::Session,
     code: ToolFailureCode,
     message: String,
     session_id: u32,
     incarnation: uuid::Uuid,
+    bound: Option<tokio::time::Instant>,
 ) -> FunctionCallError {
     let mut failure = ToolFailure::new(code, message);
     if code == ToolFailureCode::InvalidInput {
         failure.effects = codex_protocol::tool_failure::ToolEffectsState::None;
     }
-    let mut reference = session.services.unified_exec_manager
-        .process_output_reference(session_id, incarnation).await
-        .unwrap_or_else(|| crate::tools::command_output_artifact::RawOutputArtifact::output_reference(None));
+    let observed = super::bounded_failure_read(
+        bound,
+        session.services.unified_exec_manager.process_output_reference(session_id, incarnation),
+    )
+    .await;
+    let mut reference = match observed {
+        Ok(Some(reference)) => reference,
+        Ok(None) => crate::tools::command_output_artifact::RawOutputArtifact::output_reference(None),
+        Err(_) => {
+            let mut reference = crate::tools::command_output_artifact::RawOutputArtifact::output_reference(None);
+            reference["retrieval_availability"] = "unknown".into();
+            reference["observation_error"] = "process capture metadata was not observed before nested handback".into();
+            reference
+        }
+    };
     reference["owner_thread_id"] = session.thread_id.to_string().into();
     failure.details = Some(serde_json::json!({"output_reference": reference}));
     failure.live_operations.push(ToolOperationHandle {

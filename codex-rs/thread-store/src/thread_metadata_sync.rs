@@ -23,6 +23,8 @@ use crate::CreateThreadParams;
 use crate::GitInfoPatch;
 use crate::ResumeThreadParams;
 use crate::ThreadMetadataPatch;
+use crate::types::ThreadGitInfoOrigin;
+use crate::types::ThreadGitInfoOrigins;
 
 const THREAD_UPDATED_AT_TOUCH_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -71,7 +73,7 @@ impl ThreadMetadataSync {
     ) -> Self {
         let created_at = Utc::now();
         let cwd = params.metadata.cwd.clone().unwrap_or_default();
-        let update = ThreadMetadataPatch {
+        let mut update = ThreadMetadataPatch {
             model_provider: Some(params.metadata.model_provider.clone()),
             created_at: Some(created_at),
             updated_at: Some(created_at),
@@ -82,9 +84,11 @@ impl ThreadMetadataSync {
             agent_path: Some(params.source.get_agent_path().map(Into::into)),
             cwd: Some(cwd.clone()),
             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            git_info: git_info.map(git_info_patch_from_observation),
             ..Default::default()
         };
+        if let Some(git_info) = git_info {
+            observe_git_info(&mut update, git_info, ThreadGitInfoOrigin::LiveObservation);
+        }
         Self {
             thread_id: params.thread_id,
             history_observation_uncertain: false,
@@ -158,9 +162,31 @@ impl ThreadMetadataSync {
         }
     }
 
+    pub(crate) fn observe_recovered_history(&mut self, items: &[RolloutItem]) {
+        let _ = self.observe_appended_items(items, ThreadGitInfoOrigin::HistoricalFill);
+    }
+
+    // A known accepted append can supply fresh Git even when an older ambiguous
+    // append prevents us from applying the rest of its metadata until recovery.
+    pub(crate) fn record_accepted_git_observation(&mut self, items: &[RolloutItem]) {
+        let mut update = ThreadMetadataPatch::default();
+        for item in items {
+            if let RolloutItem::SessionMeta(meta_line) = item
+                && meta_line.meta.id == self.thread_id
+                && let Some(git_info) = meta_line.git.clone()
+            {
+                observe_git_info(&mut update, git_info, ThreadGitInfoOrigin::LiveObservation);
+            }
+        }
+        if update.git_info.is_some() {
+            self.merge_pending_update(Some(update));
+        }
+    }
+
     pub(crate) fn observe_appended_items(
         &mut self,
         items: &[RolloutItem],
+        git_origin: ThreadGitInfoOrigin,
     ) -> Option<PendingThreadMetadataPatch> {
         self.defer_create_update_until_history_exists = false;
         self.defer_resume_update_until_append = false;
@@ -171,7 +197,7 @@ impl ThreadMetadataSync {
             .iter()
             .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))));
         let mut update = if affects_metadata {
-            self.observe_items(items)?
+            self.observe_items_with_update(items, thread_updated_at_touch(), git_origin)?
         } else {
             thread_updated_at_touch()
         };
@@ -193,18 +219,12 @@ impl ThreadMetadataSync {
         self.take_pending_update()
     }
 
-    fn observe_items(&mut self, items: &[RolloutItem]) -> Option<ThreadMetadataPatch> {
-        self.observe_items_with_update(
-            items,
-            ThreadMetadataPatch {
-                updated_at: Some(Utc::now()),
-                ..Default::default()
-            },
-        )
-    }
-
     fn observe_resume_history(&mut self, items: &[RolloutItem]) -> Option<ThreadMetadataPatch> {
-        let mut update = self.observe_items_with_update(items, ThreadMetadataPatch::default())?;
+        let mut update = self.observe_items_with_update(
+            items,
+            ThreadMetadataPatch::default(),
+            ThreadGitInfoOrigin::HistoricalFill,
+        )?;
         // History establishes whether a first message was already seen, but is not
         // a rename operation. Replaying its default title would overwrite a custom
         // SQLite title when the next append commits this repair patch.
@@ -216,6 +236,7 @@ impl ThreadMetadataSync {
         &mut self,
         items: &[RolloutItem],
         mut update: ThreadMetadataPatch,
+        git_origin: ThreadGitInfoOrigin,
     ) -> Option<ThreadMetadataPatch> {
         if items.is_empty() {
             return None;
@@ -245,15 +266,32 @@ impl ThreadMetadataSync {
                 RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id => {
                     update.created_at = parse_session_timestamp(meta_line.meta.timestamp.as_str());
                     update.source = Some(meta_line.meta.source.clone());
-                    update.thread_source = Some(meta_line.meta.thread_source.clone());
-                    update.agent_nickname = Some(meta_line.meta.agent_nickname.clone());
-                    update.agent_role = Some(meta_line.meta.agent_role.clone());
-                    update.agent_path = Some(meta_line.meta.agent_path.clone());
+                    let historical = git_origin == ThreadGitInfoOrigin::HistoricalFill;
+                    observe_optional_header(
+                        &mut update.thread_source,
+                        &meta_line.meta.thread_source,
+                        historical,
+                    );
+                    observe_optional_header(
+                        &mut update.agent_nickname,
+                        &meta_line.meta.agent_nickname,
+                        historical,
+                    );
+                    observe_optional_header(
+                        &mut update.agent_role,
+                        &meta_line.meta.agent_role,
+                        historical,
+                    );
+                    observe_optional_header(
+                        &mut update.agent_path,
+                        &meta_line.meta.agent_path,
+                        historical,
+                    );
                     if !meta_line.meta.cli_version.is_empty() {
                         update.cli_version = Some(meta_line.meta.cli_version.clone());
                     }
                     if let Some(git_info) = meta_line.git.clone() {
-                        update.git_info = Some(git_info_patch_from_observation(git_info));
+                        observe_git_info(&mut update, git_info, git_origin);
                     }
                 }
                 RolloutItem::TurnContext(_) => {}
@@ -357,9 +395,27 @@ impl ThreadMetadataSync {
                 permission_profile,
                 token_usage,
                 first_user_message,
-                git_info,
                 project_id
             );
+
+            if let (Some(committed), Some(queued)) = (&patch.git_info, &mut pending.git_info) {
+                macro_rules! discard_committed_git {
+                    ($field:ident) => {
+                        if committed.$field.is_some()
+                            && patch.git_info_origin.$field == ThreadGitInfoOrigin::Explicit
+                        {
+                            queued.$field = None;
+                            pending.git_info_origin.$field = ThreadGitInfoOrigin::Explicit;
+                        }
+                    };
+                }
+                discard_committed_git!(sha);
+                discard_committed_git!(branch);
+                discard_committed_git!(origin_url);
+                if queued.sha.is_none() && queued.branch.is_none() && queued.origin_url.is_none() {
+                    pending.git_info = None;
+                }
+            }
             self.pending_update_generation = self.pending_update_generation.wrapping_add(1);
         }
     }
@@ -469,11 +525,30 @@ fn update_has_metadata_facts(update: &ThreadMetadataPatch) -> bool {
         || update.git_info.is_some()
 }
 
-fn git_info_patch_from_observation(git_info: GitInfo) -> GitInfoPatch {
-    GitInfoPatch {
-        sha: git_info.commit_hash.map(|sha| Some(sha.0)),
-        branch: git_info.branch.map(Some),
-        origin_url: git_info.repository_url.map(Some),
+fn observe_optional_header<T: Clone>(
+    field: &mut Option<Option<T>>,
+    observation: &Option<T>,
+    historical: bool,
+) {
+    // Retained headers can lack fields added after recording. Missing facts
+    // are not explicit clears and must not replace a known observation.
+    if !historical || observation.is_some() {
+        *field = Some(observation.clone());
     }
+}
+
+fn observe_git_info(
+    update: &mut ThreadMetadataPatch,
+    git_info: GitInfo,
+    origin: ThreadGitInfoOrigin,
+) {
+    update.merge_git_info(
+        GitInfoPatch {
+            sha: git_info.commit_hash.map(|sha| Some(sha.0)),
+            branch: git_info.branch.map(Some),
+            origin_url: git_info.repository_url.map(Some),
+        },
+        ThreadGitInfoOrigins::all(origin),
+    );
 }
 

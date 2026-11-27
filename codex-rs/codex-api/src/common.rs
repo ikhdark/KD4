@@ -73,7 +73,8 @@ pub enum ResponseEvent {
 }
 
 impl ResponseEvent {
-    pub(crate) fn advances_model_response(&self) -> bool {
+    /// Reports provider output progress, excluding response headers and sideband events.
+    pub fn advances_model_response(&self) -> bool {
         match self {
             Self::OutputTextDelta(delta)
             | Self::ToolCallInputDelta { delta, .. }

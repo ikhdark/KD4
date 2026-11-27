@@ -40,9 +40,21 @@ unknown or expired evidence, not proof of rejection or permission to resubmit.
   the OS on process exit. Pending admissions retain their reserved turn ID;
   recovery checks live and persisted history before restoring or consuming the
   entry, and pauses the queue for explicit resumption.
+- If recovery confirms that a still-pending start's recorded input belonged to
+  a turn removed by rollback, the queue retires the entry without replaying it
+  or adding an accepted receipt. Already-settled accepted receipts are unchanged.
+  Input with no confirmed handoff stays queued for explicit resumption once the
+  start is no longer in progress.
 - Retried adds with the same client message ID and unchanged input return the
   existing pending entry or retained accepted receipt's submission. Different
   input under a retained ID is rejected; deduplication is not an unlimited history.
+  Starting a retired submission by its exact ID or adding with its retained
+  client message ID returns an error with reason `submissionRolledBack`,
+  `queuedSubmissionId`, and `turnId`. To send the prompt again intentionally,
+  add a new queue submission with a new client message ID. Rollback outcomes
+  store identities only, are retained for at most 100 entries per thread, and
+  can expire earlier under the storage limit. They are not accepted receipts
+  and are not included in the list snapshot.
 - Local images are decoded and snapshotted before durable acceptance. Public
   queued input retains the original typed paths, but execution uses the sealed
   content rather than rereading mutable files. Legacy queued images without a

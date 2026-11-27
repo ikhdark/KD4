@@ -29,6 +29,23 @@ consumers do not depend on that tooling facade.
 The [thread follow-up queue contract](THREAD_QUEUE.md) is implemented by the
 handlers crate.
 
+Standalone graceful restart has a reply-only cleanup phase. The runtime stops
+new RPC admission and server request publication, then continues receiving
+responses and errors for already-published requests from their authorized
+peers. Connection retirement and terminal output continue under the existing
+shared shutdown deadline. A previously queued server request is not proof
+that a peer received it; unsent requests settle as delivery failures.
+
+The experimental `thread/search` endpoint matches persisted user and assistant
+message text and returns excerpts. It does not return matches from tool calls,
+command output, or diagnostic records. Use `thread/list.searchTerm` to filter
+thread summary metadata instead.
+
+When full history reopens a legacy collaboration result, `agentsStates` may
+include a `completion` object containing the original gate status, reasons,
+and evidence path. This is historical data, separate from whether execution
+finished or errored. Current runs do not produce this retired gate data.
+
 `thread/rollback` returns the durable post-rollback history. Its turn statuses
 use the same stale-turn projection as history reads: only the matching live
 turn can remain `inProgress`. Completed and failed turns, items, and ordering

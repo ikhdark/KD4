@@ -32,7 +32,6 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
-use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::CompactionMode;
@@ -256,8 +255,7 @@ async fn run_remote_compact_task_inner(
         return Err(error);
     }
     let mut context_compaction_item = ContextCompactionItem::new();
-    let compaction_item = TurnItem::ContextCompaction(context_compaction_item.clone());
-    sess.emit_turn_item_started(turn_context, &compaction_item)
+    sess.emit_compaction_started(turn_context, &context_compaction_item)
         .await;
     let result = run_remote_compact_task_inner_impl(
         sess,
@@ -272,9 +270,9 @@ async fn run_remote_compact_task_inner(
         cancellation_token,
     )
     .await;
-    sess.emit_turn_item_completed_with_legacy_events(
+    sess.emit_compaction_completed(
         turn_context,
-        TurnItem::ContextCompaction(context_compaction_item),
+        context_compaction_item,
         result.is_ok(),
     )
     .await;

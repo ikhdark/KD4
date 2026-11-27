@@ -1102,8 +1102,8 @@ SELECT
     attempts.created_at,
     attempts.sealed_at
 FROM assignments
-JOIN attempts USING (assignment_id)
 JOIN assignment_repositories USING (assignment_id)
+LEFT JOIN attempts USING (assignment_id)
 WHERE assignments.assignment_id = ?
 ORDER BY attempts.ordinal DESC
 LIMIT 1
@@ -1121,7 +1121,10 @@ LIMIT 1
             row.get("repository_id"),
             row.get("workspace_id"),
         )?;
-        let attempt_id = AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?;
+        let attempt_id = row
+            .get::<Option<String>, _>("attempt_id")
+            .ok_or_else(|| missing_current_attempt(assignment_id))?;
+        let attempt_id = parse_persisted_id(&attempt_id, "attempts.attempt_id")?;
 
         Ok(AgentTaskAuthorization {
             root_session_id: assignment.root_session_id.clone(),
@@ -2414,21 +2417,31 @@ LIMIT 1
                 "automatic wake cursor keys cannot be empty".to_string(),
             ));
         }
+        const SELECT_CURSOR: &str = "SELECT c.event_id, c.delivery_json,
+                o.wake_event_id IS NOT NULL AS observation_exists
+             FROM automatic_wake_cursors c
+             LEFT JOIN observations o ON o.wake_event_id = c.event_id
+                 AND o.root_session_id = c.root_session_id
+             WHERE c.root_session_id = ? AND c.consuming_agent_path = ?";
+        let decode_cursor = |row: &sqlx::sqlite::SqliteRow| -> StoreResult<Option<WakeEventId>> {
+            let Some(value) = row.get::<Option<String>, _>("event_id") else {
+                return Ok(None);
+            };
+            let event_id = parse_persisted_id(&value, "automatic_wake_cursors.event_id")?;
+            if !row.get::<bool, _>("observation_exists") {
+                return Err(missing_automatic_wake_observation());
+            }
+            Ok(Some(event_id))
+        };
         // Existing cursors are read-only observations. Do not wait for a
         // maintenance writer on the existing-cursor path.
-        if let Some(row) = sqlx::query(
-            "SELECT event_id, delivery_json FROM automatic_wake_cursors
-             WHERE root_session_id = ? AND consuming_agent_path = ?",
-        )
-        .bind(&root_session_id)
-        .bind(&consuming_agent_path)
-        .fetch_optional(&self.pool)
-        .await?
+        if let Some(row) = sqlx::query(SELECT_CURSOR)
+            .bind(&root_session_id)
+            .bind(&consuming_agent_path)
+            .fetch_optional(&self.pool)
+            .await?
         {
-            let event_id = row
-                .get::<Option<String>, _>("event_id")
-                .map(|value| WakeEventId::parse(&value))
-                .transpose()?;
+            let event_id = decode_cursor(&row)?;
             return Ok(PreparedAutomaticWakeCursor {
                 transaction: None,
                 value: (event_id, row.get("delivery_json")),
@@ -2442,19 +2455,13 @@ LIMIT 1
             .bind(&consuming_agent_path)
             .execute(&mut *transaction)
             .await?;
-        if let Some(row) = sqlx::query(
-            "SELECT event_id, delivery_json FROM automatic_wake_cursors
-             WHERE root_session_id = ? AND consuming_agent_path = ?",
-        )
-        .bind(&root_session_id)
-        .bind(&consuming_agent_path)
-        .fetch_optional(&mut *transaction)
-        .await?
+        if let Some(row) = sqlx::query(SELECT_CURSOR)
+            .bind(&root_session_id)
+            .bind(&consuming_agent_path)
+            .fetch_optional(&mut *transaction)
+            .await?
         {
-            let event_id = row
-                .get::<Option<String>, _>("event_id")
-                .map(|value| WakeEventId::parse(&value))
-                .transpose()?;
+            let event_id = decode_cursor(&row)?;
             return Ok(PreparedAutomaticWakeCursor {
                 transaction: Some(transaction),
                 value: (event_id, row.get("delivery_json")),
@@ -2485,17 +2492,12 @@ LIMIT 1
         .bind(encode(&Utc::now())?)
         .execute(&mut *transaction)
         .await?;
-        let stored = sqlx::query(
-            "SELECT event_id FROM automatic_wake_cursors
-             WHERE root_session_id = ? AND consuming_agent_path = ?",
-        )
-        .bind(&root_session_id)
-        .bind(&consuming_agent_path)
-        .fetch_one(&mut *transaction)
-        .await?
-        .get::<Option<String>, _>("event_id")
-        .map(|value| WakeEventId::parse(&value))
-        .transpose()?;
+        let row = sqlx::query(SELECT_CURSOR)
+            .bind(&root_session_id)
+            .bind(&consuming_agent_path)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let stored = decode_cursor(&row)?;
         Ok(PreparedAutomaticWakeCursor {
             transaction: Some(transaction),
             value: (stored, None),
@@ -2514,21 +2516,14 @@ LIMIT 1
             transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
             root_session_id: &str,
             event_id: WakeEventId,
-        ) -> StoreResult<i64> {
-            let Some(row) = sqlx::query(
-                "SELECT root_session_id, wake_sequence
-                 FROM observations WHERE wake_event_id = ?",
+        ) -> StoreResult<Option<i64>> {
+            Ok(sqlx::query_scalar(
+                "SELECT wake_sequence FROM observations WHERE wake_event_id = ? AND root_session_id = ?",
             )
             .bind(event_id.to_string())
+            .bind(root_session_id)
             .fetch_optional(&mut **transaction)
-            .await?
-            else {
-                return Err(StoreError::InvalidWakeWatermark(event_id.to_string()));
-            };
-            if row.get::<String, _>("root_session_id") != root_session_id {
-                return Err(StoreError::InvalidWakeWatermark(event_id.to_string()));
-            }
-            Ok(row.get::<i64, _>("wake_sequence"))
+            .await?)
         }
 
         if root_session_id.trim().is_empty() || consuming_agent_path.trim().is_empty() {
@@ -2560,6 +2555,7 @@ LIMIT 1
             });
         };
         let stored = row.get::<Option<String>, _>("event_id");
+        let next_is_current = expected == Some(next);
         let expected = expected.map(|value| value.to_string());
         if stored != expected {
             return Ok(PreparedAutomaticWakeCursor {
@@ -2567,12 +2563,22 @@ LIMIT 1
                 value: false,
             });
         }
-        let next_sequence =
-            wake_event_sequence_tx(&mut transaction, &root_session_id, next).await?;
+        let next_sequence = wake_event_sequence_tx(&mut transaction, &root_session_id, next)
+            .await?
+            .ok_or_else(|| {
+                // The matching stored cursor also names this observation.
+                if next_is_current {
+                    missing_automatic_wake_observation()
+                } else {
+                    StoreError::InvalidWakeWatermark(next.to_string())
+                }
+            })?;
         if let Some(stored) = stored {
-            let current = WakeEventId::parse(&stored)?;
+            let current = parse_persisted_id(&stored, "automatic_wake_cursors.event_id")?;
             let current_sequence =
-                wake_event_sequence_tx(&mut transaction, &root_session_id, current).await?;
+                wake_event_sequence_tx(&mut transaction, &root_session_id, current)
+                    .await?
+                    .ok_or_else(missing_automatic_wake_observation)?;
             if next_sequence < current_sequence {
                 return Err(StoreError::WakeWatermarkRegression {
                     current: current_sequence,
@@ -2602,11 +2608,16 @@ LIMIT 1
         &self,
         assignment_id: AssignmentId,
         no_progress_before: chrono::DateTime<Utc>,
+        expected_attempt_id: Option<AttemptId>,
+        reserved_at: chrono::DateTime<Utc>,
     ) -> StoreResult<bool> {
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
-        if attempt.state != AttemptState::Active {
+        if attempt.state != AttemptState::Active
+            || expected_attempt_id.is_some_and(|expected| expected != attempt.attempt_id)
+            || retained_terminal_exists_tx(&mut transaction, attempt.attempt_id, None).await?
+        {
             transaction.commit().await?;
             return Ok(false);
         }
@@ -2637,7 +2648,7 @@ LIMIT 1
                AND julianday(json_extract(last_progress_at, '$')) <= julianday(json_extract(?, '$'))
                AND nudge_sent_at IS NULL",
         )
-        .bind(encode(&now)?)
+        .bind(encode(&reserved_at)?)
         .bind(workspace_id)
         .bind(attempt.attempt_id.to_string())
         .bind(encode(&no_progress_before)?)
@@ -2652,11 +2663,15 @@ LIMIT 1
         assignment_id: AssignmentId,
         no_progress_before: chrono::DateTime<Utc>,
         unstarted_owner: Option<Option<String>>,
+        expected_attempt_id: Option<AttemptId>,
     ) -> StoreResult<NonproductiveRecovery> {
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        if expected_attempt_id.is_some_and(|expected| expected != attempt.attempt_id) {
+            return Ok(NonproductiveRecovery::NotEligible);
+        }
         if let Some(owner) = &unstarted_owner {
             let eligible: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_task_bindings WHERE assignment_id = ? AND attempt_id = ? AND thread_id IS NULL AND launch_owner IS ?)")
                 .bind(assignment_id.to_string()).bind(attempt.attempt_id.to_string())
@@ -2666,6 +2681,12 @@ LIMIT 1
             }
         }
         if attempt.state != AttemptState::Active || attempt.sealed_at.is_some() {
+            transaction.commit().await?;
+            return Ok(NonproductiveRecovery::NotEligible);
+        }
+        // Retention takes the same SQLite write lock. Recheck here, not only
+        // in the in-process coordinator, and respect even acknowledged rows.
+        if retained_terminal_exists_tx(&mut transaction, attempt.attempt_id, None).await? {
             transaction.commit().await?;
             return Ok(NonproductiveRecovery::NotEligible);
         }
@@ -2695,19 +2716,8 @@ LIMIT 1
             transaction.commit().await?;
             return Ok(NonproductiveRecovery::NotEligible);
         }
-        let active_owned_operation_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM validation_calls
-             WHERE attempt_id = ? AND status = ?
-               AND julianday(json_extract(body_json, '$.evidence.lease_expires_at'))
-                   >= julianday(json_extract(?, '$'))",
-        )
-        .bind(attempt.attempt_id.to_string())
-        .bind(encode(&ValidationCallStatus::Running)?)
-        .bind(encode(&now)?)
-        .fetch_one(&mut *transaction)
-        .await?;
         let active_owned_operation_count =
-            u32::try_from(active_owned_operation_count).unwrap_or(u32::MAX);
+            active_validation_leases_tx(&mut transaction, attempt.attempt_id, now).await?;
         if active_owned_operation_count > 0 {
             transaction.commit().await?;
             return Ok(NonproductiveRecovery::Suspended(ProductivitySummary {
@@ -2717,43 +2727,9 @@ LIMIT 1
                 recovery_policy_version: crate::NONPRODUCTIVE_RECOVERY_POLICY_VERSION,
             }));
         }
-
-        let expired_calls = sqlx::query_scalar::<_, String>(
-            "SELECT body_json FROM validation_calls
-             WHERE attempt_id = ? AND status = ?
-               AND (
-                   json_extract(body_json, '$.evidence.lease_expires_at') IS NULL
-                   OR julianday(json_extract(body_json, '$.evidence.lease_expires_at'))
-                       < julianday(json_extract(?, '$'))
-               )",
-        )
-        .bind(attempt.attempt_id.to_string())
-        .bind(encode(&ValidationCallStatus::Running)?)
-        .bind(encode(&now)?)
-        .fetch_all(&mut *transaction)
-        .await?;
         let cancelled_expired_operation_count =
-            u32::try_from(expired_calls.len()).unwrap_or(u32::MAX);
+            cancel_expired_validation_leases_tx(&mut transaction, attempt.attempt_id, now).await?;
         let current_epoch = 0;
-        for body in expired_calls {
-            let mut call: ValidationCall = decode(&body)?;
-            call.status = ValidationCallStatus::Cancelled;
-            call.evidence.end_epoch = Some(current_epoch);
-            call.evidence.lease_expires_at = None;
-            call.recorded_at = now;
-            sqlx::query(
-                "UPDATE validation_calls SET body_json = ?, status = ?, recorded_at = ?
-                 WHERE call_id = ? AND attempt_id = ? AND status = ?",
-            )
-            .bind(encode(&call)?)
-            .bind(encode(&call.status)?)
-            .bind(encode(&call.recorded_at)?)
-            .bind(&call.call_id)
-            .bind(attempt.attempt_id.to_string())
-            .bind(encode(&ValidationCallStatus::Running)?)
-            .execute(&mut *transaction)
-            .await?;
-        }
 
         let criterion_results = effective_criteria(&assignment, attempt.amendment.as_ref())
             .iter()
@@ -2840,18 +2816,29 @@ LIMIT 1
         })
     }
 
-    async fn release_stalled_nudge_impl(&self, assignment_id: AssignmentId) -> StoreResult<bool> {
+    async fn release_stalled_nudge_impl(
+        &self,
+        assignment_id: AssignmentId,
+        expected_attempt_id: Option<AttemptId>,
+        reserved_at: Option<chrono::DateTime<Utc>>,
+    ) -> StoreResult<bool> {
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        if expected_attempt_id.is_some_and(|expected| expected != attempt.attempt_id) {
+            return Ok(false);
+        }
         let workspace_id = assignment_workspace_id_tx(&mut transaction, assignment_id).await?;
         let updated = sqlx::query(
             "UPDATE workspace_actors
              SET nudge_sent_at = NULL
-             WHERE workspace_id = ? AND attempt_id = ? AND nudge_sent_at IS NOT NULL",
+             WHERE workspace_id = ? AND attempt_id = ? AND nudge_sent_at IS NOT NULL
+               AND (? IS NULL OR nudge_sent_at = ?)",
         )
         .bind(workspace_id)
         .bind(attempt.attempt_id.to_string())
+        .bind(reserved_at.as_ref().map(encode).transpose()?)
+        .bind(reserved_at.as_ref().map(encode).transpose()?)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -3217,6 +3204,33 @@ impl LocalAgentTaskStore {
         Ok(true)
     }
 
+    /// Close expired operation evidence for the exact retained terminal owner,
+    /// without replacing that terminal's outcome with a recovery abandonment.
+    pub async fn settle_retained_terminal_validation_calls(
+        &self,
+        assignment_id: AssignmentId,
+        attempt_id: AttemptId,
+        turn_id: &str,
+    ) -> StoreResult<bool> {
+        let mut transaction = self.pool.begin().await?;
+        lock_assignment_tx(&mut transaction, assignment_id).await?;
+        let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        if attempt.attempt_id != attempt_id || attempt.state != AttemptState::Active {
+            return Err(StoreError::AttemptNotActive(attempt_id));
+        }
+        if !retained_terminal_exists_tx(&mut transaction, attempt_id, Some(turn_id)).await? {
+            return Err(StoreError::CorruptData("terminal validation settlement has no retained event".into()));
+        }
+        let now = comparison_now();
+        if active_validation_leases_tx(&mut transaction, attempt_id, now).await? != 0 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        cancel_expired_validation_leases_tx(&mut transaction, attempt_id, now).await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     /// Collect a single snapshot of all pending outcomes for explicit callers.
     /// Startup recovery uses the paged methods instead.
     pub async fn pending_terminal_outcomes(
@@ -3364,7 +3378,10 @@ impl LocalAgentTaskStore {
         rows.into_iter()
             .map(|row| {
                 Ok((
-                    AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?,
+                    parse_persisted_id(
+                        &row.get::<String, _>("assignment_id"),
+                        "assignments.assignment_id",
+                    )?,
                     row.get("launch_owner"),
                 ))
             })
@@ -3924,7 +3941,10 @@ impl LocalAgentTaskStore {
         let cursor = sqlx::query_scalar::<_, String>(
             "SELECT wake_event_id FROM observations WHERE root_session_id = ? ORDER BY wake_sequence DESC LIMIT 1",
         ).bind(root_session_id).fetch_optional(&self.pool).await?;
-        cursor.as_deref().map(WakeEventId::parse).transpose()
+        cursor
+            .as_deref()
+            .map(|value| parse_persisted_id(value, "observations.wake_event_id"))
+            .transpose()
     }
 
     pub fn wait_for_wake_events(
@@ -4033,10 +4053,36 @@ impl LocalAgentTaskStore {
         assignment_id: AssignmentId,
         no_progress_before: chrono::DateTime<Utc>,
     ) -> TaskStoreFuture<'_, bool> {
+        self.reserve_stalled_nudge_for_attempt(
+            assignment_id, /*expected_attempt_id*/ None, no_progress_before,
+        )
+    }
+
+    pub fn reserve_stalled_nudge_for_attempt(
+        &self,
+        assignment_id: AssignmentId,
+        expected_attempt_id: Option<AttemptId>,
+        no_progress_before: chrono::DateTime<Utc>,
+    ) -> TaskStoreFuture<'_, bool> {
         Box::pin(async move {
-            self.reserve_stalled_nudge_impl(assignment_id, no_progress_before)
-                .await
+            self.reserve_stalled_nudge_impl(
+                assignment_id, no_progress_before, expected_attempt_id, comparison_now(),
+            ).await
         })
+    }
+
+    /// Reserve for a tracked delivery owner. The timestamp distinguishes
+    /// this reservation from another after the worker made progress.
+    pub async fn reserve_stalled_nudge_owned(
+        &self,
+        assignment_id: AssignmentId,
+        attempt_id: AttemptId,
+        no_progress_before: chrono::DateTime<Utc>,
+        reserved_at: chrono::DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.reserve_stalled_nudge_impl(
+            assignment_id, no_progress_before, Some(attempt_id), reserved_at,
+        ).await
     }
 
     pub fn recover_nonproductive_assignment(
@@ -4044,9 +4090,24 @@ impl LocalAgentTaskStore {
         assignment_id: AssignmentId,
         no_progress_before: chrono::DateTime<Utc>,
     ) -> TaskStoreFuture<'_, NonproductiveRecovery> {
+        self.recover_nonproductive_assignment_for_attempt(
+            assignment_id, /*expected_attempt_id*/ None, no_progress_before,
+        )
+    }
+
+    /// Settle stalled work only if the attempt observed by the caller still owns
+    /// the assignment inside the same transaction as the recovery decision.
+    pub fn recover_nonproductive_assignment_for_attempt(
+        &self,
+        assignment_id: AssignmentId,
+        expected_attempt_id: Option<AttemptId>,
+        no_progress_before: chrono::DateTime<Utc>,
+    ) -> TaskStoreFuture<'_, NonproductiveRecovery> {
         Box::pin(async move {
             let result = self
-                .recover_nonproductive_assignment_impl(assignment_id, no_progress_before, None)
+                .recover_nonproductive_assignment_impl(
+                    assignment_id, no_progress_before, /*unstarted_owner*/ None, expected_attempt_id,
+                )
                 .await;
             if matches!(&result, Ok(NonproductiveRecovery::Recovered { .. })) {
                 self.notify_wake_waiters();
@@ -4063,13 +4124,81 @@ impl LocalAgentTaskStore {
         no_progress_before: chrono::DateTime<Utc>,
         owner: Option<String>,
     ) -> StoreResult<NonproductiveRecovery> {
-        let result = self.recover_nonproductive_assignment_impl(assignment_id, no_progress_before, Some(owner)).await;
+        let result = self.recover_nonproductive_assignment_impl(assignment_id, no_progress_before, Some(owner), /*expected_attempt_id*/ None).await;
         if matches!(&result, Ok(NonproductiveRecovery::Recovered { .. })) { self.notify_wake_waiters(); }
         result
     }
 
     pub fn release_stalled_nudge(&self, assignment_id: AssignmentId) -> TaskStoreFuture<'_, bool> {
-        Box::pin(async move { self.release_stalled_nudge_impl(assignment_id).await })
+        self.release_stalled_nudge_for_attempt(assignment_id, /*expected_attempt_id*/ None)
+    }
+
+    pub fn release_stalled_nudge_for_attempt(
+        &self,
+        assignment_id: AssignmentId,
+        expected_attempt_id: Option<AttemptId>,
+    ) -> TaskStoreFuture<'_, bool> {
+        Box::pin(async move {
+            self.release_stalled_nudge_impl(assignment_id, expected_attempt_id, None).await
+        })
+    }
+
+    pub async fn release_stalled_nudge_owned(
+        &self,
+        assignment_id: AssignmentId,
+        attempt_id: AttemptId,
+        reserved_at: chrono::DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.release_stalled_nudge_impl(assignment_id, Some(attempt_id), Some(reserved_at)).await
+    }
+
+    pub async fn stalled_nudge_reservation_is_current(
+        &self,
+        binding: &AgentTaskBinding,
+        reserved_at: chrono::DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                SELECT 1 FROM agent_task_bindings b
+                JOIN attempts t ON t.attempt_id = b.attempt_id AND t.assignment_id = b.assignment_id
+                JOIN workspace_actors w ON w.attempt_id = b.attempt_id
+                WHERE b.assignment_id = ? AND b.attempt_id = ? AND b.thread_id IS ?
+                    AND b.root_session_id = ? AND b.agent_path = ? AND t.state = ?
+                    AND w.state <> 'terminal' AND w.nudge_sent_at = ?
+                    AND NOT EXISTS(SELECT 1 FROM pending_terminal_outcomes p WHERE p.attempt_id = b.attempt_id)
+            )",
+        )
+        .bind(binding.assignment_id.to_string())
+        .bind(binding.attempt_id.to_string())
+        .bind(&binding.thread_id)
+        .bind(&binding.root_session_id)
+        .bind(&binding.agent_path)
+        .bind(encode(&AttemptState::Active)?)
+        .bind(encode(&reserved_at)?)
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
+    }
+
+    pub async fn has_retained_terminal_outcome(&self, attempt_id: AttemptId) -> StoreResult<bool> {
+        self.has_retained_terminal_dispatch(attempt_id, None).await
+    }
+
+    pub async fn has_retained_terminal_dispatch(
+        &self,
+        attempt_id: AttemptId,
+        turn_id: Option<&str>,
+    ) -> StoreResult<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM pending_terminal_outcomes
+             WHERE attempt_id = ? AND (? IS NULL OR turn_id = ?))",
+        )
+        .bind(attempt_id.to_string())
+        .bind(turn_id)
+        .bind(turn_id)
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
     }
 }
 
@@ -4259,6 +4388,85 @@ async fn lock_attempt_tx(
     Ok(())
 }
 
+async fn retained_terminal_exists_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt_id: AttemptId,
+    turn_id: Option<&str>,
+) -> StoreResult<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM pending_terminal_outcomes
+         WHERE attempt_id = ? AND (? IS NULL OR turn_id = ?))",
+    )
+    .bind(attempt_id.to_string())
+    .bind(turn_id)
+    .bind(turn_id)
+    .fetch_one(&mut **transaction)
+    .await?
+        != 0)
+}
+
+async fn active_validation_leases_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt_id: AttemptId,
+    now: chrono::DateTime<Utc>,
+) -> StoreResult<u32> {
+    let active_owned_operation_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM validation_calls
+         WHERE attempt_id = ? AND status = ?
+           AND julianday(json_extract(body_json, '$.evidence.lease_expires_at'))
+               >= julianday(json_extract(?, '$'))",
+    )
+    .bind(attempt_id.to_string())
+    .bind(encode(&ValidationCallStatus::Running)?)
+    .bind(encode(&now)?)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(u32::try_from(active_owned_operation_count).unwrap_or(u32::MAX))
+}
+
+async fn cancel_expired_validation_leases_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt_id: AttemptId,
+    now: chrono::DateTime<Utc>,
+) -> StoreResult<u32> {
+    let expired_calls = sqlx::query_scalar::<_, String>(
+        "SELECT body_json FROM validation_calls
+         WHERE attempt_id = ? AND status = ?
+           AND (
+               json_extract(body_json, '$.evidence.lease_expires_at') IS NULL
+               OR julianday(json_extract(body_json, '$.evidence.lease_expires_at'))
+                   < julianday(json_extract(?, '$'))
+           )",
+    )
+    .bind(attempt_id.to_string())
+    .bind(encode(&ValidationCallStatus::Running)?)
+    .bind(encode(&now)?)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let cancelled_expired_operation_count =
+        u32::try_from(expired_calls.len()).unwrap_or(u32::MAX);
+    for body in expired_calls {
+        let mut call: ValidationCall = decode(&body)?;
+        call.status = ValidationCallStatus::Cancelled;
+        call.evidence.end_epoch = Some(0);
+        call.evidence.lease_expires_at = None;
+        call.recorded_at = now;
+        sqlx::query(
+            "UPDATE validation_calls SET body_json = ?, status = ?, recorded_at = ?
+             WHERE call_id = ? AND attempt_id = ? AND status = ?",
+        )
+        .bind(encode(&call)?)
+        .bind(encode(&call.status)?)
+        .bind(encode(&call.recorded_at)?)
+        .bind(&call.call_id)
+        .bind(attempt_id.to_string())
+        .bind(encode(&ValidationCallStatus::Running)?)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(cancelled_expired_operation_count)
+}
+
 async fn lock_assignment_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment_id: AssignmentId,
@@ -4268,7 +4476,7 @@ async fn lock_assignment_tx(
         .execute(&mut **transaction)
         .await?;
     if result.rows_affected() == 0 {
-        return Err(StoreError::AssignmentNotFound(assignment_id));
+        return Err(classify_missing_current_attempt_tx(transaction, assignment_id).await?);
     }
     Ok(())
 }
@@ -4751,13 +4959,40 @@ async fn load_current_attempt_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment_id: AssignmentId,
 ) -> StoreResult<Attempt> {
-    let row = sqlx::query("SELECT attempt_id, assignment_id, ordinal, amendment_json, state, created_at, sealed_at FROM attempts WHERE assignment_id = ? ORDER BY ordinal DESC LIMIT 1")
+    let Some(row) = sqlx::query("SELECT attempt_id, assignment_id, ordinal, amendment_json, state, created_at, sealed_at FROM attempts WHERE assignment_id = ? ORDER BY ordinal DESC LIMIT 1")
         .bind(assignment_id.to_string())
         .fetch_optional(&mut **transaction)
         .await?
-        .ok_or(StoreError::AssignmentNotFound(assignment_id))?;
-    let attempt_id = AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?;
+    else {
+        return Err(classify_missing_current_attempt_tx(transaction, assignment_id).await?);
+    };
+    let attempt_id = parse_persisted_id(&row.get::<String, _>("attempt_id"), "attempts.attempt_id")?;
     attempt_from_row(attempt_id, &row)
+}
+
+async fn classify_missing_current_attempt_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment_id: AssignmentId,
+) -> StoreResult<StoreError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM assignments WHERE assignment_id = ?)",
+    )
+    .bind(assignment_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(if exists {
+        missing_current_attempt(assignment_id)
+    } else {
+        StoreError::AssignmentNotFound(assignment_id)
+    })
+}
+
+fn missing_current_attempt(assignment_id: AssignmentId) -> StoreError {
+    StoreError::CorruptData(format!("assignment {assignment_id} has no current attempt"))
+}
+
+fn missing_automatic_wake_observation() -> StoreError {
+    StoreError::CorruptData("automatic wake cursor has no observation in its root session".into())
 }
 
 async fn require_active_current_attempt_tx(
@@ -5693,7 +5928,10 @@ async fn selective_admission_tx(
                     assignment.required_evidence.iter().any(|right| normalized(left) == normalized(right)));
             overlaps.warnings.push(crate::TaskOverlapWarning {
                 assignment_id: existing.assignment_id,
-                attempt_id: AttemptId::parse(&row.get::<String, _>("attempt_id"))?,
+                attempt_id: parse_persisted_id(
+                    &row.get::<String, _>("attempt_id"),
+                    "attempts.attempt_id",
+                )?,
                 task_name: row.get("task_name"),
                 agent_path: row.get("agent_path"),
                 thread_id: row.get("thread_id"),
@@ -5791,8 +6029,14 @@ fn missing_legacy_attempt_binding() -> StoreError {
 
 fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<AgentTaskBinding> {
     Ok(AgentTaskBinding {
-        assignment_id: AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?,
-        attempt_id: AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?,
+        assignment_id: parse_persisted_id(
+            &row.get::<String, _>("assignment_id"),
+            "agent_task_bindings.assignment_id",
+        )?,
+        attempt_id: parse_persisted_id(
+            &row.get::<String, _>("attempt_id"),
+            "agent_task_bindings.attempt_id",
+        )?,
         root_session_id: row.get("root_session_id"),
         agent_path: row.get("agent_path"),
         task_name: row.get("task_name"),
@@ -6150,7 +6394,10 @@ async fn insert_attempt(
 fn attempt_from_row(attempt_id: AttemptId, row: &sqlx::sqlite::SqliteRow) -> StoreResult<Attempt> {
     Ok(Attempt {
         attempt_id,
-        assignment_id: AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?,
+        assignment_id: parse_persisted_id(
+            &row.get::<String, _>("assignment_id"),
+            "attempts.assignment_id",
+        )?,
         ordinal: u8::try_from(row.get::<i64, _>("ordinal"))
             .map_err(|_| StoreError::CorruptData("attempt ordinal is out of range".to_string()))?,
         amendment: row
@@ -6266,6 +6513,15 @@ fn receipt_observation_kind(status: AgentStatusClaim) -> ObservationKind {
 
 
 
+
+fn parse_persisted_id<T>(value: &str, column: &str) -> StoreResult<T>
+where
+    T: std::str::FromStr<Err = StoreError>,
+{
+    value
+        .parse()
+        .map_err(|_| StoreError::CorruptData(format!("invalid UUIDv7 in {column}")))
+}
 
 fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))

@@ -62,9 +62,9 @@ pub struct ThreadListParams {
     #[ts(optional = nullable)]
     pub use_state_db_only: Option<bool>,
     /// Optional substring filter for thread summary metadata used by listing
-    /// (the title and, when available, cached preview text). This does not scan
-    /// arbitrary rollout content or return match snippets; use the experimental
-    /// `thread/search` method for that capability.
+    /// (the title and, when available, cached preview text). For persisted
+    /// conversation messages and matching excerpts, use the experimental
+    /// `thread/search` method.
     #[ts(optional = nullable)]
     pub search_term: Option<String>,
     /// Optional direct parent thread filter. Mutually exclusive with `ancestorThreadId`.
@@ -102,9 +102,9 @@ pub struct ThreadSearchParams {
     /// If false or null, only non-archived threads are returned.
     #[ts(optional = nullable)]
     pub archived: Option<bool>,
-    /// Required query for full rollout-content search. Unlike
-    /// `thread/list.searchTerm`, this scans persisted rollout content and each
-    /// result includes a matching snippet.
+    /// Required query for persisted user and assistant message text. Unlike
+    /// `thread/list.searchTerm`, results include a matching excerpt from the
+    /// conversation. Tool calls, command output, and diagnostics do not produce results.
     pub search_term: String,
 }
 
@@ -170,7 +170,7 @@ pub struct ThreadListResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadSearchResult {
     pub thread: Thread,
-    /// The first matching excerpt from persisted rollout content.
+    /// The first matching excerpt from persisted user or assistant message text.
     pub snippet: String,
 }
 

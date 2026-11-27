@@ -52,7 +52,10 @@ pub fn create_update_plan_tool() -> ToolSpec {
         ("necessityEvidenceRef".into(), JsonSchema::string(None)),
         ("operationId".into(), JsonSchema::string(None)),
         ("duplicateOf".into(), JsonSchema::string(None)),
-        ("modelTimeAttribution".into(), evidence_object()),
+        ("modelTimeAttribution".into(), JsonSchema {
+            description: Some("Optional attribution fields. If present, requestSpan must be an object or null.".into()),
+            ..evidence_object()
+        }),
     ]), Some(vec!["samplingRequestId".into()]), Some(false.into()));
     let properties = BTreeMap::from([
         ("receipt".into(), JsonSchema::string_enum(vec![json!("status_v1")], Some("Opt in to compact status-only receipts; other effects and omitted receipt retain the full projection.".into()))),

@@ -1,8 +1,104 @@
 use super::*;
 use crate::SortDirection;
+use codex_protocol::SessionId;
 use codex_protocol::protocol::SessionSource;
+use sqlx::Connection as _;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
+
+/// Fields supplied by an explicit Git patch. A supplied NULL is a clear;
+/// an omitted field does not establish or release explicit-clear authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExplicitThreadGitFields {
+    pub sha: bool,
+    pub branch: bool,
+    pub origin_url: bool,
+}
+
+impl ExplicitThreadGitFields {
+    // Keep the bit meanings in sync with the writer's SQL and the migration.
+    fn mask(self) -> i64 {
+        i64::from(self.sha) | (i64::from(self.branch) << 1) | (i64::from(self.origin_url) << 2)
+    }
+
+    fn clear_mask(self, metadata: &crate::ThreadMetadata) -> i64 {
+        self.mask()
+            & Self {
+                sha: metadata.git_sha.is_none(),
+                branch: metadata.git_branch.is_none(),
+                origin_url: metadata.git_origin_url.is_none(),
+            }
+            .mask()
+    }
+}
+
+/// Format version for an exact serialized logical rollout line, including LF.
+pub const THREAD_GIT_COMPATIBILITY_RECORD_VERSION: i64 = 1;
+
+/// The compatibility writer's exact record and canonical rollout provenance.
+/// The writer supplies the logical rollout path and session identity from its
+/// preflight, and serializes the bytes from the committed row's Git projection.
+#[derive(Debug)]
+pub struct ThreadGitCompatibilityRecord {
+    pub rollout_path: PathBuf,
+    pub session_id: SessionId,
+    pub bytes: Vec<u8>,
+}
+
+/// A durable Git compatibility append. Sequence is both identity and order;
+/// neither a path change nor acknowledgement can reuse it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThreadGitCompatibilityIntent {
+    pub sequence: i64,
+    pub thread_id: ThreadId,
+    pub rollout_path: PathBuf,
+    pub session_id: SessionId,
+    pub record_version: i64,
+    pub record: Vec<u8>,
+    /// Opaque exact physical publication plan, bound before any append.
+    pub publication_checkpoint: Option<Vec<u8>>,
+}
+
+/// SQLite committed. Inferred lineage runs afterward and may fail independently.
+#[derive(Debug)]
+pub struct ThreadMetadataPatchCommit {
+    pub metadata: crate::ThreadMetadata,
+    /// Last required publication, whether this patch enqueued it or found it pending.
+    pub git_compatibility_sequence: Option<i64>,
+    pub lineage_result: anyhow::Result<()>,
+}
+
+/// Result of comparing and recording an exact publication checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadGitCompatibilityPrepare {
+    Prepared,
+    AlreadyPrepared,
+    Conflict,
+    NotPendingHead,
+}
+
+const THREAD_GIT_COMPATIBILITY_SELECT: &str =
+    "SELECT sequence, thread_id, rollout_path, session_id, record_version, record, publication_checkpoint \
+     FROM thread_git_compatibility_outbox";
+
+type GitCompatibilityRecordBuilder = fn(
+    &crate::ThreadMetadata,
+    &crate::ThreadMetadata,
+) -> anyhow::Result<ThreadGitCompatibilityRecord>;
+
+impl ThreadGitCompatibilityIntent {
+    fn try_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            sequence: row.try_get("sequence")?,
+            thread_id: ThreadId::try_from(row.try_get::<String, _>("thread_id")?)?,
+            rollout_path: PathBuf::from(row.try_get::<String, _>("rollout_path")?),
+            session_id: SessionId::try_from(row.try_get::<String, _>("session_id")?)?,
+            record_version: row.try_get("record_version")?,
+            record: row.try_get("record")?,
+            publication_checkpoint: row.try_get("publication_checkpoint")?,
+        })
+    }
+}
 
 /// Failure while inserting or replacing a persisted thread-spawn edge.
 #[derive(Debug)]
@@ -831,11 +927,158 @@ ON CONFLICT(child_thread_id) DO NOTHING
         advance_recency_at: Option<DateTime<Utc>>,
         patch: impl FnOnce(&mut crate::ThreadMetadata) -> Result<(), String> + Send,
     ) -> anyhow::Result<crate::ThreadMetadata> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let mut metadata = Self::get_thread_on_connection(&mut tx, fallback.id)
-            .await?
-            .unwrap_or_else(|| fallback.clone());
+        let commit = self
+            .patch_thread_metadata_transaction(
+                fallback.id,
+                Some(fallback),
+                advance_recency_at,
+                patch,
+                None::<(ExplicitThreadGitFields, GitCompatibilityRecordBuilder)>,
+                /*import_content_sha256*/ None,
+            )
+            .await?;
+        commit.lineage_result?;
+        Ok(commit.metadata)
+    }
+
+    /// Durably commit an external import's metadata and exact content receipt together.
+    /// A receipt already present for the reserved ID rejects the patch without replay.
+    /// Like a normal metadata patch, this can report a lineage error after commit;
+    /// the receipt proves only the metadata transaction, not lineage.
+    pub async fn patch_imported_thread_metadata(
+        &self,
+        fallback: &crate::ThreadMetadata,
+        content_sha256: &str,
+        patch: impl FnOnce(&mut crate::ThreadMetadata) -> Result<(), String> + Send,
+    ) -> anyhow::Result<crate::ThreadMetadata> {
+        let commit = self
+            .patch_thread_metadata_transaction(
+                fallback.id,
+                Some(fallback),
+                /*advance_recency_at*/ None,
+                patch,
+                None::<(ExplicitThreadGitFields, GitCompatibilityRecordBuilder)>,
+                Some(content_sha256),
+            )
+            .await?;
+        commit.lineage_result?;
+        Ok(commit.metadata)
+    }
+
+    /// Check the receipt for this exact reserved ID and content fingerprint.
+    /// Missing or different receipts return false; database failures return errors.
+    pub async fn has_imported_thread_metadata_receipt(
+        &self,
+        id: ThreadId,
+        content_sha256: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM external_session_import_metadata_receipts \
+             WHERE thread_id = ? AND content_sha256 = ?)",
+        )
+        .bind(id.to_string())
+        .bind(content_sha256)
+        .fetch_one(self.pool.as_ref())
+        .await?)
+    }
+
+    /// Atomically commit a patch to an existing thread and enqueue its changed
+    /// explicit Git tuple when the caller requires rollout compatibility.
+    /// The callback runs synchronously against the exact before/after rows under
+    /// the SQLite writer reservation; it must not perform I/O. Its error rolls
+    /// back both writes. An unchanged explicit value or established clear does
+    /// not call it unless another explicit field changed.
+    ///
+    /// A successful outer result means the SQLite transaction committed. Check
+    /// `lineage_result` separately, even if there was no new intent.
+    pub async fn patch_thread_metadata_with_git_compatibility(
+        &self,
+        id: ThreadId,
+        advance_recency_at: Option<DateTime<Utc>>,
+        explicit_git_fields: ExplicitThreadGitFields,
+        patch: impl FnOnce(&mut crate::ThreadMetadata) -> Result<(), String> + Send,
+        build_record: impl FnOnce(
+            &crate::ThreadMetadata,
+            &crate::ThreadMetadata,
+        ) -> anyhow::Result<ThreadGitCompatibilityRecord>
+        + Send,
+    ) -> anyhow::Result<ThreadMetadataPatchCommit> {
+        self.patch_thread_metadata_transaction(
+            id,
+            None,
+            advance_recency_at,
+            patch,
+            Some((explicit_git_fields, build_record)),
+            /*import_content_sha256*/ None,
+        )
+        .await
+    }
+
+    async fn patch_thread_metadata_transaction(
+        &self,
+        id: ThreadId,
+        fallback: Option<&crate::ThreadMetadata>,
+        advance_recency_at: Option<DateTime<Utc>>,
+        patch: impl FnOnce(&mut crate::ThreadMetadata) -> Result<(), String> + Send,
+        git: Option<(
+            ExplicitThreadGitFields,
+            impl FnOnce(
+                &crate::ThreadMetadata,
+                &crate::ThreadMetadata,
+            ) -> anyhow::Result<ThreadGitCompatibilityRecord>
+            + Send,
+        )>,
+        import_content_sha256: Option<&str>,
+    ) -> anyhow::Result<ThreadMetadataPatchCommit> {
+        let mut durable_connection = if git.is_some() || import_content_sha256.is_some() {
+            Some(self.acquire_extra_durability_connection().await?)
+        } else {
+            None
+        };
+        let mut tx = if let Some(connection) = durable_connection.as_mut() {
+            connection.begin_with("BEGIN IMMEDIATE").await?
+        } else {
+            self.pool.begin_with("BEGIN IMMEDIATE").await?
+        };
+        if import_content_sha256.is_some() {
+            let occupied: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM external_session_import_metadata_receipts \
+                 WHERE thread_id = ?)",
+            )
+            .bind(id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            anyhow::ensure!(!occupied, "external import metadata receipt already exists: {id}");
+        }
+        let current = Self::get_thread_on_connection(&mut tx, id).await?;
+        let (before, mut metadata) = match (current, fallback) {
+            (Some(current), _) if git.is_some() => (Some(current.clone()), current),
+            (Some(current), _) => (None, current),
+            (None, Some(fallback)) => (None, fallback.clone()),
+            (None, None) => anyhow::bail!("thread metadata unavailable before git update: {id}"),
+        };
         patch(&mut metadata).map_err(anyhow::Error::msg)?;
+        if import_content_sha256.is_some() {
+            anyhow::ensure!(metadata.id == id, "external import patch changed the thread ID");
+        }
+        let fields = git.as_ref().map(|(fields, _)| *fields).unwrap_or_default();
+        let is_git_patch = git.is_some();
+        let mut explicit_git_changed = false;
+        if let Some(before) = before.as_ref() {
+            anyhow::ensure!(metadata.id == before.id, "Git patch changed the thread ID");
+            explicit_git_changed = (fields.sha && metadata.git_sha != before.git_sha)
+                || (fields.branch && metadata.git_branch != before.git_branch)
+                || (fields.origin_url && metadata.git_origin_url != before.git_origin_url);
+            let clear_mask = fields.clear_mask(&metadata);
+            if !explicit_git_changed && clear_mask != 0 {
+                let previous_clear_mask: i64 =
+                    sqlx::query_scalar("SELECT git_explicit_clear_mask FROM threads WHERE id = ?")
+                        .bind(id.to_string())
+                        .fetch_one(&mut *tx)
+                        .await?;
+                explicit_git_changed = (clear_mask & !previous_clear_mask) != 0;
+            }
+        }
         if let Some(id) = metadata.project_id.as_deref() {
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id = ?")
                 .bind(id)
@@ -845,17 +1088,32 @@ ON CONFLICT(child_thread_id) DO NOTHING
         }
         self.upsert_thread_on_connection(&mut tx, &metadata, true)
             .await?;
-        // Explicit patches own name/clear and Git/project fields. Rollout upserts
-        // preserve them, so publish explicit changes in this same writer transaction.
-        sqlx::query("UPDATE threads SET title = ?, title_is_explicit = ?, git_sha = ?, git_branch = ?, git_origin_url = ?, project_id = ? WHERE id = ?")
-            .bind(metadata.title.as_str())
-            .bind(metadata.title_is_explicit)
-            .bind(metadata.git_sha.as_deref())
-            .bind(metadata.git_branch.as_deref())
-            .bind(metadata.git_origin_url.as_deref())
-            .bind(metadata.project_id.as_deref())
-            .bind(metadata.id.to_string())
-            .execute(&mut *tx).await?;
+        // Only named explicit Git fields can release a clear. The legacy/observed
+        // patch path owns its other fields as before but cannot refill such a clear.
+        sqlx::query(
+            r#"
+UPDATE threads SET
+    title = ?1,
+    title_is_explicit = ?2,
+    git_sha = CASE WHEN (git_explicit_clear_mask & 1) != 0 AND (?8 & 1) = 0 THEN NULL ELSE ?3 END,
+    git_branch = CASE WHEN (git_explicit_clear_mask & 2) != 0 AND (?8 & 2) = 0 THEN NULL ELSE ?4 END,
+    git_origin_url = CASE WHEN (git_explicit_clear_mask & 4) != 0 AND (?8 & 4) = 0 THEN NULL ELSE ?5 END,
+    project_id = ?6,
+    git_explicit_clear_mask = (git_explicit_clear_mask & ~?8) | ?9
+WHERE id = ?7
+            "#,
+        )
+        .bind(metadata.title.as_str())
+        .bind(metadata.title_is_explicit)
+        .bind(metadata.git_sha.as_deref())
+        .bind(metadata.git_branch.as_deref())
+        .bind(metadata.git_origin_url.as_deref())
+        .bind(metadata.project_id.as_deref())
+        .bind(metadata.id.to_string())
+        .bind(fields.mask())
+        .bind(fields.clear_mask(&metadata))
+        .execute(&mut *tx)
+        .await?;
         if let Some(recency_at) = advance_recency_at {
             let recency_at = self.allocate_thread_recency_at(recency_at)?;
             Self::touch_thread_recency_at_on_connection(&mut tx, metadata.id, recency_at).await?;
@@ -863,10 +1121,217 @@ ON CONFLICT(child_thread_id) DO NOTHING
         let metadata = Self::get_thread_on_connection(&mut tx, metadata.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("thread metadata disappeared during patch"))?;
-        tx.commit().await?;
-        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
+        let git_compatibility_sequence = if let (Some(before), Some((_, build_record))) = (before, git)
+            && explicit_git_changed
+        {
+            let record = build_record(&before, &metadata)?;
+            Some(Self::enqueue_thread_git_compatibility_intent(&mut tx, &metadata, record).await?.sequence)
+        } else if is_git_patch {
+            // An unchanged resend must settle the earlier committed update instead
+            // of claiming compatibility success merely because it added no intent.
+            sqlx::query_scalar(
+                "SELECT sequence FROM thread_git_compatibility_outbox WHERE thread_id = ? ORDER BY sequence DESC LIMIT 1",
+            )
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+        if let Some(content_sha256) = import_content_sha256 {
+            sqlx::query(
+                "INSERT INTO external_session_import_metadata_receipts (thread_id, content_sha256) \
+                 VALUES (?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(content_sha256)
+            .execute(&mut *tx)
             .await?;
-        Ok(metadata)
+        }
+        tx.commit().await?;
+        // The pool may only have one slot. Lineage is a separate transaction.
+        drop(durable_connection);
+        let lineage_result = self
+            .insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
+            .await;
+        Ok(ThreadMetadataPatchCommit {
+            metadata,
+            git_compatibility_sequence,
+            lineage_result,
+        })
+    }
+
+    async fn enqueue_thread_git_compatibility_intent(
+        connection: &mut SqliteConnection,
+        metadata: &crate::ThreadMetadata,
+        record: ThreadGitCompatibilityRecord,
+    ) -> anyhow::Result<ThreadGitCompatibilityIntent> {
+        anyhow::ensure!(
+            metadata.session_id.is_none_or(|id| id == record.session_id),
+            "Git compatibility record session does not match thread {}",
+            metadata.id
+        );
+        let path = record
+            .rollout_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Git compatibility rollout path is not UTF-8"))?;
+        anyhow::ensure!(!path.is_empty(), "Git compatibility rollout path is empty");
+        anyhow::ensure!(
+            record
+                .bytes
+                .strip_suffix(b"\n")
+                .is_some_and(|line| !line.is_empty() && !line.contains(&b'\n')),
+            "Git compatibility record must be a nonempty LF-terminated line"
+        );
+        let sequence = sqlx::query_scalar(
+            r#"
+INSERT INTO thread_git_compatibility_outbox (thread_id, rollout_path, session_id, record_version, record)
+VALUES (?, ?, ?, ?, ?)
+RETURNING sequence
+            "#,
+        )
+        .bind(metadata.id.to_string())
+        .bind(path)
+        .bind(record.session_id.to_string())
+        .bind(THREAD_GIT_COMPATIBILITY_RECORD_VERSION)
+        .bind(record.bytes.as_slice())
+        .fetch_one(connection)
+        .await?;
+        Ok(ThreadGitCompatibilityIntent {
+            sequence,
+            thread_id: metadata.id,
+            rollout_path: record.rollout_path,
+            session_id: record.session_id,
+            record_version: THREAD_GIT_COMPATIBILITY_RECORD_VERSION,
+            record: record.bytes,
+            publication_checkpoint: None,
+        })
+    }
+
+    /// Read the oldest pending intent for this thread. This does not reserve the
+    /// rollout; callers must coordinate with the existing publication owner.
+    pub async fn next_thread_git_compatibility_intent(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<Option<ThreadGitCompatibilityIntent>> {
+        let mut query = QueryBuilder::<Sqlite>::new(THREAD_GIT_COMPATIBILITY_SELECT);
+        query.push(" WHERE thread_id = ").push_bind(thread_id.to_string());
+        query.push(" ORDER BY sequence LIMIT 1");
+        query
+            .build()
+            .fetch_optional(self.pool.as_ref())
+            .await?
+            .map(ThreadGitCompatibilityIntent::try_from_row)
+            .transpose()
+    }
+
+    /// Page pending `(sequence, thread_id)` pairs by the primary-key sequence
+    /// (exclusive cursor; start at zero). Pages are capped and omit record and
+    /// checkpoint blobs; drainers fetch and recheck each thread's current head.
+    pub async fn list_pending_thread_git_compatibility_intent_ids(
+        &self,
+        after_sequence: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(i64, ThreadId)>> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT sequence, thread_id FROM thread_git_compatibility_outbox \
+             WHERE sequence > ? ORDER BY sequence LIMIT ?",
+        )
+        .bind(after_sequence)
+        .bind(limit.min(128) as i64)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        rows.into_iter()
+            .map(|(sequence, id)| Ok((sequence, ThreadId::try_from(id)?)))
+            .collect()
+    }
+
+    /// Use this for commits that must survive power loss across a separate
+    /// filesystem operation. EXTRA is FULL in WAL and also syncs the directory
+    /// in rollback-journal DELETE mode.
+    async fn acquire_extra_durability_connection(
+        &self,
+    ) -> anyhow::Result<sqlx::pool::PoolConnection<Sqlite>> {
+        let mut connection = self.pool.acquire().await?;
+        // Set this before any suspension. Do not return the changed setting to
+        // the shared pool, including on cancellation or an ambiguous error.
+        connection.close_on_drop();
+        sqlx::query("PRAGMA synchronous = EXTRA")
+            .execute(&mut *connection)
+            .await?;
+        Ok(connection)
+    }
+
+    /// Record the exact physical append plan once, or compare it byte-for-byte.
+    /// The caller must own rollout publication and only write after this commit.
+    /// A conflict never replaces the existing plan.
+    pub async fn prepare_thread_git_compatibility_intent(
+        &self,
+        thread_id: ThreadId,
+        sequence: i64,
+        checkpoint: &[u8],
+    ) -> anyhow::Result<ThreadGitCompatibilityPrepare> {
+        anyhow::ensure!(!checkpoint.is_empty(), "empty Git publication checkpoint");
+        let mut connection = self.acquire_extra_durability_connection().await?;
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+        let thread_id = thread_id.to_string();
+        let pending: Option<(i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT sequence, publication_checkpoint FROM thread_git_compatibility_outbox \
+             WHERE thread_id = ? ORDER BY sequence LIMIT 1",
+        )
+        .bind(&thread_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let result = match pending {
+            Some((head, None)) if head == sequence => {
+                sqlx::query(
+                    "UPDATE thread_git_compatibility_outbox SET publication_checkpoint = ? \
+                     WHERE thread_id = ? AND sequence = ?",
+                )
+                .bind(checkpoint)
+                .bind(&thread_id)
+                .bind(sequence)
+                .execute(&mut *tx)
+                .await?;
+                ThreadGitCompatibilityPrepare::Prepared
+            }
+            Some((head, Some(existing))) if head == sequence => {
+                if existing.as_slice() == checkpoint {
+                    ThreadGitCompatibilityPrepare::AlreadyPrepared
+                } else {
+                    ThreadGitCompatibilityPrepare::Conflict
+                }
+            }
+            _ => ThreadGitCompatibilityPrepare::NotPendingHead,
+        };
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Remove only the exact prepared head after the caller has confirmed and
+    /// synced publication. False is a no-op, not evidence of publication.
+    /// Losing this acknowledgement cannot authorize a new append: the
+    /// durable checkpoint still requires exact replay.
+    pub async fn acknowledge_thread_git_compatibility_intent(
+        &self,
+        thread_id: ThreadId,
+        sequence: i64,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+DELETE FROM thread_git_compatibility_outbox
+WHERE thread_id = ?1 AND sequence = ?2 AND publication_checkpoint IS NOT NULL
+  AND sequence = (
+      SELECT sequence FROM thread_git_compatibility_outbox
+      WHERE thread_id = ?1 ORDER BY sequence LIMIT 1
+  )
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .bind(sequence)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
 
@@ -1181,7 +1646,7 @@ impl StateRuntime {
         let preview = metadata_preview(metadata);
         // A rollout observation cannot replace an explicit name/clear, including
         // a stale observation taken before the name committed. Preserve that authority
-        // and non-null Git fields at the SQL conflict boundary, not only in read repair.
+        // and Git field authority at the SQL conflict boundary, not only in read repair.
         sqlx::query(
             r#"
 INSERT INTO threads (
@@ -1248,9 +1713,12 @@ ON CONFLICT(id) DO UPDATE SET
     first_user_message = excluded.first_user_message,
     archived = excluded.archived,
     archived_at = excluded.archived_at,
-    git_sha = COALESCE(threads.git_sha, excluded.git_sha),
-    git_branch = COALESCE(threads.git_branch, excluded.git_branch),
-    git_origin_url = COALESCE(threads.git_origin_url, excluded.git_origin_url)
+    git_sha = CASE WHEN (threads.git_explicit_clear_mask & 1) != 0 THEN NULL
+        ELSE COALESCE(threads.git_sha, excluded.git_sha) END,
+    git_branch = CASE WHEN (threads.git_explicit_clear_mask & 2) != 0 THEN NULL
+        ELSE COALESCE(threads.git_branch, excluded.git_branch) END,
+    git_origin_url = CASE WHEN (threads.git_explicit_clear_mask & 4) != 0 THEN NULL
+        ELSE COALESCE(threads.git_origin_url, excluded.git_origin_url) END
             "#,
         )
         .bind(metadata.id.to_string())

@@ -1,7 +1,6 @@
 use super::LoadedPlugin;
 use super::PluginLoadOutcome;
 use crate::app_mcp_routing::apply_app_mcp_routing_policy;
-use crate::installed_marketplaces::installed_marketplace_roots_from_layer_stack;
 use crate::is_openai_curated_marketplace_name;
 use crate::loader::PluginHookLoadOutcome;
 use crate::loader::configured_curated_plugin_ids_from_codex_home;
@@ -33,7 +32,7 @@ use crate::marketplace::ResolvedMarketplacePlugin;
 use crate::marketplace::find_installable_marketplace_plugin;
 use crate::marketplace::find_marketplace_plugin;
 use crate::marketplace::home_dir;
-use crate::marketplace::list_marketplaces_with_home;
+use crate::marketplace::list_configured_marketplaces_with_home;
 use crate::marketplace::plugin_interface_with_marketplace_category;
 use crate::marketplace_policy::MarketplacePolicy;
 use crate::marketplace_policy::configured_plugins_from_stack;
@@ -49,6 +48,7 @@ use crate::remote::RemotePluginServiceConfig;
 use crate::remote_legacy::RemotePluginFetchError;
 use crate::startup_sync::curated_plugins_api_marketplace_path;
 use crate::startup_sync::curated_plugins_repo_path;
+use crate::startup_sync::lock_curated_plugins_catalog;
 use crate::startup_sync::read_curated_plugins_sha;
 use crate::startup_sync::sync_openai_plugins_repo;
 use crate::store::PluginStore;
@@ -89,6 +89,7 @@ use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1118,7 +1119,7 @@ impl PluginsManager {
             return cached_remote_plugin_id;
         }
 
-        match self.store.remote_plugin_id(plugin_id) {
+        match self.store.committed_remote_plugin_id(plugin_id) {
             Ok(remote_plugin_id) => remote_plugin_id,
             Err(err) => {
                 tracing::warn!(
@@ -1177,7 +1178,7 @@ impl PluginsManager {
         } else {
             let store = self.store.clone();
             let lookup_plugin_id = plugin_id.clone();
-            match tokio::task::spawn_blocking(move || store.remote_plugin_id(&lookup_plugin_id))
+            match tokio::task::spawn_blocking(move || store.committed_remote_plugin_id(&lookup_plugin_id))
                 .await
             {
                 Ok(Ok(id)) => id,
@@ -2212,35 +2213,55 @@ impl PluginsManager {
         Ok(())
     }
 
+    /// Blocking catalog listing. Async callers must use the async entry point.
     pub fn list_marketplaces_for_config(
         &self,
         config: &PluginsConfigInput,
         additional_roots: &[AbsolutePathBuf],
         include_openai_curated: bool,
     ) -> Result<ConfiguredMarketplaceListOutcome, MarketplaceError> {
-        Self::list_marketplaces_with_context(
-            &self.store,
+        let catalog = CuratedCatalogListing::acquire(
             self.codex_home.as_path(),
             self.auth_mode(),
+            config.plugins_enabled && include_openai_curated,
+        );
+        let mut outcome = Self::list_marketplaces_with_context(
+            &self.store,
+            self.codex_home.as_path(),
             self.restriction_product,
             config,
             additional_roots,
-            include_openai_curated,
-        )
+            catalog.as_ref(),
+        )?;
+        outcome.errors.extend(catalog.and_then(CuratedCatalogListing::into_error));
+        Ok(outcome)
     }
 
     /// Preserve request order and first source identity while combining activation
     /// state for the same plugin advertised by more than one repository.
+    /// Call on a blocking thread.
     pub fn list_marketplaces_for_scopes(
         &self,
         scopes: &[PluginMarketplaceScope],
         include_openai_curated: bool,
     ) -> Result<ConfiguredMarketplaceListOutcome, MarketplaceError> {
+        // One lease for all scopes: otherwise a swap between scopes can merge
+        // rows from different curated checkouts into one response.
+        let catalog = CuratedCatalogListing::acquire(
+            self.codex_home.as_path(),
+            self.auth_mode(),
+            include_openai_curated && scopes.iter().any(|scope| scope.config.plugins_enabled),
+        );
         let mut combined = ConfiguredMarketplaceListOutcome::default();
         let mut seen = HashMap::<String, (usize, usize)>::new();
         for scope in scopes {
-            let outcome = self.list_marketplaces_for_config(
-                &scope.config, &scope.roots, include_openai_curated,
+            let outcome = Self::list_marketplaces_with_context(
+                &self.store,
+                self.codex_home.as_path(),
+                self.restriction_product,
+                &scope.config,
+                &scope.roots,
+                catalog.as_ref(),
             )?;
             combined.errors.extend(outcome.errors);
             for mut marketplace in outcome.marketplaces {
@@ -2272,14 +2293,41 @@ impl PluginsManager {
                 }
             }
         }
+        combined.errors.extend(catalog.and_then(CuratedCatalogListing::into_error));
         Ok(combined)
     }
 
-    pub(crate) async fn list_marketplaces_for_config_async(
+    pub async fn list_marketplaces_for_config_async(
         &self,
         config: &PluginsConfigInput,
         include_openai_curated: bool,
     ) -> Result<ConfiguredMarketplaceListOutcome, MarketplaceError> {
+        self.list_marketplaces_async(config, include_openai_curated, /*retain_curated*/ false)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    pub(crate) async fn list_tool_suggest_marketplaces(
+        &self,
+        config: &PluginsConfigInput,
+        include_openai_curated: bool,
+    ) -> Result<
+        (ConfiguredMarketplaceListOutcome, Option<Arc<CuratedToolSuggestSnapshot>>),
+        MarketplaceError,
+    > {
+        self.list_marketplaces_async(config, include_openai_curated, /*retain_curated*/ true)
+            .await
+    }
+
+    async fn list_marketplaces_async(
+        &self,
+        config: &PluginsConfigInput,
+        include_openai_curated: bool,
+        retain_curated: bool,
+    ) -> Result<
+        (ConfiguredMarketplaceListOutcome, Option<Arc<CuratedToolSuggestSnapshot>>),
+        MarketplaceError,
+    > {
         let store = self.store.clone();
         let codex_home = self.codex_home.clone();
         let auth_mode = self.auth_mode();
@@ -2288,15 +2336,28 @@ impl PluginsManager {
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatcher, || {
-                Self::list_marketplaces_with_context(
-                    &store,
+                let catalog = CuratedCatalogListing::acquire(
                     codex_home.as_path(),
                     auth_mode,
+                    config.plugins_enabled && include_openai_curated,
+                );
+                let mut outcome = Self::list_marketplaces_with_context(
+                    &store,
+                    codex_home.as_path(),
                     restriction_product,
                     &config,
                     &[],
-                    include_openai_curated,
-                )
+                    catalog.as_ref(),
+                )?;
+                let snapshot = if retain_curated {
+                    catalog.and_then(|catalog| {
+                        catalog.into_tool_suggest_snapshot(codex_home.as_path(), &mut outcome)
+                    })
+                } else {
+                    outcome.errors.extend(catalog.and_then(CuratedCatalogListing::into_error));
+                    None
+                };
+                Ok((outcome, snapshot))
             })
         })
         .await
@@ -2308,11 +2369,10 @@ impl PluginsManager {
     fn list_marketplaces_with_context(
         store: &PluginStore,
         codex_home: &Path,
-        auth_mode: Option<AuthMode>,
         restriction_product: Option<Product>,
         config: &PluginsConfigInput,
         additional_roots: &[AbsolutePathBuf],
-        include_openai_curated: bool,
+        catalog: Option<&CuratedCatalogListing>,
     ) -> Result<ConfiguredMarketplaceListOutcome, MarketplaceError> {
         if !config.plugins_enabled {
             return Ok(ConfiguredMarketplaceListOutcome::default());
@@ -2320,15 +2380,12 @@ impl PluginsManager {
 
         let (mut installed_versions, enabled_plugins) =
             Self::configured_plugin_states(store, codex_home, config);
-        let marketplace_roots = Self::marketplace_roots_with_context(
+        let marketplace_outcome = Self::list_marketplaces_with_policy(
             codex_home,
-            auth_mode,
             config,
             additional_roots,
-            include_openai_curated,
+            catalog.and_then(CuratedCatalogListing::available_root),
         );
-        let marketplace_outcome =
-            Self::list_marketplaces_with_policy_at_home(codex_home, config, &marketplace_roots)?;
         let mut seen_plugin_keys = HashSet::new();
         let marketplaces = marketplace_outcome
             .marketplaces
@@ -2412,6 +2469,7 @@ impl PluginsManager {
         })
     }
 
+    /// Blocking discovery: call on a blocking thread.
     pub fn discover_marketplaces_for_config(
         &self,
         config: &PluginsConfigInput,
@@ -2421,12 +2479,19 @@ impl PluginsManager {
             return Ok(MarketplaceListOutcome::default());
         }
 
-        let marketplace_roots = self.marketplace_roots(
-            config,
-            additional_roots,
+        let catalog = CuratedCatalogListing::acquire(
+            self.codex_home.as_path(),
+            self.auth_mode(),
             /*include_openai_curated*/ true,
         );
-        self.list_marketplaces_with_policy(config, &marketplace_roots)
+        let mut outcome = Self::list_marketplaces_with_policy(
+            self.codex_home.as_path(),
+            config,
+            additional_roots,
+            catalog.as_ref().and_then(CuratedCatalogListing::available_root),
+        );
+        outcome.errors.extend(catalog.and_then(CuratedCatalogListing::into_error));
+        Ok(outcome)
     }
 
     pub(crate) async fn tool_suggest_metadata_for_marketplace_plugin(
@@ -2434,10 +2499,16 @@ impl PluginsManager {
         marketplace_name: &str,
         plugin: &ConfiguredMarketplacePlugin,
         skill_config_rules: &SkillConfigRules,
+        curated_snapshot: Option<&Arc<CuratedToolSuggestSnapshot>>,
     ) -> Result<PluginCapabilitySummary, MarketplaceError> {
         let fragment = self
             .tool_suggest_metadata_cache
-            .metadata_for_plugin(marketplace_name, plugin, self.restriction_product)
+            .metadata_for_plugin(
+                marketplace_name,
+                plugin,
+                self.restriction_product,
+                curated_snapshot,
+            )
             .await?;
         Ok(fragment.project(skill_config_rules, self.auth_mode()))
     }
@@ -2456,11 +2527,40 @@ impl PluginsManager {
         let store = self.store.clone();
         let codex_home = self.codex_home.clone();
         let restriction_product = self.restriction_product;
-        let (marketplace_name, configured_plugin) = tokio::task::spawn_blocking(move || {
+        let read = tokio::task::spawn_blocking(move || {
+            // Take the short publication lease before even resolving the path:
+            // an alias into the checkout can be temporarily unresolvable during
+            // a swap. Unrelated markets drop it after the initial source lookup.
+            let catalog = lock_curated_plugins_catalog(&codex_home);
+            let curated_root = curated_plugins_repo_path(&codex_home);
+            let canonical_curated_root = std::fs::canonicalize(&curated_root).ok();
+            let is_curated_path = |path: &Path| {
+                path.starts_with(&curated_root)
+                    || canonical_curated_root.as_ref().is_some_and(|root| {
+                        std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(root))
+                    })
+            };
+            let lock_error = |message| MarketplaceError::InvalidMarketplaceFile {
+                path: request_for_read.marketplace_path.to_path_buf(),
+                message,
+            };
+            let curated_marketplace = is_curated_path(request_for_read.marketplace_path.as_path());
+            if curated_marketplace && let Err(message) = &catalog {
+                return Err(lock_error(message.clone()));
+            }
             let plugin = find_marketplace_plugin(
                 &request_for_read.marketplace_path,
                 &request_for_read.plugin_name,
             )?;
+            let reads_curated_checkout = curated_marketplace
+                || matches!(&plugin.source, MarketplacePluginSource::Local { path }
+                    if is_curated_path(path.as_path()));
+            let curated_snapshot = if reads_curated_checkout {
+                Some(catalog.map_err(lock_error)?)
+            } else {
+                drop(catalog);
+                None
+            };
             MarketplacePolicy::from_requirements(config_for_read.config_layer_stack.requirements())
                 .validate_install(
                     &config_for_read.config_layer_stack,
@@ -2525,14 +2625,20 @@ impl PluginsManager {
                     installed,
                     enabled,
                 },
+                curated_snapshot,
             ))
-        })
-        .await
-        .map_err(|err| {
-            MarketplaceError::InvalidPlugin(format!("failed to read plugin source: {err}"))
-        })??;
+        });
+        let (marketplace_name, configured_plugin, curated_snapshot) =
+            read.await.map_err(|err| {
+                MarketplaceError::InvalidPlugin(format!("failed to read plugin source: {err}"))
+            })??;
         let plugin = self
-            .read_plugin_detail_for_marketplace_plugin(config, &marketplace_name, configured_plugin)
+            .read_plugin_detail_with_curated_snapshot(
+                config,
+                &marketplace_name,
+                configured_plugin,
+                curated_snapshot,
+            )
             .await?;
 
         Ok(PluginReadOutcome {
@@ -2548,6 +2654,22 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         marketplace_name: &str,
         plugin: ConfiguredMarketplacePlugin,
+    ) -> Result<PluginDetail, MarketplaceError> {
+        self.read_plugin_detail_with_curated_snapshot(
+            config,
+            marketplace_name,
+            plugin,
+            /*curated_snapshot*/ None,
+        )
+        .await
+    }
+
+    async fn read_plugin_detail_with_curated_snapshot(
+        &self,
+        config: &PluginsConfigInput,
+        marketplace_name: &str,
+        plugin: ConfiguredMarketplacePlugin,
+        curated_snapshot: Option<File>,
     ) -> Result<PluginDetail, MarketplaceError> {
         if !self.restriction_product_matches(plugin.policy.products.as_deref()) {
             return Err(MarketplaceError::PluginNotFound {
@@ -2597,7 +2719,7 @@ impl PluginsManager {
         let fallback = plugin.manifest_fallback.clone();
         let effective_config = config.config_layer_stack.effective_config();
         let marketplace_name = marketplace_name.to_string();
-        let (source_path, manifest, _installation, _marketplace_lease) = tokio::task::spawn_blocking(move || {
+        let (source_path, manifest, _installation, _marketplace_lease, curated_snapshot) = tokio::task::spawn_blocking(move || {
             let marketplace_lease = if is_openai_curated_marketplace_name(&marketplace_name) {
                 None
             } else {
@@ -2651,7 +2773,7 @@ impl PluginsManager {
                 .ok_or_else(|| {
                     MarketplaceError::InvalidPlugin("missing or invalid plugin.json".to_string())
                 })?;
-            Ok::<_, MarketplaceError>((source_path, manifest, installation, marketplace_lease))
+            Ok::<_, MarketplaceError>((source_path, manifest, installation, marketplace_lease, curated_snapshot))
         })
         .await
         .map_err(|err| {
@@ -2709,6 +2831,8 @@ impl PluginsManager {
             /*plugin_policy*/ None,
         )
         .await;
+        // No further reads from the live checkout after app and MCP discovery.
+        drop(curated_snapshot);
         if auth_mode.is_some() {
             apply_app_mcp_routing_policy(
                 &mut app_declarations,
@@ -3293,9 +3417,12 @@ impl PluginsManager {
                 let mut outcome = MarketplaceListOutcome::default();
                 let mut seen = HashSet::new();
                 for scope in &scopes {
-                    let roots = self.marketplace_roots(&scope.config, &scope.roots, false);
-                    let discovered = self.list_marketplaces_with_policy(&scope.config, &roots)
-                        .map_err(|err| err.to_string())?;
+                    let discovered = Self::list_marketplaces_with_policy(
+                        self.codex_home.as_path(),
+                        &scope.config,
+                        &scope.roots,
+                        /*curated_marketplace_path*/ None,
+                    );
                     outcome.errors.extend(discovered.errors);
                     for mut marketplace in discovered.marketplaces {
                         marketplace.plugins.retain(|plugin| seen.insert(
@@ -3395,86 +3522,136 @@ impl PluginsManager {
         (installed_versions, enabled_plugins)
     }
 
-    fn marketplace_roots(
-        &self,
-        config: &PluginsConfigInput,
-        additional_roots: &[AbsolutePathBuf],
-        include_openai_curated: bool,
-    ) -> Vec<AbsolutePathBuf> {
-        Self::marketplace_roots_with_context(
-            self.codex_home.as_path(),
-            self.auth_mode(),
-            config,
-            additional_roots,
-            include_openai_curated,
-        )
-    }
-
-    fn marketplace_roots_with_context(
-        codex_home: &Path,
-        auth_mode: Option<AuthMode>,
-        config: &PluginsConfigInput,
-        additional_roots: &[AbsolutePathBuf],
-        include_openai_curated: bool,
-    ) -> Vec<AbsolutePathBuf> {
-        // Treat the curated catalog as an extra marketplace root so plugin listing can surface it
-        // without requiring every caller to know where it is stored.
-        let mut roots = additional_roots.to_vec();
-        roots.extend(installed_marketplace_roots_from_layer_stack(
-            &config.config_layer_stack,
-            codex_home,
-        ));
-        let curated_marketplace_path = if include_openai_curated {
-            if matches!(auth_mode, Some(AuthMode::ApiKey | AuthMode::BedrockApiKey)) {
-                let api_marketplace_path = curated_plugins_api_marketplace_path(codex_home);
-                api_marketplace_path
-                    .is_file()
-                    .then_some(api_marketplace_path)
-            } else {
-                let curated_repo_root = curated_plugins_repo_path(codex_home);
-                curated_repo_root.is_dir().then_some(curated_repo_root)
-            }
-        } else {
-            None
-        };
-        if let Some(curated_marketplace_path) = curated_marketplace_path
-            && let Ok(curated_marketplace_path) =
-                AbsolutePathBuf::try_from(curated_marketplace_path)
-        {
-            roots.push(curated_marketplace_path);
-        }
-        roots.sort_unstable();
-        roots.dedup();
-        roots
-    }
-
     fn list_marketplaces_with_policy(
-        &self,
-        config: &PluginsConfigInput,
-        roots: &[AbsolutePathBuf],
-    ) -> Result<MarketplaceListOutcome, MarketplaceError> {
-        Self::list_marketplaces_with_policy_at_home(self.codex_home.as_path(), config, roots)
-    }
-
-    fn list_marketplaces_with_policy_at_home(
         codex_home: &Path,
         config: &PluginsConfigInput,
-        roots: &[AbsolutePathBuf],
-    ) -> Result<MarketplaceListOutcome, MarketplaceError> {
-        let mut outcome = list_marketplaces_with_home(roots, home_dir().as_deref())?;
+        additional_roots: &[AbsolutePathBuf],
+        curated_marketplace_path: Option<PathBuf>,
+    ) -> MarketplaceListOutcome {
+        // The curated catalog remains an additional root in the same sorted order.
+        let roots = additional_roots.iter().cloned().chain(
+            curated_marketplace_path.and_then(|path| AbsolutePathBuf::try_from(path).ok()),
+        );
         let policy = MarketplacePolicy::from_requirements(config.config_layer_stack.requirements());
         let user_config = config.config_layer_stack.effective_config();
-        outcome.marketplaces.retain(|marketplace| {
-            policy
-                .validate_install_with_user_config(
-                    Some(&user_config),
-                    codex_home,
-                    &marketplace.path,
-                    &marketplace.name,
-                )
-                .is_ok()
-        });
-        Ok(outcome)
+        list_configured_marketplaces_with_home(
+            codex_home,
+            &config.config_layer_stack,
+            roots,
+            home_dir().as_deref(),
+            |marketplace| {
+                policy
+                    .validate_install_with_user_config(
+                        Some(&user_config),
+                        codex_home,
+                        &marketplace.path,
+                        &marketplace.name,
+                    )
+                    .is_ok()
+            },
+        )
+    }
+}
+
+// This owns the catalog lease from before discovery's first file probe
+// until all marketplace manifests and local bundle metadata have been read.
+struct CuratedCatalogListing {
+    root: PathBuf,
+    api: bool,
+    lease: Result<File, String>,
+}
+
+impl CuratedCatalogListing {
+    fn acquire(codex_home: &Path, auth_mode: Option<AuthMode>, include: bool) -> Option<Self> {
+        if !include {
+            return None;
+        }
+        let api = matches!(auth_mode, Some(AuthMode::ApiKey | AuthMode::BedrockApiKey));
+        let root = if api {
+            curated_plugins_api_marketplace_path(codex_home)
+        } else {
+            curated_plugins_repo_path(codex_home)
+        };
+        Some(Self {
+            root,
+            api,
+            lease: lock_curated_plugins_catalog(codex_home),
+        })
+    }
+
+    fn available_root(&self) -> Option<PathBuf> {
+        self.lease.as_ref().ok()?;
+        let exists = if self.api {
+            self.root.is_file()
+        } else {
+            self.root.is_dir()
+        };
+        exists.then(|| self.root.clone())
+    }
+
+    fn into_error(self) -> Option<MarketplaceListError> {
+        let message = self.lease.err()?;
+        // A lock failure affects the curated catalog, not the other marketplaces.
+        let path = AbsolutePathBuf::try_from(self.root).ok()?;
+        Some(MarketplaceListError { path, message })
+    }
+
+    fn into_tool_suggest_snapshot(
+        self,
+        codex_home: &Path,
+        outcome: &mut ConfiguredMarketplaceListOutcome,
+    ) -> Option<Arc<CuratedToolSuggestSnapshot>> {
+        if self.lease.is_err() {
+            outcome.errors.extend(self.into_error());
+            return None;
+        }
+        let lease = self.lease.ok()?;
+        let checkout = curated_plugins_repo_path(codex_home);
+        let canonical_checkout = std::fs::canonicalize(&checkout).ok();
+        let in_checkout = |path: &Path| {
+            path.starts_with(&checkout)
+                || canonical_checkout.as_ref().is_some_and(|root| {
+                    std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(root))
+                })
+        };
+        let mut plugin_ids = HashSet::new();
+        for marketplace in &outcome.marketplaces {
+            let curated_marketplace = in_checkout(marketplace.path.as_path());
+            for plugin in &marketplace.plugins {
+                if curated_marketplace
+                    || matches!(&plugin.source, MarketplacePluginSource::Local { path }
+                        if in_checkout(path.as_path()))
+                {
+                    plugin_ids.insert(plugin.id.clone());
+                }
+            }
+        }
+        if plugin_ids.is_empty() {
+            return None;
+        }
+        // The export bootstrap can record the non-unique "export-backup" label.
+        // Only a commit ID can safely identify content across requests.
+        let revision = read_curated_plugins_sha(codex_home)
+            .filter(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(Arc::<str>::from);
+        Some(Arc::new(CuratedToolSuggestSnapshot {
+            _lease: lease,
+            revision,
+            plugin_ids,
+        }))
+    }
+}
+
+/// The checkout and its recorded revision were read under the same publication lease.
+pub(crate) struct CuratedToolSuggestSnapshot {
+    _lease: File,
+    pub(crate) revision: Option<Arc<str>>,
+    plugin_ids: HashSet<String>,
+}
+
+impl CuratedToolSuggestSnapshot {
+    pub(crate) fn contains_plugin(&self, plugin_id: &str) -> bool {
+        self.plugin_ids.contains(plugin_id)
     }
 }
 

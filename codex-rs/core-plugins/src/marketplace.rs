@@ -1,9 +1,14 @@
+use crate::installed_marketplaces::configured_marketplace_entries;
+use crate::installed_marketplaces::marketplace_install_root;
+use crate::installed_marketplaces::resolve_configured_marketplace_root;
+use crate::installed_marketplaces::with_marketplace_publication_read;
 use crate::manifest::PluginManifestInterface;
 use crate::manifest::load_plugin_manifest;
 use crate::marketplace_add::normalize_git_url;
 use crate::marketplace_add::normalize_github_shorthand_url;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginInstallPolicy;
+use codex_config::ConfigLayerStack;
 use codex_git_utils::get_git_repo_root;
 use codex_plugin::PluginId;
 use codex_plugin::PluginIdError;
@@ -12,6 +17,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Component;
@@ -455,23 +462,137 @@ pub fn list_marketplaces_with_home(
     let mut outcome = MarketplaceListOutcome::default();
 
     for marketplace_path in discover_marketplace_paths_from_roots(additional_roots, home_dir) {
-        match load_marketplace(&marketplace_path) {
-            Ok(marketplace) => outcome.marketplaces.push(marketplace),
-            Err(err) => {
-                warn!(
-                    path = %marketplace_path.display(),
-                    error = %err,
-                    "skipping marketplace that failed to load"
-                );
-                outcome.errors.push(MarketplaceListError {
-                    path: marketplace_path,
-                    message: err.to_string(),
-                });
-            }
-        }
+        let result = load_marketplace(&marketplace_path).map(Some);
+        add_marketplace_listing_result(&mut outcome, marketplace_path, result);
     }
 
     Ok(outcome)
+}
+
+#[derive(Default)]
+struct MarketplaceListingRoot {
+    additional: bool,
+    configured_local: bool,
+    configured_git: Option<(String, toml::Value)>,
+}
+
+pub(crate) fn list_configured_marketplaces_with_home(
+    codex_home: &Path,
+    config: &ConfigLayerStack,
+    additional_roots: impl IntoIterator<Item = AbsolutePathBuf>,
+    home_dir: Option<&Path>,
+    include: impl Fn(&Marketplace) -> bool,
+) -> MarketplaceListOutcome {
+    let mut outcome = MarketplaceListOutcome::default();
+    let mut seen = HashSet::new();
+    let install_root = marketplace_install_root(codex_home);
+    let mut roots = BTreeMap::<AbsolutePathBuf, MarketplaceListingRoot>::new();
+    for root in additional_roots {
+        roots.entry(root).or_default().additional = true;
+    }
+    for (name, marketplace) in configured_marketplace_entries(config, codex_home) {
+        if marketplace.get("source_type").and_then(toml::Value::as_str) == Some("git") {
+            // The path is known without looking at the checkout. Identity and
+            // manifest probes must both be deferred until the publication read.
+            if let Ok(root) = AbsolutePathBuf::try_from(install_root.join(&name)) {
+                roots.entry(root).or_default().configured_git = Some((name, marketplace));
+            }
+        } else if let Some(root) =
+            resolve_configured_marketplace_root(&name, &marketplace, &install_root)
+            && let Ok(root) = AbsolutePathBuf::try_from(root)
+        {
+            roots.entry(root).or_default().configured_local = true;
+        }
+    }
+
+    // Home precedes the sorted roots; duplicate manifest paths still use their
+    // first occurrence, before applying the existing policy filter.
+    let mut list_root = |root: &AbsolutePathBuf, options: Option<MarketplaceListingRoot>| {
+        let read = || {
+            let path = match &options {
+                None => find_marketplace_manifest_path(root.as_path()),
+                Some(options) if options.additional => discover_marketplace_path_from_root(root),
+                Some(options) => {
+                    if !options.configured_local
+                        && !options
+                            .configured_git
+                            .as_ref()
+                            .is_some_and(|(name, marketplace)| {
+                                resolve_configured_marketplace_root(name, marketplace, &install_root)
+                                    .is_some()
+                            })
+                    {
+                        return None;
+                    }
+                    find_marketplace_manifest_path(root.as_path())
+                }
+            }?;
+            if seen.contains(&path) {
+                return None;
+            }
+            let result = load_marketplace(&path)
+                .map(|marketplace| include(&marketplace).then_some(marketplace));
+            Some((path, result))
+        };
+        let result = match marketplace_publication_name(root.as_path(), &install_root) {
+            Some(name) => with_marketplace_publication_read(&install_root, name, read),
+            None => Ok(read()),
+        };
+        match result {
+            Ok(Some((path, result))) => {
+                seen.insert(path.clone());
+                add_marketplace_listing_result(&mut outcome, path, result);
+            }
+            Ok(None) => {}
+            Err(message) => outcome.errors.push(MarketplaceListError {
+                path: root.clone(),
+                message,
+            }),
+        }
+        // Release before returning any listing to callers that may acquire an
+        // operation lease (for example, installed-plugin cache refresh).
+    };
+
+    if let Some(home) = home_dir
+        && let Ok(home) = AbsolutePathBuf::try_from(home.to_path_buf())
+    {
+        list_root(&home, None);
+    }
+    for (root, options) in roots {
+        list_root(&root, Some(options));
+    }
+    outcome
+}
+
+fn marketplace_publication_name<'a>(path: &'a Path, install_root: &Path) -> Option<&'a str> {
+    let Component::Normal(name) = path.strip_prefix(install_root).ok()?.components().next()? else {
+        return None;
+    };
+    let name = name.to_str()?;
+    codex_plugin::validate_plugin_segment(name, "marketplace name").ok()?;
+    Some(name)
+}
+
+fn add_marketplace_listing_result(
+    outcome: &mut MarketplaceListOutcome,
+    path: AbsolutePathBuf,
+    result: Result<Option<Marketplace>, MarketplaceError>,
+) {
+    match result {
+        Ok(Some(marketplace)) => outcome.marketplaces.push(marketplace),
+        Ok(None) => {}
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "skipping marketplace that failed to load"
+            );
+            outcome.errors.push(MarketplaceListError {
+                path,
+                message: err.to_string(),
+            });
+        }
+    }
 }
 
 fn discover_marketplace_paths_from_roots(
@@ -487,23 +608,7 @@ fn discover_marketplace_paths_from_roots(
     }
 
     for root in additional_roots {
-        if let Some(path) = supported_marketplace_manifest_path(root.as_path()) {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-            continue;
-        }
-        // Curated marketplaces can now come from an HTTP-downloaded directory that is not a git
-        // checkout, so check the root directly before falling back to repo-root discovery.
-        if let Some(path) = find_marketplace_manifest_path(root.as_path()) {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-            continue;
-        }
-        if let Some(repo_root) = get_git_repo_root(root.as_path())
-            && let Ok(repo_root) = AbsolutePathBuf::try_from(repo_root)
-            && let Some(path) = find_marketplace_manifest_path(repo_root.as_path())
+        if let Some(path) = discover_marketplace_path_from_root(root)
             && !paths.contains(&path)
         {
             paths.push(path);
@@ -511,6 +616,17 @@ fn discover_marketplace_paths_from_roots(
     }
 
     paths
+}
+
+fn discover_marketplace_path_from_root(root: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
+    supported_marketplace_manifest_path(root.as_path())
+        // Curated marketplaces can be downloaded over HTTP, not just via Git.
+        .or_else(|| find_marketplace_manifest_path(root.as_path()))
+        .or_else(|| {
+            let repo_root = get_git_repo_root(root.as_path())?;
+            let repo_root = AbsolutePathBuf::try_from(repo_root).ok()?;
+            find_marketplace_manifest_path(repo_root.as_path())
+        })
 }
 
 fn load_raw_marketplace_manifest(

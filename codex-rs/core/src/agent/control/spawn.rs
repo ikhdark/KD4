@@ -166,6 +166,19 @@ impl PendingSpawnCapacity {
         }
     }
 
+    fn retain_until_confirmed_detach(self, child_thread: Arc<crate::CodexThread>) {
+        tokio::spawn(async move {
+            let result = child_thread
+                .retire_stopped_generation()
+                .await
+                .and_then(|_| AgentControl::confirm_stopped_v2_residency(&child_thread));
+            if let Err(error) = result {
+                warn!(%error, "retaining pending spawn capacity after an unconfirmed detach");
+                std::mem::forget(self);
+            }
+        });
+    }
+
     async fn release_after_drain(self, child_thread: Arc<crate::CodexThread>) {
         if let Err(error) = child_thread.wait_until_drained().await {
             warn!(%error, "retaining pending spawn capacity after unconfirmed session retirement");
@@ -836,7 +849,6 @@ impl AgentControl {
                     // Exclude cold loaders as well as registry publication.
                     // A loader that already owned the key has drained above.
                     let retired = state.cleanup_thread_if_absent(thread_id, || {
-                        self.forget_v2_residency(thread_id);
                         self.state.release_spawned_thread(thread_id);
                     }).await;
                     owner.finish(&Err(CodexErr::ThreadNotFound(thread_id)));
@@ -903,7 +915,7 @@ impl AgentControl {
                 Ok(thread) => thread,
                 Err(CodexErr::ThreadNotFound(_)) => {
                     state
-                        .cleanup_thread_if_absent(thread_id, || self.forget_v2_residency(thread_id))
+                        .cleanup_thread_if_absent(thread_id, || {})
                         .await;
                     match state.get_thread(thread_id).await {
                         Ok(_) => continue,
@@ -913,37 +925,18 @@ impl AgentControl {
                 }
                 Err(err) => return Err(err),
             };
-            if !thread.is_running() {
-                // Stream closure is a shutdown trigger, not a drain receipt.
-                // The bounded outer observer may expire, but registration and
-                // residency stay owned until actual accepted work has retired.
-                thread.request_shutdown().await?;
-                thread.wait_until_drained().await?;
-                if state
-                    .remove_thread_if_same_with_cleanup(&thread_id, &thread, || {
-                        self.forget_v2_residency(thread_id)
-                    })
-                    .await
-                {
-                    match state.get_thread(thread_id).await {
-                        Ok(_) => continue,
-                        Err(CodexErr::ThreadNotFound(_)) => return Ok(false),
-                        Err(err) => return Err(err),
-                    }
-                }
-                continue;
-            }
-            if !self.touch_loaded_v2_residency(state, thread_id).await {
+            if thread.is_running()
+                && !self.touch_loaded_v2_residency(state, thread_id, &thread).await
+            {
                 continue;
             }
             if !thread.is_running() {
-                thread.request_shutdown().await?;
-                thread.wait_until_drained().await?;
+                // Stream closure triggers shutdown, not release. The bounded
+                // observer can expire without cancelling admitted retirement.
+                let retirement = thread.retire_stopped_generation().await?;
                 if state
-                    .remove_thread_if_same_with_cleanup(&thread_id, &thread, || {
-                        self.forget_v2_residency(thread_id)
-                    })
-                    .await
+                    .remove_stopped_thread_if_same(thread_id, &thread, &retirement, || {})
+                    .await?
                 {
                     match state.get_thread(thread_id).await {
                         Ok(_) => continue,
@@ -960,7 +953,7 @@ impl AgentControl {
                 Ok(_) => continue,
                 Err(CodexErr::ThreadNotFound(_)) => {
                     state
-                        .cleanup_thread_if_absent(thread_id, || self.forget_v2_residency(thread_id))
+                        .cleanup_thread_if_absent(thread_id, || {})
                         .await;
                     match state.get_thread(thread_id).await {
                         Ok(_) => continue,
@@ -1040,7 +1033,31 @@ impl AgentControl {
             .await
         {
             Ok(reloaded_thread) => {
-                residency_slot.commit(reloaded_thread.thread_id);
+                let mut residency_slot = Some(residency_slot);
+                state
+                    .with_current_thread_generation(
+                        reloaded_thread.thread_id,
+                        &reloaded_thread.thread,
+                        |lease| {
+                            if let Some(slot) = residency_slot.take() {
+                                slot.commit(lease, reloaded_thread.thread_id, &reloaded_thread.thread);
+                            }
+                        },
+                    )
+                    .await;
+                if let Some(slot) = residency_slot {
+                    PendingSpawnCapacity {
+                        reservation: None,
+                        residency_slot: Some(slot),
+                    }
+                    .retain_until_confirmed_detach(reloaded_thread.thread);
+                    if self.use_loaded_v2_agent_or_clear_stopped(state, thread_id).await? {
+                        return Ok(());
+                    }
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "agent {thread_id} stopped before residency publication; retry with fresh history"
+                    )));
+                }
                 self.watch_loaded_typed_actor(
                     self.state
                         .agent_metadata_for_thread(thread_id)
@@ -1459,21 +1476,52 @@ impl AgentControl {
                 turn.record_causal_agent("spawn", &new_thread.thread_id.to_string(), execution, *at);
             }
             agent_metadata.last_task_message = initial_last_task_message;
-            #[expect(
-                clippy::expect_used,
-                reason = "PendingSpawnCleanup owns the reservation until this commit consumes it"
-            )]
-            let reservation = pending_cleanup
-                .capacity
-                .reservation
-                .as_mut()
-                .expect("created child retains its uncommitted spawn reservation");
-            if let Err(err) = reservation.try_commit(agent_metadata.clone()) {
-                return Err(pending_cleanup.rollback(err).await);
-            }
-            drop(pending_cleanup.capacity.reservation.take());
-            if let Some(residency_slot) = pending_cleanup.capacity.residency_slot.take() {
-                residency_slot.commit(new_thread.thread_id);
+            let has_residency_slot = pending_cleanup.capacity.residency_slot.is_some();
+            let mut publish = |lease: Option<&crate::thread_manager::ThreadRegistryLease>| {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "PendingSpawnCleanup owns the reservation until this commit consumes it"
+                )]
+                let reservation = pending_cleanup
+                    .capacity
+                    .reservation
+                    .as_mut()
+                    .expect("created child retains its uncommitted spawn reservation");
+                reservation.try_commit(agent_metadata.clone())?;
+                drop(pending_cleanup.capacity.reservation.take());
+                if let Some(lease) = lease
+                    && let Some(slot) = pending_cleanup.capacity.residency_slot.take()
+                {
+                    slot.commit(lease, new_thread.thread_id, &new_thread.thread);
+                }
+                CodexResult::Ok(())
+            };
+            let published = if has_residency_slot {
+                state
+                    .with_current_thread_generation(
+                        new_thread.thread_id,
+                        &new_thread.thread,
+                        |lease| publish(Some(lease)),
+                    )
+                    .await
+            } else {
+                Some(publish(None))
+            };
+            match published {
+                Some(Ok(())) => {}
+                Some(Err(err)) => return Err(pending_cleanup.rollback(err).await),
+                None => {
+                    // The old generation may have been replaced under the same
+                    // ID. Do not run ID-keyed rollback against the replacement.
+                    pending_cleanup.disarm();
+                    pending_cleanup
+                        .take_capacity()
+                        .retain_until_confirmed_detach(Arc::clone(&new_thread.thread));
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "agent {} stopped before spawn publication",
+                        new_thread.thread_id
+                    )));
+                }
             }
 
             // Notify only after the initial work is queued and the child becomes path-addressable.

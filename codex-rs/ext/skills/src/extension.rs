@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use futures::StreamExt;
 
 use codex_core_skills::HostSkillsSnapshot;
@@ -50,6 +51,22 @@ use crate::tools::skill_tools;
 use crate::world_state::SKILLS_WORLD_STATE_ID;
 use crate::world_state::SKILLS_DISCOVERY_WORLD_STATE_ID;
 use crate::world_state::executor_skills_world_state_sections;
+
+// Reserve time for world-state projection, but leave most of the turn-input
+// window available to selection after its earlier host and orchestrator discovery.
+const WORLD_STATE_CATALOG_SETTLEMENT_MARGIN: Duration = Duration::from_secs(1);
+const TURN_INPUT_CATALOG_SETTLEMENT_MARGIN: Duration = Duration::from_millis(100);
+
+fn executor_catalog_settlement_deadline(
+    contribution_deadline: std::time::Instant,
+    margin: Duration,
+) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(
+        contribution_deadline
+            .checked_sub(margin)
+            .unwrap_or(contribution_deadline),
+    )
+}
 
 struct SkillsExtension<C> {
     providers: SkillProviders,
@@ -190,6 +207,10 @@ where
         &'a self,
         input: WorldStateContributionInput<'a>,
     ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
+        let settlement_deadline = executor_catalog_settlement_deadline(
+            input.contribution_deadline,
+            WORLD_STATE_CATALOG_SETTLEMENT_MARGIN,
+        );
         Box::pin(async move {
             let Some(thread_state) = input.thread_store.get::<SkillsThreadState>() else {
                 return Vec::new();
@@ -216,6 +237,7 @@ where
                         include_orchestrator_skills: false,
                         mcp_resources: input.session_store.get::<McpResourceClient>(),
                     },
+                    settlement_deadline,
                 )
                 .await;
             executor_skills_world_state_sections(
@@ -229,6 +251,10 @@ where
         &'a self,
         input: WorldStateContributionInput<'a>,
     ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
+        let settlement_deadline = executor_catalog_settlement_deadline(
+            input.contribution_deadline,
+            WORLD_STATE_CATALOG_SETTLEMENT_MARGIN,
+        );
         Box::pin(async move {
             let Some(thread_state) = input.thread_store.get::<SkillsThreadState>() else {
                 return Vec::new();
@@ -249,8 +275,10 @@ where
                         include_orchestrator_skills: false,
                         mcp_resources: input.session_store.get::<McpResourceClient>(),
                     },
+                    settlement_deadline,
                 )
-                .await;
+                .await
+                .catalog;
             let catalog = Arc::new(catalog);
             input
                 .turn_store
@@ -328,29 +356,36 @@ where
             };
             let mut catalog = self.list_skills(query, &thread_state, false).await;
             if !input.ready_selected_capability_roots.is_empty() {
-                catalog.extend(
-                    thread_state
-                        .executor_catalog_snapshot(
-                            &self.providers,
-                            SkillListQuery {
-                                continuation: None,
-                                turn_id: input.turn_id.clone(),
-                                bound_executor_roots: input
-                                    .bound_selected_capability_roots
-                                    .to_vec(),
-                                executor_roots: input.ready_selected_capability_roots.clone(),
-                                executor_file_system_sandboxes: input
-                                    .file_system_sandboxes
-                                    .clone(),
-                                host_snapshot: None,
-                                include_host_skills: false,
-                                include_bundled_skills: config.bundled_skills_enabled,
-                                include_orchestrator_skills: false,
-                                mcp_resources: session_store.get::<McpResourceClient>(),
-                            },
-                        )
-                        .await,
-                );
+                let snapshot = thread_state
+                    .executor_catalog_snapshot(
+                        &self.providers,
+                        SkillListQuery {
+                            continuation: None,
+                            turn_id: input.turn_id.clone(),
+                            bound_executor_roots: input.bound_selected_capability_roots.to_vec(),
+                            executor_roots: input.ready_selected_capability_roots.clone(),
+                            executor_file_system_sandboxes: input.file_system_sandboxes.clone(),
+                            host_snapshot: None,
+                            include_host_skills: false,
+                            include_bundled_skills: config.bundled_skills_enabled,
+                            include_orchestrator_skills: false,
+                            mcp_resources: session_store.get::<McpResourceClient>(),
+                        },
+                        executor_catalog_settlement_deadline(
+                            input.contribution_deadline,
+                            TURN_INPUT_CATALOG_SETTLEMENT_MARGIN,
+                        ),
+                    )
+                    .await;
+                if !snapshot.all_roots_settled {
+                    // A missing root can hide a match or ambiguity. As on a host timeout,
+                    // leave selection pending and do not substitute a partial or host-only match.
+                    tracing::warn!(
+                        "executor skill discovery did not settle before turn-input selection"
+                    );
+                    return Vec::new();
+                }
+                catalog.extend(snapshot.catalog);
             }
             if let Some(executor_skills) = turn_store.get::<ExecutorSkillsStepState>() {
                 catalog.extend_ref(&executor_skills.0);

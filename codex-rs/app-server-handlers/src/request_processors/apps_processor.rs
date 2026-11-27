@@ -553,14 +553,35 @@ where
     A: Future<Output = AppListLoadResult>,
     D: Future<Output = AppListLoadResult>,
 {
+    let deadline_error = || {
+        let timeout_seconds = APP_LIST_LOAD_TIMEOUT.as_secs();
+        internal_error(format!(
+            "timed out waiting for app lists after {timeout_seconds} seconds"
+        ))
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return Err(deadline_error());
+    }
+
+    let load = async {
+        // Keep the accessible/directory competition unbiased. Only the
+        // deadline takes precedence over a loader that became ready with it.
+        tokio::select! {
+            result = &mut accessible_loader, if !accessible_loaded => result,
+            result = &mut directory_loader, if !all_loaded => result,
+            else => std::future::pending().await,
+        }
+    };
     tokio::select! {
-        result = &mut accessible_loader, if !accessible_loaded => Ok(result),
-        result = &mut directory_loader, if !all_loaded => Ok(result),
-        _ = tokio::time::sleep_until(deadline) => {
-            let timeout_seconds = APP_LIST_LOAD_TIMEOUT.as_secs();
-            Err(internal_error(format!(
-                "timed out waiting for app lists after {timeout_seconds} seconds"
-            )))
+        biased;
+        _ = tokio::time::sleep_until(deadline) => Err(deadline_error()),
+        result = load => {
+            // A loader's synchronous poll can cross the cutoff.
+            if tokio::time::Instant::now() >= deadline {
+                Err(deadline_error())
+            } else {
+                Ok(result)
+            }
         }
     }
 }

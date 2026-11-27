@@ -46,6 +46,7 @@ use crate::context::ContextualUserFragment;
 use crate::context::HookAdditionalContext;
 use crate::event_mapping::parse_turn_item;
 use crate::session::TurnInput;
+use crate::session::paired_lifecycle::StartHookInvocation;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::hook_names::HookToolName;
@@ -128,6 +129,7 @@ pub(crate) async fn run_pending_session_start_hooks(
             sess,
             turn_context,
             preview_runs,
+            Some(turn_context.paired_lifecycle().start_hook_invocation()),
             hooks.run_session_start(request, Some(turn_context.sub_id.clone())),
         )
         .await
@@ -632,6 +634,7 @@ pub(crate) async fn inspect_pending_input(
                 sess,
                 turn_context,
                 preview_runs,
+                /*start_hook_invocation*/ None,
                 hooks.run_user_prompt_submit(request),
             )
             .await
@@ -674,12 +677,27 @@ async fn run_context_injecting_hook<Fut>(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     preview_runs: Vec<HookRunSummary>,
+    start_hook_invocation: Option<StartHookInvocation>,
     outcome_future: Fut,
 ) -> HookRuntimeOutcome
 where
     Fut: Future<Output = ContextInjectingHookOutcome>,
 {
-    emit_hook_started_events(sess, turn_context, preview_runs).await;
+    if let Some(invocation) = start_hook_invocation {
+        for run in preview_runs {
+            sess.emit_scoped_start_hook_started(
+                turn_context,
+                invocation,
+                HookStartedEvent {
+                    turn_id: Some(turn_context.sub_id.clone()),
+                    run,
+                },
+            )
+            .await;
+        }
+    } else {
+        emit_hook_started_events(sess, turn_context, preview_runs).await;
+    }
 
     let ContextInjectingHookOutcome {
         hook_events,
@@ -687,7 +705,16 @@ where
         stop_reason,
         additional_contexts,
     } = outcome_future.await;
-    emit_hook_completed_events(sess, turn_context, hook_events).await;
+    if let Some(invocation) = start_hook_invocation {
+        for completed in hook_events {
+            emit_hook_completed_metrics(turn_context, &completed);
+            track_hook_completed_analytics(sess, turn_context, &completed);
+            sess.emit_scoped_start_hook_completed(turn_context, invocation, completed)
+                .await;
+        }
+    } else {
+        emit_hook_completed_events(sess, turn_context, hook_events).await;
+    }
     HookRuntimeOutcome {
         should_stop,
         stop_reason,

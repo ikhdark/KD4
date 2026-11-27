@@ -44,6 +44,12 @@ fn discovery_timeout() -> SkillProviderError {
         .with_kind(SkillProviderErrorKind::Timeout)
 }
 
+pub(crate) struct ExecutorCatalogSnapshot {
+    pub(crate) catalog: SkillCatalog,
+    /// False if the contribution cutoff left any root without a result.
+    pub(crate) all_roots_settled: bool,
+}
+
 pub(crate) struct SkillsThreadState {
     config: Mutex<SkillsExtensionConfig>,
     orchestrator_skills_available: bool,
@@ -96,24 +102,13 @@ impl SkillsThreadState {
     pub(crate) async fn executor_catalog_snapshot(
         &self,
         providers: &SkillProviders,
-        mut query: SkillListQuery,
-    ) -> SkillCatalog {
-        let roots = std::mem::take(&mut query.executor_roots);
-        let mut results = futures::stream::iter(roots.into_iter().enumerate())
-            .map(|(index, root)| {
-                let mut query = query.clone();
-                query.executor_roots = vec![root.clone()];
-                async move { (index, self.executor_root_catalog(providers, root, query).await) }
-            })
-            .buffer_unordered(MAX_CONCURRENT_EXECUTOR_ROOTS)
-            .collect::<Vec<_>>()
-            .await;
-        results.sort_unstable_by_key(|(index, _)| *index);
-        let mut catalog = SkillCatalog::default();
-        for (_, root_catalog) in results {
-            catalog.extend_ref(&root_catalog);
-        }
-        catalog
+        query: SkillListQuery,
+        settlement_deadline: tokio::time::Instant,
+    ) -> ExecutorCatalogSnapshot {
+        self.collect_executor_catalog(query, settlement_deadline, |root, query| {
+            self.executor_root_catalog(providers, root, query)
+        })
+        .await
     }
 
     /// Returns the catalog that runtime contribution would observe without populating the
@@ -122,30 +117,68 @@ impl SkillsThreadState {
     pub(crate) async fn estimate_executor_catalog_snapshot(
         &self,
         providers: &SkillProviders,
-        mut query: SkillListQuery,
+        query: SkillListQuery,
+        settlement_deadline: tokio::time::Instant,
     ) -> SkillCatalog {
+        self.collect_executor_catalog(query, settlement_deadline, |root, query| async move {
+            match self.cached_executor_catalog(&root, &query) {
+                Some(cached) => cached,
+                None => Arc::new(catalog_or_warning(
+                    providers.list_executor_for_turn(query).await,
+                )),
+            }
+        })
+        .await
+        .catalog
+    }
+
+    async fn collect_executor_catalog<F>(
+        &self,
+        mut query: SkillListQuery,
+        settlement_deadline: tokio::time::Instant,
+        mut load_root: impl FnMut(SelectedCapabilityRoot, SkillListQuery) -> F,
+    ) -> ExecutorCatalogSnapshot
+    where
+        F: Future<Output = Arc<SkillCatalog>>,
+    {
         let roots = std::mem::take(&mut query.executor_roots);
-        let mut results = futures::stream::iter(roots.into_iter().enumerate())
-            .map(|(index, root)| {
-                let mut query = query.clone();
-                query.executor_roots = vec![root.clone()];
-                async move {
-                    let catalog = match self.cached_executor_catalog(&root, &query) {
-                        Some(cached) => cached,
-                        None => Arc::new(catalog_or_warning(providers.list_executor_for_turn(query).await)),
-                    };
-                    (index, catalog)
-                }
-            })
-            .buffer_unordered(MAX_CONCURRENT_EXECUTOR_ROOTS)
-            .collect::<Vec<_>>()
-            .await;
-        results.sort_unstable_by_key(|(index, _)| *index);
-        let mut catalog = SkillCatalog::default();
-        for (_, root_catalog) in results {
-            catalog.extend_ref(&root_catalog);
+        let mut results = vec![None; roots.len()];
+        {
+            let pending = futures::stream::iter(roots.iter().cloned().enumerate())
+                .map(|(index, root)| {
+                    let mut root_query = query.clone();
+                    root_query.executor_roots = vec![root.clone()];
+                    let load = load_root(root, root_query);
+                    async move { (index, load.await) }
+                })
+                .buffer_unordered(MAX_CONCURRENT_EXECUTOR_ROOTS)
+                .take_until(tokio::time::sleep_until(settlement_deadline));
+            let mut pending = std::pin::pin!(pending);
+            while let Some((index, catalog)) = pending.next().await {
+                results[index] = Some(catalog);
+            }
+            // Drop unfinished work rather than caching a short contribution cutoff
+            // as a root failure. Existing live slots keep their own retry deadlines.
         }
-        catalog
+
+        let mut catalog = SkillCatalog::default();
+        let mut incomplete = false;
+        for (root, result) in roots.iter().zip(results) {
+            // A queued root might already have a reusable catalog without ever
+            // getting a fanout slot in this observation.
+            if let Some(result) = result.or_else(|| self.cached_executor_catalog(root, &query)) {
+                catalog.extend_ref(&result);
+            } else {
+                incomplete = true;
+            }
+        }
+        if incomplete {
+            catalog.warnings.push(discovery_timeout().message);
+        }
+        ExecutorCatalogSnapshot {
+            catalog,
+            all_roots_settled: !incomplete,
+        }
     }
 
     pub(crate) async fn orchestrator_catalog_snapshot(

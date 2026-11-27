@@ -276,14 +276,27 @@ fn drain_released_pipe_readers(
         let deadline = tokio::time::Instant::now() + PTY_OUTPUT_DRAIN_TIMEOUT;
         if let Some(tree) = settle {
             let settle_deadline = tokio::time::Instant::now() + PIPE_TREE_SETTLE_TIMEOUT;
-            while !tree.tree_is_empty().unwrap_or(false) {
+            let settled = loop {
                 if tokio::time::Instant::now() >= settle_deadline {
-                    // A live descendant may hold the write ends indefinitely.
-                    abort.abort();
-                    streams.iter().for_each(AbortHandle::abort);
-                    return;
+                    break false;
                 }
-                tokio::time::sleep(PIPE_TREE_SETTLE_POLL).await;
+                let empty = tree.tree_is_empty().unwrap_or(false);
+                let now = tokio::time::Instant::now();
+                // The native query may have crossed the cutoff.
+                if now >= settle_deadline {
+                    break false;
+                }
+                if empty {
+                    break true;
+                }
+                tokio::time::sleep_until((now + PIPE_TREE_SETTLE_POLL).min(settle_deadline))
+                    .await;
+            };
+            if !settled {
+                // A live descendant may hold the write ends indefinitely.
+                abort.abort();
+                streams.iter().for_each(AbortHandle::abort);
+                return;
             }
         }
         if tokio::time::timeout_at(deadline, reader).await.is_err() {

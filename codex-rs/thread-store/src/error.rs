@@ -56,6 +56,18 @@ pub enum ThreadStoreError {
         operation: &'static str,
     },
 
+    /// This update's SQLite metadata patch committed, but its Git compatibility
+    /// projection is still pending. Do not retry the metadata mutation.
+    #[error("metadata committed for thread {thread_id}; Git compatibility intent {intent_id} is pending (projection outcome unknown: {outcome_unknown})")]
+    GitCompatibilityPending {
+        /// Thread whose metadata was committed.
+        thread_id: ThreadId,
+        /// Durable compatibility intent for the committed patch.
+        intent_id: i64,
+        /// Whether the compatibility write may already have taken effect.
+        outcome_unknown: bool,
+    },
+
     /// Catch-all for implementation failures that do not fit a more specific category.
     #[error("thread-store internal error: {message}")]
     Internal {

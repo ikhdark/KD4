@@ -358,16 +358,21 @@ impl PluginStore {
             .map(|plugin_version| self.plugin_root(plugin_id, &plugin_version))
     }
 
-    /// Hold the existing entry owner's shared lease across all capability reads.
-    /// A pending/failed commit is never a committed installation.
-    pub(crate) fn read_plugin(&self, plugin_id: &PluginId) -> Result<PluginReadLease, PluginStoreError> {
-        let base = self.plugin_base_root(plugin_id);
+    fn lock_committed_plugin(&self, base: &AbsolutePathBuf) -> Result<fs::File, PluginStoreError> {
         let entry_lock = try_read_plugin_cache_entry(base.as_path())
             .map_err(|err| PluginStoreError::io("plugin cache entry is busy or unavailable", err))?;
         if base.join(".codex-install-owner").as_path().try_exists()
             .map_err(|err| PluginStoreError::io("failed to inspect plugin publication state", err))? {
             return Err(PluginStoreError::Invalid("plugin installation is not committed; reinstall the plugin".to_string()));
         }
+        Ok(entry_lock)
+    }
+
+    /// Hold the existing entry owner's shared lease across all capability reads.
+    /// A pending/failed commit is never a committed installation.
+    pub(crate) fn read_plugin(&self, plugin_id: &PluginId) -> Result<PluginReadLease, PluginStoreError> {
+        let base = self.plugin_base_root(plugin_id);
+        let entry_lock = self.lock_committed_plugin(&base)?;
         let root = self.active_plugin_root(plugin_id);
         let metadata_path = base.join(PLUGIN_INSTALL_METADATA_FILE);
         let installation_id = match fs::File::open(metadata_path.as_path()) {
@@ -400,6 +405,41 @@ impl PluginStore {
         self.active_plugin_version(plugin_id).is_some()
     }
 
+    pub(crate) fn committed_remote_plugin_id(
+        &self,
+        plugin_id: &PluginId,
+    ) -> Result<Option<String>, PluginStoreError> {
+        let _lease = self.lock_committed_plugin(&self.plugin_base_root(plugin_id))?;
+        self.remote_plugin_id(plugin_id)
+    }
+
+    /// Read the installed version and remote identity from one committed local
+    /// publication. This lookup is advisory; busy or unavailable is not a version.
+    pub fn committed_remote_local_version(
+        &self,
+        plugin_id: &PluginId,
+        expected_remote_id: Option<&str>,
+    ) -> Option<String> {
+        let _lease = self.lock_committed_plugin(&self.plugin_base_root(plugin_id)).ok()?;
+        let version = self.active_plugin_version(plugin_id)?;
+        if let Some(stored_id) = self.remote_plugin_id(plugin_id).ok()?
+            && Some(stored_id.as_str()) != expected_remote_id
+        {
+            return None;
+        }
+        let root = self.plugin_root(plugin_id, &version);
+        let manifest = load_plugin_manifest(root.as_path())?;
+        if manifest.name != plugin_id.plugin_name() {
+            return None;
+        }
+        // Legacy cache entries can omit manifest.version.
+        manifest
+            .version
+            .or_else(|| (version != DEFAULT_PLUGIN_VERSION).then_some(version))
+    }
+
+    /// The caller may already own mutation authority for this entry. Use
+    /// committed_remote_plugin_id for unleased observers.
     pub fn remote_plugin_id(
         &self,
         plugin_id: &PluginId,

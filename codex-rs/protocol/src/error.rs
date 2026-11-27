@@ -99,6 +99,13 @@ pub enum CodexErr {
     ContextWindowExceeded,
     #[error("no thread with id: {0}")]
     ThreadNotFound(ThreadId),
+    /// This update's SQLite metadata committed; retrying the mutation is not recovery.
+    #[error("metadata committed for thread {thread_id}; Git compatibility intent {intent_id} is pending (projection outcome unknown: {outcome_unknown})")]
+    GitCompatibilityPending {
+        thread_id: ThreadId,
+        intent_id: i64,
+        outcome_unknown: bool,
+    },
     #[error("child instruction recovery is blocked: parent {0} must be loaded before resuming its child (no thread with id: {0})")]
     ResumeParentNotLoaded(ThreadId),
     #[error("agent thread limit reached")]
@@ -286,6 +293,7 @@ impl CodexErr {
             | CodexErr::RetryLimit(_)
             | CodexErr::ContextWindowExceeded
             | CodexErr::ThreadNotFound(_)
+            | CodexErr::GitCompatibilityPending { .. }
             | CodexErr::ResumeParentNotLoaded(_)
             | CodexErr::AgentLimitReached { .. }
             | CodexErr::Spawn
@@ -378,6 +386,8 @@ impl CodexErr {
             return source.http_status_code_value();
         }
         let http_status_code = match self {
+            // The API bridge reserves this variant for a provider HTTP 500.
+            CodexErr::InternalServerError { .. } => Some(StatusCode::INTERNAL_SERVER_ERROR),
             CodexErr::RetryLimit(err) => Some(err.status),
             CodexErr::UnexpectedStatus(err) | CodexErr::RegionRestricted(err) => Some(err.status),
             CodexErr::ConnectionFailed(err) => err.status,

@@ -297,6 +297,37 @@ async fn process_connection_request(
     }
 }
 
+async fn retire_standalone_connection(
+    connection_id: ConnectionId,
+    connection_state: Arc<ConnectionState>,
+    processor: &Arc<MessageProcessor>,
+    outbound_control_tx: &mpsc::Sender<OutboundControlEvent>,
+    connection_cleanup_tasks: &mut ConnectionCleanupTasks,
+    cleanup_complete: Option<oneshot::Sender<()>>,
+) -> bool {
+    connection_state.session.rpc_gate.close().await;
+    connection_state.disconnect.cancel();
+    let outbound_open = !matches!(
+        outbound_control_tx.try_send(OutboundControlEvent::Closed { connection_id }),
+        Err(mpsc::error::TrySendError::Closed(_))
+    );
+    let processor = Arc::clone(processor);
+    connection_cleanup_tasks.spawn(async move {
+        processor
+            .connection_closed(connection_id, &connection_state.session)
+            .await;
+        tracing::debug!(
+            target: "codex_app_server::queue_origin_custody",
+            ?connection_id,
+            "retired queue-origin connection"
+        );
+        if let Some(tx) = cleanup_complete {
+            let _ = tx.send(());
+        }
+    });
+    outbound_open
+}
+
 #[derive(Default)]
 struct ShutdownState {
     requested: bool,
@@ -1344,32 +1375,20 @@ async fn run_main_owned(
                                 let Some(connection_state) = connections.remove(&connection_id) else {
                                     continue;
                                 };
-                                connection_state.session.rpc_gate.close().await;
-                                connection_state.disconnect.cancel();
-                                let outbound_closed = !matches!(outbound_control_tx.try_send(
-                                    OutboundControlEvent::Closed { connection_id },
-                                ), Err(mpsc::error::TrySendError::Closed(_)));
-                                let processor = Arc::clone(&processor);
                                 let is_last_connection = shutdown_when_no_connections && connections.is_empty();
                                 let cleanup_complete = is_last_connection.then(|| {
                                     let (tx, rx) = oneshot::channel();
                                     last_connection_cleanup = Some((connection_id, rx));
                                     tx
                                 });
-                                connection_cleanup_tasks.spawn(async move {
-                                    processor
-                                        .connection_closed(connection_id, &connection_state.session)
-                                        .await;
-                                    tracing::debug!(
-                                        target: "codex_app_server::queue_origin_custody",
-                                        ?connection_id,
-                                        "retired queue-origin connection"
-                                    );
-                                    if let Some(tx) = cleanup_complete {
-                                        let _ = tx.send(());
-                                    }
-                                });
-                                if !outbound_closed {
+                                if !retire_standalone_connection(
+                                    connection_id,
+                                    connection_state,
+                                    &processor,
+                                    &outbound_control_tx,
+                                    &mut connection_cleanup_tasks,
+                                    cleanup_complete,
+                                ).await {
                                     break "outbound_router_closed";
                                 }
                                 if is_last_connection {
@@ -1470,34 +1489,112 @@ async fn run_main_owned(
             };
 
             init_watchdog_shutdown.cancel();
-            processor.clear_runtime_references().await;
-            thread_attachment_tasks.shutdown().await;
             let disconnect_all = shutdown_state.requested();
+            let receive_cleanup_replies =
+                exit_reason == "shutdown_requested" && !shutdown_state.forced();
+            let prepare_cleanup = async {
+                processor.clear_runtime_references().await;
+                thread_attachment_tasks.shutdown().await;
+            };
+            let graceful_preparation = if receive_cleanup_replies {
+                Some(prepare_cleanup)
+            } else {
+                prepare_cleanup.await;
+                None
+            };
             let mut stdio_producers_drained = false;
             shutdown_state
                 .finish_cleanup(
                     async {
-                        processor.cancel_active_login().await;
-                        futures::future::join_all(
-                            connections.values().map(|connection_state| {
-                                connection_state.session.rpc_gate.shutdown()
-                            }),
-                        )
-                        .await;
-                        connection_cleanup_tasks.drain().await;
-                        processor.drain_background_tasks().await;
-                        let threads_drained = if single_client_mode {
-                            processor.shutdown_threads_with_result().await.is_ok()
-                        } else {
-                            processor.shutdown_threads().await;
-                            false
-                        };
-                        processor.wait_for_background_tasks().await;
-                        // Hand back an active rollout-index claim so the next process resumes
-                        // from its checkpoint instead of waiting out the lease, as exec does.
-                        if let Some(state_db) = backfill_state_db.as_ref() {
-                            state_db.stop_backfill_worker().await;
+                        let closing_sessions = connections
+                            .values()
+                            .map(|connection_state| Arc::clone(&connection_state.session))
+                            .collect::<Vec<_>>();
+                        if receive_cleanup_replies {
+                            // Stop previously queued RPCs before cutting over to reply-only
+                            // ingress. Close the task gate, not the live peer's writer.
+                            for session in &closing_sessions {
+                                session.rpc_gate.close().await;
+                            }
+                            processor.stop_server_request_publication();
                         }
+                        let cleanup = async {
+                            if let Some(preparation) = graceful_preparation {
+                                preparation.await;
+                            }
+                            processor.cancel_active_login().await;
+                            futures::future::join_all(
+                                closing_sessions.iter().map(|session| session.rpc_gate.shutdown()),
+                            )
+                            .await;
+                            connection_cleanup_tasks.drain().await;
+                            processor.drain_background_tasks().await;
+                            let threads_drained = if single_client_mode {
+                                processor.shutdown_threads_with_result().await.is_ok()
+                            } else {
+                                processor.shutdown_threads().await;
+                                false
+                            };
+                            processor.wait_for_background_tasks().await;
+                            // Hand back an active rollout-index claim so the next process resumes
+                            // from its checkpoint instead of waiting out the lease, as exec does.
+                            if let Some(state_db) = backfill_state_db.as_ref() {
+                                state_db.stop_backfill_worker().await;
+                            }
+                            threads_drained
+                        };
+                        tokio::pin!(cleanup);
+                        // Closures observed here can unblock the gate drain above. Track
+                        // them separately from the pre-cutover workers it already joins.
+                        let mut retirements = ConnectionCleanupTasks::new();
+                        let mut ingress_open = receive_cleanup_replies;
+                        let threads_drained = loop {
+                            tokio::select! {
+                                biased;
+                                drained = &mut cleanup => break drained,
+                                event = transport_event_rx.recv(), if ingress_open => {
+                                    let Some(event) = event else {
+                                        ingress_open = false;
+                                        continue;
+                                    };
+                                    match event {
+                                        TransportEvent::IncomingMessage { connection_id, message, _ingress_permit }
+                                            if connections.get(&connection_id)
+                                                .is_some_and(|connection| !connection.disconnect.is_cancelled()) =>
+                                        {
+                                            match message {
+                                                JSONRPCMessage::Response(response) => {
+                                                    processor.process_response(connection_id, response).await;
+                                                }
+                                                JSONRPCMessage::Error(error) => {
+                                                    processor.process_error(connection_id, error).await;
+                                                }
+                                                JSONRPCMessage::Request(_) | JSONRPCMessage::Notification(_) => {}
+                                            }
+                                        }
+                                        TransportEvent::ConnectionClosed { connection_id } => {
+                                            if let Some(connection) = connections.remove(&connection_id) {
+                                                let _ = retire_standalone_connection(
+                                                    connection_id,
+                                                    connection,
+                                                    &processor,
+                                                    &outbound_control_tx,
+                                                    &mut retirements,
+                                                    /*cleanup_complete*/ None,
+                                                ).await;
+                                            }
+                                        }
+                                        TransportEvent::ConnectionOpened {
+                                            disconnect_sender: Some(disconnect), ..
+                                        } => disconnect.cancel(),
+                                        TransportEvent::ConnectionOpened { disconnect_sender: None, .. }
+                                        | TransportEvent::IncomingMessage { .. }
+                                        | TransportEvent::RequestRejected { .. } => {}
+                                    }
+                                }
+                            }
+                        };
+                        retirements.drain().await;
                         processor.finish_shutdown_delivery().await;
                         stdio_producers_drained = threads_drained;
                         if disconnect_all {

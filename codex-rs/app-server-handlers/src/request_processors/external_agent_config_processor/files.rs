@@ -13,7 +13,11 @@ use super::formats;
 
 const EXTERNAL_AGENT_MCP_CONFIG_FILE: &str = ".mcp.json";
 
-pub(super) fn detect(home: &Path, params: ExternalAgentConfigDetectParams) -> io::Result<Vec<ExternalAgentConfigMigrationItem>> {
+pub(super) fn detect(
+    home: &Path,
+    params: ExternalAgentConfigDetectParams,
+    detect_sessions: bool,
+) -> io::Result<Vec<ExternalAgentConfigMigrationItem>> {
     let mut scopes = Vec::new();
     if params.include_home {
         scopes.push(None);
@@ -86,7 +90,7 @@ pub(super) fn detect(home: &Path, params: ExternalAgentConfigDetectParams) -> io
                     format!("Migrate hooks into {}", target_config_dir.display())));
             }
         }
-        if cwd.is_none() {
+        if detect_sessions && cwd.is_none() {
             let sessions = super::sessions::detect_recent_sessions(&paths.external_home, home)?;
             if !sessions.is_empty() {
                 items.push(item(ExternalAgentConfigMigrationItemType::Sessions, None,

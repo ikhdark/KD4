@@ -241,8 +241,8 @@ async fn search_threads_inner(
                     )
                     .is_ok_and(|source| params.allowed_sources.contains(&source))
             });
-            // Archived discovery accepts empty previews. A metadata-only hit has no
-            // visible result to represent, even under the active preview policy.
+            // Archived discovery accepts empty previews. A hit without a
+            // conversation snippet has no visible result to represent.
             if eligible
                 && !params.archived
                 && snippet.is_some()
@@ -302,8 +302,8 @@ async fn search_threads_inner(
         let page = selected.page;
         for item in page.items {
             let logical_path = codex_rollout::plain_rollout_path(item.path.as_path());
-            // Content search already inspected each snippetless candidate to its
-            // end: the match is metadata-only, and rereading cannot find one.
+            // A raw rollout match may be outside user or assistant message text.
+            // Search already checked these candidates for a supported snippet.
             let Some(snippet) = remaining_rollouts
                 .remove(logical_path.as_path())
                 .flatten()

@@ -1053,7 +1053,9 @@ pub(crate) fn retry_trigger(err: &CodexErr) -> RetryTrigger {
     match err {
         CodexErr::TerminalResponse { source, .. } => retry_trigger(source),
         CodexErr::ConnectionFailed(_) | CodexErr::PreDispatchRetryExhausted(_) => RetryTrigger::Connection,
-        CodexErr::UnexpectedStatus(_) | CodexErr::RegionRestricted(_) => RetryTrigger::Http,
+        CodexErr::UnexpectedStatus(_)
+        | CodexErr::RegionRestricted(_)
+        | CodexErr::InternalServerError { .. } => RetryTrigger::Http,
         CodexErr::RequestTimeout | CodexErr::Timeout => RetryTrigger::Timeout,
         CodexErr::Stream(..) | CodexErr::ResponseStreamFailed(_) | CodexErr::IncompleteResponse(_) => RetryTrigger::Stream,
         CodexErr::WebsocketRejected { .. } => RetryTrigger::WebsocketRejected,

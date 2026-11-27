@@ -30,6 +30,7 @@ use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::time::MissedTickBehavior;
 use tracing::Event;
 use tracing::field::Field;
 use tracing::field::Visit;
@@ -467,6 +468,9 @@ async fn run_inserter(
     let mut buffer = Vec::with_capacity(config.batch_size);
     let mut insert_error = None;
     let mut ticker = tokio::time::interval(config.flush_interval);
+    // Flush once after a stall, then wait a full interval rather than replaying
+    // elapsed ticks and reopening retention retries back-to-back.
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut pending_retention = Some(LogRetentionScope::for_reconciliation());
     let mut maintenance = None;
     let mut retry_on_tick = false;

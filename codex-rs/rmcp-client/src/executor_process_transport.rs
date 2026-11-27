@@ -23,6 +23,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use codex_exec_server::ExecOutputStream;
@@ -40,6 +41,8 @@ use rmcp::transport::Transport;
 use serde_json::from_slice;
 use serde_json::to_vec;
 use tokio::sync::broadcast;
+use tokio::time::Instant;
+use tokio::time::timeout_at;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
@@ -55,6 +58,8 @@ pub(super) const MCP_STDERR_MAX_LINE_BYTES: usize = 1024 * 1024;
 /// exec-server's own 64 MiB JSON-RPC message limit rather than the diagnostic
 /// line limit.
 const MCP_STDOUT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Observation budget for one gap repair, not for ordinary pushed output.
+const OUTPUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct LineBuffer {
@@ -130,6 +135,11 @@ enum ReceiveState {
     Interrupted,
 }
 
+struct PendingOutputRecovery {
+    deadline: Instant,
+    trigger: Option<ExecProcessEvent>,
+}
+
 // Remote public implementation.
 
 /// A client-side rmcp transport backed by an executor-managed process.
@@ -171,6 +181,10 @@ pub(super) struct ExecutorProcessTransport {
     /// cursor to recover missed stdout/stderr chunks from the executor.
     last_seq: u64,
     exit_known: bool,
+
+    // Retain the consumed trigger and its original deadline if rmcp drops a
+    // receive future. The receive future still owns the read itself.
+    pending_output_recovery: Option<PendingOutputRecovery>,
 }
 
 impl ExecutorProcessTransport {
@@ -189,6 +203,7 @@ impl ExecutorProcessTransport {
             receive_state: ReceiveState::Open,
             last_seq: 0,
             exit_known: false,
+            pending_output_recovery: None,
         }
     }
 
@@ -258,30 +273,32 @@ impl ExecutorProcessTransport {
                 return None;
             }
 
+            if let Some(recovery) = &self.pending_output_recovery {
+                let deadline = recovery.deadline;
+                let failure_context = if recovery.trigger.is_some() {
+                    "Failed to recover remote MCP output sequence"
+                } else {
+                    "Failed to recover remote MCP server output stream"
+                };
+                if let Err(error) = self.recover_events(deadline).await {
+                    warn!("{failure_context} ({}): {error}", self.program_name);
+                    self.pending_output_recovery = None;
+                    self.receive_state = ReceiveState::Interrupted;
+                }
+                continue;
+            }
+
             match self.events.recv().await {
-                Ok(event) => match self.recover_forward_gap(event).await {
-                    Ok(Some(event)) => self.handle_process_event(event),
-                    Ok(None) => {}
-                    Err(error) => {
-                        warn!(
-                            "Failed to recover remote MCP output sequence ({}): {error}",
-                            self.program_name
-                        );
-                        self.receive_state = ReceiveState::Interrupted;
-                    }
-                },
+                Ok(event) if self.has_forward_gap(&event) => {
+                    self.begin_output_recovery(Some(event));
+                }
+                Ok(event) => self.handle_process_event(event),
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(
                         "Remote MCP server output stream lagged ({}): skipped {skipped} events",
                         self.program_name
                     );
-                    if let Err(error) = self.recover_lagged_events().await {
-                        warn!(
-                            "Failed to recover remote MCP server output stream ({}): {error}",
-                            self.program_name
-                        );
-                        self.receive_state = ReceiveState::Interrupted;
-                    }
+                    self.begin_output_recovery(None);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     warn!(
@@ -332,11 +349,8 @@ impl ExecutorProcessTransport {
         self.last_seq = self.last_seq.max(seq);
     }
 
-    async fn recover_forward_gap(
-        &mut self,
-        event: ExecProcessEvent,
-    ) -> io::Result<Option<ExecProcessEvent>> {
-        let seq = match &event {
+    fn has_forward_gap(&self, event: &ExecProcessEvent) -> bool {
+        let seq = match event {
             ExecProcessEvent::Output(chunk) => Some(chunk.seq),
             ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq, .. } => {
                 Some(*seq)
@@ -350,12 +364,7 @@ impl ExecutorProcessTransport {
             } => Some(*through_seq),
             _ => None,
         };
-        if seq.is_some_and(|seq| seq > self.last_seq.saturating_add(1)) {
-            self.recover_events(Some(event)).await?;
-            Ok(None)
-        } else {
-            Ok(Some(event))
-        }
+        seq.is_some_and(|seq| seq > self.last_seq.saturating_add(1))
     }
 
     fn should_accept_seq(&mut self, seq: u64) -> bool {
@@ -366,20 +375,34 @@ impl ExecutorProcessTransport {
         true
     }
 
-    async fn recover_lagged_events(&mut self) -> io::Result<()> {
-        self.recover_events(None).await
+    fn begin_output_recovery(&mut self, trigger: Option<ExecProcessEvent>) {
+        self.pending_output_recovery = Some(PendingOutputRecovery {
+            deadline: Instant::now() + OUTPUT_RECOVERY_TIMEOUT,
+            trigger,
+        });
     }
 
-    async fn recover_events(&mut self, trigger: Option<ExecProcessEvent>) -> io::Result<()> {
-        let response = self
-            .process
-            .read(
+    async fn recover_events(&mut self, deadline: Instant) -> io::Result<()> {
+        Self::check_output_recovery_deadline(deadline)?;
+        // wait_ms=0 only skips the server's long poll; queueing and reply
+        // delivery can still stall. With no byte cap this read is a single
+        // snapshot through its reported sequence, including terminal events.
+        let response = timeout_at(
+            deadline,
+            self.process.read(
                 Some(self.last_seq),
                 /*max_bytes*/ None,
                 /*wait_ms*/ Some(0),
-            )
-            .await
-            .map_err(io::Error::other)?;
+            ),
+        )
+        .await
+        .map_err(|_| Self::output_recovery_timeout())?
+        .map_err(io::Error::other)?;
+        Self::check_output_recovery_deadline(deadline)?;
+        let trigger = self
+            .pending_output_recovery
+            .take()
+            .and_then(|recovery| recovery.trigger);
         // A retained read can include valid output before its first gap.
         // Replay in sequence order and stop at that gap rather than dropping
         // the entire validated prefix or interpreting a later close as EOF.
@@ -391,12 +414,29 @@ impl ExecutorProcessTransport {
         )
         .map_err(io::Error::other)?;
         for event in recovered {
+            // Do not promote a late terminal event to clean EOF. Any complete
+            // lines already buffered still drain on the interrupted path.
+            Self::check_output_recovery_deadline(deadline)?;
             self.handle_process_event(event);
             if self.receive_state != ReceiveState::Open {
-                break;
+                return Ok(());
             }
         }
+        Self::check_output_recovery_deadline(deadline)
+    }
+
+    fn check_output_recovery_deadline(deadline: Instant) -> io::Result<()> {
+        if Instant::now() >= deadline {
+            return Err(Self::output_recovery_timeout());
+        }
         Ok(())
+    }
+
+    fn output_recovery_timeout() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("remote MCP output recovery timed out after {OUTPUT_RECOVERY_TIMEOUT:?}"),
+        )
     }
 
     fn push_process_output_if_new(&mut self, chunk: ProcessOutputChunk) {

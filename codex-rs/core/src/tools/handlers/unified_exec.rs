@@ -4,6 +4,7 @@ use crate::shell::ShellType;
 use crate::shell::get_shell;
 use crate::shell::get_shell_by_model_provided_path;
 use crate::shell::resolve_use_login_shell;
+use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -23,11 +24,111 @@ pub use exec_command::ExecCommandHandler;
 pub(crate) use exec_command::ExecCommandHandlerOptions;
 pub use write_stdin::WriteStdinHandler;
 
+/// The manager gives back control with NESTED_POLL_MARGIN remaining. Use
+/// only part of that headroom for optional handler work; leave the rest for
+/// dispatch and transport to return the failure.
+fn nested_failure_return_bound(
+    deadline: Option<std::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    let deadline = tokio::time::Instant::from_std(deadline?);
+    Some(
+        deadline
+            .checked_sub(crate::unified_exec::NESTED_POLL_MARGIN / 2)
+            .unwrap_or_else(tokio::time::Instant::now),
+    )
+}
+
+/// Only for observations without a commit, cursor acknowledgement, or send.
+async fn bounded_failure_read<T>(
+    bound: Option<tokio::time::Instant>,
+    read: impl std::future::Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    match bound {
+        Some(bound) => tokio::time::timeout_at(bound, read).await,
+        None => Ok(read.await),
+    }
+}
+
+fn append_failure_notice(output: &mut ExecCommandToolOutput, notice: String) {
+    output.repair_notice = Some(match output.repair_notice.take() {
+        Some(previous) => format!("{previous}\n{notice}"),
+        None => notice,
+    });
+}
+
+/// Publish a separate, exact byte locator before storage can block. Do not
+/// replace the process owner's cumulative log, rewrite its byte map, or
+/// invent producer bytes from a failure notice. A durability failure can
+/// also retain the observed receipt bytes, explicitly not a transcript.
+fn retain_nested_failure_output(
+    output: &mut ExecCommandToolOutput,
+    session: &Arc<crate::session::Session>,
+    turn: &crate::session::turn_context::TurnContext,
+    call_id: &str,
+    durability_failure: bool,
+) {
+    use crate::tools::command_output_artifact as artifacts;
+    if output.raw_output_artifact.as_ref().is_some_and(|artifact| {
+        !artifact.is_pending() && !matches!(artifact, artifacts::RawOutputArtifact::Empty)
+    }) {
+        return;
+    }
+    let snapshot = output.process_output.as_ref().filter(|snapshot| {
+        output.process_exited
+            && snapshot.output_closed
+            && snapshot.aggregated_output_is_exact
+    });
+    let (bytes, scope) = if let Some(snapshot) = snapshot {
+        (&snapshot.aggregated_output, "exact terminal output snapshot")
+    } else if durability_failure || output.output_ranges.as_ref().is_some_and(|ranges| !ranges.range.is_empty()) {
+        (&output.raw_output, "observed receipt bytes, not the complete producer transcript")
+    } else {
+        // There are no newly observed producer bytes to preserve.
+        return;
+    };
+    if bytes.is_empty() {
+        return;
+    }
+
+    let bytes = bytes.clone();
+    let length = bytes.len();
+    let call_id = call_id.to_owned();
+    let id = artifacts::ToolOutputArtifactId::new();
+    let codex_home = turn.config.codex_home.clone();
+    let thread_id = session.thread_id.to_string();
+    let owner = artifacts::reserve_canonical_retention(&codex_home, &thread_id, id);
+    let tasks = session.terminal_tasks.clone();
+    let session = Arc::clone(session);
+    tasks.spawn(async move {
+        let canonical = codex_tools::CanonicalToolResult::bytes(bytes);
+        let artifact = artifacts::create_canonical_output_artifact_with_id(
+            &codex_home, &thread_id, &canonical, id,
+        )
+        .await;
+        owner.settle(&artifact);
+        if artifact.complete && let Some(id) = artifact.artifact_id() {
+            session
+                .register_tool_artifact_origin(id, call_id, canonical.exact_bytes, canonical.sha256)
+                .await;
+        }
+    });
+    append_failure_notice(output, format!(
+        "Recovery storage pending for {scope}; this is separate from the process log. Do not rerun or resend input. {}",
+        serde_json::json!({
+            "tool": "read_tool_output", "arguments": {
+                "artifact_id": id.to_string(),
+                "selectors": [{"kind": "bytes", "start": 0, "end": length}]
+            }
+        }),
+    ));
+}
+
 async fn preserve_durability_failure_output(
     message: String,
-    output: Option<Box<crate::tools::context::ExecCommandToolOutput>>,
-    codex_home: &std::path::Path,
-    thread_id: &str,
+    output: Option<Box<ExecCommandToolOutput>>,
+    session: &Arc<crate::session::Session>,
+    turn: &crate::session::turn_context::TurnContext,
+    nested_call_id: Option<&str>,
 ) -> String {
     let Some(mut output) = output else {
         return message;
@@ -35,9 +136,13 @@ async fn preserve_durability_failure_output(
     // A zero display budget must not discard the only observed result when
     // durable history failed. Keep this fatal diagnostic bounded and recoverable.
     output.max_output_tokens = Some(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS);
-    output
-        .prepare_recovery_artifact(codex_home, thread_id)
-        .await;
+    if let Some(call_id) = nested_call_id {
+        retain_nested_failure_output(&mut output, session, turn, call_id, true);
+    } else {
+        output
+            .prepare_recovery_artifact(turn.config.codex_home.as_path(), &session.thread_id.to_string())
+            .await;
+    }
     let observed = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".into(),
     });

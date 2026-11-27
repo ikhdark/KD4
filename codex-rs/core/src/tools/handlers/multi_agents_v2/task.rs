@@ -345,7 +345,7 @@ async fn handle_submit_agent_receipt(
         .map_err(receipt_store_error)?;
     turn.extension_data
         .insert(crate::agent::task_coordinator::AuthoredReceiptSealed);
-    coordinator.mark_task_inactive(binding.assignment_id);
+    coordinator.mark_task_inactive(receipt.assignment_id, receipt.attempt_id);
     drop(plan_publication);
     coordinator
         .maybe_emit_terminal_metrics(binding.assignment_id, &turn.session_telemetry)
@@ -729,9 +729,11 @@ async fn handle_abandon_agent_task(
         )
         .await
         .map_err(|error| task_store_error(ABANDON_AGENT_TASK_TOOL, error))?;
-    coordinator.mark_task_inactive(assignment_id);
+    // Release only this attempt's occupancy now. A live usage owner will
+    // retire the recorder after both worker exit and final accounting.
+    coordinator.mark_attempt_abandoned(receipt.assignment_id, receipt.attempt_id);
     coordinator
-        .maybe_emit_terminal_metrics(assignment_id, &turn.session_telemetry)
+        .maybe_emit_terminal_metrics(receipt.assignment_id, &turn.session_telemetry)
         .await;
 
     // Durable abandonment is authoritative. Every following step is best-effort so a missing or
@@ -744,7 +746,7 @@ async fn handle_abandon_agent_task(
             .ok()
             .flatten(),
     };
-    if let Some(binding) = binding {
+    if let Some(binding) = binding.filter(|binding| binding.attempt_id == receipt.attempt_id) {
         let thread_id = binding
             .thread_id
             .as_deref()
@@ -761,7 +763,16 @@ async fn handle_abandon_agent_task(
                 .await
                 .ok(),
         };
-        if let Some(thread_id) = thread_id {
+        if let Some(thread_id) = thread_id
+            && coordinator
+                .binding_for_assignment(receipt.assignment_id)
+                .is_some_and(|current| {
+                    current.attempt_id == receipt.attempt_id
+                        && current.thread_id.as_deref().is_none_or(|bound| {
+                            bound == thread_id.to_string()
+                        })
+                })
+        {
             let _ = session
                 .services
                 .agent_control

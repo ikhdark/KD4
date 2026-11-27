@@ -179,15 +179,14 @@ async fn search_rollout_matches_with_query(
     if let (Some(observation), Some(started)) = (observation.as_mut(), started) {
         observation.plain_search_us = started.elapsed().as_micros() as u64;
     }
-    let Some(plain_matches) = plain_matches? else {
+    let Some(mut matches) = plain_matches? else {
         return scan_fallback_matches(root.as_path(), query, observation).await;
     };
-    let mut matches = HashMap::new();
-    for (path, snippet) in plain_matches {
-        if snippet.is_some() {
-            insert_rollout_match(&mut matches, path, snippet);
-            continue;
-        }
+    // Reuse ripgrep's result table. Keep owned path keys while deferring
+    // payload reads until the subprocess and its pipes have settled.
+    let mut hydrated_matches = Vec::new();
+    let mut hydration_candidates = matches.extract_if(|_, snippet| snippet.is_none());
+    for (path, _) in &mut hydration_candidates {
         // A payload reference is only a candidate. Search its canonical hydrated lines
         // after ripgrep has exited, so storage cannot block draining the child pipes.
         let started = observation.is_some().then(Instant::now);
@@ -198,18 +197,18 @@ async fn search_rollout_matches_with_query(
         }
         let (matched, snippet) = inspected?;
         if matched {
-            insert_rollout_match(&mut matches, path, snippet);
+            hydrated_matches.push((path, snippet));
         }
     }
+    drop(hydration_candidates);
+    matches.extend(hydrated_matches);
     let started = observation.is_some().then(Instant::now);
-    let compressed_matches =
-        scan_rollout_matches(root.as_path(), query, /*compressed_only*/ true).await;
+    let compressed_scan =
+        scan_rollout_matches(root.as_path(), query, /*compressed_only*/ true, &mut matches).await;
     if let (Some(observation), Some(started)) = (observation.as_mut(), started) {
         observation.compressed_scan_us = started.elapsed().as_micros() as u64;
     }
-    for (path, snippet) in compressed_matches? {
-        insert_rollout_match(&mut matches, path, snippet);
-    }
+    compressed_scan?;
     Ok(matches)
 }
 
@@ -219,12 +218,13 @@ async fn scan_fallback_matches(
     observation: &mut Option<ContentSearchObservation>,
 ) -> io::Result<RolloutSearchMatches> {
     let started = observation.is_some().then(Instant::now);
-    let matches = scan_rollout_matches(root, query, /*compressed_only*/ false).await;
+    let mut matches = HashMap::new();
+    let result = scan_rollout_matches(root, query, /*compressed_only*/ false, &mut matches).await;
     if let (Some(observation), Some(started)) = (observation.as_mut(), started) {
         observation.fallback_used = true;
         observation.fallback_scan_us = started.elapsed().as_micros() as u64;
     }
-    matches
+    result.map(|()| matches)
 }
 
 /// Above this many matching bodies, every payload reference stays a candidate
@@ -476,8 +476,8 @@ async fn scan_rollout_matches(
     root: &Path,
     query: &RolloutSearchQuery,
     compressed_only: bool,
-) -> io::Result<RolloutSearchMatches> {
-    let mut matches = HashMap::new();
+    matches: &mut RolloutSearchMatches,
+) -> io::Result<()> {
     let mut dirs = vec![root.to_path_buf()];
 
     while let Some(dir) = dirs.pop() {
@@ -510,7 +510,7 @@ async fn scan_rollout_matches(
             .await?;
             if matched {
                 insert_rollout_match(
-                    &mut matches,
+                    matches,
                     compression::plain_rollout_path(rollout_file.path()),
                     snippet,
                 );
@@ -518,7 +518,7 @@ async fn scan_rollout_matches(
         }
     }
 
-    Ok(matches)
+    Ok(())
 }
 
 async fn inspect_rollout_match(

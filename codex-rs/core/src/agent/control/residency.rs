@@ -1,8 +1,12 @@
 use super::AgentControl;
 use crate::agent::AgentStatus;
 use crate::codex_thread::CodexThread;
+use crate::codex_thread::StoppedThreadRetirement;
 use crate::config::Config;
 use crate::thread_manager::ThreadManagerState;
+use crate::thread_manager::ThreadRegistryLease;
+use crate::thread_manager::V2ResidencyOwner;
+use crate::thread_manager::V2ResidencyRegistration;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -13,6 +17,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -30,9 +35,27 @@ pub(super) struct V2Residency {
 
 #[derive(Default)]
 struct V2ResidencyState {
-    residents: VecDeque<ThreadId>,
+    residents: VecDeque<ResidentGeneration>,
     pending_slots: usize,
-    evicting: HashMap<ThreadId, watch::Sender<bool>>,
+    evicting: HashMap<ThreadId, EvictingGeneration>,
+}
+
+#[derive(Clone)]
+struct ResidentGeneration {
+    thread_id: ThreadId,
+    thread: Weak<CodexThread>,
+    _registration: V2ResidencyRegistration,
+}
+
+impl ResidentGeneration {
+    fn matches(&self, thread: &Arc<CodexThread>) -> bool {
+        self.thread.ptr_eq(&Arc::downgrade(thread))
+    }
+}
+
+struct EvictingGeneration {
+    resident: ResidentGeneration,
+    completion: Arc<watch::Sender<bool>>,
 }
 
 pub(super) struct V2ResidencySlot {
@@ -42,7 +65,8 @@ pub(super) struct V2ResidencySlot {
 
 struct V2EvictionClaim {
     residency: Arc<V2Residency>,
-    thread_id: ThreadId,
+    resident: ResidentGeneration,
+    completion: Arc<watch::Sender<bool>>,
     active: bool,
 }
 
@@ -65,8 +89,14 @@ enum EvictionDisposition {
 }
 
 impl V2ResidencySlot {
-    pub(super) fn commit(mut self, thread_id: ThreadId) {
-        self.residency.commit_slot(thread_id);
+    pub(super) fn commit(
+        mut self,
+        lease: &ThreadRegistryLease,
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+    ) {
+        let resident = self.residency.register_generation(lease, thread_id, thread);
+        self.residency.commit_slot(resident);
         self.active = false;
     }
 }
@@ -98,20 +128,63 @@ impl AgentControl {
         &self,
         state: &Arc<ThreadManagerState>,
         thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
     ) -> bool {
-        let Ok(thread) = state.get_thread(thread_id).await else {
-            return false;
-        };
-        if !is_resident_candidate(thread.as_ref()) {
+        if !is_resident_candidate(thread) {
             return true;
         }
-        self.v2_residency
-            .wait_for_eviction_or_touch(thread_id)
+        let Some(completion) = state
+            .with_current_thread_generation(thread_id, thread, |lease| {
+                let resident = self.v2_residency.register_generation(lease, thread_id, thread);
+                self.v2_residency.touch_or_watch_eviction(resident)
+            })
             .await
+        else {
+            return false;
+        };
+        let Some(mut completion) = completion else {
+            return true;
+        };
+        let completed = *completion.borrow_and_update();
+        if !completed {
+            let _ = completion.changed().await;
+        }
+        false
     }
 
-    pub(super) fn forget_v2_residency(&self, thread_id: ThreadId) {
-        self.v2_residency.remove(thread_id);
+    pub(crate) fn is_v2_resident_thread(thread: &CodexThread) -> bool {
+        is_resident_candidate(thread)
+    }
+
+    // Call after observing the exact generation's stopped-thread retirement.
+    // Nonresident callers keep their existing orderly-drain contract.
+    pub(crate) fn confirm_stopped_v2_residency(thread: &CodexThread) -> CodexResult<()> {
+        if !is_resident_candidate(thread) {
+            return Ok(());
+        }
+        let session = &thread.codex.session;
+        let retirement = session
+            .persistence_retirement_result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !session.terminal_tasks.is_closed()
+            || !session.persistence_tasks.is_closed()
+            || !matches!(retirement, Some(Ok(())))
+        {
+            return Err(CodexErr::Fatal(
+                "stopped resident agent has no confirmed persistence retirement".into(),
+            ));
+        }
+        let durability = session.rollout_durability_error.try_lock().map_err(|_| {
+            CodexErr::Fatal("stopped resident agent's durable rollout barrier is pending".into())
+        })?;
+        if let Some(error) = durability.as_ref() {
+            return Err(CodexErr::Fatal(format!(
+                "stopped resident agent's durable rollout barrier failed: {error}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -203,19 +276,27 @@ impl V2Residency {
             let Some(claim) = self.claim_lru_candidate(protected_thread_id) else {
                 return UnloadOneResult::Unavailable;
             };
-            let candidate_thread_id = claim.thread_id;
+            let candidate_thread_id = claim.resident.thread_id;
             if !attempted.insert(candidate_thread_id) {
                 claim.restore();
                 continue;
+            }
+            let publication = manager
+                .acquire_thread_registry_lease(candidate_thread_id)
+                .await;
+            if !self.is_current_claim(&claim) {
+                return UnloadOneResult::Retry;
             }
             let Some(candidate_thread) = manager
                 .get_thread(candidate_thread_id)
                 .await
                 .ok()
-                .filter(|thread| is_resident_candidate(thread))
+                .filter(|thread| claim.resident.matches(thread) && is_resident_candidate(thread))
             else {
-                claim.discard();
-                return UnloadOneResult::Retry;
+                // A generic detach is not a drain receipt. Neither evict a
+                // replacement nor release the old generation's charge here.
+                claim.restore();
+                continue;
             };
             // Idleness alone is not ownership: exclude newly accepted input
             // through materialization, irreversible shutdown and exact removal.
@@ -245,32 +326,27 @@ impl V2Residency {
                     continue;
                 }
             }
+            drop(publication);
             let (completion_tx, mut completion_rx) = oneshot::channel();
             let manager = Arc::clone(manager);
             // Transfer the claim before shutdown can be accepted. Cancellation of the
             // requester must never restore a runtime whose shutdown is underway.
             tokio::spawn(async move {
                 let _residency_pin = residency_pin;
-                if let Err(err) = candidate_thread.request_shutdown().await {
-                    warn!(
-                        "failed to submit shutdown for v2 resident thread {candidate_thread_id}: {err}"
-                    );
-                    claim.restore();
-                    let _ = completion_tx.send(CompletedUnloadResult::Retry);
-                    return;
-                }
-                if let Err(err) = candidate_thread.wait_until_drained().await {
-                    warn!(
-                        "v2 resident thread {candidate_thread_id} did not shut down orderly: {err}"
-                    );
-                    claim.restore();
-                    let _ = completion_tx.send(CompletedUnloadResult::Retry);
-                    return;
-                }
+                let retirement = match candidate_thread.retire_stopped_generation().await {
+                    Ok(retirement) => retirement,
+                    Err(err) => {
+                        warn!("v2 resident thread {candidate_thread_id} did not confirm retirement: {err}");
+                        claim.restore();
+                        let _ = completion_tx.send(CompletedUnloadResult::Retry);
+                        return;
+                    }
+                };
                 let result = finish_completed_unload(
                     &manager,
                     candidate_thread_id,
                     &candidate_thread,
+                    &retirement,
                     claim,
                 )
                 .await;
@@ -308,61 +384,100 @@ impl V2Residency {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let candidates_to_scan = state.residents.len();
         for _ in 0..candidates_to_scan {
-            let candidate_thread_id = state.residents.pop_front()?;
-            if Some(candidate_thread_id) == protected_thread_id {
-                state.residents.push_back(candidate_thread_id);
+            let resident = state.residents.pop_front()?;
+            if Some(resident.thread_id) == protected_thread_id
+                || state.evicting.contains_key(&resident.thread_id)
+            {
+                state.residents.push_back(resident);
                 continue;
             }
             let (completion, _) = watch::channel(false);
-            state.evicting.insert(candidate_thread_id, completion);
+            let completion = Arc::new(completion);
+            state.evicting.insert(
+                resident.thread_id,
+                EvictingGeneration {
+                    resident: resident.clone(),
+                    completion: Arc::clone(&completion),
+                },
+            );
             return Some(V2EvictionClaim {
                 residency: Arc::clone(self),
-                thread_id: candidate_thread_id,
+                resident,
+                completion,
                 active: true,
             });
         }
         None
     }
 
-    async fn wait_for_eviction_or_touch(&self, thread_id: ThreadId) -> bool {
+    fn register_generation(
+        self: &Arc<Self>,
+        lease: &ThreadRegistryLease,
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+    ) -> ResidentGeneration {
+        let owner: Arc<dyn V2ResidencyOwner> = self.clone();
+        ResidentGeneration {
+            thread_id,
+            thread: Arc::downgrade(thread),
+            _registration: lease.register_v2_residency_owner(Arc::downgrade(&owner)),
+        }
+    }
+
+    fn touch_or_watch_eviction(&self, resident: ResidentGeneration) -> Option<watch::Receiver<bool>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(evicting) = state.evicting.get(&resident.thread_id)
+            && evicting.resident.thread.ptr_eq(&resident.thread)
+        {
+            return Some(evicting.completion.subscribe());
+        }
+        touch_resident(&mut state.residents, resident);
+        None
+    }
+
+    fn remove_matching(&self, thread_id: ThreadId, matches: impl Fn(&ResidentGeneration) -> bool) {
         let completion = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match state.evicting.get(&thread_id) {
-                Some(completion) => Some(completion.subscribe()),
-                None => {
-                    touch_resident(&mut state.residents, thread_id);
-                    None
-                }
+            state
+                .residents
+                .retain(|resident| resident.thread_id != thread_id || !matches(resident));
+            if state
+                .evicting
+                .get(&thread_id)
+                .is_some_and(|evicting| matches(&evicting.resident))
+            {
+                state
+                    .evicting
+                    .remove(&thread_id)
+                    .map(|evicting| evicting.completion)
+            } else {
+                None
             }
         };
-        let Some(mut completion) = completion else {
-            return true;
-        };
-        let completed = *completion.borrow();
-        if !completed {
-            let _ = completion.changed().await;
+        if let Some(completion) = completion {
+            let _ = completion.send(true);
         }
-        false
     }
 
-    fn remove(&self, thread_id: ThreadId) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .residents
-            .retain(|resident_thread_id| *resident_thread_id != thread_id);
-    }
-
-    fn commit_slot(&self, thread_id: ThreadId) {
+    fn commit_slot(&self, resident: ResidentGeneration) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.pending_slots = state.pending_slots.saturating_sub(1);
-        touch_resident(&mut state.residents, thread_id);
+        if !state
+            .evicting
+            .get(&resident.thread_id)
+            .is_some_and(|evicting| evicting.resident.thread.ptr_eq(&resident.thread))
+        {
+            touch_resident(&mut state.residents, resident);
+        }
     }
 
     fn release_pending_slot(&self) {
@@ -373,29 +488,48 @@ impl V2Residency {
         state.pending_slots = state.pending_slots.saturating_sub(1);
     }
 
-    fn finish_eviction(&self, thread_id: ThreadId, disposition: EvictionDisposition) {
-        let completion = {
+    fn is_current_claim(&self, claim: &V2EvictionClaim) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .evicting
+            .get(&claim.resident.thread_id)
+            .is_some_and(|evicting| Arc::ptr_eq(&evicting.completion, &claim.completion))
+    }
+
+    fn finish_eviction(&self, claim: &V2EvictionClaim, disposition: EvictionDisposition) -> bool {
+        {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let completion = state.evicting.remove(&thread_id);
-            if completion.is_some() {
-                match disposition {
-                    EvictionDisposition::ConvertToPending => {
-                        state.pending_slots = state.pending_slots.saturating_add(1);
-                    }
-                    EvictionDisposition::RestoreResident => {
-                        touch_resident(&mut state.residents, thread_id);
-                    }
-                    EvictionDisposition::Discard => {}
-                }
+            let thread_id = claim.resident.thread_id;
+            if !state
+                .evicting
+                .get(&thread_id)
+                .is_some_and(|evicting| Arc::ptr_eq(&evicting.completion, &claim.completion))
+            {
+                return false;
             }
-            completion
-        };
-        if let Some(completion) = completion {
-            let _ = completion.send(true);
+            state.evicting.remove(&thread_id);
+            match disposition {
+                EvictionDisposition::ConvertToPending => {
+                    state.pending_slots = state.pending_slots.saturating_add(1);
+                }
+                EvictionDisposition::RestoreResident => {
+                    state.residents.push_back(claim.resident.clone());
+                }
+                EvictionDisposition::Discard => {}
+            }
         }
+        let _ = claim.completion.send(true);
+        true
+    }
+}
+
+impl V2ResidencyOwner for V2Residency {
+    fn retire_resident_generation(&self, thread_id: ThreadId, expected: &Arc<CodexThread>) {
+        self.remove_matching(thread_id, |resident| resident.matches(expected));
     }
 }
 
@@ -403,45 +537,41 @@ async fn finish_completed_unload(
     manager: &Arc<ThreadManagerState>,
     candidate_thread_id: ThreadId,
     candidate_thread: &Arc<CodexThread>,
+    retirement: &StoppedThreadRetirement,
     claim: V2EvictionClaim,
 ) -> CompletedUnloadResult {
     let mut claim = Some(claim);
     let mut slot = None;
-    if manager
-        .remove_thread_if_same_with_cleanup(&candidate_thread_id, candidate_thread, || {
-            slot = claim.take().map(V2EvictionClaim::into_pending_slot);
+    match manager
+        .remove_stopped_thread_if_same(candidate_thread_id, candidate_thread, retirement, || {
+            slot = claim.take().and_then(V2EvictionClaim::into_pending_slot);
         })
         .await
-        && let Some(slot) = slot
     {
-        return CompletedUnloadResult::Reserved(slot);
+        Ok(true) => {
+            return slot.map_or(CompletedUnloadResult::Retry, CompletedUnloadResult::Reserved);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(%candidate_thread_id, %error, "retaining unconfirmed v2 resident generation");
+            return CompletedUnloadResult::Retry;
+        }
     }
-    let Some(claim) = claim else {
-        return CompletedUnloadResult::Retry;
-    };
-    let _lease = manager
-        .acquire_thread_registry_lease(candidate_thread_id)
-        .await;
-    if manager
-        .get_thread(candidate_thread_id)
-        .await
-        .is_ok_and(|thread| is_resident_candidate(thread.as_ref()))
-    {
-        claim.restore();
-    } else {
+    // This claim's generation is confirmed drained even if another owner
+    // detached it first. Never reattach it or change a replacement's charge.
+    if let Some(claim) = claim {
         claim.discard();
     }
     CompletedUnloadResult::Retry
 }
 
 impl V2EvictionClaim {
-    fn into_pending_slot(mut self) -> V2ResidencySlot {
-        let residency = Arc::clone(&self.residency);
-        self.finish(EvictionDisposition::ConvertToPending);
-        V2ResidencySlot {
-            residency,
-            active: true,
-        }
+    fn into_pending_slot(mut self) -> Option<V2ResidencySlot> {
+        self.finish(EvictionDisposition::ConvertToPending)
+            .then(|| V2ResidencySlot {
+                residency: Arc::clone(&self.residency),
+                active: true,
+            })
     }
 
     fn restore(mut self) {
@@ -452,11 +582,12 @@ impl V2EvictionClaim {
         self.finish(EvictionDisposition::Discard);
     }
 
-    fn finish(&mut self, disposition: EvictionDisposition) {
-        if self.active {
-            self.residency.finish_eviction(self.thread_id, disposition);
-            self.active = false;
+    fn finish(&mut self, disposition: EvictionDisposition) -> bool {
+        if !self.active {
+            return false;
         }
+        self.active = false;
+        self.residency.finish_eviction(self, disposition)
     }
 }
 
@@ -466,9 +597,11 @@ impl Drop for V2EvictionClaim {
     }
 }
 
-fn touch_resident(residents: &mut VecDeque<ThreadId>, thread_id: ThreadId) {
-    residents.retain(|resident_thread_id| *resident_thread_id != thread_id);
-    residents.push_back(thread_id);
+fn touch_resident(residents: &mut VecDeque<ResidentGeneration>, resident: ResidentGeneration) {
+    residents.retain(|current| {
+        current.thread_id != resident.thread_id || !current.thread.ptr_eq(&resident.thread)
+    });
+    residents.push_back(resident);
 }
 
 fn is_resident_candidate(thread: &CodexThread) -> bool {

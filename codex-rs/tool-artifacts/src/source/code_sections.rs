@@ -801,34 +801,36 @@ pub(crate) fn sections(items: &[CodeItem]) -> Vec<ToolProjectionSection> {
     // Imports are not definitions: one row each used to fill the first pages
     // of a large file before any item. Their sections above stay addressable;
     // the directory only summarizes where they are.
+    const MAX_IMPORT_RANGES: usize = 16;
     let mut import_ranges = Vec::<(usize, usize, usize)>::new();
+    let mut import_range_count = 0;
     let mut previous_was_import = false;
     for item in items {
         let import = item.kind == "use";
         if import {
-            match import_ranges.last_mut().filter(|_| previous_was_import) {
-                Some(run) => {
-                    run.1 = item.end_line;
-                    run.2 += 1;
+            if !previous_was_import {
+                import_range_count += 1;
+                if import_range_count <= MAX_IMPORT_RANGES {
+                    import_ranges.push((item.start_line, item.end_line, 1));
                 }
-                None => import_ranges.push((item.start_line, item.end_line, 1)),
+            } else if import_range_count <= MAX_IMPORT_RANGES
+                && let Some(run) = import_ranges.last_mut()
+            {
+                run.1 = item.end_line;
+                run.2 += 1;
             }
         }
         previous_was_import = import;
     }
-    let items = items
-        .iter()
-        .filter(|item| item.kind != "use")
-        .collect::<Vec<_>>();
-    let mut outline = outline_sections(&items);
+    let mut outline = outline_sections(items.iter().filter(|item| item.kind != "use"));
     if let Some(value) = outline.first_mut().and_then(|section| section.value.as_mut())
         && !import_ranges.is_empty()
     {
-        value["import_ranges"] = import_ranges.iter().take(16)
+        value["import_ranges"] = import_ranges.iter()
             .map(|(start_line, end_line, count)| json!({"start_line": start_line, "end_line": end_line, "count": count}))
             .collect();
-        if import_ranges.len() > 16 {
-            value["omitted_import_ranges"] = (import_ranges.len() - 16).into();
+        if import_range_count > MAX_IMPORT_RANGES {
+            value["omitted_import_ranges"] = (import_range_count - MAX_IMPORT_RANGES).into();
         }
     }
     sections.extend(outline);
@@ -836,25 +838,30 @@ pub(crate) fn sections(items: &[CodeItem]) -> Vec<ToolProjectionSection> {
 }
 
 /// Shared bounded directory pages; exact source ranges remain with their owner.
-pub(super) fn outline_sections(items: &[impl Serialize]) -> Vec<ToolProjectionSection> {
+pub(super) fn outline_sections<'a, T: Serialize + 'a>(
+    items: impl Iterator<Item = &'a T> + Clone,
+) -> Vec<ToolProjectionSection> {
+    let total_items = items.clone().count();
+    let mut items = items.peekable();
     let mut sections = Vec::new();
     // Fit ordinary outlines in one response instead of forcing a round trip
     // per handful of items. Larger outlines retain bounded directory pages.
     let mut start = 0;
     loop {
-        let mut end = start;
+        let mut page = Vec::<&T>::new();
         let mut bytes = 0usize;
-        while end < items.len() && end - start < 64 {
-            let item_bytes = serde_json::to_vec(&items[end]).map_or(usize::MAX, |item| item.len());
-            if end > start && bytes.saturating_add(item_bytes) > 16 * 1024 {
+        while page.len() < 64 {
+            let Some(item) = items.peek() else { break };
+            let item_bytes = serde_json::to_vec(item).map_or(usize::MAX, |item| item.len());
+            if !page.is_empty() && bytes.saturating_add(item_bytes) > 16 * 1024 {
                 break;
             }
             bytes = bytes.saturating_add(item_bytes);
-            end += 1;
+            page.extend(items.next());
         }
-        let next = (end < items.len()).then(|| format!("outline:{end}"));
-        let mut value =
-            json!({"items": &items[start..end], "total_items": items.len(), "next": next});
+        let end = start + page.len();
+        let next = (end < total_items).then(|| format!("outline:{end}"));
+        let mut value = json!({"items": page, "total_items": total_items, "next": next});
         value["parse_complete"] = true.into();
         sections.push(ToolProjectionSection {
             id: if start == 0 {
@@ -869,7 +876,7 @@ pub(super) fn outline_sections(items: &[impl Serialize]) -> Vec<ToolProjectionSe
             children: next.into_iter().collect(),
             recovery_chunk_bytes: None,
         });
-        if end == items.len() {
+        if end == total_items {
             break;
         }
         start = end;
