@@ -1819,6 +1819,7 @@ pub(super) async fn handle_runtime_response(
     });
     let needs_retained_results = response_needs_retained_nested_results(&response);
     let mut nested_presentations = std::collections::BTreeMap::new();
+    let mut preserve_emitted_prefix_offsets = false;
     let nested_results = if needs_retained_results {
         let content_items = match &response {
             RuntimeResponse::Result { content_items, .. }
@@ -1861,25 +1862,66 @@ pub(super) async fn handle_runtime_response(
             );
             let mut directory = Vec::with_capacity(packet.nested_recovery.len());
             for (ordinal, entry) in packet.nested_recovery {
+                // A retained structured selection already has an exact recovery
+                // recipe. Keep its source identity, not a truncated graph preview.
+                let structured_summary = if script_failed
+                    && entry["failed"] == false
+                    && entry["tool_name"] == "read_file"
+                    && let Some(result) = entry.pointer("/outcome/result")
+                    && result["retained_artifact_complete"] == true
+                    && is_complete_structured_read(result)
+                {
+                    Some(serde_json::json!({
+                        "path": result["path"],
+                        "environment_id": result["environment_id"],
+                        "source_sha256": result["source_sha256"],
+                        "complete": result["complete"],
+                        "file_complete": result["file_complete"],
+                    }))
+                } else {
+                    None
+                };
                 let mut entry = compact_emitted_packet_recovery(entry, &emitted);
                 // Preserve the existing inline references for bytes already
                 // printed by the script. Spill only an unprojected result.
-                if script_failed && entry.pointer("/outcome/result").is_some_and(|result| {
-                    ["stdout", "stderr", "output"].iter().all(|key| {
-                        result[*key].get("emitted_prefix").is_none()
-                    })
-                }) {
-                    retain_bulk_failed_cell_result(exec, &mut entry).await;
+                if let Some(result) = entry.pointer("/outcome/result") {
+                    let has_emitted_prefix = ["stdout", "stderr", "output"]
+                        .iter()
+                        .any(|key| result[*key].get("emitted_prefix").is_some());
+                    preserve_emitted_prefix_offsets |= has_emitted_prefix;
+                    if script_failed && !has_emitted_prefix {
+                        retain_bulk_failed_cell_result(exec, &mut entry).await;
+                    }
                 }
-                // Don't print a truncated success preview twice. The complete
-                // inline result must reproduce that exact preview for this
-                // call; neither an artifact locator nor a summary is enough.
+                if script_failed
+                    && entry["failed"] == false
+                    && entry["outcome"]["recovery"]["tool"] == "read_tool_output"
+                    && entry["outcome"]["recovery"]["arguments"]["artifact_id"]
+                        == entry["outcome"]["artifact_id"]
+                    && entry["outcome"]["artifact_id"].is_string()
+                {
+                    if let Some(summary) = structured_summary {
+                        entry["outcome"]["summary"] = summary;
+                    }
+                    if entry["outcome"]["summary"].is_object() {
+                        nested_presentations.entry(ordinal).or_insert_with(|| (
+                            serde_json::json!({"see":"nested_result_recovery_directory: matching call_id, outcome.summary and outcome.recovery"}).to_string(),
+                            true,
+                        ));
+                    }
+                }
+                // Don't print a truncated success preview or a settled raw
+                // read twice. The inline result must reproduce the preview
+                // for this exact call; a locator alone is not equivalent.
                 if let Some(preview) = packet.nested_results.iter().find(|r| r.ordinal == ordinal)
-                    && !preview.failed && preview.output_truncated
+                    && !preview.failed
                     && entry["call_id"].as_str() == Some(preview.call_id.as_str())
                     && entry["tool_name"].as_str() == Some(preview.tool_name.as_str())
                     && entry["failed"] == false
                     && let Some(full) = entry.pointer("/outcome/result")
+                    && (preview.output_truncated
+                        || (script_failed && preview.tool_name == "read_file"
+                            && full["read_mode"] == "byte_ranges"))
                     && (!matches!(preview.tool_name.as_str(), "read_file" | "read_tool_output")
                         || full["complete"] == true)
                     && !nested_presentations.contains_key(&ordinal)
@@ -2013,6 +2055,7 @@ pub(super) async fn handle_runtime_response(
         post_tool_use_feedback,
         nested_results,
         nested_presentations,
+        preserve_emitted_prefix_offsets,
         packet.first_required_terminal,
         (packet.tool_output_recovery_count > 0 && !packet.output_budget_explicit)
             .then_some(hard_limit.saturating_sub(control_tokens)),
@@ -2528,6 +2571,16 @@ fn compact_emitted_packet_recovery(mut entry: JsonValue, emitted: &str) -> JsonV
     entry
 }
 
+fn is_complete_structured_read(result: &JsonValue) -> bool {
+    result["source_sha256"].is_string()
+        && result["complete"] == true
+        && result["results"].as_array().is_some_and(|rows| {
+            !rows.is_empty() && rows.iter().all(|row| {
+                row["selector"]["kind"] == "structured" && row["complete"] == true
+            })
+        })
+}
+
 /// Move a bulky settled result out of an error packet, not out of custody.
 async fn retain_bulk_failed_cell_result(exec: &ExecContext, entry: &mut JsonValue) {
     use crate::tools::command_output_artifact::ToolOutputArtifactId;
@@ -2570,6 +2623,11 @@ async fn retain_bulk_failed_cell_result(exec: &ExecContext, entry: &mut JsonValu
                 "file_revision",
                 "readback_sha256",
             ]
+        }
+        (Some(false), Some("read_file"))
+            if is_complete_structured_read(result) =>
+        {
+            &["path", "environment_id", "source_sha256", "complete", "file_complete"]
         }
         (Some(true), Some(tool))
             if (matches!(tool, "read_file" | "read_tool_output" | "list_files")
@@ -2699,6 +2757,7 @@ fn format_runtime_response(
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
     nested_presentations: std::collections::BTreeMap<usize, (String, bool)>,
+    preserve_emitted_prefix_offsets: bool,
     required_terminal: Option<CodeModeNestedTerminal>,
     recovery_whole_limit: Option<usize>,
     no_nested_calls: bool,
@@ -2878,8 +2937,11 @@ fn format_runtime_response(
         }
     }
     let diagnostic_index = diagnostic.map(|text| {
-        let index = content_items.len();
-        content_items.push(FunctionCallOutputContentItem::InputText { text });
+        // A projected command prefix addresses bytes from the start of
+        // emitted cell text. Keep that layout when a receipt uses it; in
+        // other failures show the diagnostic before the retained results.
+        let index = if preserve_emitted_prefix_offsets { content_items.len() } else { 0 };
+        content_items.insert(index, FunctionCallOutputContentItem::InputText { text });
         index
     });
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
@@ -3238,16 +3300,30 @@ fn truncate_code_mode_failure(
         unreachable!("the caller identifies a script-error text item")
     };
     let error_tokens = codex_utils_output_truncation::model_token_count(&error_text);
-    let preceding = code_mode_text_content(&items);
+    let diagnostic_first = error_index == 0;
+    let other_text = code_mode_text_content(&items);
     let (offset, total) =
-        source_lines.unwrap_or((0, preceding.lines().count() + error_text.lines().count()));
-    let error_offset = offset
-        + preceding.bytes().filter(|byte| *byte == b'\n').count()
-        + usize::from(!items.is_empty());
+        source_lines.unwrap_or((0, error_text.lines().count() + other_text.lines().count()));
+    let error_offset = if diagnostic_first {
+        offset
+    } else {
+        offset + other_text.bytes().filter(|byte| *byte == b'\n').count()
+            + usize::from(!items.is_empty())
+    };
+    let other_offset = if diagnostic_first {
+        offset + error_text.bytes().filter(|byte| *byte == b'\n').count()
+            + usize::from(!items.is_empty())
+    } else {
+        offset
+    };
     let reserved_error_tokens = error_tokens.min(token_limit);
     let other_policy = TruncationPolicy::Tokens(token_limit.saturating_sub(reserved_error_tokens));
-    let (mut projected, mut omitted, mut omitted_lines) =
-        truncate_code_mode_text_items(items, other_policy.token_budget(), Some((offset, total)));
+    let (mut projected, mut omitted, other_gaps) = truncate_code_mode_text_items(
+        items,
+        other_policy.token_budget(),
+        Some((other_offset, total)),
+    );
+    let mut omitted_lines = Vec::new();
     let error_text = if error_tokens <= reserved_error_tokens {
         error_text
     } else {
@@ -3259,13 +3335,17 @@ fn truncate_code_mode_failure(
             total,
             Some("{cell_output_artifact_id}"),
         );
-        // The error follows every other item, so its gap stays last. Keeping
-        // only the earlier gaps would leave the error's omitted lines unnamed.
         omitted_lines.extend(gap);
         text
     };
+    if diagnostic_first {
+        omitted_lines.extend(other_gaps);
+    } else {
+        omitted_lines.splice(..0, other_gaps);
+    }
     if !error_text.is_empty() {
-        projected.push(FunctionCallOutputContentItem::InputText { text: error_text });
+        let index = if diagnostic_first { 0 } else { projected.len() };
+        projected.insert(index, FunctionCallOutputContentItem::InputText { text: error_text });
     }
     (projected, omitted, omitted_lines)
 }

@@ -147,6 +147,53 @@ const __codex_paginate_search = (search) => {
     return sources;
   };
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const identitiesMatch = async (scope, expected) => {
+    // Keep the same guarded raw checksums and the same inventory sandwiches.
+    // Batch only the dispatch, not the freshness decision or the observation time.
+    const check = typeof globalThis.resolve_tool === "function"
+      ? globalThis.resolve_tool("check_snapshot_freshness") : undefined;
+    const environment = scope.receipt.environment_id;
+    if (!Array.isArray(expected) || expected.length !== scope.paths.length) return false;
+    if (expected.length < 2 || typeof check !== "function" ||
+        typeof tools.checksum_file !== "function" || typeof environment !== "string")
+      return same(await identities(scope), expected);
+    if (!expected.every(source => source?.environment_id === environment)) return false;
+
+    let matches = true;
+    for (let offset = 0; offset < expected.length; offset += 32) {
+      const sources = expected.slice(offset, offset + 32);
+      // The new inventory supplies the paths. Stored identities are only
+      // expectations, never authority to check a different file or environment.
+      const checks = sources.map((source, index) => ({
+        path: scope.paths[offset + index], environment_id: environment,
+        source_sha256: source.sha256,
+      }));
+      const { results } = await check({ checks });
+      if (!Array.isArray(results) || results.length !== checks.length)
+        throw new Error("incomplete search source freshness batch");
+      for (let index = 0; index < results.length; ++index) {
+        const result = results[index], source = sources[index];
+        if (result?.input_index !== index || result.path !== checks[index].path ||
+            result.environment_id !== environment || result.source_sha256 !== source.sha256)
+          throw new Error("search source freshness identity unavailable");
+        if (result.status === "unknown" && result.reason === "representation_unavailable") {
+          // Hashes here came from checksum_file, not a rendered snapshot.
+          // This hash-only batch reports representation uncertainty only after
+          // a raw mismatch. Do not let a later read erase that observation.
+          matches = false;
+        } else if (result.status === "changed") {
+          matches = false;
+        } else if (result.status === "matches" && result.checked_sha256 === source.sha256 &&
+            typeof result.source_identity === "string" && Number.isSafeInteger(result.bytes_hashed)) {
+          matches = result.source_identity === source.source_identity &&
+            result.bytes_hashed === source.bytes_hashed && matches;
+        } else {
+          throw new Error(`search source identity unavailable: ${result.reason ?? "unverified"}`);
+        }
+      }
+    }
+    return matches;
+  };
   const present = (result, pattern, contextLines) => {
     if (Array.isArray(pattern) || result.pagination ||
         (result.complete && result.files?.some(file => file.lines?.length >= 16))) {
@@ -221,8 +268,8 @@ const __codex_paginate_search = (search) => {
       currentScope = { ...scope.receipt, limits: { ...scope.receipt.limits,
         max_matches_per_file: null, page_size: request.page_size, inventory_files: 128 } };
       if (state && !same(scope, state.scope)) return incomplete(pattern, "search_scope_changed");
-      const sources = await identities(scope);
-      if (state && !same(sources, state.sources)) return incomplete(pattern, "source_changed");
+      const sources = state ? state.sources : await identities(scope);
+      if (state && !await identitiesMatch(scope, sources)) return incomplete(pattern, "source_changed");
       if (state && !same(scope, await inventory(opts))) return incomplete(pattern, "search_scope_changed");
       if (!state) {
         const result = await search(request.pattern, opts, true);
@@ -231,7 +278,7 @@ const __codex_paginate_search = (search) => {
           pagination: { consistent: false, reason: "search_incomplete" } }, request.pattern);
         const after = await inventory(opts);
         if (!same(scope, after)) return incomplete(pattern, "search_scope_changed");
-        if (!same(sources, await identities(after))) return incomplete(pattern, "source_changed");
+        if (!await identitiesMatch(after, sources)) return incomplete(pattern, "source_changed");
         // Native parsing already deduplicates path/line identities. Sort once,
         // then retain exact page positions, independent of rg's worker order.
         for (const entry of result.files) entry.lines.sort((a, b) => a.line - b.line);

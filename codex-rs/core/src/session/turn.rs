@@ -516,6 +516,7 @@ pub(crate) fn run_turn<'a>(
         let PendingTurnPlan {
             step_context: first_step_context,
             first_router,
+            mut pending_soft_limit_waiver,
             injection_items,
             explicitly_enabled_connectors,
             skill_plan,
@@ -654,6 +655,7 @@ pub(crate) fn run_turn<'a>(
             };
 
             if recorded_input.accepted_context_input {
+                pending_soft_limit_waiver = false;
                 one_request_soft_limit_waiver = None;
                 seen_stop_repairs.clear();
                 stop_hook_bookkeeping_revisions = 0;
@@ -940,6 +942,8 @@ pub(crate) fn run_turn<'a>(
                     window_id,
                     CodexResponsesRequestKind::Turn,
                 );
+                let pending_waiver = std::mem::take(&mut pending_soft_limit_waiver);
+                soft_compaction_deferred |= pending_waiver;
                 Box::pin(run_sampling_request(
                     Arc::clone(&sess),
                     Arc::clone(&step_context),
@@ -953,7 +957,7 @@ pub(crate) fn run_turn<'a>(
                     &base_instructions,
                     &mut preparation_timing_guard,
                     generation_request.clone(),
-                    one_request_soft_limit_waiver.as_ref().is_some_and(|(epoch, fingerprint)|
+                    pending_waiver || one_request_soft_limit_waiver.as_ref().is_some_and(|(epoch, fingerprint)|
                         *epoch == step_context.user_intent_epoch
                             && *fingerprint == request_baselines.relevant_state_fingerprint()),
                     generation_id.clone(),
@@ -3123,6 +3127,8 @@ struct PendingTurnPlan {
     explicitly_enabled_connectors: HashSet<String>,
     projected_prompt_pressure: ProjectedPromptPressure,
     pending_body_floor_tokens: i64,
+    pending_body_growth_tokens: i64,
+    pending_soft_limit_waiver: bool,
     mcp_dependency_effect: Option<PlannedMcpDependencyEffect>,
     warnings: Vec<String>,
     skill_plan: PlannedSkillInjections,
@@ -3560,6 +3566,8 @@ async fn build_pure_pending_turn_plan(
         first_router,
         projected_prompt_pressure,
         pending_body_floor_tokens: pending_token_estimate.input_tokens,
+        pending_body_growth_tokens: pending_token_estimate.body_growth_tokens,
+        pending_soft_limit_waiver: false,
         injection_items,
         explicitly_enabled_connectors,
         mcp_dependency_effect: planned_mcp.effect,
@@ -3654,7 +3662,7 @@ fn stabilize_pending_turn_plan<'a>(
             ))
             .or_cancel(cancellation_token)
             .await??;
-            let plan = match plan_build {
+            let mut plan = match plan_build {
                 PendingTurnPlanBuild::Stale => {
                     last_retry_reason = "planning generation changed while building the plan";
                     continue;
@@ -3668,7 +3676,7 @@ fn stabilize_pending_turn_plan<'a>(
             // Compaction is maintenance of the pre-existing history, not persistence
             // of this pending turn. Any compaction invalidates this pure plan and loops
             // through a fresh snapshot before effects are applied.
-            let compaction_reason = time_planning_step("pending_input_compaction", || {
+            let maintenance = time_planning_step("pending_input_compaction", || {
                 run_pending_input_pre_sampling_compact(
                     sess,
                     turn_context,
@@ -3676,12 +3684,13 @@ fn stabilize_pending_turn_plan<'a>(
                     Arc::clone(&plan.step_context),
                     plan.projected_prompt_pressure,
                     plan.pending_body_floor_tokens,
+                    plan.pending_body_growth_tokens,
                     !incoming_precompaction_completed,
                     cancellation_token,
                 )
             })
             .await?;
-            if compaction_reason.is_some() {
+            if maintenance == PendingInputMaintenance::Replan {
                 last_retry_reason = "pending-input compaction invalidated the plan";
                 incoming_precompaction_completed = true;
                 client_session.invalidate_incremental_history("compaction");
@@ -3690,6 +3699,8 @@ fn stabilize_pending_turn_plan<'a>(
                     .record_planning_invalidation();
                 continue;
             }
+
+            plan.pending_soft_limit_waiver = maintenance == PendingInputMaintenance::DeferSoftLimit;
 
             if let Some(effect) = plan.mcp_dependency_effect.as_ref()
                 && !mcp_dependency_effect_is_completed(completed_mcp_effect.as_ref(), &effect.id)
@@ -4365,7 +4376,13 @@ fn turn_submission_type(input: &[TurnInput]) -> TurnSubmissionType {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreSamplingCompactionReason {
     PreviousModel,
-    ProjectedContextLimit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingInputMaintenance {
+    None,
+    Replan,
+    DeferSoftLimit,
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -4404,9 +4421,10 @@ async fn run_pending_input_pre_sampling_compact(
     step_context: Arc<StepContext>,
     projected_prompt_pressure: ProjectedPromptPressure,
     pending_body_floor_tokens: i64,
+    pending_body_growth_tokens: i64,
     allow_pending_input_compaction: bool,
     cancellation_token: &CancellationToken,
-) -> CodexResult<Option<PreSamplingCompactionReason>> {
+) -> CodexResult<PendingInputMaintenance> {
     // Compare one absolute projection of the next prompt against the limits. Adding the pure
     // plan's full tool schema estimate to the previous server usage double-counts the stable tool
     // prefix and causes premature compaction churn.
@@ -4418,7 +4436,30 @@ async fn run_pending_input_pre_sampling_compact(
     )
     .await;
     if !token_status.token_limit_reached {
-        return Ok(None);
+        return Ok(PendingInputMaintenance::None);
+    }
+    // Previous-model maintenance already ran. A restored remote checkpoint with
+    // little new history is a poor candidate for another summary. Count the entire
+    // new tail (even retained items); do not assume tool results are disposable.
+    // Changes in current instructions, tools and limits still contribute to the
+    // projected and immutable prepared-request checks, not the old checkpoint.
+    if !token_status.full_context_window_limit_reached
+        && can_defer_compaction_once(
+            true,
+            projected_prompt_pressure.total_tokens,
+            token_status.full_context_window_limit,
+        )
+        && let Some(tail_tokens) = remote_checkpoint_tail_below_reserve(sess, pending_body_growth_tokens).await
+    {
+        tracing::debug!(
+            turn_id = %turn_context.sub_id,
+            thread_id = %sess.thread_id,
+            maintenance_event = "pending_low_yield_compaction_deferred",
+            projected_tokens = projected_prompt_pressure.total_tokens,
+            tail_tokens,
+            "pending-turn maintenance observation"
+        );
+        return Ok(PendingInputMaintenance::DeferSoftLimit);
     }
     // This total floor contains only incoming items. For BodyAfterPrefix,
     // retirement may reduce active history below the existing prefill baseline
@@ -4495,7 +4536,28 @@ async fn run_pending_input_pre_sampling_compact(
         cancellation_token,
     )
     .await?;
-    Ok(Some(PreSamplingCompactionReason::ProjectedContextLimit))
+    Ok(PendingInputMaintenance::Replan)
+}
+
+async fn remote_checkpoint_tail_below_reserve(sess: &Session, pending_tokens: i64) -> Option<i64> {
+    if pending_tokens >= FINAL_ANSWER_TOKEN_RESERVE {
+        return None;
+    }
+    let history = sess.state.lock().await.history.clone();
+    let mut tokens = pending_tokens;
+    for item in history.raw_items().iter().rev() {
+        if matches!(item, ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }) {
+            return Some(tokens);
+        }
+        if crate::compact::is_compaction_summary_item(item) {
+            return None;
+        }
+        tokens = tokens.saturating_add(crate::context_manager::estimate_item_token_count(item));
+        if tokens >= FINAL_ANSWER_TOKEN_RESERVE {
+            return None;
+        }
+    }
+    None
 }
 
 /// Returns true only when both turns declare compaction compatibility hashes and they differ.

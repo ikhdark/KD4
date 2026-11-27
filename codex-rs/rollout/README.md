@@ -118,6 +118,17 @@ Its measured cost over 96 matched pairs of 100-turn sessions was about 3.4
 percent of process CPU (median pair ratio 1.034) and a median 4 ms per turn of
 wall time.
 
+## Thread-index backfill and shutdown
+
+The [rollout backfill](src/metadata.rs) checks for shutdown and abandoned
+passes between records and buffer reads, including while scanning named
+payload dependencies. This is independent of timing capture. A cancelled
+scan is neither a completed observation nor a failed rollout: it does not
+advance the contiguous checkpoint. The next worker resumes from the committed
+watermark after the previous claim is released or expires. A periodic slice
+can let an individual long rollout finish so it cannot permanently block
+coverage.
+
 ## Opt-in append writer-open timing
 
 For a diagnostic backend launch, set `CODEX_ROLLOUT_WRITER_OPEN_TIMING=1`

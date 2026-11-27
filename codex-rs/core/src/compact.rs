@@ -830,32 +830,36 @@ async fn run_compact_task_inner_impl(
                 loop {
                     retry_state.check_retry_budget(cancellation_token)?;
                     let complete_budget = fit_capture.then(|| prompt.budget_tokens_for_input(&prompt.input));
-                    // Size the complete request, including format and repair
+                    // Check the prepared request, including format and repair
                     // instructions, before starting another provider attempt.
-                    if local_compaction_input_exceeds_window(
-                        &prompt, turn_context.model_context_window(),
-                    ) && let Some(history) = pin_source.take() {
-                        let mut pinned_input = local_compaction_prompt_items(
-                            &history.for_local_compaction_prompt_with_checkpoint_pins(
-                                &turn_context.model_info.input_modalities,
-                                workspace_identity.as_ref(),
-                                &sess.services.git_workspace,
-                            ),
-                        );
-                        pinned_input.extend(prompt.input.iter().skip(source_input_len).cloned());
-                        prompt.input = pinned_input.into();
-                    }
-                    // Formatting can shrink the raw request, and a matching sampling
-                    // prefix can also contribute provider calibration. Keep the raw
-                    // pin substitution above: a provider overflow has no pin fallback.
                     let window = turn_context.model_context_window();
-                    let admission = if local_compaction_input_exceeds_window(&prompt, window) {
-                        Some(crate::session::turn::prompt_token_estimates(
+                    let mut admission = None;
+                    if let Some(limit) = window {
+                        let mut estimates = crate::session::turn::prompt_token_estimates(
                             sess.as_ref(), turn_context.as_ref(), &prompt,
-                        ).await)
-                    } else {
-                        None
-                    };
+                        ).await;
+                        // Keep exact inputs when they fit. Otherwise try recovery
+                        // pins, which preserve access to the exact archived outputs.
+                        if estimates.calibrated_tokens >= limit
+                            && let Some(history) = pin_source.take()
+                        {
+                            let mut pinned_input = local_compaction_prompt_items(
+                                &history.for_local_compaction_prompt_with_checkpoint_pins(
+                                    &turn_context.model_info.input_modalities,
+                                    workspace_identity.as_ref(),
+                                    &sess.services.git_workspace,
+                                ),
+                            );
+                            pinned_input.extend(prompt.input.iter().skip(source_input_len).cloned());
+                            if pinned_input.as_slice() != prompt.input.as_ref() {
+                                prompt.input = pinned_input.into();
+                                estimates = crate::session::turn::prompt_token_estimates(
+                                    sess.as_ref(), turn_context.as_ref(), &prompt,
+                                ).await;
+                            }
+                        }
+                        admission = Some(estimates);
+                    }
                     let refused = admission.as_ref().zip(window)
                         .is_some_and(|(estimates, window)| estimates.calibrated_tokens >= window);
                     if fit_capture {
@@ -1137,15 +1141,6 @@ fn local_compaction_prompt_items(turn_input: &[ResponseItem]) -> Vec<ResponseIte
             .cloned()
             .collect::<Vec<_>>(),
     )
-}
-
-/// The local summarizer reads acquired evidence exactly whenever that fits.
-/// Sampling and the compaction trigger measured retired outputs as their
-/// checkpoint pins; re-expanded past the window, the request could only fail,
-/// again on every later turn, so the caller sends the pins instead. Exact
-/// outputs stay recoverable through those pins and the source archive.
-fn local_compaction_input_exceeds_window(prompt: &Prompt, context_window: Option<i64>) -> bool {
-    context_window.is_some_and(|window| prompt.budget_tokens_for_input(&prompt.input) >= window)
 }
 
 fn bounded_task_state_summary(previous_summary: Option<&str>, summary_suffix: &str) -> String {

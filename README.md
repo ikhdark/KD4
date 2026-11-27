@@ -29,7 +29,7 @@ Approval policy, validation restrictions and project/hook trust remain separate.
 | Turn timing | [Critical-path timing](codex-rs/core/critical-path-timing.md), [response-start timing](codex-rs/core/response-start-timing.md), [wall-clock profile](codex-rs/turn-timing/WALL_CLOCK_PROFILE.md) |
 | App-server queue | [Thread queue](codex-rs/app-server/THREAD_QUEUE.md) |
 | Execution service | [Exec server](codex-rs/exec-server/README.md) |
-| Session persistence | [Rollout storage](codex-rs/rollout/README.md) |
+| Session persistence | [Rollout storage](codex-rs/rollout/README.md), [SQLite state and recovery](codex-rs/state/README.md) |
 | Process and transport utilities | [Process hardening](codex-rs/process-hardening/README.md), [PTY](codex-rs/utils/pty/README.md), [stdio-to-UDS](codex-rs/stdio-to-uds/README.md) |
 | Parsing and rendering utilities | [Stream parser](codex-rs/utils/stream-parser/README.md), [templates](codex-rs/utils/template/README.md) |
 | Extension API and skill delivery | [Extension API](codex-rs/ext/extension-api/src/), [how bundled skills are delivered](codex-rs/core/instruction-architecture.md#extensions-skills-apps-and-plugin-guidance) |

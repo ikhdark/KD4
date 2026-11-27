@@ -229,15 +229,30 @@ async fn closed_syntax_inputs(
             && (key.to_ascii_uppercase().starts_with("NODE_")
                 || key.eq_ignore_ascii_case("OPENSSL_CONF")))
     { return None; }
+    // Node treats "-" as stdin and leading dashes as options. Check the
+    // operand, not the extension of whatever it happens to resolve to.
+    use std::path::{Component, Path};
+    let source_path = Path::new(source);
+    if source.starts_with('-') || source_path.extension()?.to_str()? != "cjs"
+        || (!source_path.is_absolute()
+            && (source_path.has_root() || matches!(source_path.components().next(), Some(Component::Prefix(_)))))
+        || source_path.components().chain(tool.components()).any(|part| part == Component::ParentDir)
+    {
+        return None;
+    }
     let source = codex_utils_absolute_path::AbsolutePathBuf::resolve_literal_path_against_base(
-        source, cwd.to_abs_path().ok()?,
+        source_path, cwd.to_abs_path().ok()?,
     );
-    let source = fs.canonicalize(&codex_utils_path_uri::PathUri::from_abs_path(&source), Some(sandbox)).await.ok()?;
-    let source = source.to_abs_path().ok()?.to_path_buf();
-    if source.extension()?.to_str()? != "cjs" { return None; }
     let tool = codex_utils_absolute_path::AbsolutePathBuf::try_from(tool).ok()?;
-    let tool = fs.canonicalize(&codex_utils_path_uri::PathUri::from_abs_path(&tool), Some(sandbox)).await.ok()?;
-    Some(vec![source, tool.to_abs_path().ok()?.to_path_buf()])
+    for path in [&source, &tool] {
+        let canonical = fs.canonicalize(
+            &codex_utils_path_uri::PathUri::from_abs_path(path), Some(sandbox),
+        ).await.ok()?.to_abs_path().ok()?;
+        // The command still opens the original paths. Never fingerprint a
+        // different canonical target and assume the launch followed that alias.
+        if &canonical != path { return None; }
+    }
+    Some(vec![source.to_path_buf(), tool.to_path_buf()])
 }
 
 async fn compilation_reuse_fingerprints(

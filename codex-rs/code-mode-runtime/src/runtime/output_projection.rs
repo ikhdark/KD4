@@ -1175,7 +1175,18 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
           observations.push(field.value);
         }
         observations.push({same_as: 'terminal'});
-        return {...item, observations};
+        const display = {...item, observations};
+        // A one-receipt collection can expose the exact stdout again in its
+        // terminal display. Alias only identical text in both representations:
+        // lossy projections, stderr and multi-observation streams are distinct.
+        if (command.count === 1 && display.streams_complete === true &&
+            typeof display.stdout === 'string' && display.stdout.length >= 64 &&
+            display.stderr === '' &&
+            descriptor(command.terminal, 'output')?.value === display.stdout &&
+            get(command.terminal)?.projected?.output === display.stdout) {
+          display.stdout = {same_as: 'terminal.output'};
+        }
+        return display;
       }
       const entry = item !== null && typeof item === 'object' ? get(item) : undefined;
       if (!entry) return item;

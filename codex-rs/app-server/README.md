@@ -29,6 +29,12 @@ consumers do not depend on that tooling facade.
 The [thread follow-up queue contract](THREAD_QUEUE.md) is implemented by the
 handlers crate.
 
+With no local listener, standalone startup in persisted remote-control
+mode requires an enabled persisted preference. Preference resolution shares
+the startup deadline; cancellation or expiration stops startup and shuts
+down the remote-control listener task. An enabled preference admits startup,
+but does not establish a remote connection.
+
 Standalone graceful restart has a reply-only cleanup phase. The runtime stops
 new RPC admission and server request publication, then continues receiving
 responses and errors for already-published requests from their authorized
@@ -50,6 +56,21 @@ finished or errored. Current runs do not produce this retired gate data.
 use the same stale-turn projection as history reads: only the matching live
 turn can remain `inProgress`. Completed and failed turns, items, and ordering
 are unchanged by that status projection.
+
+For pending `turn/interrupt` requests settled by the terminal listener,
+response enqueueing shares one deadline across the pending replies. A reply
+that misses the deadline is not enqueued and its connection is failed for
+delivery. A reply enqueued before the deadline is not a client receipt. See
+[terminal diagnostics](../turn-timing/README.md#opt-in-owner-journals-and-client-hooks)
+for the observation boundaries.
+
+When `thread/metadata/update` returns `data.reason: "gitCompatibilityPending"`,
+`metadataCommitted: true` means the SQLite update already committed.
+`outcomeUnknown: true` means the rollout write may already have landed.
+Neither outcome authorizes retrying the mutation (`retryable: false`).
+`intentId` is a decimal string so clients can preserve the exact ID.
+See [thread Git metadata and rollout compatibility](../state/README.md#thread-git-metadata-and-rollout-compatibility)
+for recovery.
 
 For an explicit request to retrieve an already recorded answer by thread and
 turn ID, clients can call `thread/read` with `includeTurns: true` rather than

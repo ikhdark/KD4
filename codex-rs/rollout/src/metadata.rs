@@ -31,8 +31,10 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use tracing::info;
 use tracing::warn;
@@ -47,6 +49,46 @@ const MAX_CONCURRENT_BACKFILL_READS: usize = 8;
 pub(crate) const BACKFILL_LEASE_SECONDS: i64 = 30;
 /// How much a killed worker can lose. Short processes must still add up to full coverage.
 const BACKFILL_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A running blocking scan cannot be cancelled by dropping its join handle.
+#[derive(Clone)]
+pub(crate) struct BackfillReadStop {
+    runtime: codex_state::StateRuntime,
+    abandoned: Arc<AtomicBool>,
+}
+
+impl BackfillReadStop {
+    fn requested(&self) -> bool {
+        self.runtime.backfill_stop_requested() || self.abandoned.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn check(&self) -> std::io::Result<()> {
+        if self.requested() {
+            // A buffered read retries Interrupted, so return a terminal error.
+            return Err(std::io::Error::other("rollout backfill read cancelled"));
+        }
+        Ok(())
+    }
+}
+
+struct BackfillReadScope(BackfillReadStop);
+
+impl Drop for BackfillReadScope {
+    fn drop(&mut self) {
+        self.0.abandoned.store(true, Ordering::Relaxed);
+    }
+}
+
+pub(crate) struct BackfillReader<'a, R>(pub R, pub Option<&'a BackfillReadStop>);
+
+impl<R: std::io::Read> std::io::Read for BackfillReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(stop) = self.1 {
+            stop.check()?;
+        }
+        self.0.read(buf)
+    }
+}
 
 pub(crate) fn builder_from_session_meta(
     session_meta: &SessionMetaLine,
@@ -114,19 +156,6 @@ pub fn builder_from_items(
     ))
 }
 
-pub async fn extract_metadata_from_rollout(
-    rollout_path: &Path,
-    default_provider: &str,
-) -> anyhow::Result<ExtractionOutcome> {
-    extract_metadata_from_rollout_with_cache_status(
-        rollout_path,
-        default_provider,
-        /*populate_cache*/ false,
-    )
-        .await
-        .map(|(outcome, _cache_hit)| outcome)
-}
-
 pub(crate) async fn rollout_source_version(
     path: &Path,
 ) -> anyhow::Result<(PathBuf, u64, Option<SystemTime>)> {
@@ -174,13 +203,24 @@ pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
     default_provider: &str,
     populate_cache: bool,
 ) -> anyhow::Result<(ExtractionOutcome, bool)> {
+    extract_metadata_inner(rollout_path, default_provider, populate_cache, None).await
+}
+
+async fn extract_metadata_inner(
+    rollout_path: &Path,
+    default_provider: &str,
+    populate_cache: bool,
+    stop: Option<BackfillReadStop>,
+) -> anyhow::Result<(ExtractionOutcome, bool)> {
     if let Some(outcome) = cached_extraction_outcome(rollout_path, default_provider).await {
         return Ok((outcome, true));
     }
     let scan = tokio::task::spawn_blocking({
         let rollout_path = rollout_path.to_path_buf();
         let default_provider = default_provider.to_string();
-        move || scan_rollout_metadata(&rollout_path, &default_provider, populate_cache)
+        move || {
+            scan_rollout_metadata(&rollout_path, &default_provider, populate_cache, stop.as_ref())
+        }
     })
     .await
     .map_err(std::io::Error::other)??;
@@ -252,7 +292,7 @@ pub async fn has_unavailable_session_meta(
     }
     let path = rollout_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let scan = scan_rollout_metadata(&path, "", /*populate_cache*/ false)?;
+        let scan = scan_rollout_metadata(&path, "", /*populate_cache*/ false, None)?;
         Ok(!scan.accumulator.saw_first_session_meta)
     }).await.map_err(std::io::Error::other)?
 }
@@ -269,10 +309,14 @@ fn scan_rollout_metadata(
     rollout_path: &Path,
     default_provider: &str,
     populate_cache: bool,
+    stop: Option<&BackfillReadStop>,
 ) -> std::io::Result<RolloutMetadataScan> {
     use std::io::BufRead;
     use std::io::Read;
 
+    if let Some(stop) = stop {
+        stop.check()?;
+    }
     let (physical, file) = compression::open_rollout_file_with_retry(rollout_path)?;
     // Stamp the exact file being decoded, not a second open of its pathname.
     let cache_key = populate_cache
@@ -281,7 +325,8 @@ fn scan_rollout_metadata(
         })
         .flatten();
     let mut payload_versions = HashMap::new();
-    let input: Box<dyn Read + Send> = if physical
+    let file = BackfillReader(file, stop);
+    let input: Box<dyn Read + Send + '_> = if physical
         .extension()
         .is_some_and(|extension| extension == "zst")
     {
@@ -289,12 +334,16 @@ fn scan_rollout_metadata(
     } else {
         Box::new(file)
     };
-    let mut reader = std::io::BufReader::with_capacity(METADATA_SCAN_BUFFER_BYTES, input);
+    let mut reader =
+        std::io::BufReader::with_capacity(METADATA_SCAN_BUFFER_BYTES, BackfillReader(input, stop));
     let mut decoder = crate::recorder::RolloutRecordDecoder::default();
     let mut accumulator = RolloutMetadataAccumulator::default();
     let mut unresolved_payloads = 0usize;
     let mut raw = Vec::new();
     loop {
+        if let Some(stop) = stop {
+            stop.check()?;
+        }
         raw.clear();
         if reader.read_until(b'\n', &mut raw)? == 0 {
             break;
@@ -944,6 +993,7 @@ async fn start_backfill_read(
     runtime: &codex_state::StateRuntime,
     rollout: &BackfillRolloutPath,
     memo: &BackfillMemo,
+    stop: &BackfillReadStop,
 ) -> Result<BackfillReadStart, BackfillRead> {
     let Ok(source_version) = rollout_source_version(&rollout.path).await else {
         return Err(BackfillRead::SourceUnavailable);
@@ -954,7 +1004,7 @@ async fn start_backfill_read(
     // Stamp a known gap's payloads before reading it again, so a payload that
     // appears during or after this read is still a change for the next pass.
     let gap_dependencies = if memo.payload_gap_at(&rollout.path, &source_version) {
-        crate::payload_artifact::named_payload_versions(&source_version.0)
+        crate::payload_artifact::named_payload_versions_for_backfill(&source_version.0, stop.clone())
             .await
             .ok()
     } else {
@@ -974,10 +1024,13 @@ async fn finish_backfill_read(
     start: Result<BackfillReadStart, BackfillRead>,
     rollout: &BackfillRolloutPath,
     default_provider: &str,
+    stop: BackfillReadStop,
 ) -> BackfillRead {
     match start {
         Ok(start) => BackfillRead::Read {
-            extraction: extract_metadata_from_rollout(&rollout.path, default_provider).await,
+            extraction: extract_metadata_inner(&rollout.path, default_provider, false, Some(stop))
+                .await
+                .map(|(outcome, _cache_hit)| outcome),
             source_version: start.source_version,
             gap_dependencies: start.gap_dependencies,
             expected: start.expected,
@@ -1016,7 +1069,11 @@ pub(crate) async fn backfill_sessions_until(
     memo: &mut BackfillMemo,
     mut should_stop: impl FnMut() -> bool,
 ) -> BackfillPassReport {
-    let mut should_stop = move || runtime.backfill_stop_requested() || should_stop();
+    let read_scope = BackfillReadScope(BackfillReadStop {
+        runtime: runtime.clone(),
+        abandoned: Arc::new(AtomicBool::new(false)),
+    });
+    let mut should_stop = || read_scope.0.requested() || should_stop();
     memo.last_pass = None;
     let metric_client = codex_otel::global();
     let timer = metric_client
@@ -1142,10 +1199,27 @@ pub(crate) async fn backfill_sessions_until(
                 while attempts.len() < parallelism
                     && let Some(next) = unread.next()
                 {
-                    let start = start_backfill_read(runtime, next, memo_view).await;
-                    attempts.push_back(finish_backfill_read(start, next, default_provider));
+                    let start =
+                        start_backfill_read(runtime, next, memo_view, &read_scope.0).await;
+                    if read_scope.0.requested() {
+                        stopped = true;
+                        break 'batches;
+                    }
+                    attempts.push_back(finish_backfill_read(
+                        start,
+                        next,
+                        default_provider,
+                        read_scope.0.clone(),
+                    ));
                 }
-                let Some(attempt) = attempts.next().await else {
+                let attempt = attempts.next().await;
+                // A cancelled scan did not observe the whole rollout: do not
+                // count it as a failure or advance the watermark past it.
+                if read_scope.0.requested() {
+                    stopped = true;
+                    break 'batches;
+                }
+                let Some(attempt) = attempt else {
                     break;
                 };
                 stats.scanned = stats.scanned.saturating_add(1);

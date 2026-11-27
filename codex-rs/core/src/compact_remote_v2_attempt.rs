@@ -144,13 +144,26 @@ pub(super) async fn run_remote_compact_v2_attempt(
                 "occurrences": occurrences(history.raw_items()),
             }));
         }
-        if rewritten_outputs > 0 {
+        let final_estimates = if rewritten_outputs > 0 {
             info!(
                 turn_id = %turn_context.sub_id,
                 rewritten_outputs,
                 "rewrote history outputs before remote compaction v2"
             );
             prompt = project(history.clone());
+            prompt_token_estimates(sess, turn_context, &prompt).await
+        } else {
+            estimates
+        };
+        // Trimming is best effort, not a fit receipt. Check the final prepared
+        // request against the hard window even when the raw estimate fit: a
+        // compatible provider prefix can move the estimate in either direction.
+        // Without a compatible receipt, the admission estimator uses local costs.
+        if turn_context
+            .model_context_window()
+            .is_some_and(|limit| final_estimates.calibrated_tokens >= limit)
+        {
+            return Err(codex_protocol::error::CodexErr::ContextWindowExceeded);
         }
         (prompt, estimated_deleted_tokens)
     };
@@ -165,23 +178,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
                     .saturating_sub(estimated_deleted_tokens.min(max_local_deleted_tokens))
             });
     }
-
-    // Trimming is best effort, not a fit receipt. Required text may still be
-    // oversized; do not spend a compaction request that cannot fit either. The
-    // byte estimate overstates recorded text-heavy prompts by 11-45 % (557,192
-    // tokens for a measured 442,400), so refuse only when sampling admission's
-    // provider-calibrated estimate does not fit either.
-    let largest_input = largest_compaction_request_input(&prompt);
-    if let Some(limit) = turn_context.model_context_window()
-        && prompt.budget_tokens_for_input(&largest_input) >= limit
-        && prompt_token_estimates(sess, turn_context, &prompt)
-            .await
-            .calibrated_tokens
-            >= limit
-    {
-        return Err(codex_protocol::error::CodexErr::ContextWindowExceeded);
-    }
-
 
     // Required recovery must be available before spending a provider request.
     // Use source IDs, not the lossy sampling projection or synthetic trigger.

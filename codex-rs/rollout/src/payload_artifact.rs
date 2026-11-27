@@ -227,19 +227,41 @@ pub async fn payload_dependencies_unchanged(versions: &[PayloadDependencyVersion
 /// Unlike [`payload_dependency_versions`], records that cannot name a payload
 /// are skipped instead of failing the scan: no artifact change repairs them.
 pub async fn named_payload_versions(path: &Path) -> io::Result<Vec<PayloadDependencyVersion>> {
+    scan_named_payload_versions(path, None).await
+}
+
+pub(crate) async fn named_payload_versions_for_backfill(
+    path: &Path,
+    stop: crate::metadata::BackfillReadStop,
+) -> io::Result<Vec<PayloadDependencyVersion>> {
+    scan_named_payload_versions(path, Some(stop)).await
+}
+
+async fn scan_named_payload_versions(
+    path: &Path,
+    stop: Option<crate::metadata::BackfillReadStop>,
+) -> io::Result<Vec<PayloadDependencyVersion>> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        use crate::metadata::BackfillReader;
         use std::io::BufRead;
-        let file = std::fs::File::open(&path)?;
-        let input: Box<dyn Read> = if path.extension().is_some_and(|extension| extension == "zst") {
+        let stop = stop.as_ref();
+        if let Some(stop) = stop {
+            stop.check()?;
+        }
+        let file = BackfillReader(std::fs::File::open(&path)?, stop);
+        let input: Box<dyn Read + '_> = if path.extension().is_some_and(|extension| extension == "zst") {
             Box::new(zstd::stream::read::Decoder::new(file)?)
         } else {
             Box::new(file)
         };
-        let mut reader = std::io::BufReader::new(input);
+        let mut reader = std::io::BufReader::new(BackfillReader(input, stop));
         let mut paths = BTreeMap::new();
         let mut line = Vec::new();
         loop {
+            if let Some(stop) = stop {
+                stop.check()?;
+            }
             line.clear();
             if reader.read_until(b'\n', &mut line)? == 0 {
                 break;

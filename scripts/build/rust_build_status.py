@@ -3236,6 +3236,16 @@ def bundle_index_path(env: Mapping[str, str] = os.environ) -> Path:
     return source_mirrors_root(env).parent / "bundle-index.jsonl"
 
 
+def _frozen_environment_digest(env: Mapping[str, str]) -> str:
+    # Rust and native build scripts may consume arbitrary inherited variables,
+    # including through macro expansion. Never store their values in receipts.
+    # These three inputs are replaced by the lane owner before Cargo starts.
+    inherited = {key: value for key, value in env.items() if key not in (
+        "CARGO_TARGET_DIR", "CODEX_CARGO_LANE_TARGET_DIR", "CODEX_CARGO_LANE_OWNER_PID",
+    )}
+    return hashlib.sha256(json.dumps(inherited, sort_keys=True).encode("ascii")).hexdigest()
+
+
 def _reuse_key(receipt: Mapping[str, object]) -> str:
     context = dict(receipt.get("buildContext") or {})
     context.pop("sourceRoot", None)
@@ -3245,6 +3255,7 @@ def _reuse_key(receipt: Mapping[str, object]) -> str:
         manifest.get("sha256") if isinstance(manifest, dict) else None,
         context,
         receipt.get("rustc"),
+        receipt.get("buildEnvironmentSha256"),
     ]
     return hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -3320,7 +3331,8 @@ def _verified_receipt(
         # Two missing compiler identities are not a confirmed match. Keep this
         # distinct from a known composite-key mismatch and from Cargo freshness.
         manifest = receipt.get("sourceManifest")
-        gaps = [field for field in ("command", "buildContext", "rustc") if not receipt.get(field)]
+        gaps = [field for field in ("command", "buildContext", "rustc", "buildEnvironmentSha256")
+                if not receipt.get(field)]
         if not isinstance(manifest, dict) or not manifest.get("sha256"):
             gaps.append("sourceManifest.sha256")
         if gaps:
@@ -3552,6 +3564,7 @@ def find_reusable_bundle(
         "sourceManifest": source.summary(),
         "buildContext": context,
         "rustc": rustc,
+        "buildEnvironmentSha256": _frozen_environment_digest(env),
     })
     indexed: set[str] = set()
     try:
@@ -3690,9 +3703,18 @@ def run_in_cargo_lane(
             or skipped is None
             or (external and not (repo_root / ".git").exists())
         )
+        cargo_index = _cargo_launch_subcommand(command)
+        if not freeze and cargo_index is not None and command[cargo_index] in {"build", "b"}:
+            print(
+                "Build advisory: this Cargo build leaves mutable lane outputs. For behavioral "
+                "verification, reconcile overlapping source edits or use a session workspace, "
+                "then use --freeze-bundle NEW_DIR to check for exact reuse and run the frozen copy.",
+                file=sys.stderr,
+            )
         source = _source_manifest(repo_root, materialize_internal_file_links=materialize_internal_file_links) if freeze else None
         if source is not None:
             _require_captured_manifest(repo_root, build_context, source)
+        environment_digest = _frozen_environment_digest(child_env) if freeze else None
         capture_started = time.perf_counter()
         rustc = (
             _rustc_identity(child_env, repo_root / build_context["workingDirectory"], command)
@@ -3727,7 +3749,6 @@ def run_in_cargo_lane(
             record["timingEvidence"] = timing_evidence
         if source is not None and rebuild:
             cache_reuse["frozenBinary"].update(status="disabled", gate="explicit_rebuild")
-        cargo_index = _cargo_launch_subcommand(command)
         may_skip_execution = cargo_index is not None and command[cargo_index] in {"build", "b"}
         if source is not None and not rebuild and not may_skip_execution:
             cache_reuse["frozenBinary"].update(status="disabled", gate="execution_required")
@@ -3740,6 +3761,7 @@ def run_in_cargo_lane(
                 "sourceManifest": source.summary(),
                 "buildContext": build_context,
                 "rustc": rustc,
+                "buildEnvironmentSha256": environment_digest,
             }), reuse_decisions)
             if reuse is not None:
                 cache_reuse["frozenBinary"]["status"] = "hit"
@@ -3953,6 +3975,7 @@ def run_in_cargo_lane(
                             "sourceManifest": manifest,
                             "buildContext": build_context,
                             "rustc": rustc,
+                            "buildEnvironmentSha256": environment_digest,
                             "resolvedLane": resolved_lane,
                             "targetDir": str(target_dir),
                             "binaries": binaries,

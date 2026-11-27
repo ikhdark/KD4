@@ -106,8 +106,25 @@ impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
 fn completed_process_output(
     mut result: serde_json::Value,
 ) -> Box<dyn crate::tools::context::ToolOutput> {
-    let retained_signal = result.as_object_mut().and_then(|result| result.remove("_sampling_request_signal"));
     let success = result["success"].as_bool();
+    let mut retained_signal = result.as_object_mut()
+        .and_then(|result| result.remove("_sampling_request_signal"))
+        .or_else(|| (success == Some(false)).then(|| serde_json::json!({
+            "outcome": "failure",
+            "failure": {"fingerprint": "unified_exec.completed_process_recovery"}
+        })));
+    if let Some(success) = success
+        && result["process_exited"] == true
+    {
+        let signal = retained_signal.get_or_insert_with(|| serde_json::json!({}));
+        // Do not overwrite the owner's verdict (e.g. confirmed cancellation).
+        if !signal["collected_command_passed"].is_boolean() {
+            signal["collected_command_passed"] = serde_json::json!(success && result["exit_code"] == 0);
+        }
+        if result["output_drained"] == false {
+            signal["command_log_capture_incomplete"] = serde_json::json!(true);
+        }
+    }
     let output = if success.is_none() {
         // Checkpoint-only recovery proves exit, not success or failure.
         // Preserve the evidence as data without certifying the operation.
@@ -115,16 +132,9 @@ fn completed_process_output(
     } else {
         codex_tools::JsonToolOutput::with_success(result, success)
     };
-    if let Some(signal) = retained_signal {
-        return boxed_tool_output(output.with_sampling_request_signal(signal));
-    }
-    if success != Some(false) {
-        boxed_tool_output(output)
-    } else {
-        boxed_tool_output(output.with_sampling_request_signal(serde_json::json!({
-            "outcome": "failure",
-            "failure": {"fingerprint": "unified_exec.completed_process_recovery"}
-        })))
+    match retained_signal {
+        Some(signal) => boxed_tool_output(output.with_sampling_request_signal(signal)),
+        None => boxed_tool_output(output),
     }
 }
 

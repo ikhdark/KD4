@@ -117,31 +117,51 @@
 
   // A live byte-range read has a revision and file size, not a snapshot SHA.
   // Ask past EOF for the empty file: the native selector itself must be nonempty.
+  const rawByteLimit = 64 * 1024;
   const smallBytes = expected => {
-    const limit = 64 * 1024;
-    if (typeof expected === "string" && expected.length <= limit && expected.isWellFormed())
+    if (typeof expected === "string" && expected.length <= rawByteLimit && expected.isWellFormed())
       expected = new TextEncoder().encode(expected);
-    if (!(expected instanceof Uint8Array) || expected.length > limit)
+    if (!(expected instanceof Uint8Array) || expected.length > rawByteLimit)
       throw new TypeError("expected at most 64 KiB of UTF-8 text or bytes");
     return expected;
   };
+  const readRawHex = (path, end, environment_id) =>
+    tools.read_file({ path, ...(environment_id === undefined ? {} : { environment_id }),
+      encoding: "hex", selectors: [{kind:"bytes", start:0, end}] });
+  const completeRawHex = (r, size) => {
+    const row = r.results?.[0];
+    return r.read_mode === "byte_ranges" && r.selector_coordinate_space === "source_bytes" &&
+      r.complete === true && Number.isSafeInteger(size) && size >= 0 && size <= rawByteLimit &&
+      r.file_bytes === size && r.results?.length === 1 && row?.status === "ok" &&
+      row.complete === true && row.canonical_range?.start === 0 && row.canonical_range?.end === size &&
+      row.exact_bytes === size && typeof row.data_hex === "string" && row.data_hex.length === size * 2;
+  };
+  const rawIdentity = r => ({ path: r.path, environment_id: r.environment_id, bytes: r.file_bytes,
+    file_revision: r.file_revision, readback_sha256: r.readback_sha256 });
   const verifyBytes = async (path, bytes, helper, branch) => {
     // Capture the expectation before yielding; callers may mutate a Uint8Array.
-    const size = bytes.length, end = Math.max(1, size);
+    const size = bytes.length;
     const hex = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
-    const r = await nativeCall(helper, branch, () =>
-      tools.read_file({ path, encoding: "hex", selectors: [{kind:"bytes", start:0, end}] }));
-    const row = r.results?.[0];
-    if (r.read_mode !== "byte_ranges" || r.selector_coordinate_space !== "source_bytes" ||
-        r.complete !== true || r.file_bytes !== size || r.results?.length !== 1 ||
-        row?.status !== "ok" || row.complete !== true || row.canonical_range?.start !== 0 ||
-        row.canonical_range?.end !== size || row.exact_bytes !== size || row.data_hex !== hex)
+    const r = await nativeCall(helper, branch, () => readRawHex(path, Math.max(1, size)));
+    if (!completeRawHex(r, size) || r.results[0].data_hex !== hex)
       throw Object.assign(new Error("complete file bytes did not match"), { evidence: r });
     if (!patchHash(r.readback_sha256))
       throw Object.assign(new Error("complete file readback did not return its SHA-256"), { evidence: r });
-    return { path: r.path, environment_id: r.environment_id, bytes: size, file_revision: r.file_revision,
-      readback_sha256: r.readback_sha256 };
+    return rawIdentity(r);
   };
+  Object.defineProperty(globalThis, "read_verified_prefix", {
+    value: owned(async (helper, path, {source_sha256, length = 3, environment_id} = {}) => {
+      if (typeof path !== "string" || !path || !patchHash(source_sha256) ||
+          !Number.isSafeInteger(length) || length < 1 || length > 64)
+        throw new TypeError("expected a file path, full original-byte source SHA-256 and 1–64 prefix bytes");
+      // Only a complete encoded range has a native full-original-byte digest.
+      const r = await nativeCall(helper, 0, () => readRawHex(path, rawByteLimit, environment_id));
+      if (!completeRawHex(r, r.file_bytes) || r.readback_sha256 !== source_sha256)
+        throw Object.assign(new Error("raw prefix could not be bound to the expected source SHA-256"),
+          { evidence: r });
+      return { ...rawIdentity(r), data_hex: r.results[0].data_hex.slice(0, length * 2) };
+    }, "read_verified_prefix"),
+  });
   // A matched native absence probe observes the exact directory entry. A
   // timeout, cancellation or error is unknown, never a proof of absence.
   Object.defineProperty(globalThis, "verify_paths_absent", {

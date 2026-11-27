@@ -1847,6 +1847,17 @@ impl ToolOutput for ExecCommandToolOutput {
             serde_json::json!(!self.raw_output.is_empty() || self.process_exited);
         signal["empty_output"] = serde_json::json!(self.raw_output.is_empty());
         signal["command_evidence"] = serde_json::json!(true);
+        let shutdown_confirmed = self.session_capabilities.as_ref()
+            .and_then(|capabilities| capabilities.shutdown)
+            == Some(ExecShutdownStatus::ShutdownConfirmed);
+        if self.process_exited && self.process_id.is_none()
+            && (self.exit_code.is_some() || self.error.is_some() || shutdown_confirmed)
+        {
+            // Successful termination acknowledges cancellation, not validation.
+            signal["collected_command_passed"] = serde_json::json!(
+                self.exit_code == Some(0) && self.error.is_none() && !shutdown_confirmed
+            );
+        }
         // Capture completeness is independent of the exit result and of
         // display reduction. Missing or pending artifacts do not imply loss.
         if self.process_exited && self.process_id.is_none()

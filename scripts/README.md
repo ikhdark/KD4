@@ -39,6 +39,15 @@ SNAPSHOT` reuse an exact frozen bundle, or build in the nearest free warm slot
 through a content-synced source mirror, and freeze their executables with
 `build-receipt.json` (`--freeze-bundle NEW_DIR`, else the local bundle store).
 `find-bundle` answers without building; `--include-legacy` covers older bundles.
+Frozen reuse binds the effective inherited build environment because Rust,
+macros and build scripts can read variables not named in Cargo's options.
+The receipt's `buildEnvironmentSha256` records the digest, not the inherited
+values. It excludes the three variables set by the lane owner:
+`CARGO_TARGET_DIR`, `CODEX_CARGO_LANE_TARGET_DIR`, and `CODEX_CARGO_LANE_OWNER_PID`.
+A changed environment or a legacy receipt without the digest cannot establish
+an exact frozen match. `run-lane` falls through to normal Cargo freshness;
+ordinary warm-lane scheduling is unchanged. This does not attest to inputs
+created or read outside the inherited environment during compilation.
 Explicit `--freeze-bundle` builds also select that mirror automatically when
 eligible, including live checkouts, so edits after the copy cannot invalidate
 the compiled bundle. Ordinary checkout builds without freezing stay in place;
@@ -164,7 +173,10 @@ Freezing or reusing a bundle prints its `Build receipt:` path on stderr.
 `build-receipt.json` to stdout for the exact source/settings/command match,
 without building. It exits 1 if there is no match. Ordinary checkout builds do
 not freeze by default: request a bundle with `run-lane --freeze-bundle NEW_DIR`
-when one is needed.
+when one is needed. For behavioral verification amid concurrent edits, follow
+[KDR's build handoff](../../KDR/scripts/build/README.md#concurrent-verification-handoff).
+The managed runner warns on Cargo builds that leave only mutable lane outputs.
+For behavioral verification, run the frozen executable, not the mutable one.
 
 `run-lane` emits one `Build reuse:` diagnostic on stderr and retains it in
 `--timing-json` under `cacheReuse`; `find-bundle` emits `Frozen-binary reuse:`.

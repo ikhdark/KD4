@@ -3232,6 +3232,18 @@ impl CodeModeArgumentPreflight {
                         .collect();
                     failure.details = Some(serde_json::json!({"selector_branches": details}));
                 } else if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "read_file"
+                    && let Some(path) = misplaced_read_file_encoding(&value)
+                {
+                    let details = serde_json::json!({"message": failure.message, "field_errors": failure.field_errors,
+                        "details": failure.details});
+                    failure.message = "Bytes selectors do not accept encoding; pass it beside path and selectors. The native error retains the full schema diagnostic in tool_failure.details.selector_branches.".into();
+                    failure.field_errors = vec![ToolFieldError {
+                        path,
+                        expected: "encoding at the top level of read_file arguments".into(),
+                        correction: "Move encoding to /encoding; keep kind, start and end inside the bytes selector.".into(),
+                    }];
+                    failure.details = Some(serde_json::json!({"selector_branches": details}));
+                } else if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "read_file"
                     && misplaced_resume_filter(&value)
                 {
                     let details = serde_json::json!({"message": failure.message, "field_errors": failure.field_errors,
@@ -3250,6 +3262,32 @@ impl CodeModeArgumentPreflight {
             None => Ok(()),
         }
     }
+}
+
+// Diagnose the relocation only if it is the sole issue in the advertised
+// shape and the relocated arguments pass the native parser. Never run them.
+fn misplaced_read_file_encoding(value: &Value) -> Option<String> {
+    if value.get("encoding").is_some() {
+        return None;
+    }
+    let mut misplaced = None;
+    for (index, selector) in value.get("selectors")?.as_array()?.iter().enumerate() {
+        if let Some(encoding) = selector.get("encoding") {
+            if misplaced.is_some()
+                || selector["kind"] != "bytes"
+                || !matches!(encoding.as_str(), Some("hex" | "base64"))
+            {
+                return None;
+            }
+            misplaced = Some(index);
+        }
+    }
+    let index = misplaced?;
+    let mut corrected = value.clone();
+    let encoding = corrected["selectors"][index].as_object_mut()?.remove("encoding")?;
+    corrected["encoding"] = encoding;
+    crate::tools::handlers::validate_read_file_arguments(&corrected.to_string()).ok()?;
+    Some(format!("/selectors/{index}/encoding"))
 }
 
 // A misplaced inventory filter is not a malformed data projection. Offer a

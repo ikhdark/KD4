@@ -55,7 +55,7 @@ impl StateRuntime {
         matches!(self.get_backfill_state().await, Ok(state) if state.coverage_certified())
     }
 
-    /// Whether exit asked this runtime's worker to stop between rollouts.
+    /// Whether exit asked this runtime's worker to stop, including in-flight scans.
     pub fn backfill_stop_requested(&self) -> bool {
         self.backfill_worker
             .stop
@@ -63,9 +63,9 @@ impl StateRuntime {
     }
 
     /// Hands this runtime's claim back before exit, so the next process resumes from the
-    /// checkpoint instead of waiting out the lease. A pass normally stops between rollouts
-    /// and saves its progress; one inside a long read loses only what followed its last
-    /// checkpoint. Holds up exit only while a pass is running.
+    /// checkpoint instead of waiting out the lease. In-flight scans observe this stop;
+    /// a pass saves contiguous progress if it settles before the fallback claim release.
+    /// Holds up exit only while a pass is running.
     pub async fn stop_backfill_worker(&self) {
         self.backfill_worker
             .stop

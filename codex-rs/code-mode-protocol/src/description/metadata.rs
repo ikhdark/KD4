@@ -354,9 +354,29 @@ fn add_focused_contracts(
                 )));
             }
         }
-        "exec_command" => {
-            if let Some(properties) = definition.output_schema.as_ref()
-                .and_then(|schema| schema.get("properties"))
+        "exec_command" | "write_stdin" => {
+            let Some(schema) = definition.output_schema.as_ref() else {
+                return;
+            };
+            let ordinary = if definition.tool_name.name == "write_stdin" {
+                // Only normal command collection declares exact separate pipes.
+                // Event and status observations must not be treated as drains.
+                let Some(branch) = schema["anyOf"].as_array().and_then(|branches| {
+                    let mut matches = branches.iter().filter(|branch| {
+                        branch.pointer("/properties/streams_complete").is_some()
+                    });
+                    matches.next().filter(|_| matches.next().is_none())
+                }) else {
+                    return;
+                };
+                branch
+            } else {
+                schema
+            };
+            let Some(properties) = ordinary.get("properties") else {
+                return;
+            };
+            if definition.tool_name.name == "exec_command"
                 && let Some(fields) = selected_properties(properties, &[
                     "execution_state", "exit_code", "session_id", "process_exited", "output_drained",
                     "produced_stdout_bytes", "delivered_view_bytes", "output_reference",
@@ -364,6 +384,11 @@ fn add_focused_contracts(
                 ])
             {
                 sections.push(("output_custody", fields.to_string()));
+            }
+            if let Some(fields) = selected_properties(properties, &[
+                "streams_complete", "stream_chunks_complete", "stream_ranges", "stdout", "stderr",
+            ]) {
+                sections.push(("separate_streams", fields.to_string()));
             }
         }
         _ => {}

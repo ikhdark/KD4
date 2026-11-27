@@ -27,9 +27,19 @@ Object.defineProperty(globalThis, "run_graph", {
     const isProcessSubscription = (value) =>
       value?.subscription_closed === true && Number.isSafeInteger(value.session_id) &&
       typeof value.incarnation === "string" && typeof value.exit_status === "string";
+    // A grouped wait owns observations, not command output or completion.
+    const isGroupedProcessObservation = (value) =>
+      (value?.mode === "all" || value?.mode === "any") &&
+      ["completed", "timed_out", "deadline_exceeded", "cancelled"].includes(value.status) &&
+      Number.isSafeInteger(value.elapsed_ms) && value.elapsed_ms >= 0 &&
+      Array.isArray(value.outcomes) && value.outcomes.length > 0 &&
+      value.outcomes.every((outcome) =>
+        Number.isSafeInteger(outcome?.session_id) &&
+        typeof outcome.incarnation === "string" && typeof outcome.status === "string");
     const resultsSucceeded = (value) =>
       (Array.isArray(value) ? value : [value]).every(
         (item) => item?.success !== false && !isProcessSubscription(item) &&
+          !isGroupedProcessObservation(item) &&
           (item?.completion_recovered !== true || item.success === true) &&
           (!isCommand(item) ||
             (item.error == null && item.exit_code === 0 &&

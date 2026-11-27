@@ -212,6 +212,7 @@ struct SamplingToolOutcome {
     validation_mutation_revision: Option<u64>,
     background_process_id: Option<u64>,
     observed_process_id: Option<u64>,
+    collected_command_passed: Option<bool>,
     /// The authoritative wait owner reported its dependency already terminal.
     owner_wait_terminal: bool,
 }
@@ -223,7 +224,8 @@ struct PendingValidation {
     compilation_scope: Option<crate::validation::CompilationCheckScope>,
 }
 
-/// Preserve the process identity from an actual poll, without coverage claims.
+/// Bind validation settlement to a command owner's definitive collection, never
+/// to successful status/event subscriptions, input acknowledgements or stale handles.
 pub(crate) fn validation_scope_signal(
     tool_name: &ToolName,
     payload: &ToolPayload,
@@ -232,11 +234,13 @@ pub(crate) fn validation_scope_signal(
     _default_cwd: &std::path::Path,
     _environment_id: &str,
 ) -> Option<Value> {
-    if !tool_name_matches(tool_name, "write_stdin") {
+    if !tool_name_matches(tool_name, "write_stdin")
+        || !signal.as_ref().is_some_and(|signal| signal["collected_command_passed"].is_boolean())
+    {
         return signal;
     }
     let arguments = canonical_tool_action(payload).value;
-    let mut signal = signal.unwrap_or_else(|| serde_json::json!({}));
+    let mut signal = signal?;
     if let Some(process_id) = arguments.get("session_id").and_then(Value::as_u64) {
         signal["observed_process_id"] = serde_json::json!(process_id);
     }
@@ -289,6 +293,7 @@ impl SamplingToolOutcome {
             background_process_id: signal
                 .and_then(|signal| signal["background_process_id"].as_u64()),
             observed_process_id: signal.and_then(|signal| signal["observed_process_id"].as_u64()),
+            collected_command_passed: signal.and_then(|signal| signal["collected_command_passed"].as_bool()),
             owner_wait_terminal: signal.is_some_and(|signal| {
                 signal["authoritative_wait_owner_v1"]["disposition"] == "terminal"
             }),
@@ -4333,7 +4338,10 @@ impl TurnExecutionControl {
                         } else {
                             self.compilation_check_scopes.remove(&check);
                         }
-                        if outcome.kind == SamplingToolOutcomeKind::Success {
+                        let passed = pending.as_ref()
+                            .and(outcome.collected_command_passed)
+                            .unwrap_or(outcome.kind == SamplingToolOutcomeKind::Success);
+                        if passed {
                             self.failed_validation_checks.remove(&check);
                             if let Some(scope) = compilation_scope.as_ref() {
                                 self.successful_compilation_scopes.entry(scope.clone())
