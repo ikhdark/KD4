@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -214,8 +215,44 @@ pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {
     codex_home.join("auth.json")
 }
 
-pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> {
+const AUTH_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AuthFileSizeError {
+    #[error("auth.json exceeds the 16 MiB limit; move it to a secure backup outside CODEX_HOME, then log in again")]
+    Existing,
+    #[error("new auth.json would exceed the 16 MiB limit; use smaller credentials or a keyring that supports them")]
+    Proposed,
+}
+
+impl AuthFileSizeError {
+    pub(super) fn into_io(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, self)
+    }
+
+    pub fn from_io(error: &std::io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<Self>().copied()
+    }
+}
+
+fn validate_existing_auth_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > AUTH_FILE_MAX_BYTES as u64 => {
+            Err(AuthFileSizeError::Existing.into_io())
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn validate_local_auth_file(codex_home: &Path) -> std::io::Result<()> {
+    validate_existing_auth_file(&get_auth_file(codex_home))
+}
+
+fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> {
     let auth_file = get_auth_file(codex_home);
+    validate_existing_auth_file(&auth_file)?;
     match std::fs::remove_file(&auth_file) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -228,6 +265,9 @@ pub(super) trait AuthStorageBackend: Debug + Send + Sync {
         None
     }
     fn load(&self) -> std::io::Result<Option<AuthDotJson>>;
+    fn load_for_logout(&self) -> std::io::Result<Option<AuthDotJson>> {
+        self.load()
+    }
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()>;
     fn delete(&self) -> std::io::Result<bool>;
     fn delete_if_lifecycle_unchanged(&self, expected: Option<&AuthDotJson>) -> std::io::Result<bool> {
@@ -307,6 +347,21 @@ impl TransactionalAuthStorage {
         action(&mut revision)
     }
 
+    fn load_recording_lifecycle(
+        &self,
+        load: impl FnOnce(&dyn AuthStorageBackend) -> std::io::Result<Option<AuthDotJson>>,
+    ) -> std::io::Result<Option<AuthDotJson>> {
+        self.transaction(|revision| {
+            let auth = load(self.inner.as_ref())?;
+            *self
+                .observed
+                .lock()
+                .map_err(|_| std::io::Error::other("auth snapshot lock poisoned"))? =
+                Some(revision.clone());
+            Ok(auth)
+        })
+    }
+
     fn advance(&self, revision: &mut String) -> std::io::Result<()> {
         let next = format!("{:032x}", rand::random::<u128>());
         if !self.ephemeral {
@@ -355,15 +410,11 @@ impl AuthStorageBackend for TransactionalAuthStorage {
     }
 
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
-        self.transaction(|revision| {
-            let auth = self.inner.load()?;
-            *self
-                .observed
-                .lock()
-                .map_err(|_| std::io::Error::other("auth snapshot lock poisoned"))? =
-                Some(revision.clone());
-            Ok(auth)
-        })
+        self.load_recording_lifecycle(|inner| inner.load())
+    }
+
+    fn load_for_logout(&self) -> std::io::Result<Option<AuthDotJson>> {
+        self.load_recording_lifecycle(|inner| inner.load_for_logout())
     }
 
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
@@ -437,14 +488,41 @@ impl FileAuthStorage {
     /// Attempt to read and parse the `auth.json` file in the given `CODEX_HOME` directory.
     /// Returns the full AuthDotJson structure.
     pub(super) fn try_read_auth_json(&self, auth_file: &Path) -> std::io::Result<AuthDotJson> {
-        let mut file = File::open(auth_file)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        let auth_dot_json: AuthDotJson = serde_json::from_str(&contents).map_err(|error| {
+        let mut file = File::open(auth_file)?.take(AUTH_FILE_MAX_BYTES as u64 + 1);
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        if contents.len() > AUTH_FILE_MAX_BYTES {
+            return Err(AuthFileSizeError::Existing.into_io());
+        }
+        let contents = std::str::from_utf8(&contents).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "auth.json is not valid UTF-8")
+        })?;
+        let auth_dot_json: AuthDotJson = serde_json::from_str(contents).map_err(|error| {
             credential_json_error("failed to deserialize CLI auth from file", &error)
         })?;
 
         Ok(auth_dot_json)
+    }
+}
+
+#[derive(Default)]
+struct AuthFileWriteBuffer {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl Write for AuthFileWriteBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > AUTH_FILE_MAX_BYTES - self.bytes.len() {
+            self.exceeded = true;
+            return Err(AuthFileSizeError::Proposed.into_io());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -461,14 +539,22 @@ impl AuthStorageBackend for FileAuthStorage {
 
     fn save(&self, auth_dot_json: &AuthDotJson) -> std::io::Result<()> {
         let auth_file = get_auth_file(&self.codex_home);
-
+        validate_existing_auth_file(&auth_file)?;
+        let mut json = AuthFileWriteBuffer::default();
+        if let Err(error) = serde_json::to_writer_pretty(&mut json, auth_dot_json) {
+            return Err(if json.exceeded {
+                AuthFileSizeError::Proposed.into_io()
+            } else {
+                std::io::Error::from(error)
+            });
+        }
         if let Some(parent) = auth_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json_data = serde_json::to_string_pretty(auth_dot_json)?;
         let paths = codex_file_system::resolve_symlink_write_paths(&auth_file)?;
+        validate_existing_auth_file(&paths.write_path)?;
         codex_file_system::write_bytes_atomically_preserving_permissions(
-            &paths.write_path, json_data.as_bytes(),
+            &paths.write_path, &json.bytes,
         )
     }
 
@@ -549,7 +635,13 @@ impl AuthStorageBackend for DirectKeyringAuthStorage {
         self.load_from_keyring(&key)
     }
 
+    fn load_for_logout(&self) -> std::io::Result<Option<AuthDotJson>> {
+        validate_local_auth_file(&self.codex_home)?;
+        self.load()
+    }
+
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        validate_local_auth_file(&self.codex_home)?;
         let key = compute_store_key(&self.codex_home)?;
         // Simpler error mapping per style: prefer method reference over closure
         let serialized = serde_json::to_string(auth).map_err(std::io::Error::other)?;
@@ -559,6 +651,7 @@ impl AuthStorageBackend for DirectKeyringAuthStorage {
     }
 
     fn delete(&self) -> std::io::Result<bool> {
+        validate_local_auth_file(&self.codex_home)?;
         let key = compute_store_key(&self.codex_home)?;
         let keyring_removed = self
             .keyring_store
@@ -626,7 +719,13 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
         }
     }
 
+    fn load_for_logout(&self) -> std::io::Result<Option<AuthDotJson>> {
+        validate_local_auth_file(&self.codex_home)?;
+        self.load()
+    }
+
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        validate_local_auth_file(&self.codex_home)?;
         let serialized = serde_json::to_string(auth).map_err(std::io::Error::other)?;
         self.secrets_manager
             .set(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME, &serialized)
@@ -644,6 +743,7 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
     }
 
     fn delete(&self) -> std::io::Result<bool> {
+        validate_local_auth_file(&self.codex_home)?;
         let keyring_removed = self
             .secrets_manager
             .delete(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME)
@@ -692,12 +792,24 @@ impl AuthStorageBackend for AutoAuthStorage {
         }
     }
 
+    fn load_for_logout(&self) -> std::io::Result<Option<AuthDotJson>> {
+        match self.keyring_storage.load_for_logout()? {
+            Some(auth) => Ok(Some(auth)),
+            None => self.file_storage.load(),
+        }
+    }
+
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
         match self.keyring_storage.save(auth) {
             Ok(()) => Ok(()),
             // Contention is not backend unavailability: a fallback would hide
             // the new credential behind the existing encrypted value.
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Err(err),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || AuthFileSizeError::from_io(&err).is_some() =>
+            {
+                Err(err)
+            }
             Err(err) => {
                 match self.keyring_storage.load() {
                     Ok(None) => {}

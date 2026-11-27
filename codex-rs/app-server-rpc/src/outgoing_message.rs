@@ -1974,16 +1974,28 @@ impl OutgoingMessageSender {
                 targeted_connections = connection_ids.len(),
                 "app-server event: {notification}"
             );
-            let (thread, turn, output, source) = match &notification {
-                ServerNotification::AgentMessageDelta(delta) => (
-                    delta.thread_id.as_str(), delta.turn_id.as_str(), delta.item_id.as_str(),
-                    delta.source_occurrence.as_deref()),
-                _ => ("", "", "", None),
-            };
-            let observation = codex_protocol::timing::observations::Span::start(
-                "notification_route", thread, turn, output,
-                serde_json::json!({"target_connections":connection_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
-                    "broadcast":connection_ids.is_empty(), "source_occurrence":source}));
+            let observation = codex_protocol::timing::observations::enabled().then(|| {
+                let (thread, turn, output, source) = match &notification {
+                    ServerNotification::AgentMessageDelta(delta) => (
+                        delta.thread_id.as_str(),
+                        delta.turn_id.as_str(),
+                        delta.item_id.as_str(),
+                        delta.source_occurrence.as_deref(),
+                    ),
+                    _ => ("", "", "", None),
+                };
+                codex_protocol::timing::observations::Span::start(
+                    "notification_route",
+                    thread,
+                    turn,
+                    output,
+                    serde_json::json!({
+                        "target_connections":connection_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+                        "broadcast":connection_ids.is_empty(),
+                        "source_occurrence":source,
+                    }),
+                )
+            });
             let outgoing_message = OutgoingMessage::AppServerNotification(notification);
             let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
             if connection_ids.is_empty() {
@@ -2007,7 +2019,12 @@ impl OutgoingMessageSender {
                         self.fail_connection_delivery(target).await;
                     }
                 }
-                observation.finish(if sent {"enqueued"} else {"delivery_failed"}, serde_json::json!({"broadcast":true}));
+                if let Some(observation) = observation {
+                    observation.finish(
+                        if sent { "enqueued" } else { "delivery_failed" },
+                        serde_json::json!({"broadcast":true}),
+                    );
+                }
                 return;
             }
             let mut outgoing_message = Some(outgoing_message);
@@ -2037,8 +2054,12 @@ impl OutgoingMessageSender {
                 }
                 if sent { delivered += 1; }
             }
-            observation.finish(if delivered == connection_ids.len() {"enqueued"} else {"delivery_failed"},
-                serde_json::json!({"enqueued":delivered, "expected":connection_ids.len()}));
+            if let Some(observation) = observation {
+                observation.finish(
+                    if delivered == connection_ids.len() { "enqueued" } else { "delivery_failed" },
+                    serde_json::json!({"enqueued":delivered, "expected":connection_ids.len()}),
+                );
+            }
         })
     }
 
@@ -2101,15 +2122,25 @@ impl OutgoingMessageSender {
             "app-server terminal event: {notification}"
         );
         let dispatch_started = Instant::now();
-        let emission = codex_protocol::timing::observations::Span::start(
-            "terminal_emission", &thread_id.to_string(), &turn_id, &turn_id,
-            serde_json::json!({"scope":"one_terminal_dispatch_not_client_receipt",
-                "actual_targets":target_connection_ids.len(),
-                "targets":target_connection_ids.iter().take(8192).map(|id| id.0).collect::<Vec<_>>(),
-                "targets_complete":target_connection_ids.len() <= 8192,
-                "origin_connection":origin_connection_id.map(|id| id.0),
-                "status":match &notification {
-                    ServerNotification::TurnCompleted(completed) => Some(&completed.turn.status), _ => None }}));
+        let emission = codex_protocol::timing::observations::enabled().then(|| {
+            codex_protocol::timing::observations::Span::start(
+                "terminal_emission",
+                &thread_id.to_string(),
+                &turn_id,
+                &turn_id,
+                serde_json::json!({
+                    "scope":"one_terminal_dispatch_not_client_receipt",
+                    "actual_targets":target_connection_ids.len(),
+                    "targets":target_connection_ids.iter().take(8192).map(|id| id.0).collect::<Vec<_>>(),
+                    "targets_complete":target_connection_ids.len() <= 8192,
+                    "origin_connection":origin_connection_id.map(|id| id.0),
+                    "status":match &notification {
+                        ServerNotification::TurnCompleted(completed) => Some(&completed.turn.status),
+                        _ => None,
+                    },
+                }),
+            )
+        });
         tracing::info!(target: "codex_task_observation", schema_version = 1,
             %thread_id, %turn_id, phase = "server_notification_dispatch_started",
             at_unix_ms = chrono::Utc::now().timestamp_millis(), clock = "unix_wall_ms",
@@ -2153,7 +2184,9 @@ impl OutgoingMessageSender {
         }
 
         if receipts.is_empty() {
-            emission.finish("no_targets", serde_json::Value::Null);
+            if let Some(emission) = emission {
+                emission.finish("no_targets", serde_json::Value::Null);
+            }
             self.analytics_events_client
                 .track_turn_delivery(aggregate_turn_delivery(
                     thread_id,
@@ -2177,11 +2210,18 @@ impl OutgoingMessageSender {
                     delivery_shutdown,
                 )
                 .await;
-                emission.finish("writer_observation_complete", serde_json::json!({
-                    "actual_outcomes":outcomes.len(),
-                    "outcomes":outcomes.iter().take(8192).map(|outcome| serde_json::json!({
-                        "connection_id":outcome.connection_id.0,
-                        "outcome":format!("{:?}", outcome.kind)})).collect::<Vec<_>>()}));
+                if let Some(emission) = emission {
+                    emission.finish(
+                        "writer_observation_complete",
+                        serde_json::json!({
+                            "actual_outcomes":outcomes.len(),
+                            "outcomes":outcomes.iter().take(8192).map(|outcome| serde_json::json!({
+                                "connection_id":outcome.connection_id.0,
+                                "outcome":format!("{:?}", outcome.kind)
+                            })).collect::<Vec<_>>(),
+                        }),
+                    );
+                }
                 analytics_events_client.track_turn_delivery(aggregate_turn_delivery(
                     thread_id,
                     turn_id,
@@ -2193,7 +2233,9 @@ impl OutgoingMessageSender {
         }
         drop(accepting);
 
-        emission.finish("shutdown_not_accepting_receipts", serde_json::Value::Null);
+        if let Some(emission) = emission {
+            emission.finish("shutdown_not_accepting_receipts", serde_json::Value::Null);
+        }
 
         let outcomes = receipts
             .into_iter()

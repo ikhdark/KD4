@@ -355,10 +355,11 @@ def resolve_release_workflow(
 
 
 def resolve_workflow_url(
-    version: str, override: str | None, github_repo: str, workflow_name: str | None
-) -> tuple[str, str | None]:
+    version: str, override: str | None, github_repo: str | None, workflow_name: str | None
+) -> tuple[str, str | None, str]:
     if override:
         reference = parse_workflow_run_url(override)
+        github_repo = github_repo or reference.github_repo
         stdout = check_output_owned(
             [
                 "gh",
@@ -376,6 +377,7 @@ def resolve_workflow_url(
         workflow = json.loads(stdout)
         workflow["url"] = override
     elif workflow_name:
+        github_repo = resolve_github_repo(github_repo)
         workflow = resolve_release_workflow(version, github_repo, workflow_name)
     else:
         raise ValueError(
@@ -388,7 +390,7 @@ def resolve_workflow_url(
             "native artifact workflow must be completed successfully; "
             f"status={workflow.get('status')!r}, conclusion={workflow.get('conclusion')!r}"
         )
-    return workflow["url"], workflow.get("headSha")
+    return workflow["url"], workflow.get("headSha"), github_repo
 
 
 def workflow_id_from_url(workflow_url: str) -> str:
@@ -1235,8 +1237,6 @@ def _main() -> int:
 
     packages = expand_packages(list(args.packages))
     native_component_sets = collect_native_component_sets(packages)
-    if native_component_sets and vendor_src_arg is None:
-        github_repo = resolve_github_repo(github_repo)
     print("Expanded packages: " + ", ".join(packages), flush=True)
     if native_component_sets:
         component_sets = [
@@ -1275,8 +1275,7 @@ def _main() -> int:
                         )
                     vendor_src_by_native_key[(components, targets)] = vendor_src
             else:
-                assert github_repo is not None
-                workflow_url, resolved_head_sha = resolve_workflow_url(
+                workflow_url, resolved_head_sha, github_repo = resolve_workflow_url(
                     args.release_version,
                     args.workflow_url,
                     github_repo,

@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireCellId;
 use tokio::sync::mpsc;
 
+use super::ExecuteClaims;
 use super::types::DeferredWait;
 use super::types::DriverEvent;
 use super::types::InitialResponse;
@@ -35,17 +37,19 @@ pub(super) struct RequestTracker {
     pending: HashMap<RequestId, PendingRequest>,
     control_deadlines: HashMap<RequestId, ControlDeadline>,
     unclaimed_executes: HashMap<RequestId, UnclaimedExecute>,
+    execute_claims: Arc<ExecuteClaims>,
     initial_responses: HashMap<RequestId, InitialResponse>,
     deferred_waits: VecDeque<DeferredWait>,
     next_request_id: i64,
 }
 
 impl RequestTracker {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(execute_claims: Arc<ExecuteClaims>) -> Self {
         Self {
             pending: HashMap::new(),
             control_deadlines: HashMap::new(),
             unclaimed_executes: HashMap::new(),
+            execute_claims,
             initial_responses: HashMap::new(),
             deferred_waits: VecDeque::new(),
             next_request_id: 1,
@@ -179,10 +183,17 @@ impl RequestTracker {
         );
         let replaced = self.initial_responses.insert(id, response);
         debug_assert!(replaced.is_none());
+        // ExecutionStarted reserves this ID before sending the execute result
+        // to the caller, which can claim it before the unclaimed row is inserted.
+        self.execute_claims.register(id);
     }
 
     pub(super) fn remove_initial_response(&mut self, id: RequestId) -> Option<InitialResponse> {
-        self.initial_responses.remove(&id)
+        let response = self.initial_responses.remove(&id);
+        if !self.unclaimed_executes.contains_key(&id) {
+            self.execute_claims.retire(id);
+        }
+        response
     }
 
     pub(super) fn insert_unclaimed_execute(&mut self, id: RequestId, execute: UnclaimedExecute) {
@@ -210,14 +221,18 @@ impl RequestTracker {
                     .then_some(CancellationAction::Send(*id))
             })
             .collect::<Vec<_>>();
+        let claims = &self.execute_claims;
         actions.extend(
             self.unclaimed_executes
                 .extract_if(|_, execute| {
                     execute.cancellation.is_cancelled() && execute.cancellation.mark_reported()
                 })
-                .map(|(request_id, execute)| CancellationAction::Terminate {
-                    request_id,
-                    execute,
+                .map(|(request_id, execute)| {
+                    claims.retire(request_id);
+                    CancellationAction::Terminate {
+                        request_id,
+                        execute,
+                    }
                 }),
         );
         actions
@@ -237,6 +252,7 @@ impl RequestTracker {
         if !execute.cancellation.mark_reported() {
             return None;
         }
+        self.execute_claims.retire(id);
         self.unclaimed_executes
             .remove(&id)
             .map(|execute| CancellationAction::Terminate {
@@ -270,8 +286,14 @@ impl RequestTracker {
     }
 
     pub(super) fn remove_unclaimed_for_session(&mut self, session_id: &SessionId) {
-        self.unclaimed_executes
-            .retain(|_, execute| &execute.session.id != session_id);
+        let claims = &self.execute_claims;
+        self.unclaimed_executes.retain(|id, execute| {
+            if &execute.session.id != session_id {
+                return true;
+            }
+            claims.retire(*id);
+            false
+        });
     }
 
     pub(super) fn operation_count(&self) -> usize {
@@ -286,6 +308,7 @@ impl RequestTracker {
     }
 
     pub(super) fn fail_all(&mut self, reason: &str) {
+        self.execute_claims.close();
         self.control_deadlines.clear();
         for (_, pending) in self.pending.drain() {
             pending.fail(reason.to_string());

@@ -47,8 +47,14 @@ pub fn parse_all_rate_limits(headers: &HeaderMap) -> Vec<RateLimitSnapshot> {
     }
 
     snapshots.extend(limit_ids.into_iter().filter_map(|limit_id| {
-        let snapshot = parse_rate_limit_for_limit(headers, Some(limit_id.as_str()))?;
-        has_rate_limit_data(&snapshot).then_some(snapshot)
+        let mut snapshot = parse_rate_limit_for_limit(headers, Some(limit_id.as_str()))?;
+        if !has_rate_limit_data(&snapshot) {
+            return None;
+        }
+        // The default snapshot already carries the one account observation
+        // from these headers. Keyed bucket updates are not additional samples.
+        snapshot.credits = None;
+        Some(snapshot)
     }));
 
     snapshots

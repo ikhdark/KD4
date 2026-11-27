@@ -1,112 +1,294 @@
-//! Overflow event journal backed by the existing bounded-memory raw artifact sink.
-//! Writers apply disk backpressure outside the turn-state lock. Sequence numbers
-//! assigned under that lock preserve causality even when concurrent writes arrive
-//! out of order; no unbounded write queue or new admission policy is added.
+//! Bounded ingress for the native overflow journal. Event reservation and
+//! enqueue happen under the turn-state lock; only the blocking writer owns the
+//! artifact sink. A stalled sink never holds a lock needed by a producer.
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use codex_tool_artifacts::RawOutputArtifact;
 use codex_tool_artifacts::capture::RawOutputArtifactTask;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::Notify;
+use tokio::runtime::Handle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+
 use super::{TurnTimingState, TurnTimingStateInner};
 
+const MAX_PENDING_RECORDS: usize = 1024;
+const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+const TERMINAL_OBSERVATION: Duration = Duration::from_millis(100);
+// An overflowing turn keeps an idle blocking worker until the journal seals.
+static WRITER_SLOTS: Semaphore = Semaphore::const_new(16);
+
 #[derive(Debug)]
-pub(super) struct Capture {
-    task: Option<RawOutputArtifactTask>,
-    artifact: Arc<tokio::sync::Mutex<RawOutputArtifact>>,
-    notify: Arc<Notify>,
+pub(super) struct Archive {
+    home: PathBuf,
     thread_id: String,
     turn_id: String,
-    received: u64,
-    bytes: u64,
-    digest: Sha256,
-    finishing: bool,
+    runtime: Option<Handle>,
+    ingress: Mutex<Ingress>,
 }
 
-pub(super) struct PendingRecord {
-    capture: Arc<Mutex<Capture>>,
+#[derive(Debug, Default)]
+enum Ingress {
+    #[default]
+    Dormant,
+    Unavailable(&'static str),
+    Active {
+        sender: Option<CloseIngress>,
+        byte_budget: Arc<Semaphore>,
+        sealed_expected: Arc<AtomicU64>,
+        accepted: u64,
+        finished: watch::Receiver<Option<Value>>,
+    },
+}
+
+// Either turn custody ending or runtime shutdown closes the queue. Neither
+// can leave an idle blocking worker holding the runtime open.
+#[derive(Debug)]
+struct CloseIngress(async_channel::Sender<Record>);
+
+impl Drop for CloseIngress {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+#[derive(Debug)]
+struct Record {
+    line: Vec<u8>,
+    _bytes: OwnedSemaphorePermit,
+}
+
+#[derive(Serialize)]
+struct JournalLine<'a> {
+    schema_version: u8,
     sequence: u64,
+    thread_id: &'a str,
+    turn_id: &'a str,
     event: Value,
 }
 
-impl PendingRecord {
-    pub(super) fn write(self) {
-        let mut capture = self.capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let encoded = serde_json::to_vec(&json!({
-            "schema_version": 1, "sequence": self.sequence,
-            "thread_id": capture.thread_id, "turn_id": capture.turn_id, "event": self.event,
-        }));
-        match encoded {
-            Ok(mut bytes) => {
-                bytes.push(b'\n');
-                // Whole records only: one that would cross the shared sink's
-                // per-log ceiling is dropped as a journal gap, never cut.
-                let fits = capture.bytes.saturating_add(bytes.len() as u64)
-                    <= codex_tool_artifacts::MAX_COMMAND_LOG_BYTES;
-                if let Some(task) = capture.task.as_mut() {
-                    if fits { task.write_chunk(&bytes); } else { task.mark_output_gap(); }
-                }
-                capture.bytes = capture.bytes.saturating_add(bytes.len() as u64);
-                capture.digest.update(&bytes);
-            }
-            Err(_) => {
-                if let Some(task) = capture.task.as_mut() { task.mark_output_gap(); }
-            }
+#[derive(Default)]
+struct BoundedLine(Vec<u8>);
+
+impl Write for BoundedLine {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_PENDING_BYTES.saturating_sub(self.0.len()) {
+            return Err(io::Error::other("overflow journal record exceeds ingress byte budget"));
         }
-        capture.received = capture.received.saturating_add(1);
-        capture.notify.notify_waiters();
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
-impl Capture {
-    fn receipt(&self, expected: u64) -> Value {
-        let reference = self.artifact.try_lock().ok()
-            .map(|artifact| RawOutputArtifact::output_reference(Some(&artifact)))
-            .unwrap_or_else(|| json!({}));
-        let mut receipt = json!({
-            "schema_version": 1, "format": "turn-timing-overflow-jsonl-v1",
-            "artifact_id": reference.get("artifact_id"),
-            "owner_thread_id": self.thread_id, "turn_id": self.turn_id,
-            "sha256": hex::encode(self.digest.clone().finalize()),
-            "bytes": self.bytes, "expected_records": expected, "received_records": self.received,
-            "complete": self.received == expected && reference.get("capture_complete") == Some(&Value::Bool(true)),
-            "output_reference": reference,
-            "ordering": "sequence; disk order may differ",
+impl Archive {
+    fn start(&self) -> Ingress {
+        let Some(runtime) = self.runtime.clone().or_else(|| Handle::try_current().ok()) else {
+            return Ingress::Unavailable("archive writer runtime unavailable");
+        };
+        let Ok(writer_slot) = WRITER_SLOTS.try_acquire() else {
+            return Ingress::Unavailable("archive writer capacity exhausted");
+        };
+        let (sender, receiver) = async_channel::bounded(MAX_PENDING_RECORDS);
+        let abort_ingress = CloseIngress(sender.clone());
+        let (done, finished) = watch::channel(None);
+        let sealed_expected = Arc::new(AtomicU64::new(0));
+        let expected = Arc::clone(&sealed_expected);
+        let home = self.home.clone();
+        let thread_id = self.thread_id.clone();
+        let turn_id = self.turn_id.clone();
+        // The supervisor joins the actual sink owner, even when the terminal
+        // observer is cancelled or times out. If runtime shutdown cancels
+        // the supervisor, its guard closes ingress and wakes an idle writer.
+        runtime.spawn(async move {
+            let _abort_ingress = abort_ingress;
+            let result = tokio::task::spawn_blocking(move || {
+                let _writer_slot = writer_slot;
+                run_writer(&home, &thread_id, &turn_id, receiver, &expected)
+            })
+            .await;
+            let receipt = match result {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    tracing::warn!(%error, "overflow journal writer failed");
+                    return;
+                }
+            };
+            done.send_replace(Some(receipt));
         });
-        if self.bytes > codex_tool_artifacts::MAX_COMMAND_LOG_BYTES {
-            receipt["reason"] = "journal reached its size limit; later records were not retained".into();
+        Ingress::Active {
+            sender: Some(CloseIngress(sender)),
+            byte_budget: Arc::new(Semaphore::new(MAX_PENDING_BYTES)),
+            sealed_expected,
+            accepted: 0,
+            finished,
         }
-        receipt
     }
+
+    fn enqueue(&self, sequence: u64, event: Value) {
+        let mut ingress = self.ingress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*ingress, Ingress::Dormant) {
+            *ingress = self.start();
+        }
+        let Ingress::Active { sender: Some(sender), byte_budget, accepted, .. } = &mut *ingress else {
+            return;
+        };
+        if sender.0.is_closed() || sender.0.is_full() {
+            return;
+        }
+        let event = JournalLine {
+            schema_version: 1,
+            sequence,
+            thread_id: &self.thread_id,
+            turn_id: &self.turn_id,
+            event,
+        };
+        let mut line = BoundedLine::default();
+        if serde_json::to_writer(&mut line, &event).is_err() || line.write_all(b"\n").is_err() {
+            return;
+        }
+        let Ok(capacity) = u32::try_from(line.0.capacity()) else {
+            return;
+        };
+        let Ok(bytes) = Arc::clone(byte_budget).try_acquire_many_owned(capacity) else {
+            return;
+        };
+        if sender.0.try_send(Record { line: line.0, _bytes: bytes }).is_ok() {
+            *accepted = accepted.saturating_add(1);
+        }
+    }
+
+    fn seal(&self, expected: u64) -> (Result<watch::Receiver<Option<Value>>, &'static str>, u64) {
+        let mut ingress = self.ingress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *ingress {
+            Ingress::Active { sender, sealed_expected, accepted, finished, .. } => {
+                // A reservation cannot be in flight after the turn snapshot:
+                // producer enqueue and sequence assignment take the same lock.
+                if let Some(sender) = sender.take() {
+                    sealed_expected.store(expected, Ordering::Release);
+                    drop(sender);
+                }
+                (Ok(finished.clone()), expected.saturating_sub(*accepted))
+            }
+            Ingress::Unavailable(reason) => (Err(*reason), expected),
+            Ingress::Dormant => (Err("archive writer was not started"), expected),
+        }
+    }
+}
+
+fn run_writer(
+    home: &Path,
+    thread_id: &str,
+    turn_id: &str,
+    receiver: async_channel::Receiver<Record>,
+    sealed_expected: &AtomicU64,
+) -> Value {
+    let artifact = Arc::new(tokio::sync::Mutex::new(RawOutputArtifact::pending(home, thread_id)));
+    let mut task = RawOutputArtifactTask::spawn(Some(Arc::clone(&artifact)), Default::default());
+    let mut received = 0_u64;
+    let mut bytes = 0_u64;
+    let mut digest = Sha256::new();
+    let mut size_limit = false;
+    while let Ok(record) = receiver.recv_blocking() {
+        let total = bytes.saturating_add(record.line.len() as u64);
+        // Keep whole JSONL records and a stable retained prefix at the ceiling.
+        if !size_limit && total <= codex_tool_artifacts::MAX_COMMAND_LOG_BYTES {
+            if let Some(task) = task.as_mut() {
+                task.write_chunk(&record.line);
+            }
+            bytes = total;
+            digest.update(&record.line);
+        } else {
+            size_limit = true;
+        }
+        received = received.saturating_add(1);
+    }
+
+    let expected = sealed_expected.load(Ordering::Acquire);
+    if let Some(mut task) = task {
+        if expected == 0 || received != expected || size_limit {
+            task.mark_output_gap();
+        }
+        task.finish_blocking();
+    }
+    let reference = RawOutputArtifact::output_reference(Some(&*artifact.blocking_lock()));
+    let mut receipt = json!({
+        "schema_version": 1, "format": "turn-timing-overflow-jsonl-v1",
+        "artifact_id": reference.get("artifact_id"),
+        "owner_thread_id": thread_id, "turn_id": turn_id,
+        "bytes": reference.get("retained_bytes"),
+        "expected_records": expected, "received_records": received,
+        "complete": expected != 0 && received == expected
+            && reference.get("capture_complete") == Some(&Value::Bool(true)),
+        "output_reference": reference,
+        "ordering": "sequence; disk order may differ",
+    });
+    if reference["retrieval_availability"] == "available"
+        && reference["retained_bytes"].as_u64() == Some(bytes)
+    {
+        receipt["sha256"] = hex::encode(digest.finalize()).into();
+    }
+    if received != expected && expected != 0 {
+        receipt["missing_records"] = expected.saturating_sub(received).into();
+    }
+    if let Some(reason) = if expected == 0 {
+        Some("archive owner ended before terminal seal")
+    } else if received != expected {
+        Some("archive ingress lost reserved records")
+    } else if size_limit {
+        Some("journal reached its size limit; later records were not retained")
+    } else if receipt["complete"] != true {
+        Some("archive sink did not retain a complete journal")
+    } else {
+        None
+    } {
+        receipt["reason"] = reason.into();
+    }
+    receipt
 }
 
 impl TurnTimingStateInner {
-    pub(super) fn archive_record(&mut self, event: Value, force: bool) -> Option<PendingRecord> {
-        if self.completed_snapshot.is_some() || (!force && self.archive_sequence == 0) { return None; }
-        let capture = self.detail_archive.as_ref()?.clone();
+    pub(super) fn archive_record(&mut self, event: Value, force: bool) {
+        if self.completed_snapshot.is_some() || (!force && self.archive_sequence == 0) {
+            return;
+        }
+        let Some(archive) = self.detail_archive.as_ref() else { return; };
         self.archive_sequence = self.archive_sequence.saturating_add(1);
-        Some(PendingRecord { capture, sequence: self.archive_sequence, event })
+        // A refused enqueue never rewinds expected_records. That gap is
+        // observable both in the journal receipt and in native raw recovery.
+        archive.enqueue(self.archive_sequence, event);
     }
-}
-
-pub(super) fn write(record: Option<PendingRecord>) {
-    if let Some(record) = record { record.write(); }
 }
 
 impl TurnTimingState {
-    pub fn bind_detail_archive(&self, home: &std::path::Path, thread_id: &str, turn_id: &str) {
+    pub fn bind_detail_archive(&self, home: &Path, thread_id: &str, turn_id: &str) {
         let mut state = self.state();
-        if state.detail_archive.is_some() || state.completed_snapshot.is_some() { return; }
-        let artifact = Arc::new(tokio::sync::Mutex::new(RawOutputArtifact::pending(home, thread_id)));
-        let task = RawOutputArtifactTask::spawn(Some(artifact.clone()), Default::default());
-        state.detail_archive = Some(Arc::new(Mutex::new(Capture {
-            task, artifact, notify: Arc::new(Notify::new()), thread_id: thread_id.into(),
-            turn_id: turn_id.into(), received: 0, bytes: 0, digest: Sha256::new(), finishing: false,
-        })));
+        if state.detail_archive.is_some() || state.completed_snapshot.is_some() {
+            return;
+        }
+        state.detail_archive = Some(Arc::new(Archive {
+            home: home.into(),
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            runtime: Handle::try_current().ok(),
+            ingress: Mutex::default(),
+        }));
     }
 
-    pub async fn retain_overflow_details(&self, timing: &mut codex_protocol::protocol::TurnTiming, ephemeral: bool) {
-        let (capture, expected) = {
+    pub async fn retain_overflow_details(
+        &self,
+        timing: &mut codex_protocol::protocol::TurnTiming,
+        ephemeral: bool,
+    ) {
+        let ((finished, ingress_missing), expected) = {
             let state = self.state();
             if state.archive_sequence == 0 {
                 if timing.tool_call_timing_overflow > 0 {
@@ -121,50 +303,36 @@ impl TurnTimingState {
                 }
                 return;
             }
-            (state.detail_archive.clone(), state.archive_sequence)
+            let Some(archive) = state.detail_archive.as_ref() else { return; };
+            (archive.seal(state.archive_sequence), state.archive_sequence)
         };
-        let Some(capture) = capture else { return; };
-        let runtime = tokio::runtime::Handle::current();
-        // Writers hold this mutex across filesystem I/O. Even acquiring it to
-        // start finalization or read a receipt must stay off the async worker.
-        // The blocking owner survives expiry of the terminal observer below.
-        let finish = tokio::task::spawn_blocking(move || {
-            let start = {
-                let mut state = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.finishing { false } else { state.finishing = true; true }
-            };
-            if start {
-                let notify = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).notify.clone();
-                let drained = runtime.block_on(async {
-                    tokio::time::timeout(std::time::Duration::from_millis(100), async {
-                        loop {
-                            let changed = notify.notified();
-                            tokio::pin!(changed);
-                            changed.as_mut().enable();
-                            if capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).received >= expected { break; }
-                            changed.await;
-                        }
-                    }).await.is_ok()
-                });
-                let task = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).task.take();
-                if let Some(mut task) = task {
-                    if !drained { task.mark_output_gap(); }
-                    task.finish_blocking();
-                }
-            }
-            capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).receipt(expected)
-        });
-        let receipt = match tokio::time::timeout(std::time::Duration::from_millis(100), finish).await {
-            Ok(Ok(receipt)) => receipt,
-            result => json!({
+        let receipt = match finished {
+            Ok(mut finished) => match tokio::time::timeout(
+                TERMINAL_OBSERVATION,
+                finished.wait_for(Option::is_some),
+            )
+            .await
+            {
+                Ok(Ok(receipt)) => Ok(receipt.as_ref().expect("matched a writer receipt").clone()),
+                Ok(Err(_)) => Err("archive finalization worker failed"),
+                Err(_) => Err("archive observation timed out"),
+            },
+            Err(reason) => Err(reason),
+        }
+        .unwrap_or_else(|reason| {
+            let mut receipt = json!({
                 "schema_version": 1, "format": "turn-timing-overflow-jsonl-v1",
                 "complete": false, "capture_bound": true, "ephemeral": ephemeral,
-                "expected_records": expected,
-                "reason": if result.is_err() { "archive observation timed out" } else { "archive finalization worker failed" },
-            }),
-        };
+                "expected_records": expected, "reason": reason,
+            });
+            // A stalled writer cannot report final persistence, but rejected
+            // ingress is already known and will never be recovered.
+            if ingress_missing != 0 {
+                receipt["ingress_missing_records"] = ingress_missing.into();
+            }
+            receipt
+        });
         let evidence = timing.measurement_evidence.get_or_insert_with(|| json!({}));
         evidence["toolTimingOverflow"] = receipt;
     }
 }
-

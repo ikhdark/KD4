@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -23,13 +25,14 @@ use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS;
 use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_REQUESTS;
 use codex_code_mode_protocol::host::ProtocolVersion;
-use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
 use codex_utils_pty::ManagedRootProcess;
+use codex_utils_pty::process_observation::ObservedProcess;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::Command;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -40,6 +43,7 @@ use self::driver::ConnectionDriver;
 use self::driver::DriverCommand;
 use self::driver::DriverEvent;
 use self::driver::DriverLifecycle;
+use self::driver::ExecuteClaims;
 pub(super) use self::driver::RemoteSession;
 pub(super) use self::driver::SessionCleanup;
 use self::reader::drive_reader;
@@ -67,10 +71,10 @@ const BACKEND_STALL_EVIDENCE: Duration = Duration::from_secs(1);
 const MAX_BACKEND_STALL_EXTENSIONS: u32 = 5;
 
 pub(super) struct Connection {
-    observation: codex_utils_pty::process_observation::ObservedProcess,
+    observation: ObservedProcess,
     interrupt_cause_supported: bool,
     command_tx: mpsc::Sender<DriverCommand>,
-    execute_claim_tx: mpsc::UnboundedSender<RequestId>,
+    execute_claims: Arc<ExecuteClaims>,
     alive: Arc<AtomicBool>,
     failure: Arc<std::sync::Mutex<Option<String>>>,
     cancellation: CancellationToken,
@@ -103,9 +107,64 @@ impl Drop for AcceptedControlRequest<'_> {
     }
 }
 
-struct ConnectionSupervisor {
+struct OwnedHostProcess {
     child: Child,
-    managed: Arc<ManagedRootProcess>,
+    managed: ManagedRootProcess,
+    observation: ObservedProcess,
+    attached: bool,
+}
+
+/// Keep a post-birth cleanup owner through startup and supervision, even if
+/// either future is dropped before its explicit retirement path runs.
+struct HostProcessGuard {
+    owned: Option<OwnedHostProcess>,
+    runtime: Handle,
+}
+
+impl HostProcessGuard {
+    fn owned_mut(&mut self) -> &mut OwnedHostProcess {
+        self.owned.as_mut().expect("code-mode host still owned")
+    }
+
+    fn start_cleanup(&mut self) -> Option<impl Future<Output = io::Result<()>>> {
+        let OwnedHostProcess {
+            child,
+            managed,
+            observation,
+            attached,
+        } = self.owned.take()?;
+        // A caller can drop its pending spawn future outside the process's
+        // runtime context. Dispatch cleanup on the original runtime.
+        let _runtime = self.runtime.enter();
+        Some(managed.cleanup_observed_child(child, observation, attached))
+    }
+
+    async fn cleanup(mut self) {
+        if let Some(cleanup) = self.start_cleanup()
+            && let Err(error) = cleanup.await
+        {
+            warn!("code-mode host cleanup: {error}");
+        }
+    }
+
+    fn record_reaped(mut self) {
+        if let Some(owned) = self.owned.take() {
+            owned
+                .observation
+                .cleanup_observed("root_reaped; descendants_unknown");
+        }
+    }
+}
+
+impl Drop for HostProcessGuard {
+    fn drop(&mut self) {
+        // Dispatch is synchronous; only the caller's bounded waiter is dropped.
+        drop(self.start_cleanup());
+    }
+}
+
+struct ConnectionSupervisor {
+    process: HostProcessGuard,
     event_tx: mpsc::Sender<DriverEvent>,
     cancellation: CancellationToken,
     alive: Arc<AtomicBool>,
@@ -156,12 +215,11 @@ impl Connection {
             command.creation_flags(/*flags*/ 0x0800_0000); // CREATE_NO_WINDOW
         }
 
-        let managed = Arc::new(
-            ManagedRootProcess::reserve_with_reclaim()
-                .await
-                .map_err(|err| format!("failed to reserve code-mode host process: {err}"))?,
-        );
-        let mut child = command
+        let managed = ManagedRootProcess::reserve_with_reclaim()
+            .await
+            .map_err(|err| format!("failed to reserve code-mode host process: {err}"))?;
+        let runtime = Handle::current();
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -179,22 +237,34 @@ impl Connection {
             child.id(),
             None,
         );
-        let process_id = child
+        let mut process = HostProcessGuard {
+            owned: Some(OwnedHostProcess {
+                child,
+                managed,
+                observation: observation.clone(),
+                attached: false,
+            }),
+            runtime,
+        };
+        let host = process.owned_mut();
+        let process_id = host
+            .child
             .id()
             .ok_or_else(|| "spawned code-mode host has no process id".to_string())?;
 
-        if let Err(err) = managed.attach(process_id) {
-            kill_and_reap(&mut child, &managed).await;
+        if let Err(err) = host.managed.attach(process_id) {
+            process.cleanup().await;
             return Err(format!(
                 "failed to contain code-mode host {}: {err}",
                 host_program.display()
             ));
         }
+        host.attached = true;
 
-        let host_process_id = child.id();
+        let host_process_id = host.child.id();
         tracing::debug!(?host_process_id, host_program = %host_program.display(),
             stage = "spawned", "code-mode host lifecycle");
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = host.child.stderr.take() {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 loop {
@@ -215,11 +285,13 @@ impl Connection {
             });
         }
 
-        let stdin = child
+        let stdin = host
+            .child
             .stdin
             .take()
             .ok_or_else(|| "spawned code-mode host has no stdin".to_string())?;
-        let stdout = child
+        let stdout = host
+            .child
             .stdout
             .take()
             .ok_or_else(|| "spawned code-mode host has no stdout".to_string())?;
@@ -296,7 +368,7 @@ impl Connection {
         let handshake_result = match handshake.await {
             Some(result) => result,
             None => {
-                kill_and_reap(&mut child, &managed).await;
+                process.cleanup().await;
                 return Err("timed out negotiating with the code-mode host".to_string());
             }
         };
@@ -309,7 +381,7 @@ impl Connection {
         ) = match handshake_result {
             Ok(enabled) => enabled,
             Err(err) => {
-                kill_and_reap(&mut child, &managed).await;
+                process.cleanup().await;
                 return Err(err);
             }
         };
@@ -333,7 +405,7 @@ impl Connection {
                 async move { drive_reader(reader, reader_events, reader_cancellation).await },
             );
 
-        let (mut driver, execute_claim_tx) = ConnectionDriver::new(
+        let (mut driver, execute_claims) = ConnectionDriver::new(
             command_rx,
             event_rx,
             event_tx.clone(),
@@ -351,8 +423,7 @@ impl Connection {
         let driver_task = tokio::spawn(driver.run());
         tokio::spawn(
             ConnectionSupervisor {
-                child,
-                managed,
+                process,
                 event_tx,
                 cancellation: cancellation.clone(),
                 alive: Arc::clone(&alive),
@@ -368,7 +439,7 @@ impl Connection {
             observation,
             interrupt_cause_supported,
             command_tx,
-            execute_claim_tx,
+            execute_claims,
             alive,
             failure,
             cancellation,
@@ -436,9 +507,11 @@ impl Connection {
                 return Err(err);
             }
         };
-        self.execute_claim_tx
-            .send(delivered.request_id)
-            .map_err(|_| self.failure_message())?;
+        // Record the exact claim before exposing StartedCell, without an
+        // await that could let caller cancellation abandon the admitted cell.
+        if !self.execute_claims.submit(delivered.request_id) {
+            return Err(self.failure_message());
+        }
         cancellation.disarm();
         Ok(delivered.started)
     }
@@ -588,7 +661,7 @@ impl Drop for Connection {
 
 impl ConnectionSupervisor {
     async fn run(mut self) {
-        let mut child_exited = false;
+        let mut root_reaped = false;
         let mut reader_finished = false;
         let mut driver_finished = false;
         let reason = tokio::select! {
@@ -606,10 +679,12 @@ impl ConnectionSupervisor {
                 task_failure("reader", result)
             },
             result = &mut self.writer_task => task_failure("writer", result),
-            result = self.child.wait() => {
-                child_exited = true;
+            result = self.process.owned_mut().child.wait() => {
                 match result {
-                    Ok(status) => format!("code-mode host exited with status {status}"),
+                    Ok(status) => {
+                        root_reaped = true;
+                        format!("code-mode host exited with status {status}")
+                    }
                     Err(err) => format!("failed waiting for code-mode host: {err}"),
                 }
             }
@@ -630,8 +705,10 @@ impl ConnectionSupervisor {
             }
         }
         self.cancellation.cancel();
-        if !child_exited {
-            kill_and_reap(&mut self.child, &self.managed).await;
+        if root_reaped {
+            self.process.record_reaped();
+        } else {
+            self.process.cleanup().await;
         }
     }
 }
@@ -772,18 +849,6 @@ fn failure_message(failure: &std::sync::Mutex<Option<String>>) -> String {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
         .unwrap_or_else(|| "code-mode host connection closed".to_string())
-}
-
-async fn kill_and_reap(child: &mut Child, managed: &Arc<ManagedRootProcess>) {
-    let owner = Arc::clone(managed);
-    let _ = codex_utils_pty::run_windows_process_operation(
-        codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT,
-        move || owner.terminate(),
-    )
-    .await;
-
-    let _ = child.start_kill();
-    let _ = child.wait().await;
 }
 
 /// Whether this process is attached to a console, with or without a window.

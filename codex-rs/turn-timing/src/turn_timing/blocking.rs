@@ -63,13 +63,14 @@ impl BlockingGuard<'_> {
             );
             interval.cancelled = cancelled;
         }
-        let record = overflow.and_then(|mut interval| {
+        if let Some(mut interval) = overflow {
             interval.end_ns = Some(u64::try_from(end).unwrap_or(u64::MAX).max(interval.start_ns));
             interval.cancelled = cancelled;
-            state.archive_record(serde_json::json!({"kind":"blocking_interval", "interval":interval}), true)
-        });
-        drop(state);
-        super::detail_archive::write(record);
+            state.archive_record(
+                serde_json::json!({"kind":"blocking_interval", "interval":interval}),
+                true,
+            );
+        }
     }
 }
 
@@ -149,13 +150,18 @@ impl TurnTimingState {
                             });
                         }
                     }
-                    let edge_record = dropped_edge.and_then(|edge| state.archive_record(
-                        serde_json::json!({"kind":"dependency", "edge":edge}), true));
-                    let interval_record = dropped_interval.and_then(|interval| state.archive_record(
-                        serde_json::json!({"kind":"blocking_interval", "interval":interval}), true));
-                    drop(state);
-                    super::detail_archive::write(edge_record);
-                    super::detail_archive::write(interval_record);
+                    if let Some(edge) = dropped_edge {
+                        state.archive_record(
+                            serde_json::json!({"kind":"dependency", "edge":edge}),
+                            true,
+                        );
+                    }
+                    if let Some(interval) = dropped_interval {
+                        state.archive_record(
+                            serde_json::json!({"kind":"blocking_interval", "interval":interval}),
+                            true,
+                        );
+                    }
                 }
                 Poll::Pending
             }

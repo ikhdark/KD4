@@ -1358,6 +1358,11 @@ async fn run_main_owned(
                                     processor
                                         .connection_closed(connection_id, &connection_state.session)
                                         .await;
+                                    tracing::debug!(
+                                        target: "codex_app_server::queue_origin_custody",
+                                        ?connection_id,
+                                        "retired queue-origin connection"
+                                    );
                                     if let Some(tx) = cleanup_complete {
                                         let _ = tx.send(());
                                     }

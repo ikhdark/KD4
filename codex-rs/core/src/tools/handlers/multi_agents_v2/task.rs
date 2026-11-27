@@ -2005,8 +2005,8 @@ impl_json_output!(AbandonAgentTaskResult, ABANDON_AGENT_TASK_TOOL);
 fn get_agent_task_spec() -> ToolSpec {
     function_spec(
         GET_AGENT_TASK_TOOL,
-        "Read a durable task's current attempt, gates, receipt, evidence and recent observations. \
-         With attempt_id, recover only that exact attempt and its sealed receipt, even after a follow-up; this historical result is not acceptance or current gate state. \
+        "Read a durable task. In the full result, use result.task.current_attempt.state, result.task.receipt, and result.task for gates, evidence and recent observations. \
+         With attempt_id, recover only that exact result.attempt and its sealed result.receipt at the top level, even after a follow-up; this historical result is not acceptance or current gate state. \
          Bound Reviewers, Verifiers and Integrators use their OWN assignment_id for compact \
          target/dependency handoffs. Recover only needed contract, receipt or evidence fields \
          with read_tool_output using canonical_recovery.artifact_id and the supplied JSON pointers. \

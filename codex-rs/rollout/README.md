@@ -56,11 +56,10 @@ output bytes, terminal stdin, and provider-supplied reasoning text. Output
 chunks retain their protocol base64 encoding. Access and retention follow the
 existing rollout directory policy.
 
-For request-attempt and execution diagnostics beyond the emitted activity,
-the existing `CODEX_ROLLOUT_TRACE_ROOT` environment variable enables separate
-trace bundles. This feature neither enables those bundles nor copies them into
-the rollout. Completed summaries, plans and tool results already persist
-without either diagnostic option.
+For request diagnostics on persisted turns, inspect the `context_replay`
+capture for the matching sampling request and physical attempt. This is
+separate from activity events. Completed summaries, plans and tool results
+persist even when intermediate activity recording is disabled.
 
 Operational history (`RolloutRecorder::load_rollout_items` and the dependency-
 version variant) excludes diagnostic `context_replay` snapshots. Recognized

@@ -185,9 +185,13 @@ fn inventory(directory: &Path, artifact_id: &str, family_only: bool) -> std::io:
         let Some(name) = name.to_str() else {
             continue;
         };
+        let durable_receipt_stem = name
+            .strip_suffix(super::DURABLE_RECEIPT_PROTECTION_EXTENSION)
+            .and_then(|prefix| prefix.strip_suffix('.'));
         let stem = logical_artifact_stem(name)
             .or_else(|| name.strip_suffix(".active-tool-history"))
-            .or_else(|| name.strip_suffix(".status"));
+            .or_else(|| name.strip_suffix(".status"))
+            .or(durable_receipt_stem);
         let Some(stem) = stem else {
             continue;
         };
@@ -195,7 +199,8 @@ fn inventory(directory: &Path, artifact_id: &str, family_only: bool) -> std::io:
             continue;
         }
         let allocation = allocation(&entry.path())?;
-        let payload = name.ends_with(".log") || name.contains(".segment-");
+        let payload =
+            durable_receipt_stem.is_none() && (name.ends_with(".log") || name.contains(".segment-"));
         thread.add(&allocation, payload)?;
         if stem == artifact_id {
             artifact.add(&allocation, payload)?;

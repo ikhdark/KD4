@@ -1,5 +1,10 @@
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -7,6 +12,7 @@ use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::RequestId;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +40,83 @@ pub(super) struct DriverLifecycle {
     pub(super) cancellation: CancellationToken,
 }
 
+/// Execute-result claims in caller submission order. Only IDs backed by a
+/// tracker obligation can enter the queue; tracker retirement revokes even a
+/// claim that is already queued. Each eligible ID is charged to a tracker
+/// operation, and stale submissions never consume capacity.
+#[derive(Default)]
+pub(super) struct ExecuteClaims {
+    state: Mutex<ExecuteClaimState>,
+    ready: Notify,
+}
+
+#[derive(Default)]
+struct ExecuteClaimState {
+    closed: bool,
+    // Whether each eligible request ID has already been queued.
+    live: HashMap<RequestId, bool>,
+    queued: VecDeque<RequestId>,
+}
+
+impl ExecuteClaims {
+    fn state(&self) -> MutexGuard<'_, ExecuteClaimState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn register(&self, id: RequestId) {
+        let replaced = self.state().live.insert(id, false);
+        debug_assert!(replaced.is_none());
+    }
+
+    pub(super) fn submit(&self, id: RequestId) -> bool {
+        let mut state = self.state();
+        if state.closed {
+            return false;
+        }
+        let Some(queued) = state.live.get_mut(&id) else {
+            // Shutdown can retire the row before the caller sees the result.
+            // Such a claim was already a no-op in the driver.
+            return true;
+        };
+        if !*queued {
+            *queued = true;
+            state.queued.push_back(id);
+            drop(state);
+            self.ready.notify_one();
+        }
+        true
+    }
+
+    fn retire(&self, id: RequestId) {
+        let mut state = self.state();
+        if state.live.remove(&id) == Some(true) {
+            state.queued.retain(|queued| *queued != id);
+        }
+    }
+
+    async fn recv(&self) -> RequestId {
+        loop {
+            {
+                let mut state = self.state();
+                if let Some(id) = state.queued.pop_front() {
+                    state.live.remove(&id);
+                    return id;
+                }
+            }
+            // The single receiver rechecks the queue after a wake; notify_one
+            // also keeps a permit for a submission before it starts waiting.
+            self.ready.notified().await;
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state();
+        state.closed = true;
+        state.live.clear();
+        state.queued.clear();
+    }
+}
+
 pub(super) struct ConnectionDriver {
     pub(super) tool_catalog_references: bool,
     pub(super) named_state_snapshots: bool,
@@ -46,7 +129,7 @@ pub(super) struct ConnectionDriver {
     command_rx: mpsc::Receiver<DriverCommand>,
     event_rx: mpsc::Receiver<DriverEvent>,
     event_tx: mpsc::Sender<DriverEvent>,
-    execute_claim_rx: mpsc::UnboundedReceiver<RequestId>,
+    execute_claims: Arc<ExecuteClaims>,
     outgoing_tx: mpsc::Sender<EncodedFrame>,
     requests: RequestTracker,
     sessions: SessionRegistry,
@@ -85,8 +168,8 @@ impl ConnectionDriver {
         event_tx: mpsc::Sender<DriverEvent>,
         outgoing_tx: mpsc::Sender<EncodedFrame>,
         lifecycle: DriverLifecycle,
-    ) -> (Self, mpsc::UnboundedSender<RequestId>) {
-        let (execute_claim_tx, execute_claim_rx) = mpsc::unbounded_channel();
+    ) -> (Self, Arc<ExecuteClaims>) {
+        let execute_claims = Arc::new(ExecuteClaims::default());
         (
             Self {
                 tool_catalog_references: false,
@@ -97,9 +180,9 @@ impl ConnectionDriver {
                 command_rx,
                 event_rx,
                 event_tx: event_tx.clone(),
-                execute_claim_rx,
+                execute_claims: Arc::clone(&execute_claims),
                 outgoing_tx,
-                requests: RequestTracker::new(),
+                requests: RequestTracker::new(Arc::clone(&execute_claims)),
                 sessions: SessionRegistry::new(),
                 delegates: DelegateRuntime::new(event_tx),
                 alive: lifecycle.alive,
@@ -108,7 +191,7 @@ impl ConnectionDriver {
                 failed: false,
                 stall_observed: tokio::time::Instant::now(),
             },
-            execute_claim_tx,
+            execute_claims,
         )
     }
 
@@ -118,7 +201,7 @@ impl ConnectionDriver {
             StallProbe(std::time::Duration),
             StallTick,
             Event(Option<DriverEvent>),
-            Claim(Option<RequestId>),
+            Claim(RequestId),
             Command(Option<DriverCommand>),
         }
         let mut ticks = tokio::time::interval(super::BACKEND_STALL_TICK);
@@ -153,7 +236,7 @@ impl ConnectionDriver {
                     // default fair selector rather than event-first priority.
                     tokio::select! {
                         event = self.event_rx.recv() => Ready::Event(event),
-                        claim = self.execute_claim_rx.recv() => Ready::Claim(claim),
+                        claim = tokio::task::coop::cooperative(self.execute_claims.recv()) => Ready::Claim(claim),
                         command = self.command_rx.recv() => Ready::Command(command),
                     }
                 } => ready,
@@ -197,13 +280,7 @@ impl ConnectionDriver {
                         return;
                     }
                 }
-                Ready::Claim(claim) => {
-                    let Some(request_id) = claim else {
-                        self.fail("code-mode execute claim stream closed".to_string());
-                        return;
-                    };
-                    self.requests.claim_execute(request_id);
-                }
+                Ready::Claim(request_id) => self.requests.claim_execute(request_id),
                 Ready::Command(command) => {
                     let Some(command) = command else {
                         self.fail("code-mode host command stream closed".to_string());

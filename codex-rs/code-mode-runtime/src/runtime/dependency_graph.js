@@ -24,9 +24,12 @@ Object.defineProperty(globalThis, "run_graph", {
       ["exit_code", "execution_state", "process_exited"].some(
         (key) => key in value,
       );
+    const isProcessSubscription = (value) =>
+      value?.subscription_closed === true && Number.isSafeInteger(value.session_id) &&
+      typeof value.incarnation === "string" && typeof value.exit_status === "string";
     const resultsSucceeded = (value) =>
       (Array.isArray(value) ? value : [value]).every(
-        (item) => item?.success !== false &&
+        (item) => item?.success !== false && !isProcessSubscription(item) &&
           (item?.completion_recovered !== true || item.success === true) &&
           (!isCommand(item) ||
             (item.error == null && item.exit_code === 0 &&
@@ -266,8 +269,10 @@ Object.defineProperty(globalThis, "run_graph", {
           graph.get(a).ordinal - graph.get(b).ordinal,
       );
     const results = Object.create(null);
-    const observation = observeGraph?.("graph", admissionOrder.map((id) => ({id, deps: graph.get(id).deps})));
     const priority = new Map(admissionOrder.map((id, i) => [id, i]));
+    // Give native provenance exact names once and graph-local edge indexes.
+    const observation = observeGraph?.("graph", admissionOrder,
+      admissionOrder.map((id) => graph.get(id).deps.map((dep) => priority.get(dep))));
     const remainingDeps = new Map(
       admissionOrder.map((id) => [id, graph.get(id).deps.length]),
     );
@@ -377,7 +382,8 @@ Object.defineProperty(globalThis, "run_graph", {
       for (const key of lease.write) writers.delete(key);
     }
     async function execute(id, node) {
-      const previousContext = observeGraph?.("enter", observation, id);
+      const index = priority.get(id);
+      const previousContext = observeGraph?.("enter", observation, id, index);
       let value,
         produced = false;
       try {
@@ -406,7 +412,7 @@ Object.defineProperty(globalThis, "run_graph", {
           ? { status: "rejected", value, reason }
           : { status: "rejected", reason };
       } finally {
-        observeGraph?.("leave", observation, id, previousContext, results[id]?.status ?? "interrupted");
+        observeGraph?.("leave", observation, id, index, previousContext, results[id]?.status ?? "interrupted");
       }
     }
     while (remaining) {

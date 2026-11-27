@@ -20,7 +20,6 @@ use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::task;
@@ -374,38 +373,76 @@ impl ConfigDocument {
         self.remove(&resolved)
     }
 
-    fn add_tool_suggest_disabled_tool(&mut self, disabled_tool: &ToolSuggestDisabledTool) -> bool {
-        let disabled_tools_item = self
+    // Compare normalized typed IDs without cleaning up or reformatting any stored entry.
+    fn has_tool_suggest_disabled_tool(&self, disabled_tool: &ToolSuggestDisabledTool) -> bool {
+        let item = self
             .doc
             .get("tool_suggest")
-            .and_then(|item| item.as_table_like())
+            .and_then(TomlItem::as_table_like)
             .and_then(|table| table.get("disabled_tools"));
-        let existing_from_array = disabled_tools_item
-            .and_then(|item| item.as_value())
-            .and_then(|value| value.as_array())
-            .into_iter()
-            .flat_map(|array| array.iter())
-            .filter_map(document_helpers::parse_tool_suggest_disabled_tool);
-        let existing_from_tables = disabled_tools_item
-            .and_then(|item| match item {
-                TomlItem::ArrayOfTables(array) => Some(array),
-                _ => None,
-            })
-            .into_iter()
-            .flat_map(|array| array.iter())
-            .filter_map(document_helpers::parse_tool_suggest_disabled_tool_table);
+        let is_duplicate = |existing: ToolSuggestDisabledTool| {
+            existing.normalized().as_ref() == Some(disabled_tool)
+        };
+        match item {
+            Some(TomlItem::Value(toml_edit::Value::Array(array))) => array
+                .iter()
+                .filter_map(document_helpers::parse_tool_suggest_disabled_tool)
+                .any(is_duplicate),
+            Some(TomlItem::ArrayOfTables(tables)) => tables
+                .iter()
+                .filter_map(document_helpers::parse_tool_suggest_disabled_tool_table)
+                .any(is_duplicate),
+            _ => false,
+        }
+    }
 
-        let mut seen = HashSet::new();
-        let disabled_tools = existing_from_array
-            .chain(existing_from_tables)
-            .chain(std::iter::once(disabled_tool.clone()))
-            .filter_map(|disabled_tool| disabled_tool.normalized())
-            .filter(|disabled_tool| seen.insert(disabled_tool.clone()))
-            .collect::<Vec<_>>();
-        self.write_value(
-            &["tool_suggest", "disabled_tools"],
-            document_helpers::tool_suggest_disabled_tools_value(&disabled_tools),
-        )
+    fn add_tool_suggest_disabled_tool(&mut self, disabled_tool: &ToolSuggestDisabledTool) -> bool {
+        let Some(disabled_tool) = disabled_tool.normalized() else {
+            return false;
+        };
+        if self.has_tool_suggest_disabled_tool(&disabled_tool) {
+            return false;
+        }
+
+        let mut new_items = document_helpers::tool_suggest_disabled_tools_value(
+            std::slice::from_ref(&disabled_tool),
+        );
+        let Some(parent) = self
+            .doc
+            .get_mut("tool_suggest")
+            .and_then(TomlItem::as_table_like_mut)
+        else {
+            // Retain the usual creation and malformed-parent handling.
+            return self.write_value(&["tool_suggest", "disabled_tools"], new_items);
+        };
+
+        match parent.get_mut("disabled_tools") {
+            Some(TomlItem::Value(toml_edit::Value::Array(array))) => {
+                let entry = new_items
+                    .as_array_mut()
+                    .expect("disabled tools serialize to an array")
+                    .remove(0);
+                array.push(entry);
+            }
+            Some(TomlItem::ArrayOfTables(tables)) => {
+                let mut entry = new_items
+                    .into_array_of_tables()
+                    .expect("disabled tools serialize to an array of inline tables")
+                    .remove(0);
+                // Emit after all parsed tables, including interleaved child tables
+                // of the preceding records, so none attach to the new record.
+                entry.set_position(Some(isize::MAX));
+                tables.push(entry);
+            }
+            Some(existing) => {
+                Self::preserve_decor(existing, &mut new_items);
+                *existing = new_items;
+            }
+            None => {
+                parent.insert("disabled_tools", new_items);
+            }
+        }
+        true
     }
 
     fn replace_mcp_servers(&mut self, servers: &BTreeMap<String, McpServerConfig>) -> bool {
@@ -813,13 +850,23 @@ fn apply_blocking_to_resolved_file_with_snapshot<T>(
     // under this same writer lock so clearing one cannot resurrect a raw alias.
     let migrated = codex_config::loader::migrate_config_document(&mut doc, resolved_config_file)?;
     let mut document = ConfigDocument::new(doc);
-    let mut mutated = migrated;
+    let mut mutated = false;
 
     for edit in edits {
         mutated |= document.apply(edit)?;
     }
 
-    if !mutated {
+    // An already-persisted preference is a byte-level no-op even if the
+    // loaded document needed an unrelated in-memory migration.
+    if !mutated
+        && (!migrated
+            || edits.iter().all(|edit| match edit {
+                ConfigEdit::AddToolSuggestDisabledTool(disabled_tool) => disabled_tool
+                    .normalized()
+                    .is_some_and(|entry| document.has_tool_suggest_disabled_tool(&entry)),
+                _ => false,
+            }))
+    {
         return snapshot(&serialized).map(Some);
     }
 

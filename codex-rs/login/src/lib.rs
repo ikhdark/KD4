@@ -31,6 +31,7 @@ pub use success_page::LoginSuccessPageBrand;
 pub use auth::AgentIdentityAuthPolicy;
 pub use auth::AuthConfig;
 pub use auth::AuthDotJson;
+pub use auth::AuthFileSizeError;
 pub use auth::AuthHeaders;
 pub use auth::AuthKeyringBackendKind;
 pub use auth::AuthManager;

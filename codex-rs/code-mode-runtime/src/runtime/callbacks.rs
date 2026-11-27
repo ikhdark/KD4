@@ -128,7 +128,8 @@ pub(super) fn tool_callback(
         let cell = scope.get_slot::<RuntimeState>().map(|state| state.tool_call_id.clone());
         let context = scope.get_continuation_preserved_embedder_data();
         let graph_node = v8::Local::<v8::String>::try_from(context).ok()
-            .map(|value| value.to_rust_string_lossy(scope));
+            .map(|value| value.to_rust_string_lossy(scope))
+            .map(|context| graph_trace_operation(&context).unwrap_or(context));
         let _ = codex_protocol::timing::observations::record("nested_tool_dispatched", "", "", &id,
             serde_json::json!({"cell_call_id":cell, "graph_node":graph_node,
                 "shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
@@ -145,6 +146,138 @@ pub(super) fn aggregate_observation_callback(
 ) {
     let join_all = args.get(0).is_true();
     super::causal::aggregate(scope, join_all, args.get(1), args.get(2));
+}
+
+// Leave room for the enclosing runtime observation row (whose cap is 1 MiB).
+const LEGACY_GRAPH_TRACE_BYTES: usize = 1024 * 1024 - 1024;
+const MAX_GRAPH_NODES: u32 = 256;
+const MAX_GRAPH_NAME_UNITS: usize = 256;
+
+enum GraphName {
+    Text(String),
+    Utf16(Vec<u16>),
+}
+
+impl GraphName {
+    fn read(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> Option<Self> {
+        let value = v8::Local::<v8::String>::try_from(value).ok()?;
+        let length = value.length();
+        if !(1..=MAX_GRAPH_NAME_UNITS).contains(&length) {
+            return None;
+        }
+        let mut units = [0; MAX_GRAPH_NAME_UNITS];
+        let units = &mut units[..length];
+        value.write_v2(scope, 0, units, v8::WriteFlags::empty());
+        // JS accepts unpaired surrogates in IDs. Neither a lossy Rust string
+        // nor a JSON string can distinguish them from all other JS IDs.
+        Some(match String::from_utf16(units) {
+            Ok(name) => Self::Text(name),
+            Err(_) => Self::Utf16(units.to_vec()),
+        })
+    }
+
+    fn trace_value(&self) -> serde_json::Value {
+        match self {
+            Self::Text(name) => serde_json::json!(name),
+            Self::Utf16(units) => serde_json::json!({"utf16":units}),
+        }
+    }
+
+    fn trace_operation(&self, graph: &str, index: u8) -> String {
+        match self {
+            Self::Text(name) => format!("{graph}:{name}"),
+            Self::Utf16(_) => format!("{graph}/{index}"),
+        }
+    }
+}
+
+struct GraphTopology {
+    names: Vec<GraphName>,
+    deps: Vec<Vec<u8>>,
+}
+
+impl GraphTopology {
+    fn read(
+        scope: &mut v8::PinScope<'_, '_>,
+        names: v8::Local<'_, v8::Value>,
+        deps: v8::Local<'_, v8::Value>,
+    ) -> Option<Self> {
+        let names = v8::Local::<v8::Array>::try_from(names).ok()?;
+        let deps = v8::Local::<v8::Array>::try_from(deps).ok()?;
+        let count = names.length();
+        if !(1..=MAX_GRAPH_NODES).contains(&count) || deps.length() != count {
+            return None;
+        }
+        let mut graph = Self {
+            names: Vec::with_capacity(count as usize),
+            deps: Vec::with_capacity(count as usize),
+        };
+        for index in 0..count {
+            let name = names.get_index(scope, index)?;
+            graph.names.push(GraphName::read(scope, name)?);
+            let row = v8::Local::<v8::Array>::try_from(deps.get_index(scope, index)?).ok()?;
+            let len = row.length();
+            if len >= count {
+                return None;
+            }
+            let mut edges = Vec::with_capacity(len as usize);
+            for offset in 0..len {
+                let dep = v8::Local::<v8::Uint32>::try_from(row.get_index(scope, offset)?)
+                    .ok()?
+                    .value();
+                if dep >= count || dep == index {
+                    return None;
+                }
+                edges.push(dep as u8);
+            }
+            graph.deps.push(edges);
+        }
+        Some(graph)
+    }
+
+    fn trace_definition(&self, cell: &str) -> serde_json::Value {
+        // Only expand a topology if it can fit the legacy trace shape. Count
+        // escaped names once, then account for their repeated edge references.
+        let text_lengths = self.names.iter().map(|name| match name {
+            GraphName::Text(name) => serde_json::to_string(name).ok().map(|value| value.len()),
+            GraphName::Utf16(_) => None,
+        }).collect::<Option<Vec<_>>>();
+        let names: Vec<_> = self.names.iter().map(GraphName::trace_value).collect();
+        if let Some(lengths) = text_lengths {
+            let size = 2 + self.deps.len().saturating_sub(1) + self.deps.iter().enumerate()
+                .map(|(index, deps)| {
+                    r#"{"id":,"deps":[]}"#.len() + lengths[index] + deps.len().saturating_sub(1)
+                        + deps.iter().map(|&dep| lengths[usize::from(dep)]).sum::<usize>()
+                }).sum::<usize>();
+            let cell_size = serde_json::to_string(cell).map_or(usize::MAX, |value| value.len());
+            if size.saturating_add(cell_size) <= LEGACY_GRAPH_TRACE_BYTES {
+                return serde_json::Value::Array(self.deps.iter().enumerate().map(|(index, deps)| {
+                    let deps: Vec<_> = deps.iter().map(|&dep| &names[usize::from(dep)]).collect();
+                    serde_json::json!({"id":names[index], "deps":deps})
+                }).collect());
+            }
+        }
+        // Admission order indexes both arrays, and each row retains declared
+        // edge order. Even the densest valid DAG fits the journal row budget.
+        serde_json::json!({"encoding":"indexed-v1", "nodes":names, "deps":self.deps})
+    }
+}
+
+fn graph_node_index(value: v8::Local<'_, v8::Value>) -> Option<u8> {
+    u8::try_from(v8::Local::<v8::Uint32>::try_from(value).ok()?.value()).ok()
+}
+
+// The private V8 tag carries an index for causal lookup but preserves the
+// original trace operation for scalar IDs, including IDs containing ':' or '/'.
+fn graph_trace_operation(context: &str) -> Option<String> {
+    let (graph, node) = context.split_once('/')?;
+    if !graph.starts_with("graph-") {
+        return None;
+    }
+    Some(match node.split_once(':') {
+        Some((_, name)) => format!("{graph}:{name}"),
+        None => context.to_owned(),
+    })
 }
 
 /// Private adapter captured by the validated run_graph helper and then removed
@@ -183,45 +316,64 @@ pub(super) fn graph_observation_callback(
         }
         "helper_leave" => scope.set_continuation_preserved_embedder_data(args.get(2)),
         "graph" => {
-            let definition = v8_value_to_json(scope, args.get(1)).ok().flatten();
+            let topology = GraphTopology::read(scope, args.get(1), args.get(2));
+            let trace_enabled = codex_protocol::timing::observations::enabled();
+            let definition = topology.as_ref().filter(|_| trace_enabled)
+                .map(|topology| topology.trace_definition(&cell));
             if let Some(state) = scope.get_slot_mut::<RuntimeState>()
-                && let Some(definition) = definition.as_ref() {
-                state.causal.graph(&key, definition);
+                && let Some(topology) = topology {
+                state.causal.graph(&key, topology.deps);
             }
-            let observation = codex_protocol::timing::observations::Span::start("graph", "", "", &key,
-                serde_json::json!({"cell_call_id":cell, "definition":definition,
-                    "shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
-            if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-                if state.graph_observations.len() < 1024 { state.graph_observations.insert(key.clone(), observation); }
+            if trace_enabled {
+                let shared = codex_code_mode_protocol::shared_monotonic_now();
+                let data = match definition {
+                    Some(definition) => serde_json::json!({"cell_call_id":cell,
+                        "definition":definition, "shared_ns":shared}),
+                    None => serde_json::json!({"cell_call_id":cell, "definition":null,
+                        "definition_unavailable_reason":"invalid_topology", "shared_ns":shared}),
+                };
+                let observation = codex_protocol::timing::observations::Span::start("graph", "", "", &key, data);
+                if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+                    if state.graph_observations.len() < 1024 { state.graph_observations.insert(key.clone(), observation); }
+                }
             }
             if let Some(value) = v8::String::new(scope, &key) { retval.set(value.into()); }
         }
         "enter" => {
-            let node = args.get(2).to_rust_string_lossy(scope);
-            let operation = format!("{key}:{node}");
             let previous = scope.get_continuation_preserved_embedder_data();
-            let observation = codex_protocol::timing::observations::Span::start("graph_node", "", "", &operation,
-                serde_json::json!({"graph_id":key, "node_id":node, "cell_call_id":cell,
-                    "shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
-            if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-                if state.graph_observations.len() < 1024 { state.graph_observations.insert(operation.clone(), observation); }
-            }
-            if let Some(value) = v8::String::new(scope, &operation) {
-                scope.set_continuation_preserved_embedder_data(value.into());
-            }
             retval.set(previous);
+            if let (Some(index), Some(node)) = (graph_node_index(args.get(3)), GraphName::read(scope, args.get(2))) {
+                let operation = node.trace_operation(&key, index);
+                let context = match &node {
+                    GraphName::Text(name) => format!("{key}/{index}:{name}"),
+                    GraphName::Utf16(_) => operation.clone(),
+                };
+                let observation = codex_protocol::timing::observations::Span::start("graph_node", "", "", &operation,
+                    serde_json::json!({"graph_id":key, "node_id":node.trace_value(), "cell_call_id":cell,
+                        "shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
+                if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+                    if state.graph_observations.len() < 1024 { state.graph_observations.insert(operation, observation); }
+                }
+                if let Some(value) = v8::String::new(scope, &context) {
+                    scope.set_continuation_preserved_embedder_data(value.into());
+                }
+            }
         }
         "leave" => {
-            let node = args.get(2).to_rust_string_lossy(scope);
-            if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-                state.causal.graph_finished(format!("{key}:{node}"));
+            if let Some(index) = graph_node_index(args.get(3)) {
+                if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+                    state.causal.graph_finished(&key, index);
+                }
+                if let Some(node) = GraphName::read(scope, args.get(2)) {
+                    let operation = node.trace_operation(&key, index);
+                    let outcome = args.get(5).to_rust_string_lossy(scope);
+                    if let Some(observation) = scope.get_slot_mut::<RuntimeState>()
+                        .and_then(|state| state.graph_observations.remove(&operation)) {
+                        observation.finish(&outcome, serde_json::json!({"shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
+                    }
+                }
             }
-            let outcome = args.get(4).to_rust_string_lossy(scope);
-            if let Some(observation) = scope.get_slot_mut::<RuntimeState>()
-                .and_then(|state| state.graph_observations.remove(&format!("{key}:{node}"))) {
-                observation.finish(&outcome, serde_json::json!({"shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
-            }
-            scope.set_continuation_preserved_embedder_data(args.get(3));
+            scope.set_continuation_preserved_embedder_data(args.get(4));
         }
         "finish" => {
             let outcome = args.get(2).to_rust_string_lossy(scope);

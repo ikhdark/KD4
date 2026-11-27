@@ -265,7 +265,6 @@ pub async fn run() -> Result<()> {
         command,
     } = cli;
 
-    let dynamic_tools = parse_dynamic_tools_arg(&dynamic_tools)?;
     let command_timeout = command_timeout_seconds.map(Duration::from_secs);
     let resolve_endpoint = |codex_bin, url| {
         let endpoint = resolve_endpoint(codex_bin, url)?;
@@ -304,15 +303,9 @@ pub async fn run() -> Result<()> {
             thread_id,
             user_message,
         } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "resume-message-v2")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
-            resume_message_v2(
-                &endpoint,
-                &config_overrides,
-                thread_id,
-                user_message,
-                &dynamic_tools,
-            )
-            .await
+            resume_message_v2(&endpoint, &config_overrides, thread_id, user_message).await
         }
         CliCommand::ThreadResume { thread_id } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-resume")?;
@@ -568,11 +561,12 @@ async fn send_message_v2_endpoint(
     config_overrides: &[String],
     user_message: String,
     experimental_api: bool,
-    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
+    dynamic_tools_arg: &Option<String>,
 ) -> Result<()> {
-    if dynamic_tools.is_some() && !experimental_api {
+    if dynamic_tools_arg.is_some() && !experimental_api {
         bail!("--dynamic-tools requires --experimental-api for send-message-v2");
     }
+    let dynamic_tools = parse_dynamic_tools_arg(dynamic_tools_arg)?;
 
     send_message_v2_with_policies(
         endpoint,
@@ -581,7 +575,7 @@ async fn send_message_v2_endpoint(
         SendMessagePolicies {
             command_name: "send-message-v2",
             experimental_api,
-            dynamic_tools,
+            dynamic_tools: &dynamic_tools,
         },
     )
     .await
@@ -592,10 +586,7 @@ async fn resume_message_v2(
     config_overrides: &[String],
     thread_id: String,
     user_message: String,
-    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
 ) -> Result<()> {
-    ensure_dynamic_tools_unused(dynamic_tools, "resume-message-v2")?;
-
     with_client("resume-message-v2", endpoint, config_overrides, |client| {
         let initialize = client.initialize()?;
         println!("< initialize response: {initialize:?}");
@@ -899,10 +890,7 @@ fn thread_hold_elicitation(url: &str, thread_id: String, hold_seconds: u64) -> R
 }
 
 
-fn ensure_dynamic_tools_unused(
-    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
-    command: &str,
-) -> Result<()> {
+fn ensure_dynamic_tools_unused(dynamic_tools: &Option<String>, command: &str) -> Result<()> {
     if dynamic_tools.is_some() {
         bail!(
             "dynamic tools are only supported for v2 thread/start; remove --dynamic-tools for {command} or use send-message-v2"

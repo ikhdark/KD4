@@ -1459,7 +1459,9 @@
         if (eof?.session_id != null && (eof.session_id !== handle.session_id ||
             eof.session_capabilities?.incarnation !== handle.incarnation))
           throw new Error("EOF returned a different owner");
-        const collection = await globalThis.await_command(eof);
+        // Earlier interactions may already have drained output. Include those
+        // receipts in order without polling them again.
+        const collection = await collectCommand(eof, undefined, [launch, sent]);
         return { sent, eof, collection, terminal: collection.terminal };
       } catch (cause) {
         throw Object.assign(new Error("stdin exchange incomplete: " + cause.message, { cause }),
@@ -1468,10 +1470,10 @@
     },
   });
 
-  Object.defineProperty(globalThis, "await_command", {
-    value: async function await_command(
+  async function collectCommand(
       initial,
       { max_observations = 256, max_wait_ms = 300_000, max_bytes = 4 * 1024 * 1024, on_progress } = {},
+      prior = [],
     ) {
       try {
         integer(max_observations, 1, 1024, "max_observations");
@@ -1502,7 +1504,8 @@
       const packetSnapshots = [];
       let incremental = on_progress === undefined && typeof nativeIsProxy === "function";
       const evidenceFramingBytes = bytes('{"observations":[]}');
-      let current = initial;
+      let nextPrior = 0;
+      let current = prior[nextPrior++] ?? initial;
       let session;
       let incarnation;
       const reject = (message, evidence, code = "failed", cause) => {
@@ -1556,7 +1559,13 @@
               let joined = "";
               for (let index = 0; index < observations.length; ++index)
                 joined += observations[index]?.output ?? "";
-              return joined;
+              // A prior observer may already have drained the process. Use its
+              // bounded terminal transcript only in lieu of an empty display;
+              // never append it to deltas or promote it to exact pipe data.
+              const terminal = evidence.terminal;
+              return !joined && terminal?.retained_output_complete === true &&
+                typeof terminal.retained_output === "string"
+                ? terminal.retained_output : joined;
             },
             configurable: true,
           },
@@ -1582,10 +1591,12 @@
           streamsExact = false;
         }
         if (current?.execution_state === "exited" && current?.process_exited === true && current.session_id == null) {
-          if (streamsExact && streamsObserved) {
+          if (current.output_drained === true && streamsExact && streamsObserved) {
             evidence.stdout = streamParts[0].join("");
             evidence.stderr = streamParts[1].join("");
             evidence.streams_complete = true;
+            evidence.stream_chunks_complete = true;
+            evidence.stream_ranges = streamEnds.map(end => ({ start: 0, end }));
           } else if (current.streams_complete === true && typeof current.stdout === "string" && typeof current.stderr === "string") {
             // Compatibility with hosts whose terminal receipt owns both whole
             // streams, rather than independent per-receipt ranges.
@@ -1685,6 +1696,10 @@
         if (observations.length >= max_observations)
           reject("command observation limit reached", evidence);
         try {
+          if (current !== initial && nextPrior <= prior.length) {
+            current = prior[nextPrior++] ?? initial;
+            continue;
+          }
           if (on_progress && (await on_progress(current)) !== true)
             reject("command progress needs review", evidence);
           const remaining = Math.floor(deadline - now());
@@ -1714,6 +1729,11 @@
           );
         }
       }
+  }
+
+  Object.defineProperty(globalThis, "await_command", {
+    value: async function await_command(initial, options) {
+      return collectCommand(initial, options);
     },
   });
 })();

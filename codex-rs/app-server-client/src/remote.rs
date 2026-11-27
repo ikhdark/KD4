@@ -15,6 +15,9 @@ use std::collections::VecDeque;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Duration;
 
 use crate::AppServerEvent;
@@ -42,7 +45,9 @@ use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
+use futures::Sink;
 use futures::SinkExt;
+use futures::Stream;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use tokio::io::AsyncRead;
@@ -231,8 +236,59 @@ enum RemoteClientCommand {
         response_tx: oneshot::Sender<IoResult<()>>,
     },
     Shutdown {
-        response_tx: oneshot::Sender<IoResult<()>>,
+        completed_tx: oneshot::Sender<()>,
     },
+}
+
+enum RemoteRead {
+    Frame(Result<Message, TungsteniteError>),
+    LocalCloseAcknowledged,
+}
+
+/// Classify a peer close under the same split lock as the WebSocket's sink.
+/// Marking it after `send().await` would race the peer response; marking it
+/// when the command is queued would misclassify unsolicited closes.
+struct RemoteWebSocket<S> {
+    socket: WebSocketStream<S>,
+    local_close_started: bool,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Sink<Message> for RemoteWebSocket<S> {
+    type Error = TungsteniteError;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.socket).poll_ready(cx)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, frame: Message) -> Result<(), Self::Error> {
+        let close = matches!(&frame, Message::Close(_));
+        Pin::new(&mut self.socket).start_send(frame)?;
+        self.local_close_started |= close;
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.socket).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.socket).poll_close(cx)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Stream for RemoteWebSocket<S> {
+    type Item = RemoteRead;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let frame = std::task::ready!(Pin::new(&mut self.socket).poll_next(cx));
+        Poll::Ready(frame.map(|frame| {
+            if self.local_close_started && matches!(&frame, Ok(Message::Close(_))) {
+                RemoteRead::LocalCloseAcknowledged
+            } else {
+                RemoteRead::Frame(frame)
+            }
+        }))
+    }
 }
 
 struct RemoteWrite {
@@ -243,8 +299,9 @@ struct RemoteWrite {
 enum RemoteWriteMessage {
     JsonRpc(JSONRPCMessage),
     Ping(Vec<u8>),
-    // An ordered close, after all previously admitted frames.
+    // Ordered closes follow all previously admitted frames.
     Close,
+    ShutdownClose,
 }
 
 fn queue_remote_write(
@@ -389,12 +446,19 @@ impl RemoteAppServerClient {
         let force_shutdown = tokio_util::sync::CancellationToken::new();
         let worker_shutdown = force_shutdown.clone();
         let worker_handle = tokio::spawn(async move {
-            let (mut sink, mut stream) = stream.split();
+            let (mut sink, mut stream) = RemoteWebSocket {
+                socket: stream,
+                local_close_started: false,
+            }
+            .split();
             let (writer_tx, mut writer_rx) = mpsc::channel::<RemoteWrite>(channel_capacity);
             let writer_endpoint = endpoint.clone();
             let mut writer_handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
                 while let Some(write) = writer_rx.recv().await {
-                    let close = matches!(&write.message, RemoteWriteMessage::Close);
+                    let close = matches!(
+                        &write.message,
+                        RemoteWriteMessage::Close | RemoteWriteMessage::ShutdownClose
+                    );
                     let result = timeout(WRITE_TIMEOUT, async {
                         let frame = match write.message {
                             RemoteWriteMessage::JsonRpc(message) => Some(Message::Text(
@@ -402,12 +466,21 @@ impl RemoteAppServerClient {
                             )),
                             RemoteWriteMessage::Ping(payload) => Some(Message::Ping(payload.into())),
                             RemoteWriteMessage::Close => None,
+                            // Unlike Sink::close, a Close message requires the
+                            // WebSocket to still be open when the writer starts it.
+                            RemoteWriteMessage::ShutdownClose => Some(Message::Close(None)),
                         };
                         if let Some(frame) = frame {
                             sink.send(frame).await.map_err(|error| {
-                                IoError::other(format!(
-                                    "failed to write websocket message to `{writer_endpoint}`: {error}"
-                                ))
+                                if close {
+                                    IoError::other(format!(
+                                        "failed to close websocket app server `{writer_endpoint}`: {error}"
+                                    ))
+                                } else {
+                                    IoError::other(format!(
+                                        "failed to write websocket message to `{writer_endpoint}`: {error}"
+                                    ))
+                                }
                             })
                         } else {
                             sink.close().await.or_else(|error| {
@@ -437,6 +510,8 @@ impl RemoteAppServerClient {
             }));
             let mut writer_finished = false;
             let mut closing = false;
+            let mut peer_acknowledged_close = false;
+            let mut shutdown_completed_tx = None;
             let mut staged_command = None;
             let mut control_requests = std::collections::HashSet::<RequestId>::new();
             let mut pending_requests =
@@ -663,9 +738,10 @@ impl RemoteAppServerClient {
                                     break;
                                 }
                             }
-                            RemoteClientCommand::Shutdown { response_tx } => {
+                            RemoteClientCommand::Shutdown { completed_tx } => {
                                 closing = true;
-                                if let Err(error) = queue_remote_write(&writer_tx, None, Some(response_tx)) {
+                                shutdown_completed_tx = Some(completed_tx);
+                                if let Err(error) = queue_remote_frame(&writer_tx, RemoteWriteMessage::ShutdownClose, None) {
                                     worker_exit_error = Some((error.kind(), error.to_string()));
                                     break;
                                 }
@@ -675,7 +751,17 @@ impl RemoteAppServerClient {
                     // Retained lossless events pause reads for backpressure, except while a
                     // caller awaits an RPC: its response shares this socket, and a consumer
                     // blocked on that response cannot drain the event queue.
-                    message = stream.next(), if can_read => {
+                    message = stream.next(), if can_read && !peer_acknowledged_close => {
+                        let message = match message {
+                            Some(RemoteRead::Frame(frame)) => Some(frame),
+                            Some(RemoteRead::LocalCloseAcknowledged) => {
+                                // The writer still owns the result of flushing the
+                                // Close. Don't read EOF in place of its result.
+                                peer_acknowledged_close = true;
+                                continue;
+                            }
+                            None => None,
+                        };
                         if let Some(Ok(frame)) = &message {
                             let acknowledged = matches!(frame, Message::Pong(payload)
                                 if pending_ping.as_deref() == Some(payload.as_ref()));
@@ -847,6 +933,8 @@ impl RemoteAppServerClient {
             // consumer. Rendering a disconnect must never gate request failure.
             command_rx.close();
             drop(command_rx);
+            // A staged shutdown can also own the receipt that releases event_rx.
+            drop(staged_command);
             drop(writer_tx);
             if !writer_finished {
                 writer_handle.abort();
@@ -869,6 +957,11 @@ impl RemoteAppServerClient {
             let worker_result = disconnect_message.as_ref().map_or(Ok(()), |_| Err(IoError::new(err_kind, err_message.clone())));
             for (_, response_tx) in pending_requests {
                 let _ = response_tx.send(Err(IoError::new(err_kind, err_message.clone())));
+            }
+            if let Some(completed_tx) = shutdown_completed_tx {
+                // Let the shutdown owner release its event receiver before
+                // terminal event delivery; the joined worker carries the result.
+                let _ = completed_tx.send(());
             }
             if let Some(message) = disconnect_message {
                 let _ = deliver_disconnect(
@@ -1002,16 +1095,16 @@ impl RemoteAppServerClient {
         let Self { command_tx, event_rx, pending_events: _pending_events,
             initialize_response: _initialize_response, mut worker_handle, force_shutdown } = self;
         let mut event_rx = Some(event_rx);
-        let (response_tx, response_rx) = oneshot::channel();
+        let (completed_tx, completed_rx) = oneshot::channel();
         let result = timeout(SHUTDOWN_TIMEOUT, async {
-            let close_result = if command_tx.send(RemoteClientCommand::Shutdown { response_tx }).await.is_ok() {
-                response_rx.await.unwrap_or_else(|_| Err(IoError::new(ErrorKind::BrokenPipe, "remote close receipt dropped")))
+            let completion = if command_tx.send(RemoteClientCommand::Shutdown { completed_tx }).await.is_ok() {
+                completed_rx.await.map_err(|_| IoError::new(ErrorKind::BrokenPipe, "remote close receipt dropped"))
             } else {
                 Err(IoError::new(ErrorKind::BrokenPipe, "remote shutdown command channel closed"))
             };
             drop(event_rx.take());
             let joined = (&mut worker_handle).await.map_err(|error| IoError::other(format!("remote coordinator failed: {error}")))?;
-            close_result.and(joined)
+            joined.and(completion)
         }).await;
         match result {
             Ok(result) => result,

@@ -526,8 +526,14 @@ impl HostState {
                     .get(&session_id)
                     .cloned();
                 if session.is_some() {
-                    self.catalogs.lock().unwrap_or_else(PoisonError::into_inner)
+                    let retired = self
+                        .catalogs
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
                         .insert(session_id.clone(), None);
+                    // Publish the tombstone under the lock, but retire the
+                    // old catalog (and potentially its schemas) after release.
+                    drop(retired);
                 }
                 let result = match session {
                     Some(session) => match session.shutdown().await {
@@ -638,10 +644,14 @@ impl HostState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .drain()
-            .map(|(_, session)| session)
             .collect::<Vec<_>>();
-        for session in sessions {
-            let _ = session.shutdown().await;
+        for (session_id, session) in sessions {
+            if let Err(err) = session.shutdown().await {
+                tracing::warn!(%err, %session_id, "session shutdown incomplete at host disconnect");
+                // Continue draining other sessions, but don't certify a clean
+                // disconnect while a session still owns storage cleanup.
+                self.peer.fail(format!("code-mode host session shutdown incomplete: {err}"));
+            }
         }
     }
 }

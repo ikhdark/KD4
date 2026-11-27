@@ -2677,7 +2677,7 @@ fn pressure_retired_reasoning_boundary(items: &[ResponseItem]) -> Option<usize> 
             if role == "developer"
                 && matches!(content.as_slice(),
                     [codex_protocol::models::ContentItem::InputText { text }]
-                        if crate::tool_history::is_pressure_retirement_checkpoint_text(text)))
+                        if crate::tool_history::is_reasoning_retirement_checkpoint_text(text)))
     })?;
     let mut generations = 0usize;
     let mut in_generation = false;

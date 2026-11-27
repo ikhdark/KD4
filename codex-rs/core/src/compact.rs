@@ -2092,7 +2092,7 @@ async fn drain_to_completed(
         } => result,
     };
     drop(model_request_timing_guard);
-    sess.bind_rate_limit_account(client_session.dispatched_account().cloned())
+    sess.bind_rate_limit_account(turn_context, client_session.dispatched_account().cloned())
         .await;
     if let Err(CodexErr::UsageLimitReached(error)) = &stream_result
         && let Some(snapshot) = error.rate_limits.as_deref()

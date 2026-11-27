@@ -261,6 +261,9 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
     {
         schemas.push(("raw_byte_ranges", raw_bytes.to_owned()));
     }
+    if definition.tool_name.namespace.is_none() {
+        add_focused_contracts(definition, &mut schemas);
+    }
     // Process workflows often need one lifecycle control, not both complete
     // command signatures. Quote the registered field, including its restrictions;
     // the ordinary arguments section remains the full cross-field contract.
@@ -319,6 +322,87 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         output_schema: definition.output_schema.as_ref(),
         schemas: &schemas,
     })
+}
+
+fn add_focused_contracts(
+    definition: &ToolDefinition,
+    sections: &mut Vec<(&'static str, String)>,
+) {
+    match definition.tool_name.name.as_str() {
+        "read_file" | "read_tool_output" => {
+            // Reuse only the requested selector branch, rather than the whole union.
+            if let Some(variants) = definition.input_schema.as_ref()
+                .and_then(|schema| schema.pointer("/properties/selectors/items/oneOf"))
+                .and_then(JsonValue::as_array)
+            {
+                for kind in ["structured", "json_pointer"] {
+                    if let Some(branch) = variants.iter().find(|branch| {
+                        branch.pointer("/properties/kind/enum/0").and_then(JsonValue::as_str)
+                            == Some(kind)
+                    }) {
+                        sections.push((kind, branch.to_string()));
+                    }
+                }
+            }
+            if definition.tool_name.name == "read_tool_output"
+                && let Some(schema) = &definition.output_schema
+                && let Some(receipt) = selection_receipt_properties(schema)
+                && let Some(row) = exact_selection_row_properties(schema)
+            {
+                sections.push(("selection_receipt", format!(
+                    "Content selection, not audit_only. Check continuation_stop.resumable and remaining_selectors on incomplete delivery. Each results[] row echoes selector; canonical_range uses half-open source bytes. For search-specific value fields see result.\nReceipt fields: {receipt}\nNon-search results[] fields: {row}"
+                )));
+            }
+        }
+        "exec_command" => {
+            if let Some(properties) = definition.output_schema.as_ref()
+                .and_then(|schema| schema.get("properties"))
+                && let Some(fields) = selected_properties(properties, &[
+                    "execution_state", "exit_code", "session_id", "process_exited", "output_drained",
+                    "produced_stdout_bytes", "delivered_view_bytes", "output_reference",
+                    "raw_output_artifact_id", "recovery",
+                ])
+            {
+                sections.push(("output_custody", fields.to_string()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn selection_receipt_properties(schema: &JsonValue) -> Option<JsonValue> {
+    // Identify the content branch by its delivery fields, not its position
+    // beside the audit.
+    let mut content = schema.get("anyOf")?.as_array()?.iter().filter_map(|branch| {
+        selected_properties(branch.get("properties")?, &[
+            "artifact_id", "canonical_sha256", "historical_authenticity",
+            "retained_artifact_complete", "delivered_selection_complete",
+        ])
+    });
+    let receipt = content.next()?;
+    content.next().is_none().then_some(receipt)
+}
+
+fn exact_selection_row_properties(schema: &JsonValue) -> Option<JsonValue> {
+    let mut exact = schema.pointer("/$defs/result/oneOf")?.as_array()?.iter().filter_map(|row| {
+        let kinds = row.pointer("/properties/selector/oneOf")?.as_array()?;
+        if !kinds.iter().any(|selector| {
+            selector.pointer("/properties/kind/enum/0").and_then(JsonValue::as_str) == Some("lines")
+        }) {
+            return None;
+        }
+        selected_properties(row.get("properties")?, &[
+            "status", "complete", "text", "data_base64", "value", "exact_bytes",
+        ])
+    });
+    let row = exact.next()?;
+    exact.next().is_none().then_some(row)
+}
+
+fn selected_properties(properties: &JsonValue, names: &[&str]) -> Option<JsonValue> {
+    names.iter().map(|&name| Some((name.to_owned(), properties.get(name)?.clone())))
+        .collect::<Option<serde_json::Map<_, _>>>()
+        .map(JsonValue::Object)
 }
 
 /// Render one model-visible contract bundle. Shared shapes are named once across

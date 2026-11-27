@@ -1042,24 +1042,23 @@ impl ModelAttemptGuard {
         }
         self.emitted = true;
         self.clock.mark_completed();
+        let physical_identity = self.physical_response_identity();
         if let Some(timing) = &self.turn_timing {
             let outcome = match outcome {
                 ModelAttemptOutcome::Success => "success",
                 ModelAttemptOutcome::Failed => "failed",
                 ModelAttemptOutcome::Cancelled => "cancelled",
             };
-            let (progress, transport_attempt) = {
-                let offsets = self.clock.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                (offsets.first_actionable_output_us.is_some(), offsets.transport_attempt)
-            };
-            let physical_attempt = if transport_attempt == 0 { self.attempt_id.clone() }
-                else { format!("{}:http-{transport_attempt}", self.attempt_id) };
-            timing.record_model_attempt_outcome(&physical_attempt, outcome, progress, self.terminal_usage.as_ref());
+            let progress = self.clock.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .first_actionable_output_us.is_some();
+            timing.record_model_attempt_outcome(
+                &physical_identity.physical_attempt_id, outcome, progress, self.terminal_usage.as_ref(),
+            );
         }
         if self.provider_completed && let Some(timing) = &self.turn_timing {
             timing.record_provider_terminal(
                 &self.sampling_request_id,
-                &self.physical_response_identity().physical_attempt_id,
+                &physical_identity.physical_attempt_id,
             );
         }
         let uncached_input_tokens = self
@@ -1102,7 +1101,7 @@ impl ModelAttemptGuard {
             { event.name = if self.details_only { "codex.model_cache_details" } else { "codex.model_cache" },
             turn_id = self.turn_id.as_deref(),
             sampling_request_id = %self.sampling_request_id,
-            physical_attempt_id = %self.attempt_id,
+            physical_attempt_id = %physical_identity.physical_attempt_id,
             transport = ?self.transport,
             outcome = ?outcome,
             input_representation = self.measurements.selected_representation.map(SelectedInputRepresentation::as_str),
@@ -6744,6 +6743,7 @@ where
             attempt_identity,
             consumer_dropped: consumer_dropped_for_stream,
             text_delivery,
+            received_nonempty_text: false,
             pending_capture: None,
         },
         rx_last_response,

@@ -1282,13 +1282,21 @@ impl ThreadManager {
                 .collect::<Vec<_>>()
         };
 
-        let observation = codex_protocol::timing::observations::Span::start(
-            "shutdown_inventory", "", "", "tracked_threads", serde_json::json!({
-                "scope":"tracked_core_threads_not_all_process_resources",
-                "actual_count":threads.len(), "retention_complete":threads.len() <= 8192,
-                "thread_ids":threads.iter().take(8192).map(|(id, _)| id.to_string()).collect::<Vec<_>>(),
-                "budget_ns":u64::try_from(timeout.as_nanos()).ok(),
-                "policy":"observe_concurrent_shutdown_and_drain; timeout_does_not_abort_owner"}));
+        let observation = codex_protocol::timing::observations::enabled().then(|| {
+            codex_protocol::timing::observations::Span::start(
+                "shutdown_inventory",
+                "",
+                "",
+                "tracked_threads",
+                serde_json::json!({
+                    "scope":"tracked_core_threads_not_all_process_resources",
+                    "actual_count":threads.len(), "retention_complete":threads.len() <= 8192,
+                    "thread_ids":threads.iter().take(8192).map(|(id, _)| id.to_string()).collect::<Vec<_>>(),
+                    "budget_ns":u64::try_from(timeout.as_nanos()).ok(),
+                    "policy":"observe_concurrent_shutdown_and_drain; timeout_does_not_abort_owner"
+                }),
+            )
+        });
         let mut shutdowns = threads
             .into_iter()
             .map(|(thread_id, thread)| {
@@ -1345,12 +1353,18 @@ impl ThreadManager {
         report
             .timed_out
             .sort_by_key(std::string::ToString::to_string);
-        observation.finish("observation_complete", serde_json::json!({
-            "completed":report.completed.iter().take(8192).map(ToString::to_string).collect::<Vec<_>>(),
-            "submit_failed":report.submit_failed.iter().take(8192).map(ToString::to_string).collect::<Vec<_>>(),
-            "timed_out_owners_still_retained":report.timed_out.iter().take(8192).map(ToString::to_string).collect::<Vec<_>>(),
-            "actual_completed":report.completed.len(), "actual_submit_failed":report.submit_failed.len(),
-            "actual_timed_out":report.timed_out.len()}));
+        if let Some(observation) = observation {
+            observation.finish(
+                "observation_complete",
+                serde_json::json!({
+                    "completed":report.completed.iter().take(8192).map(ToString::to_string).collect::<Vec<_>>(),
+                    "submit_failed":report.submit_failed.iter().take(8192).map(ToString::to_string).collect::<Vec<_>>(),
+                    "timed_out_owners_still_retained":report.timed_out.iter().take(8192).map(ToString::to_string).collect::<Vec<_>>(),
+                    "actual_completed":report.completed.len(), "actual_submit_failed":report.submit_failed.len(),
+                    "actual_timed_out":report.timed_out.len()
+                }),
+            );
+        }
         report
     }
 

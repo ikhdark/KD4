@@ -47,6 +47,8 @@ use codex_app_server_protocol_types::ThreadQueueStartParams;
 use codex_app_server_protocol_types::ThreadQueueStartResponse;
 use codex_app_server_protocol_types::ThreadQueueUpdateParams;
 use codex_app_server_protocol_types::ThreadQueueUpdateResponse;
+use indexmap::IndexMap;
+use indexmap::IndexSet;
 use serde::Deserialize;
 use serde::Serialize;
 use std::fs::File;
@@ -317,9 +319,110 @@ pub(crate) struct QueueOrigin {
 #[derive(Default)]
 struct QueueOrigins {
     submissions: HashMap<ThreadId, HashMap<String, QueueOrigin>>,
+    // Only keys live here; the capabilities themselves are owned by submissions.
+    // Dense buckets make disconnect visit only live keys for that connection.
+    by_connection: HashMap<ConnectionId, IndexMap<ThreadId, IndexSet<String>>>,
     // A failed storage retirement must still fence late capability admission.
     // The next successful queue-lock owner completes this in-memory retirement.
     retiring: HashSet<ThreadId>,
+}
+
+impl QueueOrigins {
+    fn insert(&mut self, id: ThreadId, submission_id: String, origin: QueueOrigin) -> bool {
+        if self.retiring.contains(&id) {
+            return false;
+        }
+        let connection_id = origin.request_id.connection_id;
+        let previous = self
+            .submissions
+            .entry(id)
+            .or_default()
+            .insert(submission_id.clone(), origin);
+        if let Some(previous) = previous {
+            let previous_connection_id = previous.request_id.connection_id;
+            if previous_connection_id == connection_id {
+                // The capability was refreshed, but its membership did not move.
+                return true;
+            }
+            self.unindex(previous_connection_id, id, &submission_id);
+        }
+        self.by_connection
+            .entry(connection_id)
+            .or_default()
+            .entry(id)
+            .or_default()
+            .insert(submission_id);
+        true
+    }
+
+    fn unindex(&mut self, connection_id: ConnectionId, id: ThreadId, submission_id: &str) {
+        let Some(threads) = self.by_connection.get_mut(&connection_id) else {
+            return;
+        };
+        if let Some(submission_ids) = threads.get_mut(&id) {
+            submission_ids.swap_remove(submission_id);
+            if submission_ids.is_empty() {
+                threads.swap_remove(&id);
+            }
+        }
+        if threads.is_empty() {
+            self.by_connection.remove(&connection_id);
+        }
+    }
+
+    fn remove(&mut self, id: ThreadId, submission_id: &str) {
+        let Some(submissions) = self.submissions.get_mut(&id) else {
+            return;
+        };
+        let Some(origin) = submissions.remove(submission_id) else {
+            return;
+        };
+        if submissions.is_empty() {
+            self.submissions.remove(&id);
+        }
+        self.unindex(origin.request_id.connection_id, id, submission_id);
+    }
+
+    fn clear_thread(&mut self, id: ThreadId) {
+        if let Some(submissions) = self.submissions.remove(&id) {
+            for (submission_id, origin) in submissions {
+                self.unindex(origin.request_id.connection_id, id, &submission_id);
+            }
+        }
+    }
+
+    fn retire_thread_connection(&mut self, id: ThreadId, connection_id: ConnectionId) {
+        let Some(threads) = self.by_connection.get_mut(&connection_id) else {
+            return;
+        };
+        let Some(submission_ids) = threads.swap_remove(&id) else {
+            return;
+        };
+        if threads.is_empty() {
+            self.by_connection.remove(&connection_id);
+        }
+        self.remove_indexed_submissions(id, submission_ids);
+    }
+
+    fn retire_connection(&mut self, connection_id: ConnectionId) {
+        if let Some(threads) = self.by_connection.remove(&connection_id) {
+            for (id, submission_ids) in threads {
+                self.remove_indexed_submissions(id, submission_ids);
+            }
+        }
+    }
+
+    // The corresponding reverse bucket has already been detached.
+    fn remove_indexed_submissions(&mut self, id: ThreadId, submission_ids: IndexSet<String>) {
+        if let Some(submissions) = self.submissions.get_mut(&id) {
+            for submission_id in submission_ids {
+                submissions.remove(&submission_id);
+            }
+            if submissions.is_empty() {
+                self.submissions.remove(&id);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -369,20 +472,22 @@ impl ThreadQueueRequestProcessor {
     }
 
     async fn insert_origin(&self, id: ThreadId, submission_id: String, origin: QueueOrigin) -> bool {
-        self.thread_state_manager.with_live_connection(origin.request_id.connection_id, || {
-            let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if origins.retiring.contains(&id) { return false; }
-            origins.submissions.entry(id).or_default().insert(submission_id, origin);
-            true
-        }).await == Some(true)
+        self.thread_state_manager
+            .with_live_connection(origin.request_id.connection_id, || {
+                self.origins
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id, submission_id, origin)
+            })
+            .await
+            == Some(true)
     }
 
     fn remove_origin(&self, id: ThreadId, submission_id: &str) {
-        let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(submissions) = origins.submissions.get_mut(&id) {
-            submissions.remove(submission_id);
-            if submissions.is_empty() { origins.submissions.remove(&id); }
-        }
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id, submission_id);
     }
 
     fn has_origins(&self, id: ThreadId) -> bool {
@@ -397,7 +502,7 @@ impl ThreadQueueRequestProcessor {
         {
             let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             origins.retiring.insert(id);
-            origins.submissions.remove(&id);
+            origins.clear_thread(id);
         }
         if let Err(error) = self.lock(id).await {
             tracing::warn!(%id, error = %error.message, "queue retirement incomplete; capabilities fenced until the next queue admission");
@@ -406,19 +511,17 @@ impl ThreadQueueRequestProcessor {
 
     pub(super) async fn retire_thread_connection(&self, id: ThreadId, connection_id: ConnectionId) {
         let _guard = self.lock(id).await.ok();
-        let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(submissions) = origins.submissions.get_mut(&id) {
-            submissions.retain(|_, origin| origin.request_id.connection_id != connection_id);
-            if submissions.is_empty() { origins.submissions.remove(&id); }
-        }
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retire_thread_connection(id, connection_id);
     }
 
     pub(super) async fn retire_connection(&self, connection_id: ConnectionId) {
-        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .submissions.retain(|_, submissions| {
-                submissions.retain(|_, origin| origin.request_id.connection_id != connection_id);
-                !submissions.is_empty()
-            });
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retire_connection(connection_id);
     }
 
     async fn load(&self, id: ThreadId) -> Result<Queue, JSONRPCErrorError> {
@@ -567,8 +670,13 @@ impl ThreadQueueRequestProcessor {
             loop {
                 match file.try_lock() {
                     Ok(()) => {
-                        let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if origins.retiring.remove(&id) { origins.submissions.remove(&id); }
+                        let mut origins = self
+                            .origins
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if origins.retiring.remove(&id) {
+                            origins.clear_thread(id);
+                        }
                         return Ok((file, publication));
                     }
                     Err(TryLockError::WouldBlock) => {
@@ -1242,7 +1350,7 @@ impl ThreadQueueRequestProcessor {
         self.origins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .submissions.remove(&id);
+            .clear_thread(id);
         // This runs before the listener forwards every interrupted or failed
         // turn. Without queued prompts there is nothing to protect: skip the
         // lock file, queue write, and change notification.

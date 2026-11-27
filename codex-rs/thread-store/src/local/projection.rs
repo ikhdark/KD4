@@ -137,6 +137,18 @@ impl LocalThreadProjection {
             self.rebuild_positions();
         }
 
+        // New turn positions follow the reducer's turn creation order, even
+        // when a turn has no items. Keep item changes in first-change order
+        // so new item ordinals stay stable.
+        for change in changes.changed_turns {
+            let turn_id = change.turn_id.clone();
+            self.ensure_turn(turn_id.as_str());
+            self.turns
+                .get_mut(&turn_id)
+                .ok_or_else(|| projection_invariant_error("projected turn was not inserted"))?
+                .metadata = Some(change);
+        }
+
         for change in changes.changed_items {
             let turn_id = change.turn_id;
             self.ensure_turn(turn_id.as_str());
@@ -174,15 +186,6 @@ impl LocalThreadProjection {
                 };
                 self.insert_item_key(key);
             }
-        }
-
-        for change in changes.changed_turns {
-            let turn_id = change.turn_id.clone();
-            self.ensure_turn(turn_id.as_str());
-            self.turns
-                .get_mut(&turn_id)
-                .ok_or_else(|| projection_invariant_error("projected turn was not inserted"))?
-                .metadata = Some(change);
         }
         Ok(())
     }

@@ -1254,8 +1254,8 @@ const PRESSURE_RETIREMENT_SOURCE: &str = "context_pressure";
 const ARGUMENT_STUB_MIN_BYTES: usize = 1024;
 
 /// Why the runtime retired consumed tool results. Recorded in the checkpoint
-/// so a rollout distinguishes the two triggers without inferring them from
-/// the reason of the request that follows.
+/// so a rollout can distinguish triggers without inferring them from the
+/// reason of the request that follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PressureRetirementTrigger {
     /// Below the automatic-compaction limit, once re-sending the results had
@@ -1263,6 +1263,8 @@ pub enum PressureRetirementTrigger {
     Proactive,
     /// At the automatic-compaction limit, instead of an LLM summary.
     ContextLimit,
+    /// At a large model switch, before replaying history to the new model.
+    ModelSwitch,
 }
 
 impl PressureRetirementTrigger {
@@ -1270,6 +1272,7 @@ impl PressureRetirementTrigger {
         match self {
             Self::Proactive => "proactive",
             Self::ContextLimit => "context_limit",
+            Self::ModelSwitch => "model_switch",
         }
     }
 }
@@ -1283,6 +1286,10 @@ pub fn pressure_retirement_checkpoint(
         .iter()
         .map(|call_id| (call_id.clone(), serde_json::json!({"via": "call_id_lookup"})))
         .collect::<serde_json::Map<_, _>>();
+    let budget_rule = match trigger {
+        PressureRetirementTrigger::ModelSwitch => "Routine recoverable model-switch retirement is uncounted. The sampling budget notice reports the authoritative count.",
+        _ => "Routine recoverable retirement (proactive or context_limit) is uncounted. Only compaction/summarization or retirement beyond kept generations spends a spawned agent context event; the sampling budget notice reports its authoritative count.",
+    };
     let payload = serde_json::json!({
         "source": PRESSURE_RETIREMENT_SOURCE,
         "trigger": trigger.as_str(),
@@ -1291,7 +1298,7 @@ pub fn pressure_retirement_checkpoint(
             "filter_field": "resume_filter.call_id", "key_source": "receipts object key",
             "scope": "lookup keys, not independently authenticated artifact or semantic-review receipts"},
         "note": "The runtime retired consumed tool results to exact recovery pins. Receipts below name call lookup keys, not artifact identities. Use their filtered resume-state route; missing durable evidence remains explicitly unresolved. Retirement is not semantic review or task completion.",
-        "budget_rule": "Routine recoverable retirement (proactive or context_limit) is uncounted. Only compaction/summarization or retirement beyond kept generations spends a spawned agent context event; the sampling budget notice reports its authoritative count.",
+        "budget_rule": budget_rule,
         "receipts": receipts,
     });
     ResponseItem::Message {
@@ -1308,10 +1315,20 @@ pub fn pressure_retirement_checkpoint(
 /// Recovery guidance quotes the last checkpoint as assistant notes; a
 /// runtime retirement list is not one.
 pub fn is_pressure_retirement_checkpoint_text(text: &str) -> bool {
-    text.strip_prefix("<completed_phase_checkpoint>\n")
-        .and_then(|text| text.strip_suffix("\n</completed_phase_checkpoint>"))
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-        .is_some_and(|payload| payload["source"] == PRESSURE_RETIREMENT_SOURCE)
+    pressure_retirement_payload(text).is_some()
+}
+
+/// A model switch retires only tool output, not older reasoning.
+pub(crate) fn is_reasoning_retirement_checkpoint_text(text: &str) -> bool {
+    pressure_retirement_payload(text)
+        .is_some_and(|payload| payload["trigger"] != PressureRetirementTrigger::ModelSwitch.as_str())
+}
+
+fn pressure_retirement_payload(text: &str) -> Option<serde_json::Value> {
+    let body = text.strip_prefix("<completed_phase_checkpoint>\n")?
+        .strip_suffix("\n</completed_phase_checkpoint>")?;
+    serde_json::from_str::<serde_json::Value>(body).ok()
+        .filter(|payload| payload["source"] == PRESSURE_RETIREMENT_SOURCE)
 }
 
 /// Count delivered payloads, including partial search pages; coordinates or
@@ -1901,6 +1918,33 @@ impl ToolHistoryState {
         capture: bool,
     ) -> (Vec<String>, u64, serde_json::Value) {
         self.pressure_retirement_decision_excluding(items, keep_generations, target_tokens, capture, None)
+    }
+
+    /// Credit only exact output bodies present in the completed logical prompt.
+    /// The current retirement selector has already checked recovery and eligibility.
+    pub fn pressure_retirement_rent<'a>(
+        &self,
+        selected_calls: &[String],
+        delivered: &'a [ResponseItem],
+    ) -> BTreeMap<&'a str, u64> {
+        let selected: BTreeSet<&str> = selected_calls.iter().map(String::as_str).collect();
+        delivered
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .filter(|(id, _)| selected.contains(id))
+            .filter_map(|(id, output)| {
+                let candidate = self.candidates.get(id)?;
+                if sha256(output.as_bytes()) != candidate.derived.bounded_model_output_sha256 {
+                    return None;
+                }
+                let (_, pin_tokens) = self.checkpoint_pin_for(candidate)?;
+                let saved = candidate
+                    .derived
+                    .bounded_model_output_tokens
+                    .saturating_sub(pin_tokens as u64);
+                Some((id, saved))
+            })
+            .collect()
     }
 
     /// Evaluate one bounded later cut with the same eligibility checks.

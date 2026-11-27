@@ -502,6 +502,7 @@ pub struct ResponseStream {
     /// provider stream reached its own terminal event.
     pub consumer_dropped: CancellationToken,
     pub(crate) text_delivery: Option<Arc<TurnTimingState>>,
+    pub(crate) received_nonempty_text: bool,
     /// A retained request capture that overlapped dispatch. It is joined before
     /// the first event is delivered; a capture failure is delivered as that
     /// capture's own non-retryable error instead of any provider event.
@@ -546,18 +547,21 @@ impl Stream for ResponseStream {
             Poll::Ready(None) => return Poll::Ready(None),
             Poll::Pending => return Poll::Pending,
         };
-        match event.event() {
+        let finish_text_delivery = match event.event() {
             Ok(ResponseEvent::OutputTextDelta(text)) if !text.is_empty() => {
+                self.received_nonempty_text = true;
                 if let Some(timing) = &self.text_delivery {
                     timing.record_text_received(event.delivery_tag(), text);
                 }
+                false
             }
-            Ok(ResponseEvent::Completed { .. }) => {
-                if let Some(timing) = self.text_delivery.take() {
-                    timing.finish_text_delivery_stream();
-                }
-            }
-            _ => {}
+            Ok(ResponseEvent::Completed { .. }) => true,
+            // A drained empty failure leaves no partial text inventory to certify.
+            Err(_) => !self.received_nonempty_text,
+            _ => false,
+        };
+        if finish_text_delivery && let Some(timing) = self.text_delivery.take() {
+            timing.finish_text_delivery_stream();
         }
         Poll::Ready(Some(event.into_event()))
     }

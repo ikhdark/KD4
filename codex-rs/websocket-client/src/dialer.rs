@@ -94,22 +94,14 @@ fn warm_stream_key(
 }
 
 fn take_warm_stream(key: &WarmStreamKey) -> Option<Box<dyn AsyncIo>> {
-    let mut discarded = Vec::new();
-    let taken = {
+    // Each key holds at most one stream. Take it before checking liveness,
+    // so polling and stream destruction don't hold up unrelated keys.
+    let mut warm = {
         let mut pool = warm_streams();
-        let slot = pool.get_mut(key)?;
-        let mut taken = None;
-        while let Some(mut warm) = slot.streams.pop() {
-            if warm.ready_at.elapsed() <= WARM_STREAM_MAX_AGE && warm_stream_is_quiet(&mut warm.stream) {
-                taken = Some(warm.stream);
-                break;
-            }
-            discarded.push(warm);
-        }
-        taken
+        pool.get_mut(key)?.streams.pop()?
     };
-    drop(discarded);
-    taken
+    (warm.ready_at.elapsed() <= WARM_STREAM_MAX_AGE && warm_stream_is_quiet(&mut warm.stream))
+        .then_some(warm.stream)
 }
 
 /// A usable stream has nothing to read yet. End of stream, data or an error means the peer

@@ -215,7 +215,7 @@ async fn run_list(overrides: Vec<(String, toml::Value)>, args: ListMarketplaceAr
         .await
         .context("failed to load configuration")?;
     let manager = PluginsManager::new(config.codex_home.to_path_buf());
-    manager.set_auth_mode(load_cli_auth_mode(&config).await);
+    manager.set_auth_mode(load_cli_auth_mode(&config).await?);
     let plugins_input = config.plugins_config_input();
     let marketplace_listing = manager
         .discover_marketplaces_for_config(&plugins_input, &[])
@@ -587,13 +587,13 @@ pub(crate) fn configured_marketplace_sources(
         .collect()
 }
 
-pub(crate) async fn load_cli_auth_mode(config: &Config) -> Option<AuthMode> {
+pub(crate) async fn load_cli_auth_mode(config: &Config) -> std::io::Result<Option<AuthMode>> {
     if let Some(api_key) = read_codex_api_key_from_env() {
-        return Some(CodexAuth::from_api_key(&api_key).api_auth_mode());
+        return Ok(Some(CodexAuth::from_api_key(&api_key).api_auth_mode()));
     }
 
     let auth_route_config = config.auth_route_config();
-    CodexAuth::from_auth_storage(
+    match CodexAuth::from_auth_storage(
         &config.codex_home,
         config.cli_auth_credentials_store_mode,
         Some(&config.chatgpt_base_url),
@@ -601,9 +601,11 @@ pub(crate) async fn load_cli_auth_mode(config: &Config) -> Option<AuthMode> {
         &auth_route_config,
     )
     .await
-    .ok()
-    .flatten()
-    .map(|auth| auth.api_auth_mode())
+    {
+        Ok(auth) => Ok(auth.map(|auth| auth.api_auth_mode())),
+        Err(err) if codex_login::AuthFileSizeError::from_io(&err).is_some() => Err(err),
+        Err(_) => Ok(None),
+    }
 }
 
 pub(crate) struct ConfiguredMarketplaceSnapshotIssue {

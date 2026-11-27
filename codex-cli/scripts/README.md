@@ -34,7 +34,8 @@ Current KD4 native packages do not require or build sandbox helpers.
 When intentionally reusing GitHub artifacts instead, replace `--vendor-src` with
 an explicit `--workflow-url`, or supply `--workflow-name` and, where needed,
 `--github-repo`. There is no implicit workflow name and no fallback to an upstream
-workflow. Local vendor input cannot be combined with workflow artifact options.
+workflow. Native staging without a vendor source or workflow selector fails before
+GitHub repository discovery. Local vendor input cannot be combined with workflow artifact options.
 That route downloads artifacts and requires the configured GitHub tooling/access.
 
 `codex-cli/scripts/build_npm_package.py` remains the package-specific entry point.

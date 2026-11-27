@@ -63,6 +63,27 @@ struct Promise {
     aggregate: Option<Aggregate>,
 }
 
+struct GraphNode {
+    deps: Vec<u8>,
+    calls: Vec<String>,
+    finished: bool,
+}
+
+#[derive(Clone)]
+struct GraphContext {
+    graph: String,
+    index: u8,
+}
+
+fn graph_context(context: &str) -> Option<(&str, u8)> {
+    let (graph, node) = context.split_once('/')?;
+    if !graph.starts_with("graph-") {
+        return None;
+    }
+    let index = node.split_once(':').map_or(node, |(index, _)| index);
+    Some((graph, index.parse().ok()?))
+}
+
 #[derive(Default)]
 pub(super) struct Capture {
     key: Option<v8::Global<v8::Private>>,
@@ -71,21 +92,22 @@ pub(super) struct Capture {
     stack: Vec<Reaction>,
     received: u64,
     dropped: bool,
-    graph_deps: BTreeMap<String, Vec<String>>,
-    graph_calls: BTreeMap<String, Vec<String>>,
-    graph_finished: BTreeSet<String>,
+    graphs: BTreeMap<String, Vec<GraphNode>>,
+    graph_nodes: usize,
     helpers: BTreeMap<String, Option<Vec<String>>>,
     helper_calls: BTreeMap<String, BTreeMap<String, Vec<String>>>,
-    helper_graphs: BTreeMap<String, String>,
+    helper_graphs: BTreeMap<String, GraphContext>,
 }
 
 impl Capture {
     pub(super) fn helper(&mut self, id: String, context: Option<&str>) {
         if self.helpers.len() >= 1024 { self.dropped = true; return; }
-        let predecessors = context.and_then(|context| self.graph_predecessors(context))
+        let context = context.and_then(graph_context);
+        let predecessors = context.and_then(|(graph, index)| self.graph_predecessors(graph, index))
             .or_else(|| self.predecessors());
-        if let Some(context) = context.filter(|context| self.graph_deps.contains_key(*context)) {
-            self.helper_graphs.insert(id.clone(), context.to_owned());
+        if let Some((graph, index)) = context
+            && self.graph_node(graph, index).is_some() {
+            self.helper_graphs.insert(id.clone(), GraphContext { graph: graph.to_owned(), index });
         }
         self.helpers.insert(id, predecessors);
     }
@@ -116,29 +138,45 @@ impl Capture {
         let result = branches.values().flatten().cloned().collect::<BTreeSet<_>>();
         (result.len() <= 128).then(|| result.into_iter().collect())
     }
-    pub(super) fn graph(&mut self, id: &str, definition: &serde_json::Value) {
-        for row in definition.as_array().into_iter().flatten() {
-            let Some(name) = row["id"].as_str() else { self.dropped = true; continue; };
-            if self.graph_deps.len() >= LIMIT { self.dropped = true; break; }
-            self.graph_deps.insert(format!("{id}:{name}"), row["deps"].as_array().into_iter().flatten()
-                .filter_map(|dep| dep.as_str().map(|dep| format!("{id}:{dep}"))).collect());
+    pub(super) fn graph(&mut self, id: &str, deps: Vec<Vec<u8>>) {
+        if self.graph_nodes + deps.len() > LIMIT {
+            self.dropped = true;
+            return;
+        }
+        self.graph_nodes += deps.len();
+        self.graphs.insert(id.to_owned(), deps.into_iter().map(|deps| GraphNode {
+            deps, calls: Vec::new(), finished: false,
+        }).collect());
+    }
+
+    fn graph_node(&self, id: &str, index: u8) -> Option<&GraphNode> {
+        self.graphs.get(id)?.get(usize::from(index))
+    }
+
+    fn graph_node_mut(&mut self, id: &str, index: u8) -> Option<&mut GraphNode> {
+        self.graphs.get_mut(id)?.get_mut(usize::from(index))
+    }
+
+    pub(super) fn graph_finished(&mut self, id: &str, index: u8) {
+        if let Some(node) = self.graph_node_mut(id, index) {
+            node.finished = true;
         }
     }
 
-    pub(super) fn graph_finished(&mut self, id: String) {
-        if self.graph_finished.len() < LIMIT { self.graph_finished.insert(id); }
-        else { self.dropped = true; }
-    }
-
-    fn graph_predecessors(&self, context: &str) -> Option<Vec<String>> {
-        if self.dropped || self.graph_calls.get(context).is_some_and(|calls| !calls.is_empty()) { return None; }
-        let deps = self.graph_deps.get(context)?;
+    fn graph_predecessors(&self, id: &str, index: u8) -> Option<Vec<String>> {
+        if self.dropped { return None; }
+        let graph = self.graphs.get(id)?;
+        let node = graph.get(usize::from(index))?;
+        if !node.calls.is_empty() { return None; }
         let mut result = Vec::new();
-        for dep in deps {
-            if !self.graph_finished.contains(dep) { return None; }
-            result.extend(self.graph_calls.get(dep).into_iter().flatten().cloned());
+        for &dep in &node.deps {
+            let dep = graph.get(usize::from(dep))?;
+            if !dep.finished || result.len() + dep.calls.len() > MAX_PREDECESSORS {
+                return None;
+            }
+            result.extend(dep.calls.iter().cloned());
         }
-        (result.len() <= 128).then_some(result)
+        Some(result)
     }
 
     pub(super) fn result_received(&mut self) { self.received = self.received.saturating_add(1); }
@@ -300,9 +338,10 @@ pub(super) fn tool(
         .map(|value| value.to_rust_string_lossy(scope));
     let state = scope.get_slot_mut::<RuntimeState>()?;
     let helper_context = context.as_deref().filter(|context| context.starts_with("helper-"));
+    let graph_context = context.as_deref().and_then(graph_context);
     let predecessors = if let Some(context) = helper_context {
         state.causal.helper_predecessors(context)
-    } else { context.as_deref().and_then(|context| state.causal.graph_predecessors(context))
+    } else { graph_context.and_then(|(graph, index)| state.causal.graph_predecessors(graph, index))
         .or_else(|| state.causal.predecessors()) };
     if let Some((group, branch)) = helper_context.and_then(|context| context.rsplit_once('/')) {
         if !state.causal.dropped && state.causal.helpers.contains_key(group) {
@@ -310,13 +349,16 @@ pub(super) fn tool(
             // The next action in this branch awaits this operation first.
             state.causal.helper_calls.entry(group.to_owned()).or_default()
                 .insert(branch.to_owned(), vec![id.to_owned()]);
-            if let Some(graph) = state.causal.helper_graphs.get(group).cloned() {
-                state.causal.graph_calls.entry(graph).or_default().push(id.to_owned());
+            if let Some(context) = state.causal.helper_graphs.get(group).cloned()
+                && let Some(node) = state.causal.graph_node_mut(&context.graph, context.index) {
+                node.calls.push(id.to_owned());
             }
         }
     }
-    if let Some(context) = context.filter(|context| !state.causal.dropped && state.causal.graph_deps.contains_key(context)) {
-        state.causal.graph_calls.entry(context).or_default().push(id.to_owned());
+    if !state.causal.dropped
+        && let Some((graph, index)) = graph_context
+        && let Some(node) = state.causal.graph_node_mut(graph, index) {
+        node.calls.push(id.to_owned());
     }
     if let Some(row) = index.and_then(|index| state.causal.promises.get_mut(index)) {
         // The returned native promise identifies exactly this operation. Its

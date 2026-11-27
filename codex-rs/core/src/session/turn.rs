@@ -759,12 +759,6 @@ pub(crate) fn run_turn<'a>(
             if authored_receipt_sealed() && !generation_request.terminal_completion_only {
                 generation_request = generation_request.require_terminal_completion();
             }
-            let previous_rates = sess.state.lock().await.token_info_and_rate_limits().1;
-            turn_context.turn_timing_state.observe_credits(
-                previous_rates
-                    .as_ref()
-                    .and_then(|rates| rates.credits.as_ref()),
-            );
             let generation_budget_admission =
                 logical_generation_budget.admit(generation_request.terminal_completion_only);
             let mut request_before_forced_terminal = None;
@@ -1261,6 +1255,7 @@ pub(crate) fn run_turn<'a>(
                         && retire_consumed_tool_outputs_before_limit(
                             sess.as_ref(),
                             turn_context.as_ref(),
+                            client_session.effective_input(),
                         )
                         .await
                     {
@@ -4385,6 +4380,9 @@ async fn run_history_pre_sampling_compact(
     {
         return Ok(Some(PreSamplingCompactionReason::PreviousModel));
     }
+    if check_previous_model && turn_context.config.completed_tool_history_projection {
+        retire_consumed_tool_outputs_for_model_switch(sess, turn_context, cancellation_token).await;
+    }
     Ok(None)
 }
 
@@ -4693,6 +4691,100 @@ const CONTEXT_PRESSURE_KEPT_GENERATIONS: usize = 3;
 /// After the summary request failed, keep only the newest generation inline.
 const FAILED_COMPACTION_KEPT_GENERATIONS: usize = 1;
 
+// Demand substantial absolute and relative savings before rewriting an old prefix.
+// In particular, switching back may still find the old model's prefix warm.
+const MODEL_SWITCH_MIN_CONTEXT_TOKENS: i64 = 65_536;
+const MODEL_SWITCH_MIN_SAVED_TOKENS: i64 = 16_384;
+const MODEL_SWITCH_MIN_SAVED_DIVISOR: i64 = 5;
+
+/// After required model-transition compaction has had its chance, shorten a
+/// large switch request without a summary or borrowed provider response state.
+/// Keep the same working set, eligibility, and exact pins as routine retirement.
+async fn retire_consumed_tool_outputs_for_model_switch(
+    sess: &Session,
+    turn_context: &TurnContext,
+    cancellation_token: &CancellationToken,
+) {
+    if cancellation_token.is_cancelled()
+        || !turn_context.provider.info().is_openai()
+        || sess
+            .previous_turn_settings()
+            .await
+            .is_none_or(|previous| previous.model == turn_context.model_info.slug)
+    {
+        return;
+    }
+    let history = sess.clone_history().await;
+    let modalities = &turn_context.model_info.input_modalities;
+    let instructions = turn_context.base_instructions.as_ref();
+    let Some(before) = history.estimate_token_count(modalities, instructions) else {
+        return;
+    };
+    if before < MODEL_SWITCH_MIN_CONTEXT_TOKENS {
+        return;
+    }
+    let (call_ids, _, decisions) = history.pressure_retirement_decision(
+        CONTEXT_PRESSURE_KEPT_GENERATIONS,
+        /*target_tokens*/ u64::MAX,
+    );
+    if call_ids.is_empty() {
+        return;
+    }
+    let mut observation = RetirementAttemptObservation::new(
+        sess,
+        turn_context,
+        "model_switch",
+        /*projected*/ false,
+        CONTEXT_PRESSURE_KEPT_GENERATIONS,
+    );
+    observation.output_decisions = decisions;
+    observation.selected_outputs = call_ids.len();
+    observation.supporting_state = serde_json::json!({ "estimated_context_before": before });
+    let checkpoint = crate::tool_history::pressure_retirement_checkpoint(
+        &call_ids,
+        crate::tool_history::PressureRetirementTrigger::ModelSwitch,
+        observation.checkpoint_evidence(),
+    );
+    let mut projected = history;
+    projected.record_items(
+        std::iter::once(&checkpoint),
+        turn_context.model_info.truncation_policy.into(),
+    );
+    let Some(after) = projected.estimate_token_count(modalities, instructions) else {
+        observation.outcome = "estimate_unavailable";
+        return;
+    };
+    let saved = before.saturating_sub(after);
+    observation.estimate_available = true;
+    observation.estimated_saved_tokens = saved;
+    if saved < MODEL_SWITCH_MIN_SAVED_TOKENS
+        || saved.saturating_mul(MODEL_SWITCH_MIN_SAVED_DIVISOR) < before
+    {
+        observation.outcome = "insufficient_reclaim";
+        return;
+    }
+    let calibrated_saved = sess
+        .calibrated_prompt_tokens(turn_context, before)
+        .await
+        .saturating_sub(sess.calibrated_prompt_tokens(turn_context, after).await);
+    if cancellation_token.is_cancelled() {
+        return;
+    }
+    if let Err(error) = sess
+        .record_conversation_items(turn_context, &[checkpoint])
+        .await
+    {
+        warn!(%error, "model-switch retirement was not recorded; leaving history unchanged");
+        observation.outcome = "publication_failed";
+        return;
+    }
+    sess.state.lock().await.proactive_retirement_rent_by_call.clear();
+    sess.discount_retired_context_tokens(calibrated_saved).await;
+    sess.send_token_count_event(turn_context).await;
+    observation.published = true;
+    observation.outcome = "retired";
+}
+
 /// Steady-state ceiling for proactive retirement, as a fraction of the
 /// automatic-compaction limit.
 ///
@@ -4738,6 +4830,7 @@ const CACHED_INPUT_COST_DENOMINATOR: u128 = 10;
 async fn retire_consumed_tool_outputs_before_limit(
     sess: &Session,
     turn_context: &TurnContext,
+    delivered: Option<&[ResponseItem]>,
 ) -> bool {
     let mut observation = RetirementAttemptObservation::new(
         sess,
@@ -4759,7 +4852,7 @@ async fn retire_consumed_tool_outputs_before_limit(
         / PROACTIVE_RETIREMENT_TARGET_DENOMINATOR;
     let excess =
         u64::try_from(status.auto_compact_scope_tokens.saturating_sub(target)).unwrap_or(0);
-    let (call_ids, saved, carried, history) = {
+    let (call_ids, saved, history) = {
         let mut state = sess.state.lock().await;
         let (call_ids, saved, decisions) = if excess == 0 {
             (Vec::new(), 0, serde_json::Value::Null)
@@ -4771,7 +4864,7 @@ async fn retire_consumed_tool_outputs_before_limit(
         observation.output_decisions = decisions;
         if call_ids.is_empty() || saved == 0 {
             // No request is re-sending retirable outputs, so no charge accrues.
-            state.proactive_retirement_carried_tokens = 0;
+            state.proactive_retirement_rent_by_call.clear();
             observation.outcome = if excess == 0 {
                 "below_target"
             } else {
@@ -4779,12 +4872,27 @@ async fn retire_consumed_tool_outputs_before_limit(
             };
             return false;
         }
-        // The request that just completed re-sent these outputs.
-        let carried = state
-            .proactive_retirement_carried_tokens
-            .saturating_add(saved);
-        state.proactive_retirement_carried_tokens = carried;
-        (call_ids, saved, carried, state.history.clone())
+        (call_ids, saved, state.history.clone())
+    };
+    let Some(delivered) = delivered else {
+        observation.outcome = "logical_prompt_unavailable";
+        return false;
+    };
+    let charged = history
+        .tool_history_state_ref()
+        .pressure_retirement_rent(&call_ids, delivered);
+    let charged_this_request = charged.values().copied().fold(0_u64, u64::saturating_add);
+    let carried = {
+        let mut state = sess.state.lock().await;
+        let rent = &mut state.proactive_retirement_rent_by_call;
+        let selected: HashSet<&str> = call_ids.iter().map(String::as_str).collect();
+        // A changed selection cannot spend rent accrued by outputs it keeps.
+        rent.retain(|id, _| selected.contains(id.as_str()));
+        for (id, amount) in charged {
+            let existing = rent.entry(id.to_owned()).or_default();
+            *existing = existing.saturating_add(amount);
+        }
+        rent.values().copied().fold(0_u64, u64::saturating_add)
     };
     observation.selected_outputs = call_ids.len();
     observation.estimate_available = true;
@@ -4806,6 +4914,7 @@ async fn retire_consumed_tool_outputs_before_limit(
     observation.supporting_state = serde_json::json!({
         "target_tokens":target, "excess_tokens":excess,
         "carried_tokens":carried, "rewritten_tokens":rewritten,
+        "charged_this_request_tokens":charged_this_request,
         "cached_cost_numerator":CACHED_INPUT_COST_NUMERATOR,
         "cached_cost_denominator":CACHED_INPUT_COST_DENOMINATOR,
     });
@@ -4835,7 +4944,7 @@ async fn retire_consumed_tool_outputs_before_limit(
         observation.outcome = "publication_failed";
         return false;
     }
-    sess.state.lock().await.proactive_retirement_carried_tokens = 0;
+    sess.state.lock().await.proactive_retirement_rent_by_call.clear();
     observation.published = true;
     let saved_tokens = i64::try_from(saved).unwrap_or(i64::MAX);
     sess.discount_retired_context_tokens(saved_tokens).await;
@@ -5171,7 +5280,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
     }
     // The rewrite starts a new prefix, so proactive carrying restarts too.
     observation.published = true;
-    sess.state.lock().await.proactive_retirement_carried_tokens = 0;
+    sess.state.lock().await.proactive_retirement_rent_by_call.clear();
     sess.discount_retired_context_tokens(saved).await;
     sess.send_token_count_event(turn_context).await;
     // Publication can admit new history while persistence is awaited. Do not
@@ -5778,7 +5887,8 @@ fn run_sampling_request<'a>(
             }
             // Rejections can carry quota headers before a stream is returned.
             // Bind those updates to the account used by this physical dispatch too.
-            sess.state.lock().await.bind_rate_limit_account(client_session.dispatched_account().cloned());
+            sess.bind_rate_limit_account(&turn_context, client_session.dispatched_account().cloned())
+                .await;
             let err = match attempt_result {
                 Ok(output) => {
                     return Ok((output, accepted_attempt_input));
@@ -6088,10 +6198,7 @@ async fn drain_in_flight_with_buffer(
             pending_tool_count,
             &mut active_without_pending_passes,
         );
-        turn_context
-            .turn_timing_state
-            .record_next_sample_block_reason_async(reason)
-            .await;
+        turn_context.turn_timing_state.record_next_sample_block_reason(reason);
         trace!(?reason, pending_tool_count, "tool relay reconciliation");
         let completion = if let Some(completion) = completed.pop_front() {
             completion
@@ -6120,12 +6227,11 @@ async fn drain_in_flight_with_buffer(
             .mark_relay_delivery(&expected_execution_id);
         turn_context
             .turn_timing_state
-            .update_tool_dispatch_lifecycle_async(
+            .update_tool_dispatch_lifecycle(
                 &completion.call_id,
                 &expected_execution_id,
                 completion.timing.snapshot(tokio::time::Instant::now()),
-            )
-            .await;
+            );
         let (response_input, required_terminal, completion_error, failure_detail, pending_continuation_ack) =
             match stale_relay_error {
                 Some(err) => {
@@ -6211,7 +6317,7 @@ async fn drain_in_flight_with_buffer(
                 "failed to durably append tool output in order: {err}"
             )));
         }
-        record_reconciliation_async(
+        record_reconciliation(
             &turn_context.turn_timing_state,
             completed.len().saturating_add(in_flight.len()),
             &mut active_without_pending_passes,
@@ -6220,8 +6326,7 @@ async fn drain_in_flight_with_buffer(
             } else {
                 "relay delivery"
             },
-        )
-        .await;
+        );
         if first_error.is_none() {
             first_error = completion_error;
         }
@@ -6277,6 +6382,8 @@ fn hold_sampling_readiness_for_ordered_prefix(
     }
 }
 
+// Completion, relay enqueue and tool admission must not wait for diagnostic
+// archive I/O. Keep their live reconciliation and reservation at the caller.
 pub(crate) fn reconcile_turn_progress_event(
     turn_timing_state: &TurnTimingState,
     pending_tool_count: usize,
@@ -7417,7 +7524,8 @@ fn try_run_sampling_request<'a>(
         let attempt_identity = stream
             .as_ref()
             .and_then(|stream| stream.attempt_identity().cloned());
-        sess.state.lock().await.bind_rate_limit_account(client_session.dispatched_account().cloned());
+        sess.bind_rate_limit_account(&turn_context, client_session.dispatched_account().cloned())
+            .await;
         let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
             FuturesOrdered::new();
         let mut completed_in_flight = VecDeque::new();

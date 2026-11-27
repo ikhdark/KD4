@@ -4,12 +4,10 @@ use std::sync::atomic::AtomicBool;
 use axum::http::HeaderValue;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol_types::ServerLocalWatermark;
-use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
 use codex_login::default_client::SetOriginatorError;
-use codex_login::default_client::USER_AGENT_SUFFIX;
 use codex_login::default_client::get_codex_user_agent;
 use codex_login::default_client::set_default_client_residency_requirement;
-use codex_login::default_client::set_default_originator;
+use codex_login::default_client::set_default_originator_with_user_agent_suffix;
 
 use super::AnalyticsEventsClient;
 use super::Arc;
@@ -105,8 +103,7 @@ impl InitializeRequestProcessor {
             title: _title,
             version,
         } = params.client_info;
-        // Validate before committing; set_default_originator validates while
-        // mutating process-global metadata.
+        // Validate before committing the connection session or process identity.
         if HeaderValue::from_str(&name).is_err() {
             return Err(invalid_request(format!(
                 "Invalid clientInfo.name: '{name}'. Must be a valid HTTP header value."
@@ -142,6 +139,15 @@ impl InitializeRequestProcessor {
             return Err(invalid_request("Already initialized"));
         }
 
+        if tracing::enabled!(target: "codex_app_server::queue_origin_custody", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "codex_app_server::queue_origin_custody",
+                ?connection_id,
+                client_info_key = codex_protocol::timing::client_probe::key(&name),
+                "initialized queue-origin connection"
+            );
+        }
+
         // Negotiate only after the session commit and before its success response.
         if capabilities.stdio_reattach {
             connection_id.enable_stdio_reattach();
@@ -149,26 +155,16 @@ impl InitializeRequestProcessor {
 
         if mutates_global_identity {
             // Only real client initialization may mutate process-global client metadata.
-            let originator_overridden =
-                std::env::var_os(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).is_some();
-            match set_default_originator(originator.clone()) {
-                Ok(()) => {
-                    // Keep the first originating client's User-Agent suffix paired with its
-                    // originator. Environment-owned originators must not inherit a client suffix.
-                    if !originator_overridden && let Ok(mut suffix) = USER_AGENT_SUFFIX.lock() {
-                        *suffix = Some(user_agent_suffix);
-                    }
-                }
+            match set_default_originator_with_user_agent_suffix(
+                originator.clone(),
+                user_agent_suffix,
+            ) {
+                Ok(()) | Err(SetOriginatorError::AlreadyInitialized) => {}
                 Err(SetOriginatorError::InvalidHeaderValue) => {
                     tracing::warn!(
                         client_info_name = %name,
                         "validated clientInfo.name was rejected while setting originator"
                     );
-                }
-                Err(SetOriginatorError::AlreadyInitialized) => {
-                    // The first originating client owns both process-global identity
-                    // components. Later clients must not replace only the suffix and
-                    // create a mixed originator/User-Agent identity.
                 }
             }
         }

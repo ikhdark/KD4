@@ -2009,6 +2009,11 @@ struct PermissionSelectionToml {
     sandbox_mode: Option<SandboxMode>,
 }
 
+#[derive(Deserialize)]
+struct SessionPermissionSelectionToml {
+    default_permissions: Option<String>,
+}
+
 // Resolve the named-profile catalog and selected profile id together. Runtime
 // profile constraints are applied later after this selection compiles into a
 // concrete `PermissionProfile`.
@@ -2058,10 +2063,12 @@ fn resolve_permission_config_syntax(
         .into_iter()
         .find(|layer| matches!(layer.name, ConfigLayerSource::SessionFlags))
         .and_then(|layer| {
+            // This shortcut is only about the session's named selector. A higher
+            // layer may already have repaired a malformed sandbox_mode sibling.
             layer
                 .config
                 .clone()
-                .try_into::<PermissionSelectionToml>()
+                .try_into::<SessionPermissionSelectionToml>()
                 .ok()
         })
         .is_some_and(|selection| selection.default_permissions.is_some());

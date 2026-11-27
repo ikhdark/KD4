@@ -177,17 +177,20 @@ impl RemoteWriteCompletion {
     }
 
     fn complete_flushed(&self, flushed_at: std::time::Instant) {
-        if !self
+        if self
             .delivery_failure
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
-            && let Some(sender) = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .sender
-                .take()
         {
+            return;
+        }
+        let sender = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sender
+            .take();
+        if let Some(sender) = sender {
             let _ = sender.send(flushed_at);
         }
     }
@@ -564,6 +567,28 @@ fn websocket_error_class(error: &tungstenite::Error) -> &'static str {
     }
 }
 
+// Stages only diagnostic data; replay custody and completion stay with the ACK
+// transition. The reader emits in removal order before handling another delivery.
+struct AckObservation {
+    delivery: super::protocol::DeliveryObservation,
+    receive_boundary: Option<(uuid::Uuid, u128, u128)>,
+}
+
+impl AckObservation {
+    fn record_all(observations: Vec<Self>) {
+        for Self { delivery, receive_boundary } in observations {
+            let mut facts = serde_json::json!({"boundary":"relay_ack_not_phone_rendering"});
+            if let Some((generation, received_ns, accepted_ns)) = receive_boundary {
+                facts["socket_generation"] = serde_json::json!(generation);
+                facts["ack_reader_received_ns"] = serde_json::json!(u64::try_from(received_ns).ok());
+                facts["ack_reader_to_buffer_ns"] =
+                    serde_json::json!(u64::try_from(accepted_ns.saturating_sub(received_ns)).ok());
+            }
+            delivery.record("mobile_transport_acknowledged", facts);
+        }
+    }
+}
+
 struct BoundedOutboundBuffer {
     buffer_by_stream: HashMap<(ClientId, StreamId), VecDeque<BufferedServerEnvelope>>,
     used_tx: watch::Sender<usize>,
@@ -612,6 +637,7 @@ impl BoundedOutboundBuffer {
         acked_seq_id: u64,
         acked_segment_id: Option<usize>,
         receive_boundary: Option<(uuid::Uuid, u128, u128)>,
+        observations: &mut Vec<AckObservation>,
     ) -> bool {
         let key = (client_id.clone(), stream_id.clone());
         let Some(buffer) = self.buffer_by_stream.get_mut(&key) else {
@@ -627,15 +653,8 @@ impl BoundedOutboundBuffer {
                 if let Some(completion) = &envelope.completion {
                     completion.record_relay_ack();
                 }
-                if let Some(observation) = envelope.observation {
-                    let mut facts = serde_json::json!({"boundary":"relay_ack_not_phone_rendering"});
-                    if let Some((generation, received_ns, accepted_ns)) = receive_boundary {
-                        facts["socket_generation"] = serde_json::json!(generation);
-                        facts["ack_reader_received_ns"] = serde_json::json!(u64::try_from(received_ns).ok());
-                        facts["ack_reader_to_buffer_ns"] =
-                            serde_json::json!(u64::try_from(accepted_ns.saturating_sub(received_ns)).ok());
-                    }
-                    observation.record("mobile_transport_acknowledged", facts);
+                if let Some(delivery) = envelope.observation {
+                    observations.push(AckObservation { delivery, receive_boundary });
                 }
             }
             removed += 1;
@@ -691,9 +710,14 @@ struct PendingClientDelivery {
 }
 
 impl PendingClientDelivery {
-    fn commit(self, state: &mut WebsocketState, delivered_to_stream: bool) {
+    fn commit(
+        self,
+        state: &mut WebsocketState,
+        delivered_to_stream: bool,
+        observations: &mut Vec<AckObservation>,
+    ) {
         let _ = delivered_to_stream;
-        state.record_client_message_delivery(self.delivery, self.client_message_key);
+        state.record_client_message_delivery(self.delivery, self.client_message_key, observations);
         // Same-stream replacement must not reset dedupe before the prior
         // admitted operation has published its receive frontier.
         let _ = self.committed.send(());
@@ -812,6 +836,7 @@ impl WebsocketState {
         &mut self,
         delivery: ClientDeliveryMetadata,
         client_message_key: Option<((ClientId, Option<StreamId>), u64)>,
+        observations: &mut Vec<AckObservation>,
     ) {
         if let Some(cursor) = delivery.cursor {
             self.subscribe_cursor = Some(cursor);
@@ -820,15 +845,22 @@ impl WebsocketState {
             self.client_segment_reassembler.commit_completed(&client_id, &stream_id, seq_id);
         }
         if let Some((client_id, stream_id, seq_id, segment_id)) = delivery.ack {
-            self.record_ack(&client_id, &stream_id, seq_id, segment_id, None);
+            self.record_ack(&client_id, &stream_id, seq_id, segment_id, None, observations);
         }
     }
 
-    fn record_ack(&mut self, client_id: &ClientId, stream_id: &StreamId, seq_id: u64, segment_id: Option<usize>,
-        received: Option<(uuid::Uuid, u128)>) {
+    fn record_ack(
+        &mut self,
+        client_id: &ClientId,
+        stream_id: &StreamId,
+        seq_id: u64,
+        segment_id: Option<usize>,
+        received: Option<(uuid::Uuid, u128)>,
+        observations: &mut Vec<AckObservation>,
+    ) {
         let boundary = received.map(|(generation, received_ns)|
             (generation, received_ns, codex_protocol::timing::process_monotonic_ns()));
-        if self.outbound_buffer.ack(client_id, stream_id, seq_id, segment_id, boundary) {
+        if self.outbound_buffer.ack(client_id, stream_id, seq_id, segment_id, boundary, observations) {
             // Confirmed consumption is activity; merely generating or buffering
             // output is not proof that this virtual subscriber is alive.
             self.last_ack_activity_by_stream.insert(
@@ -1496,12 +1528,26 @@ impl RemoteControlWebsocket {
             let mut disabled_rx = self.desired_state_rx.clone();
             let socket_generation = codex_protocol::timing::observations::enabled().then(uuid::Uuid::now_v7);
             observe_socket(socket_generation, "mobile_socket_connect_attempt", serde_json::json!({}));
+            let cancel_attempt = |reason| {
+                if socket_generation.is_some() {
+                    observe_socket(
+                        socket_generation,
+                        "mobile_socket_connect_cancelled",
+                        serde_json::json!({"reason": reason}),
+                    );
+                }
+            };
             let connect_result = tokio::select! {
-                _ = shutdown_token.cancelled() => return ConnectOutcome::Shutdown,
+                _ = shutdown_token.cancelled() => {
+                    cancel_attempt("shutdown");
+                    return ConnectOutcome::Shutdown;
+                }
                 changed = disabled_rx.wait_for(|state| !state.is_enabled()) => {
                     if changed.is_err() {
+                        cancel_attempt("state_channel_closed");
                         return ConnectOutcome::Shutdown;
                     }
+                    cancel_attempt("disabled");
                     return ConnectOutcome::Disabled;
                 }
                 connect_result = async {
@@ -1527,6 +1573,7 @@ impl RemoteControlWebsocket {
                     }
                     self.transport_enrollment = Some(enrollment);
                     if !self.desired_state_rx.borrow().is_enabled() {
+                        cancel_attempt("disabled");
                         return ConnectOutcome::Disabled;
                     }
                     self.auth_recovery = self.auth_manager.unauthorized_recovery();
@@ -1548,6 +1595,7 @@ impl RemoteControlWebsocket {
                 }
                 Err(err) => {
                     if !self.desired_state_rx.borrow().is_enabled() {
+                        cancel_attempt("disabled");
                         return ConnectOutcome::Disabled;
                     }
                     if take_repaired_retry(&err, &mut repaired_retry_available) {
@@ -1921,6 +1969,7 @@ impl RemoteControlWebsocket {
                 }
                 result
             }).await;
+            let flushed_at = std::time::Instant::now();
             // Preserve the existing cancellation check before any journal
             // writes. An actual flush return can still be observed in this race.
             let cancelled = flush_result.is_ok() && shutdown_token.is_cancelled();
@@ -1930,7 +1979,7 @@ impl RemoteControlWebsocket {
             flush_result?;
             if cancelled { return Ok(()); }
             for completion in completions {
-                completion.complete_flushed(std::time::Instant::now());
+                completion.complete_flushed(flushed_at);
             }
             if heartbeat_due {
                 writer_operation(&shutdown_token, websocket_writer.send(tungstenite::Message::Ping(Vec::new().into()))).await?;
@@ -2027,7 +2076,9 @@ impl RemoteControlWebsocket {
                             delivery.client_message_key = None;
                         }
                     }
-                    delivery.commit(&mut *state.lock().await, delivered);
+                    let mut observations = Vec::new();
+                    delivery.commit(&mut *state.lock().await, delivered, &mut observations);
+                    AckObservation::record_all(observations);
                     continue;
                 }
                 incoming_message = async {
@@ -2170,15 +2221,18 @@ impl RemoteControlWebsocket {
             }
             let mut delivery = ClientDeliveryMetadata::from(&client_envelope);
             if let Some((client_id, stream_id, seq_id, segment_id)) = delivery.ack.take() {
+                let mut observations = Vec::new();
                 let mut state = state.lock().await;
-                state.record_ack(&client_id, &stream_id, seq_id, segment_id, received);
+                state.record_ack(&client_id, &stream_id, seq_id, segment_id, received, &mut observations);
                 // Coalesce the cursor into the preceding frontier operation.
                 // ACK bookkeeping never consumes ordinary forwarding admission.
                 if let Some(previous) = pending.back_mut() {
                     if delivery.cursor.is_some() { previous.delivery.cursor = delivery.cursor; }
                 } else {
-                    state.record_client_message_delivery(delivery, None);
+                    state.record_client_message_delivery(delivery, None, &mut observations);
                 }
+                drop(state);
+                AckObservation::record_all(observations);
                 continue;
             }
             // Bound both queued operations and their declared/reassembled byte cost.

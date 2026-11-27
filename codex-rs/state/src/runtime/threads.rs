@@ -497,17 +497,7 @@ ORDER BY depth ASC, child_thread_id ASC
         // reserve SQLite's sole writer; WAL readers can check it concurrently.
         // A miss is only a hint: recheck under BEGIN IMMEDIATE below before
         // validating topology or inserting, since another writer may win.
-        let edge_exists = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(SELECT 1 FROM thread_spawn_edges WHERE child_thread_id = ?)",
-        )
-        .bind(child_thread_id.to_string())
-        .fetch_one(self.pool.as_ref())
-        .await
-        .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
-            operation: "check inferred thread-spawn edge",
-            source,
-        })? != 0;
-        if edge_exists {
+        if Self::thread_spawn_edge_exists(self.pool.as_ref(), child_thread_id).await? {
             return Ok(());
         }
         let mut tx = self
@@ -518,26 +508,50 @@ ORDER BY depth ASC, child_thread_id ASC
                 operation: "begin inferred thread-spawn edge write",
                 source,
             })?;
-        let edge_exists = sqlx::query_scalar::<_, i64>(
+        let inserted = Self::insert_thread_spawn_edge_if_absent_on_writer(
+            &mut tx,
+            parent_thread_id,
+            child_thread_id,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+                operation: if inserted {
+                    "commit inferred thread-spawn edge write"
+                } else {
+                    "commit inferred thread-spawn edge check"
+                },
+                source,
+            })?;
+        Ok(())
+    }
+
+    async fn thread_spawn_edge_exists<'e>(
+        executor: impl sqlx::Executor<'e, Database = Sqlite>,
+        child_thread_id: ThreadId,
+    ) -> Result<bool, ThreadSpawnEdgeWriteError> {
+        sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM thread_spawn_edges WHERE child_thread_id = ?)",
         )
         .bind(child_thread_id.to_string())
-        .fetch_one(&mut *tx)
+        .fetch_one(executor)
         .await
         .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
             operation: "check inferred thread-spawn edge",
             source,
-        })? != 0;
-        if edge_exists {
-            tx.commit()
-                .await
-                .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
-                    operation: "commit inferred thread-spawn edge check",
-                    source,
-                })?;
-            return Ok(());
+        })
+    }
+
+    async fn insert_thread_spawn_edge_if_absent_on_writer(
+        connection: &mut SqliteConnection,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> Result<bool, ThreadSpawnEdgeWriteError> {
+        if Self::thread_spawn_edge_exists(&mut *connection, child_thread_id).await? {
+            return Ok(false);
         }
-        validate_thread_spawn_edge(&mut tx, parent_thread_id, child_thread_id).await?;
+        validate_thread_spawn_edge(connection, parent_thread_id, child_thread_id).await?;
         sqlx::query(
             r#"
 INSERT INTO thread_spawn_edges (
@@ -551,19 +565,13 @@ ON CONFLICT(child_thread_id) DO NOTHING
         .bind(parent_thread_id.to_string())
         .bind(child_thread_id.to_string())
         .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
-        .execute(&mut *tx)
+        .execute(connection)
         .await
         .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
             operation: "insert inferred thread-spawn edge",
             source,
         })?;
-        tx.commit()
-            .await
-            .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
-                operation: "commit inferred thread-spawn edge write",
-                source,
-            })?;
-        Ok(())
+        Ok(true)
     }
 
     async fn insert_thread_spawn_edge_from_source_if_absent(
@@ -595,17 +603,30 @@ ON CONFLICT(child_thread_id) DO NOTHING
         else {
             return Ok(());
         };
-        let deleted_owner = sqlx::query_scalar::<_, i64>(
+        if Self::has_deleted_thread_spawn_owner(
+            self.pool.as_ref(),
+            parent_thread_id,
+            child_thread_id,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        Err(err.into())
+    }
+
+    async fn has_deleted_thread_spawn_owner<'e>(
+        executor: impl sqlx::Executor<'e, Database = Sqlite>,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM deleted_thread_owners WHERE thread_id IN (?, ?))",
         )
         .bind(parent_thread_id.to_string())
         .bind(child_thread_id.to_string())
-        .fetch_one(self.pool.as_ref())
-        .await?;
-        if deleted_owner != 0 {
-            return Ok(());
-        }
-        Err(err.into())
+        .fetch_one(executor)
+        .await
     }
 
     /// Find a rollout path by thread id using the underlying database.
@@ -895,7 +916,56 @@ ON CONFLICT(child_thread_id) DO NOTHING
         expected: Option<&crate::ThreadMetadata>,
         source_version: &(PathBuf, u64, Option<std::time::SystemTime>),
     ) -> anyhow::Result<()> {
+        self.reconcile_thread_metadata_inner(extracted, expected, source_version, None)
+            .await
+    }
+
+    /// Publish a backfill candidate only under its current lease. Keep the row
+    /// and edge commits separate so retryable inference failures don't discard
+    /// indexed metadata. A handoff between commits prevents the old worker from
+    /// writing the edge; the successor resumes from the durable checkpoint.
+    pub async fn reconcile_backfill_thread_metadata(
+        &self,
+        claim: &crate::BackfillClaim,
+        extracted: &crate::ThreadMetadata,
+        expected: Option<&crate::ThreadMetadata>,
+        source_version: &(PathBuf, u64, Option<std::time::SystemTime>),
+        parent_thread_id: Option<ThreadId>,
+    ) -> anyhow::Result<()> {
+        self.reconcile_thread_metadata_inner(extracted, expected, source_version, Some(claim))
+            .await?;
+        if let Some(parent_thread_id) = parent_thread_id
+            && !Self::thread_spawn_edge_exists(self.pool.as_ref(), extracted.id).await?
+        {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            Self::ensure_backfill_claim_on_writer(&mut tx, claim).await?;
+            if let Err(err) = Self::insert_thread_spawn_edge_if_absent_on_writer(
+                &mut tx,
+                parent_thread_id,
+                extracted.id,
+            )
+            .await
+                && !Self::has_deleted_thread_spawn_owner(&mut *tx, parent_thread_id, extracted.id)
+                    .await?
+            {
+                return Err(err.into());
+            }
+            tx.commit().await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_thread_metadata_inner(
+        &self,
+        extracted: &crate::ThreadMetadata,
+        expected: Option<&crate::ThreadMetadata>,
+        source_version: &(PathBuf, u64, Option<std::time::SystemTime>),
+        claim: Option<&crate::BackfillClaim>,
+    ) -> anyhow::Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(claim) = claim {
+            Self::ensure_backfill_claim_on_writer(&mut tx, claim).await?;
+        }
         let source = tokio::fs::metadata(&source_version.0).await?;
         anyhow::ensure!(
             source.len() == source_version.1 && source.modified().ok() == source_version.2,

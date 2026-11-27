@@ -1216,24 +1216,16 @@ pub(crate) async fn backfill_sessions_until(
                                 .or(Some(fallback_archived_at));
                         }
                         if let Err(err) = runtime
-                            .reconcile_thread_metadata(
+                            .reconcile_backfill_thread_metadata(
+                                &claim,
                                 &metadata,
                                 expected.as_ref(),
                                 &source_version,
+                                parent_thread_id,
                             )
                             .await
                         {
-                            warn!("failed to upsert rollout {}: {err}", rollout.path.display());
-                            (false, None)
-                        } else if let Some(parent_thread_id) = parent_thread_id
-                            && let Err(err) = runtime
-                                .infer_thread_spawn_edge_if_absent(parent_thread_id, metadata.id)
-                                .await
-                        {
-                            warn!(
-                                "failed to restore parent edge for {}: {err}",
-                                rollout.path.display()
-                            );
+                            warn!("failed to reconcile rollout {}: {err}", rollout.path.display());
                             (false, None)
                         } else {
                             stats.upserted = stats.upserted.saturating_add(1);

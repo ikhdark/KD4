@@ -225,14 +225,16 @@
   // Never substitute a combined display, a decoded pipe or the last poll's suffix.
   Object.defineProperty(globalThis, "save_command_streams", {
     value: async function save_command_streams(r, stdoutPath, stderrPath) {
-      if (r?.execution_state !== "exited" || r.exit_code !== 0 || r.session_id != null ||
-          r.error != null || r.tool_failure != null || r.process_exited !== true ||
-          r.output_drained !== true || r.streams_complete !== true || r.output_encoding != null ||
-          r.stream_chunks_complete !== true || r.stream_ranges?.length !== 2)
-        throw new Error("expected a successful terminal receipt with complete separate UTF-8 streams");
-      const entries = [[stdoutPath, r.stdout], [stderrPath, r.stderr]];
+      const terminal = r?.terminal ?? r;
+      const streams = r?.stream_chunks_complete === true ? r : terminal;
+      if (terminal?.execution_state !== "exited" || terminal.exit_code !== 0 || terminal.session_id != null ||
+          terminal.error != null || terminal.tool_failure != null || terminal.process_exited !== true ||
+          terminal.output_drained !== true || streams.streams_complete !== true || terminal.output_encoding != null ||
+          streams.stream_chunks_complete !== true || streams.stream_ranges?.length !== 2)
+        throw new Error("expected a successful command with complete separate UTF-8 streams");
+      const entries = [[stdoutPath, streams.stdout], [stderrPath, streams.stderr]];
       for (const [i, [, content]] of entries.entries()) {
-        const range = r.stream_ranges[i];
+        const range = streams.stream_ranges[i];
         if (typeof content !== "string" || range?.start !== 0 || range.end !== smallBytes(content).length)
           throw new Error("stream text does not cover its original byte range");
       }

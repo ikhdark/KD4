@@ -305,7 +305,11 @@ impl ThreadHistoryBuilder {
     /// This function should handle all EventMsg variants that can be persisted in a rollout file.
     /// See `should_persist_event_msg` in `codex-rs/core/rollout/policy.rs`.
     pub fn handle_event(&mut self, event: &EventMsg) {
-        if let Some(mirror) = self.pending_legacy_user_mirror.take()
+        // Background exec output can arrive between the canonical user item and
+        // its legacy mirror without changing history. Keep only the user token
+        // across that delta; other events still end its matching window.
+        if !matches!(event, EventMsg::ExecCommandOutputDelta(_))
+            && let Some(mirror) = self.pending_legacy_user_mirror.take()
             && let EventMsg::UserMessage(payload) = event
             && payload.client_id == mirror.client_id
             && payload.message == mirror.message

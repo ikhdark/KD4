@@ -194,9 +194,8 @@ pub(crate) struct SessionState {
     /// Usage and rate limits carried by the last published `TokenCount`.
     last_published_token_count: Option<(Option<TokenUsageInfo>, Option<RateLimitSnapshot>)>,
     pub(crate) prompt_token_calibration: PromptTokenCalibration,
-    /// Estimated retirable tokens re-sent by each request checked since history
-    /// was last rewritten; see `retire_consumed_tool_outputs_before_limit`.
-    pub(crate) proactive_retirement_carried_tokens: u64,
+    /// Rent already paid for each selected output in the current sampling prefix.
+    pub(crate) proactive_retirement_rent_by_call: HashMap<String, u64>,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
     /// Settings used by the latest regular user turn, used for turn-to-turn
@@ -239,7 +238,7 @@ impl SessionState {
             latest_compaction_receipt: None,
             last_published_token_count: None,
             prompt_token_calibration: PromptTokenCalibration::default(),
-            proactive_retirement_carried_tokens: 0,
+            proactive_retirement_rent_by_call: HashMap::new(),
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
@@ -347,7 +346,7 @@ impl SessionState {
         // against discarded history must not inflate the replacement checkpoint.
         self.prompt_token_calibration = PromptTokenCalibration::default();
         // The replacement already rewrote the prompt, so carrying restarts.
-        self.proactive_retirement_carried_tokens = 0;
+        self.proactive_retirement_rent_by_call.clear();
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
@@ -470,12 +469,21 @@ impl SessionState {
     pub(crate) fn bind_rate_limit_account(
         &mut self,
         account: Option<crate::responses_retry::AccountChangeIdentity>,
-    ) {
-        if self.rate_limit_account != account {
-            self.rate_limits.clear();
-            self.active_rate_limit_id = None;
-            self.rate_limit_account = account;
+    ) -> bool {
+        if self.rate_limit_account == account {
+            return false;
         }
+        self.rate_limits.clear();
+        self.active_rate_limit_id = None;
+        self.rate_limit_account = account;
+        true
+    }
+
+    pub(crate) fn active_rate_limit_credits(
+        &self,
+    ) -> Option<&codex_protocol::protocol::CreditsSnapshot> {
+        let id = self.active_rate_limit_id.as_ref()?;
+        self.rate_limits.get(id)?.credits.as_ref()
     }
 
     pub(crate) fn set_rate_limits(&mut self, mut snapshot: RateLimitSnapshot) {

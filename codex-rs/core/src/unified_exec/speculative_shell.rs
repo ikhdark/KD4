@@ -29,7 +29,7 @@
 //! own process. An accepted host is attributed to the consuming call's process
 //! observation scope as its requested root (creation time kept, hand-off time added).
 //!
-//! Enabled by default on Windows; set `KD4_SPECULATIVE_SHELL=0` to disable.
+//! Disabled by default on Windows; set `KD4_SPECULATIVE_SHELL=1` to opt in.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;

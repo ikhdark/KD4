@@ -292,6 +292,11 @@ impl RenderBudget {
 
 type Rendered = Result<String, ()>;
 
+struct PositionOutput {
+    available_bytes: usize,
+    object_over_budget: bool,
+}
+
 const NESTED_RESOURCE_UNKNOWN: &str =
     "unknown /* schema projection incomplete: nested $id resource not projected */";
 
@@ -315,15 +320,34 @@ fn render_schema_position(
         return Err(());
     }
     budget.depth += 1;
-    let rendered = render_schema(schema, root, budget);
+    let mut output = PositionOutput {
+        available_bytes,
+        object_over_budget: false,
+    };
+    let rendered = render_schema(schema, root, budget, &mut output);
     budget.depth -= 1;
     let mut rendered = rendered?;
+    if output.object_over_budget {
+        return Err(());
+    }
     if include_description
-        && let Some(description) = schema.get("description").and_then(JsonValue::as_str)
-        && !description.trim().is_empty()
+        && let Some(description) = schema
+            .get("description")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+        && !description.is_empty()
     {
-        let comment = format!("/* {} */", sanitize_comment(description.trim()));
-        if !rendered.contains(&comment) {
+        let remaining = available_bytes.checked_sub(rendered.len()).ok_or(())?;
+        // A duplicate may already be in the rendered shape even when there
+        // is not enough room to prepend another copy of it.
+        let comment_limit = remaining.saturating_sub(1).max(rendered.len());
+        let comment_len = bounded_block_comment_len(description, comment_limit)?;
+        let mut comment = String::with_capacity(comment_len);
+        comment.push_str("/* ");
+        comment.extend(sanitized_comment_chars(description));
+        comment.push_str(" */");
+        if !rendered.contains(comment.as_str()) {
+            remaining.checked_sub(comment_len + 1).ok_or(())?;
             rendered = format!("{comment} {rendered}");
         }
     }
@@ -336,7 +360,12 @@ fn render_schema_position(
     Ok(rendered)
 }
 
-fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget) -> Rendered {
+fn render_schema(
+    schema: &JsonValue,
+    root: &JsonValue,
+    budget: &mut RenderBudget,
+    output: &mut PositionOutput,
+) -> Rendered {
     // A nested resource has its own reference identity. Until resource resolution
     // is supported, never resolve its fragments against the enclosing document.
     if !std::ptr::eq(schema, root) && schema.get("$id").and_then(JsonValue::as_str).is_some() {
@@ -470,7 +499,13 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
                         .iter()
                         .filter_map(JsonValue::as_str)
                         .map(|schema_type| {
-                            render_json_schema_type_keyword(map, schema_type, root, budget)
+                            render_json_schema_type_keyword(
+                                map,
+                                schema_type,
+                                root,
+                                budget,
+                                output,
+                            )
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     if !rendered.is_empty() {
@@ -500,6 +535,7 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
                             schema_type,
                             root,
                             budget,
+                            output,
                         )?);
                     }
                 }
@@ -518,7 +554,7 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
                 if has_object || has_array {
                     // Applicator keywords constrain only their own instance type.
                     // Retain the other JSON types, including inside compositions.
-                    let object = render_json_schema_object(map, root, budget)?;
+                    let object = render_json_schema_object(map, root, budget, output)?;
                     let array = render_json_schema_array(map, root, budget)?;
                     base = Some(format!(
                         "string | (number | bigint) | boolean | null | {array} | {object}"
@@ -685,6 +721,7 @@ fn render_json_schema_type_keyword(
     schema_type: &str,
     root: &JsonValue,
     budget: &mut RenderBudget,
+    output: &mut PositionOutput,
 ) -> Rendered {
     Ok(match schema_type {
         "string" => "string".to_string(),
@@ -693,7 +730,7 @@ fn render_json_schema_type_keyword(
         "boolean" => "boolean".to_string(),
         "null" => "null".to_string(),
         "array" => return render_json_schema_array(map, root, budget),
-        "object" => return render_json_schema_object(map, root, budget),
+        "object" => return render_json_schema_object(map, root, budget, output),
         _ => "unknown".to_string(),
     })
 }
@@ -832,10 +869,18 @@ fn has_property_description(value: &JsonValue) -> bool {
         .is_some_and(|description| !description.is_empty())
 }
 
+fn property_comment_lines(description: &str) -> impl Iterator<Item = &str> {
+    description
+        .split(['\n', '\r', '\u{2028}', '\u{2029}'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+}
+
 fn render_json_schema_object(
     map: &serde_json::Map<String, JsonValue>,
     root: &JsonValue,
     budget: &mut RenderBudget,
+    output: &mut PositionOutput,
 ) -> Rendered {
     let empty_properties = serde_json::Map::new();
     let properties = map
@@ -887,57 +932,95 @@ fn render_json_schema_object(
         if required.contains(name) && value == &JsonValue::Bool(false) {
             return Ok("never".to_string());
         }
-        if multiline && let Some(description) = value.get("description").and_then(JsonValue::as_str)
-        {
+        let description = value.get("description").and_then(JsonValue::as_str);
+        let line_description = description.filter(|_| multiline);
+        if let Some(description) = line_description {
             budget.spend(description.len())?;
-            for description_line in description
-                .split(['\n', '\r', '\u{2028}', '\u{2029}'])
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-            {
-                lines.push(format!("// {description_line}"));
-            }
         }
         budget.spend(name.len().saturating_mul(6))?;
         let property_name = render_json_schema_property_name(name);
-        let mut property_type = render_schema_position(value, root, budget, false)?;
-        // A reference can repeat the property's own guidance. Keep the existing
-        // property comment without duplicating that same annotation at its type.
-        if let Some(description) = value.get("description").and_then(JsonValue::as_str) {
-            let comment = format!("/* {} */ ", sanitize_comment(description.trim()));
-            if let Some(rest) = property_type.strip_prefix(&comment) {
-                property_type = rest.to_string();
-            }
-        }
+        let property_type = render_schema_position(value, root, budget, false)?;
+        // A reference can repeat the property's own guidance. Compare the
+        // sanitized prefix in place; no copy is needed even for long descriptions.
+        let property_type = description
+            .and_then(|description| strip_description_prefix(&property_type, description))
+            .unwrap_or(&property_type);
         let optional = if required.contains(name) { "" } else { "?" };
-        lines.push(format!("{property_name}{optional}: {property_type};"));
+        lines.push((
+            line_description,
+            format!("{property_name}{optional}: {property_type};"),
+        ));
     }
     if has_patterns {
         budget.incomplete = true;
-        lines.push("[key: string]: unknown; /* patternProperties not projected */".to_string());
+        lines.push((
+            None,
+            "[key: string]: unknown; /* patternProperties not projected */".to_string(),
+        ));
     } else if additional != &JsonValue::Bool(false)
         && (map.contains_key("additionalProperties") || properties.is_empty())
     {
         let additional_type = render_json_schema_to_typescript_inner(additional, root, budget)?;
         if names.is_empty() || additional_type == "unknown" {
-            lines.push(format!("[key: string]: {additional_type};"));
+            lines.push((None, format!("[key: string]: {additional_type};")));
         } else {
             // TS index signatures also govern named fields. An unknown signature
             // is deliberately wider; the annotation preserves the extra-key rule.
             let annotation = sanitize_comment(&additional_type);
-            lines.push(format!(
-                "[key: string]: unknown; /* additional keys: {annotation} */"
+            lines.push((
+                None,
+                format!("[key: string]: unknown; /* additional keys: {annotation} */"),
             ));
         }
     }
     if lines.is_empty() {
         return Ok("Record<string, never>".to_string());
     }
-    Ok(if multiline {
-        format!("{{\n  {}\n}}", lines.join("\n  "))
+    let (open, separator, close) = if multiline {
+        ("{\n  ", "\n  ", "\n}")
     } else {
-        format!("{{ {} }}", lines.join(" "))
-    })
+        ("{ ", " ", " }")
+    };
+    let parts = || {
+        lines.iter().flat_map(|(description, line)| {
+            (*description)
+                .into_iter()
+                .flat_map(property_comment_lines)
+                .map(|comment| ("// ", comment))
+                .chain(std::iter::once(("", line.as_str())))
+        })
+    };
+    // Keep comments borrowed until the object cannot short-circuit to never.
+    // The raw description charge above still governs traversal; this check
+    // bounds the expanded lines and separators before allocating their output.
+    let remaining = output
+        .available_bytes
+        .checked_sub(open.len() + close.len())
+        .and_then(|remaining| {
+            parts()
+                .enumerate()
+                .try_fold(remaining, |remaining, (index, (prefix, part))| {
+                    let separator_bytes = if index == 0 { 0 } else { separator.len() };
+                    remaining.checked_sub(separator_bytes + prefix.len() + part.len())
+                })
+        });
+    let Some(remaining) = remaining else {
+        // This object is included in the position's result. Defer its failure
+        // until that boundary so later siblings still record their fragments.
+        output.object_over_budget = true;
+        return Ok(String::new());
+    };
+    let mut rendered = String::with_capacity(output.available_bytes - remaining);
+    rendered.push_str(open);
+    for (index, (prefix, part)) in parts().enumerate() {
+        if index != 0 {
+            rendered.push_str(separator);
+        }
+        rendered.push_str(prefix);
+        rendered.push_str(part);
+    }
+    rendered.push_str(close);
+    Ok(rendered)
 }
 
 fn render_json_schema_property_name(name: &str) -> String {
@@ -1029,16 +1112,43 @@ impl std::io::Write for BoundedLiteralWriter {
     }
 }
 
-// Keep schema-controlled text within one generated block comment.
+fn bounded_block_comment_len(value: &str, limit: usize) -> Result<usize, ()> {
+    let remaining = limit
+        .checked_sub("/*  */".len())
+        .and_then(|remaining| remaining.checked_sub(value.len()))
+        .ok_or(())?;
+    // Newlines change to a single ASCII byte. Only escaping */ adds bytes,
+    // and the two-byte delimiter cannot overlap itself.
+    let remaining = value
+        .match_indices("*/")
+        .try_fold(remaining, |remaining, _| remaining.checked_sub(1))
+        .ok_or(())?;
+    Ok(limit - remaining)
+}
+
+fn strip_description_prefix<'a>(rendered: &'a str, description: &str) -> Option<&'a str> {
+    let mut content = rendered.strip_prefix("/* ")?.chars();
+    for expected in sanitized_comment_chars(description.trim()) {
+        if content.next() != Some(expected) {
+            return None;
+        }
+    }
+    content.as_str().strip_prefix(" */ ")
+}
+
 fn sanitize_comment(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
-    let mut previous = None;
-    for ch in value.chars() {
-        if previous == Some('*') && ch == '/' {
-            output.push(' ');
-        }
-        output.push(if matches!(ch, '\n' | '\r') { ' ' } else { ch });
-        previous = Some(ch);
-    }
+    output.extend(sanitized_comment_chars(value));
     output
+}
+
+// Keep schema-controlled text within one generated block comment.
+fn sanitized_comment_chars(value: &str) -> impl Iterator<Item = char> + '_ {
+    let mut previous = None;
+    value.chars().flat_map(move |ch| {
+        let escape = (previous == Some('*') && ch == '/').then_some(' ');
+        previous = Some(ch);
+        let ch = if matches!(ch, '\n' | '\r') { ' ' } else { ch };
+        escape.into_iter().chain(std::iter::once(ch))
+    })
 }

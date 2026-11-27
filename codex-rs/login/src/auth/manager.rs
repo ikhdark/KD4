@@ -45,6 +45,7 @@ pub use crate::auth::personal_access_token::PersonalAccessTokenAuth;
 pub use crate::auth::storage::AgentIdentityAuthRecord;
 pub use crate::auth::storage::AgentIdentityStorage;
 pub use crate::auth::storage::AuthDotJson;
+pub use crate::auth::storage::AuthFileSizeError;
 pub use crate::auth::storage::OAuthContext;
 pub use crate::auth::storage::AuthKeyringBackendKind;
 use crate::auth::storage::AuthStorageBackend;
@@ -981,7 +982,7 @@ impl PreparedAuthLogout {
         keyring: AuthKeyringBackendKind,
     ) -> std::io::Result<Self> {
         let managed = create_auth_storage(codex_home.to_path_buf(), mode, keyring);
-        let auth = managed.load()?;
+        let auth = managed.load_for_logout()?;
         let mut stores = vec![(managed, auth)];
         if mode != AuthCredentialsStoreMode::Ephemeral {
             let ephemeral = create_auth_storage(
@@ -2229,6 +2230,7 @@ struct AuthLoadFailure {
     since: Option<Instant>,
     kind: std::io::ErrorKind,
     message: String,
+    file_size_error: Option<AuthFileSizeError>,
 }
 
 /// Central manager providing a single source of truth for auth.json derived
@@ -2362,6 +2364,7 @@ impl AuthManager {
                     since: (err.kind() != std::io::ErrorKind::WouldBlock).then_some(now),
                     kind: err.kind(),
                     message: err.to_string(),
+                    file_size_error: AuthFileSizeError::from_io(&err),
                 }))
             }
         };
@@ -2775,6 +2778,9 @@ impl AuthManager {
 
     fn check_cached_auth_load(cached: &CachedAuth) -> std::io::Result<()> {
         if let Some(failure) = cached.load_error.as_ref() {
+            if let Some(error) = failure.file_size_error {
+                return Err(error.into_io());
+            }
             return Err(std::io::Error::new(
                 failure.kind,
                 format!("credentials unavailable: {}", failure.message),
@@ -2805,6 +2811,7 @@ impl AuthManager {
                 since: None,
                 kind: std::io::ErrorKind::WouldBlock,
                 message: "authentication transition is publishing credentials".into(),
+                file_size_error: None,
             });
             Ok(cached.load_publications)
         })?
@@ -2889,6 +2896,7 @@ impl AuthManager {
             since,
             kind: err.kind(),
             message: err.to_string(),
+            file_size_error: AuthFileSizeError::from_io(err),
         });
         if keep_anchor
             && !policy_denied
@@ -3771,6 +3779,7 @@ impl AuthManager {
                 since: None,
                 kind: std::io::ErrorKind::PermissionDenied,
                 message: "credential retirement did not finish; log in again".into(),
+                file_size_error: None,
             });
             let (changed, _) = self.set_cached_auth_locked(&mut cached, None);
             drop(cached);

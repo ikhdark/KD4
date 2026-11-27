@@ -70,6 +70,7 @@ pub struct ResolvedModelProviderClientSetup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderAccountError {
     CredentialsUnavailable(std::io::ErrorKind),
+    AuthFileTooLarge(codex_login::AuthFileSizeError),
     MissingChatgptAccountDetails,
     UnsupportedBedrockApiKeyAuth,
 }
@@ -81,6 +82,7 @@ impl fmt::Display for ProviderAccountError {
                 f,
                 "credentials unavailable ({kind:?}); reload authentication to retry"
             ),
+            Self::AuthFileTooLarge(error) => fmt::Display::fmt(error, f),
             Self::MissingChatgptAccountDetails => {
                 write!(f, "plan type is required for chatgpt authentication")
             }
@@ -645,9 +647,12 @@ impl ModelProvider for ConfiguredModelProvider {
         if self.info.requires_openai_auth
             && let Some(manager) = &self.auth_manager
         {
-            manager
-                .check_auth_load()
-                .map_err(|err| ProviderAccountError::CredentialsUnavailable(err.kind()))?;
+            manager.check_auth_load().map_err(|err| {
+                codex_login::AuthFileSizeError::from_io(&err).map_or_else(
+                    || ProviderAccountError::CredentialsUnavailable(err.kind()),
+                    ProviderAccountError::AuthFileTooLarge,
+                )
+            })?;
         }
         let account = if self.info.requires_openai_auth {
             self.auth_manager

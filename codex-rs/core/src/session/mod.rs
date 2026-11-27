@@ -8339,9 +8339,17 @@ impl Session {
 
     pub(crate) async fn bind_rate_limit_account(
         &self,
+        turn_context: &TurnContext,
         account: Option<crate::responses_retry::AccountChangeIdentity>,
     ) {
-        self.state.lock().await.bind_rate_limit_account(account);
+        let account_known = account.is_some();
+        let mut state = self.state.lock().await;
+        let account_changed = state.bind_rate_limit_account(account);
+        turn_context.turn_timing_state.bind_credit_balance_scope(
+            account_known,
+            account_changed,
+            state.active_rate_limit_credits(),
+        );
     }
 
     pub(crate) async fn update_rate_limits(

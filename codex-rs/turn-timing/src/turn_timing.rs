@@ -320,18 +320,22 @@ impl LiveTurnPhase {
         if phases == self.published {
             return;
         }
-        self.published = phases.clone();
-        if let Some((turn_id, sender)) = &self.sink {
-            // The session event channel is unbounded. Closed means its consumer exited.
-            let _ = sender.try_send(codex_protocol::protocol::Event {
-                id: turn_id.clone(),
-                msg: codex_protocol::protocol::EventMsg::TurnPhaseChanged(
-                    codex_protocol::protocol::TurnPhaseChangedEvent {
-                        turn_id: turn_id.clone(),
-                        phases,
-                    },
-                ),
-            });
+        let Some((turn_id, sender)) = &self.sink else {
+            return;
+        };
+        // A full event queue can reject this offer. Keep the last accepted snapshot
+        // so a later update can retry the current phases without blocking.
+        let event = codex_protocol::protocol::Event {
+            id: turn_id.clone(),
+            msg: codex_protocol::protocol::EventMsg::TurnPhaseChanged(
+                codex_protocol::protocol::TurnPhaseChangedEvent {
+                    turn_id: turn_id.clone(),
+                    phases: phases.clone(),
+                },
+            ),
+        };
+        if sender.try_send(event).is_ok() {
+            self.published = phases;
         }
     }
 }
@@ -1372,8 +1376,7 @@ struct TurnTimingStateInner {
     retry_decisions: retries::RetryDecisionLedger,
     activity_timeline: codex_protocol::timing::TurnTimingTimeline,
     final_content: FinalContentObservations,
-    starting_credit_balance: Option<f64>,
-    last_credit_balance: Option<f64>,
+    credit_balance: CreditBalanceWindow,
     started_sample: Option<ClockSample>,
     last_monotonic_ns: Option<u128>,
     activity: ActiveSet,
@@ -1394,7 +1397,7 @@ struct TurnTimingStateInner {
     prior_dispatched_usage_identity: Option<(String, String)>,
     tool_calls: Vec<TurnTimingToolCall>,
     tool_call_timing_overflow: u32,
-    detail_archive: Option<Arc<StdMutex<detail_archive::Capture>>>,
+    detail_archive: Option<Arc<detail_archive::Archive>>,
     archive_sequence: u64,
     /// Model-visible direct results without a (capped) detail row. The next
     /// dispatched request counts their consumes_tool_result edges as dropped.
@@ -1551,8 +1554,7 @@ impl TurnTimingStateInner {
             measurements: measurements::Capture::default(),
             final_content: self.final_content.clone(),
             activity_timeline: self.activity_timeline.clone(),
-            starting_credit_balance: self.starting_credit_balance,
-            last_credit_balance: self.last_credit_balance,
+            credit_balance: self.credit_balance,
             started_sample: self.started_sample,
             last_monotonic_ns: self.last_monotonic_ns,
             activity: self.activity,
@@ -2103,28 +2105,68 @@ impl Drop for TurnPreparationPhaseGuard<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+enum CreditBalanceWindow {
+    #[default]
+    Unbound,
+    Account {
+        start: Option<f64>,
+        end: Option<f64>,
+    },
+    Incomparable,
+}
+
+fn observed_credit_balance(
+    credits: Option<&codex_protocol::protocol::CreditsSnapshot>,
+) -> Option<f64> {
+    credits
+        .filter(|credits| !credits.unlimited)?
+        .balance
+        .as_deref()?
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
 impl TurnTimingState {
-    pub fn observe_credits(
+    pub fn bind_credit_balance_scope(
         &self,
-        credits: Option<&codex_protocol::protocol::CreditsSnapshot>,
+        account_known: bool,
+        account_changed: bool,
+        baseline: Option<&codex_protocol::protocol::CreditsSnapshot>,
     ) {
-        let Some(credits) = credits.filter(|credits| !credits.unlimited) else {
-            return;
-        };
-        let Some(balance) = credits
-            .balance
-            .as_deref()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value >= 0.0)
-        else {
-            return;
-        };
         let mut state = self.state();
         if state.completed_snapshot.is_some() {
             return;
         }
-        state.starting_credit_balance.get_or_insert(balance);
-        state.last_credit_balance = Some(balance);
+        match state.credit_balance {
+            CreditBalanceWindow::Unbound if account_known => {
+                state.credit_balance = CreditBalanceWindow::Account {
+                    start: observed_credit_balance(baseline),
+                    end: None,
+                };
+            }
+            CreditBalanceWindow::Account { .. } if !account_known || account_changed => {
+                state.credit_balance = CreditBalanceWindow::Incomparable;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn observe_credits(&self, credits: Option<&codex_protocol::protocol::CreditsSnapshot>) {
+        let Some(balance) = observed_credit_balance(credits) else {
+            return;
+        };
+        let mut state = self.state();
+        if state.completed_snapshot.is_none()
+            && let CreditBalanceWindow::Account { start, end } = &mut state.credit_balance
+        {
+            if start.is_none() {
+                *start = Some(balance);
+            } else {
+                *end = Some(balance);
+            }
+        }
     }
 
     fn new(clock: SystemTurnClock) -> Self {
@@ -3015,9 +3057,9 @@ impl TurnTimingState {
             blocking::record_dependency(evidence, timing.execution_id.0.clone(),
                 timing.sampling_generation_id.0.clone(), "emitted_by")
         } else { None };
-        let dependency_archive = dropped_dependency.and_then(|edge| state.archive_record(
-            serde_json::json!({"kind":"dependency", "edge":edge}), true,
-        ));
+        if let Some(edge) = dropped_dependency {
+            state.archive_record(serde_json::json!({"kind":"dependency", "edge":edge}), true);
+        }
 
         let observed_at_ms = state
             .elapsed_since_start(sample.time.monotonic_ns)
@@ -3154,19 +3196,16 @@ impl TurnTimingState {
             "outcome":tool_call.outcome, "accepted_ms":tool_call.accepted_at_ms,
             "delivered_ms":tool_call.delivered_at_ms, "lifecycle":tool_call.lifecycle_events,
             "execution_id":tool_call.execution_id}));
-        let detail = if state.tool_calls.len() >= MAX_TOOL_CALL_TIMINGS {
+        if state.tool_calls.len() >= MAX_TOOL_CALL_TIMINGS {
             state.tool_call_timing_overflow = state.tool_call_timing_overflow.saturating_add(1);
-            state.archive_record(serde_json::json!({"kind":"tool_call", "call":tool_call}), true)
+            state.archive_record(serde_json::json!({"kind":"tool_call", "call":tool_call}), true);
         } else {
             state.tool_calls.push(tool_call);
-            None
-        };
+        }
         drop(state);
         if let Some(observation) = observation {
             self.observe_runtime("tool_settled", observation["execution_id"].as_str().unwrap_or_default(), observation.clone());
         }
-        detail_archive::write(dependency_archive);
-        detail_archive::write(detail);
     }
 
     pub fn update_tool_dispatch_lifecycle(
@@ -3175,45 +3214,19 @@ impl TurnTimingState {
         execution_id: &codex_protocol::protocol::ToolExecutionId,
         timing: ToolDispatchTimingSnapshot,
     ) -> bool {
-        let (updated, archived) = self.reserve_tool_dispatch_lifecycle(call_id, execution_id, timing);
-        detail_archive::write(archived);
-        updated
-    }
-
-    pub async fn update_tool_dispatch_lifecycle_async(
-        &self,
-        call_id: &str,
-        execution_id: &codex_protocol::protocol::ToolExecutionId,
-        timing: ToolDispatchTimingSnapshot,
-    ) -> bool {
-        let (updated, archived) = self.reserve_tool_dispatch_lifecycle(call_id, execution_id, timing);
-        if let Some(record) = archived
-            && let Err(error) = tokio::task::spawn_blocking(move || record.write()).await
-        {
-            tracing::warn!(%error, "tool relay timing archive worker failed");
-        }
-        updated
-    }
-
-    fn reserve_tool_dispatch_lifecycle(
-        &self,
-        call_id: &str,
-        execution_id: &codex_protocol::protocol::ToolExecutionId,
-        timing: ToolDispatchTimingSnapshot,
-    ) -> (bool, Option<detail_archive::PendingRecord>) {
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         let Some(tool_call) = state.tool_calls.iter_mut().rev().find(|tool_call| {
             tool_call.call_id == call_id && &tool_call.execution_id == execution_id
         }) else {
-            let record = state.archive_record(serde_json::json!({
+            state.archive_record(serde_json::json!({
                 "kind":"lifecycle", "execution_id":execution_id, "call_id":call_id,
                 "lifecycle_events":timing.lifecycle_events, "timer_waits":timing.timer_waits,
                 "retry_count":timing.retry_count, "reentry_count":timing.reentry_count,
                 "first_poll_to_output_collected_ms":timing.first_poll_to_output_collected_ms,
             }), false);
-            return (false, record);
+            return false;
         };
         tool_call.lifecycle_events = timing.lifecycle_events;
         tool_call.timer_waits = timing.timer_waits;
@@ -3227,7 +3240,16 @@ impl TurnTimingState {
             .first_poll_at_ms
             .zip(timing.first_poll_to_output_collected_ms)
             .map(|(first_poll, duration)| first_poll.saturating_add(duration));
-        (true, None)
+        true
+    }
+
+    pub async fn update_tool_dispatch_lifecycle_async(
+        &self,
+        call_id: &str,
+        execution_id: &codex_protocol::protocol::ToolExecutionId,
+        timing: ToolDispatchTimingSnapshot,
+    ) -> bool {
+        self.update_tool_dispatch_lifecycle(call_id, execution_id, timing)
     }
 
     pub fn record_next_sample_block_reason(&self, reason: NextSampleBlockReason) {
@@ -3237,26 +3259,8 @@ impl TurnTimingState {
 
     /// Per-tool observers may outlive model work and cannot author the turn's live phase.
     pub fn record_tool_sample_block_reason(&self, reason: NextSampleBlockReason) {
-        detail_archive::write(self.reserve_sample_block_reason(reason));
-    }
-
-    pub async fn record_next_sample_block_reason_async(&self, reason: NextSampleBlockReason) {
-        self.set_live_sampling_phase(Some(reason));
-        self.record_tool_sample_block_reason_async(reason).await;
-    }
-
-    /// Record an async tool observer without changing the live sampling phase.
-    pub async fn record_tool_sample_block_reason_async(&self, reason: NextSampleBlockReason) {
-        if let Some(record) = self.reserve_sample_block_reason(reason)
-            && let Err(error) = tokio::task::spawn_blocking(move || record.write()).await
-        {
-            tracing::warn!(%error, "sample block timing archive worker failed");
-        }
-    }
-
-    fn reserve_sample_block_reason(&self, reason: NextSampleBlockReason) -> Option<detail_archive::PendingRecord> {
         let mut state = self.state();
-        let record = state.archive_record(serde_json::json!({"kind":"sample_block_reason", "reason":reason}), false);
+        state.archive_record(serde_json::json!({"kind":"sample_block_reason", "reason":reason}), false);
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         state.ready_to_sample_ns = if reason == NextSampleBlockReason::ReadyToSample {
@@ -3272,43 +3276,32 @@ impl TurnTimingState {
             }
             tool_call.next_sample_block_reason = reason;
         }
-        record
     }
 
-    pub fn record_pending_tool_timer_wait(&self, wait: ToolLifecycleTimerWait) {
-        detail_archive::write(self.reserve_pending_tool_timer_wait(wait));
+    pub async fn record_next_sample_block_reason_async(&self, reason: NextSampleBlockReason) {
+        self.record_next_sample_block_reason(reason);
     }
 
-    /// Publish both sampling observations before yielding to the overflow writer.
+    /// Record an async tool observer without changing the live sampling phase.
+    pub async fn record_tool_sample_block_reason_async(&self, reason: NextSampleBlockReason) {
+        self.record_tool_sample_block_reason(reason);
+    }
+
+    /// Reserve both sampling observations before returning to live admission.
     pub async fn record_sampling_timer_wait_and_block_reason(
         &self,
         wait: ToolLifecycleTimerWait,
         next_reason: impl FnOnce() -> NextSampleBlockReason,
     ) -> NextSampleBlockReason {
-        let timer_record = self.reserve_pending_tool_timer_wait(wait);
+        self.record_pending_tool_timer_wait(wait);
         let reason = next_reason();
-        self.set_live_sampling_phase(Some(reason));
-        let reason_record = self.reserve_sample_block_reason(reason);
-        let records = [timer_record, reason_record];
-        if records.iter().any(Option::is_some)
-            && let Err(error) = tokio::task::spawn_blocking(move || {
-                for record in records.into_iter().flatten() {
-                    record.write();
-                }
-            })
-            .await
-        {
-            tracing::warn!(%error, "sampling timer and block reason archive worker failed");
-        }
+        self.record_next_sample_block_reason(reason);
         reason
     }
 
-    fn reserve_pending_tool_timer_wait(
-        &self,
-        wait: ToolLifecycleTimerWait,
-    ) -> Option<detail_archive::PendingRecord> {
+    pub fn record_pending_tool_timer_wait(&self, wait: ToolLifecycleTimerWait) {
         let mut state = self.state();
-        let record = state.archive_record(serde_json::json!({"kind":"timer_wait", "wait":wait}), false);
+        state.archive_record(serde_json::json!({"kind":"timer_wait", "wait":wait}), false);
         for tool_call in state.tool_calls.iter_mut().rev() {
             if tool_call.model_resumed_at_ms.is_some() {
                 break;
@@ -3319,44 +3312,29 @@ impl TurnTimingState {
             );
             tool_call.reentry_count = tool_call.reentry_count.saturating_add(1);
         }
-        record
     }
 
     /// Records the point at which a direct tool result has been inserted into
     /// model-visible history. This is intentionally separate from durable
     /// rollout persistence.
-    pub fn record_tool_output_model_visible(&self, call_id: &str) {
-        detail_archive::write(self.reserve_tool_output_model_visible(call_id));
-    }
-
     pub async fn record_tool_outputs_model_visible<'a>(
         &self,
         call_ids: impl Iterator<Item = &'a str> + Send,
     ) {
-        // Reserve every event before yielding, just as in the inline version.
-        // The worker owns the batch even if the history observer is dropped.
-        let records = call_ids
-            .filter_map(|call_id| self.reserve_tool_output_model_visible(call_id))
-            .collect::<Vec<_>>();
-        if !records.is_empty()
-            && let Err(error) = tokio::task::spawn_blocking(move || {
-                for record in records {
-                    record.write();
-                }
-            })
-            .await
-        {
-            tracing::warn!(%error, "model-visible tool timing archive worker failed");
+        // Keep the existing async observer interface, but diagnostic I/O must
+        // not hold up the publication of the already-committed tool result.
+        for call_id in call_ids {
+            self.record_tool_output_model_visible(call_id);
         }
     }
 
-    fn reserve_tool_output_model_visible(&self, call_id: &str) -> Option<detail_archive::PendingRecord> {
+    pub fn record_tool_output_model_visible(&self, call_id: &str) {
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         if state.completed_snapshot.is_some() {
             state.invalid_transition();
-            return None;
+            return;
         }
         let model_visible_at_ms = state
             .elapsed_since_start(sample.time.monotonic_ns)
@@ -3386,11 +3364,10 @@ impl TurnTimingState {
                     && entry.identity.source == TurnTimingToolCallSource::Direct
                     && entry.identity.sampling_generation_id.0 == generation
             }).map(|entry| entry.identity.execution_id.clone());
-            return state.archive_record(serde_json::json!({
+            state.archive_record(serde_json::json!({
                 "kind":"model_visible", "execution_id":execution_id, "at_ms":model_visible_at_ms,
             }), false);
         }
-        None
     }
 
     /// Resolve wire IDs while their producing generation is still current, before
@@ -3498,49 +3475,27 @@ impl TurnTimingState {
         call_id: &str,
         timing: ToolDispatchTimingSnapshot,
     ) {
-        detail_archive::write(self.reserve_background_tool_process_exit(call_id, timing));
-    }
-
-    /// Record the exit at the observation site, then await any overflow archive write
-    /// without blocking the async process watcher.
-    pub async fn record_background_tool_process_exit_async(
-        &self,
-        call_id: &str,
-        timing: ToolDispatchTimingSnapshot,
-    ) {
-        if let Some(record) = self.reserve_background_tool_process_exit(call_id, timing)
-            && let Err(error) = tokio::task::spawn_blocking(move || record.write()).await
-        {
-            tracing::warn!(%error, "background process exit timing archive worker failed");
-        }
-    }
-
-    fn reserve_background_tool_process_exit(
-        &self,
-        call_id: &str,
-        timing: ToolDispatchTimingSnapshot,
-    ) -> Option<detail_archive::PendingRecord> {
         if timing.exec_spawn_to_exit_ms.is_none()
             && lifecycle_boundary_at(&timing.lifecycle_events, ToolLifecycleBoundary::ProcessExit)
                 .is_none()
         {
-            return None;
+            return;
         }
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         if state.completed_snapshot.is_some() {
             state.invalid_transition();
-            return None;
+            return;
         }
         if let Some(tool_call) = state.tool_calls.iter_mut().find(|tool_call| {
             tool_call.call_id == call_id && tool_call.execution_id == timing.execution_id
         }) {
             record_tool_process_exit(tool_call, &timing);
-            return None;
+            return;
         }
         let force = state.background_tool_process_exits.len() >= MAX_TOOL_CALL_TIMINGS;
-        let record = state.archive_record(serde_json::json!({
+        state.archive_record(serde_json::json!({
             "kind":"process_exit", "execution_id":timing.execution_id,
             "event":timing.lifecycle_events.iter().find(|event| event.boundary == ToolLifecycleBoundary::ProcessExit),
             "spawn_to_exit_ms":timing.exec_spawn_to_exit_ms,
@@ -3550,7 +3505,15 @@ impl TurnTimingState {
                 .background_tool_process_exits
                 .insert((call_id.to_string(), timing.execution_id.clone()), timing);
         }
-        record
+    }
+
+    /// The exit watcher must not wait on diagnostic storage before publishing.
+    pub async fn record_background_tool_process_exit_async(
+        &self,
+        call_id: &str,
+        timing: ToolDispatchTimingSnapshot,
+    ) {
+        self.record_background_tool_process_exit(call_id, timing);
     }
 
     pub fn record_initial_plan_generation(&self) {
@@ -5066,15 +5029,14 @@ impl TurnTimingState {
         }
         let lifecycle_context = self.lifecycle_context();
         let mut consumed_tools = Vec::new();
-        let mut archive_records = Vec::new();
         if let Some(model_resumed_at_ms) = state
             .elapsed_since_start(sample.time.monotonic_ns)
             .map(u128_to_u64_ms)
         {
-            archive_records.extend(state.archive_record(serde_json::json!({
+            state.archive_record(serde_json::json!({
                 "kind":"model_resumed", "at_ms":model_resumed_at_ms,
                 "context":lifecycle_context, "generation_id":resumed_generation_id,
-            }), false));
+            }), false);
             for tool_call in state.tool_calls.iter_mut().rev() {
                 if tool_call.model_resumed_at_ms.is_some() {
                     break;
@@ -5121,7 +5083,7 @@ impl TurnTimingState {
                 evidence.dropped_dependencies.saturating_add(unrecorded_consumptions);
         }
         for edge in dropped_dependencies {
-            archive_records.extend(state.archive_record(serde_json::json!({"kind":"dependency", "edge":edge}), true));
+            state.archive_record(serde_json::json!({"kind":"dependency", "edge":edge}), true);
         }
         if state.dispatch_ready_snapshot.is_none()
             && let Some(elapsed_ns) = elapsed_ns
@@ -5137,9 +5099,9 @@ impl TurnTimingState {
         {
             let ready_to_dispatch_ns =
                 u64::try_from(elapsed_ns.saturating_sub(ready_to_sample_ns)).unwrap_or(u64::MAX);
-            archive_records.extend(state.archive_record(serde_json::json!({
+            state.archive_record(serde_json::json!({
                 "kind":"ready_to_dispatch", "duration_ns":ready_to_dispatch_ns,
-            }), false));
+            }), false);
             for tool_call in state.tool_calls.iter_mut().rev() {
                 if tool_call.ready_to_sample_to_dispatch_ns.is_some() {
                     break;
@@ -5187,7 +5149,6 @@ impl TurnTimingState {
                 "generation_id":format!("generation-{generation_index}"), "internal_retry":internal_retry,
                 "owner_at_ns":sample.time.monotonic_ns}));
         }
-        for record in archive_records { record.write(); }
     }
 
     pub fn record_ttfm_for_turn_item(&self, item: &TurnItem) -> Option<Duration> {
@@ -5932,10 +5893,13 @@ impl TurnTimingStateInner {
                 open_process_count: self.activity.observed_processes,
                 ..self.activity_timeline.clone()
             },
-            credit_delta: self
-                .starting_credit_balance
-                .zip(self.last_credit_balance)
-                .map(|(start, end)| credit_delta_text(start - end)),
+            credit_delta: match self.credit_balance {
+                CreditBalanceWindow::Account {
+                    start: Some(start),
+                    end: Some(end),
+                } => Some(credit_delta_text(start - end)),
+                _ => None,
+            },
             started_at_unix_ms: started_sample.map(|started| started.time.wall_unix_ms),
             completed_at_unix_ms: started_sample.map(|_| sample.time.wall_unix_ms),
             completed_at_unix_secs: started_sample.map(|_| sample.time.wall_unix_ms / 1_000),

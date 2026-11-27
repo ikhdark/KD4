@@ -923,7 +923,7 @@ fn build_code_mode_executors(
                         "revision",
                     ],
                     "read_tool_output" => &["audit_only", "cell_recovery", "source_thread_id"],
-                    "exec_command" => &["login", "tty", "pipe_stdin", "stall_timeout_ms", "shell"],
+                    "exec_command" => &["login", "tty", "stall_timeout_ms", "shell"],
                     "update_plan" => &[
                         "measurements",
                         "scope_change_instructions",
@@ -1120,7 +1120,7 @@ fn defer_nested_selector_details(properties: &mut serde_json::Map<String, serde_
             "properties": {"kind": {"type": "string", "enum": deferred}},
             "required": ["kind"],
             "additionalProperties": true,
-            "description": "For these selectors load the tool's arguments section with resolve_tool(name).section(\"arguments\")."
+            "description": "Use resolve_tool(name).section(\"structured\") or .section(\"json_pointer\") for those selectors; other forms are in section(\"arguments\")."
         }));
     }
 }

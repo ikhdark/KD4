@@ -3,6 +3,10 @@
 Terminal `TurnTiming` snapshots retain diagnostic facts on the existing process
 clock. These are observations, not task acceptance or achievable savings.
 
+- `creditDelta`: observed balance change for one account, not turn billing.
+  Requires two finite balance observations: a cached same-account baseline or
+  the first fresh sample, followed by a fresh sample. Missing endpoints or a
+  changed account leave the delta unavailable; equal observed endpoints are zero.
 - `dependencyGraph`: schema-version-2 request/tool lanes segmented at recorded
   prefix-release and consumption boundaries, including qualified nested fork/join
   relations. Unknown prefix release or unrecorded nested dependencies,

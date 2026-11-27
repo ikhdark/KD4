@@ -67,6 +67,19 @@ requirements belong to each script/SDK project's manifest. Reuse configured
 toolchains and environments rather than provisioning the machine as a side
 effect of documentation or source inspection.
 
+## Local credential file size
+
+`$CODEX_HOME/auth.json` has a 16 MiB (16,777,216 byte) limit, inclusive.
+The limit applies to the actual file bytes read and to the serialized JSON
+written by file storage (including Auto's file fallback). It does not cap
+credentials stored in the keyring or held only in memory.
+
+An oversized existing file is not loaded, migrated, replaced, or removed by
+KD4 credential operations. To recover, move it to a secure backup outside
+`CODEX_HOME`, then log in again. Do not truncate it or paste its contents
+into logs. Close processes using that home before moving or editing the file
+externally; external writers do not participate in KD4's credential transaction.
+
 ## Workflow boundaries
 
 [AGENTS.md](AGENTS.md) owns repository policy and links the shared KDR evidence,

@@ -536,7 +536,7 @@ impl ManagedRootProcess {
         self,
         child: tokio::process::Child,
     ) -> impl Future<Output = io::Result<()>> {
-        self.cleanup_child(child, true)
+        self.cleanup_child(child, /*always_terminate_root*/ true, None)
     }
 
     /// Terminate a contained process tree and retain its admission until reaped.
@@ -546,7 +546,20 @@ impl ManagedRootProcess {
         self,
         child: tokio::process::Child,
     ) -> impl Future<Output = io::Result<()>> {
-        self.cleanup_child(child, false)
+        self.cleanup_child(child, /*always_terminate_root*/ false, None)
+    }
+
+    /// Transfer an observed child to retained cleanup. Pass `attached = true`
+    /// only after successful Job attachment. The five-second caller result is
+    /// separate from the root-only observation written when the child is reaped.
+    #[cfg(windows)]
+    pub fn cleanup_observed_child(
+        self,
+        child: tokio::process::Child,
+        observation: crate::process_observation::ObservedProcess,
+        attached: bool,
+    ) -> impl Future<Output = io::Result<()>> {
+        self.cleanup_child(child, !attached, Some(observation))
     }
 
     #[cfg(windows)]
@@ -554,6 +567,7 @@ impl ManagedRootProcess {
         self,
         mut child: tokio::process::Child,
         always_terminate_root: bool,
+        observation: Option<crate::process_observation::ObservedProcess>,
     ) -> impl Future<Output = io::Result<()>> {
         self.admission.observe(RootCustody::CleanupWait, "cleanup_wait");
         // Spawn before returning the future: dropping an unpolled caller must
@@ -591,6 +605,9 @@ impl ManagedRootProcess {
                     }
                 }
                 self.admission.observe(RootCustody::RootExited, "root_exited");
+                if let Some(observation) = observation {
+                    observation.cleanup_observed("root_reaped; descendants_unknown");
+                }
                 // Reaping the root cannot settle a failed tree termination.
                 // Reuse the runtime-independent reconciler: an indefinitely
                 // failing job must not pin Tokio's blocking pool at shutdown.

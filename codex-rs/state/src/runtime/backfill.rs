@@ -154,6 +154,22 @@ RETURNING last_watermark
         Ok(claim)
     }
 
+    /// Check authority after BEGIN IMMEDIATE has reserved the SQLite writer.
+    /// Claim release and takeover cannot interleave between this check and commit.
+    pub(super) async fn ensure_backfill_claim_on_writer(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        claim: &crate::BackfillClaim,
+    ) -> anyhow::Result<()> {
+        let owns_claim = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM backfill_state WHERE id = 1 AND status = 'running' AND claim_token = ?)",
+        )
+        .bind(&claim.token)
+        .fetch_one(&mut **tx)
+        .await?;
+        anyhow::ensure!(owns_claim, "backfill claim ownership was lost");
+        Ok(())
+    }
+
     pub async fn checkpoint_backfill_claim(&self, claim: &crate::BackfillClaim, watermark: &str) -> anyhow::Result<()> {
         let result = sqlx::query("UPDATE backfill_state SET last_watermark = ?, updated_at = ? WHERE id = 1 AND status = 'running' AND claim_token = ?")
             .bind(watermark).bind(Utc::now().timestamp()).bind(&claim.token).execute(self.pool.as_ref()).await?;

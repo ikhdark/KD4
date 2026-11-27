@@ -19,11 +19,13 @@ use http::HeaderValue;
 use http::header::USER_AGENT;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 
 use crate::outbound_proxy::AuthRouteConfig;
 
 /// Set this to add a suffix to the User-Agent string.
+/// App-server initialization sets the first client's suffix together with its originator.
 ///
 /// It is not ideal that we're using a global singleton for this.
 /// This is primarily designed to differentiate MCP clients from each other.
@@ -50,7 +52,14 @@ pub struct Originator {
     pub value: String,
     pub header_value: HeaderValue,
 }
-static ORIGINATOR: LazyLock<RwLock<Option<Originator>>> = LazyLock::new(|| RwLock::new(None));
+// The suffix remains directly mutable by public callers. An initializer that sets both
+// values holds the suffix mutex until the originator has been published. Readers of the
+// pair snapshot the originator under that same mutex.
+static ORIGINATOR: OnceLock<Originator> = OnceLock::new();
+static FALLBACK_ORIGINATOR: LazyLock<Originator> = LazyLock::new(|| Originator {
+    value: DEFAULT_ORIGINATOR.to_string(),
+    header_value: HeaderValue::from_static(DEFAULT_ORIGINATOR),
+});
 static REQUIREMENTS_RESIDENCY: LazyLock<RwLock<Option<ResidencyRequirement>>> =
     LazyLock::new(|| RwLock::new(None));
 static PLATFORM_USER_AGENT: LazyLock<String> = LazyLock::new(|| {
@@ -71,12 +80,7 @@ pub enum SetOriginatorError {
     AlreadyInitialized,
 }
 
-fn get_originator_value(provided: Option<String>) -> Originator {
-    let value = std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR)
-        .ok()
-        .or(provided)
-        .unwrap_or(DEFAULT_ORIGINATOR.to_string());
-
+fn originator_from_value(value: String) -> Originator {
     match HeaderValue::from_str(&value) {
         Ok(header_value) => Originator {
             value,
@@ -84,27 +88,58 @@ fn get_originator_value(provided: Option<String>) -> Originator {
         },
         Err(e) => {
             tracing::error!("Unable to turn originator override {value} into header value: {e}");
-            Originator {
-                value: DEFAULT_ORIGINATOR.to_string(),
-                header_value: HeaderValue::from_static(DEFAULT_ORIGINATOR),
-            }
+            FALLBACK_ORIGINATOR.clone()
         }
     }
 }
 
 pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
+    set_default_client_identity(value, /*user_agent_suffix*/ None)
+}
+
+/// Set the first app-server client's identity. An environment-owned originator never
+/// inherits a suffix from the initializing client.
+pub fn set_default_originator_with_user_agent_suffix(
+    value: String,
+    user_agent_suffix: String,
+) -> Result<(), SetOriginatorError> {
+    set_default_client_identity(value, Some(user_agent_suffix))
+}
+
+fn set_default_client_identity(
+    value: String,
+    user_agent_suffix: Option<String>,
+) -> Result<(), SetOriginatorError> {
     if HeaderValue::from_str(&value).is_err() {
         return Err(SetOriginatorError::InvalidHeaderValue);
     }
-    let originator = get_originator_value(Some(value));
-    let Ok(mut guard) = ORIGINATOR.write() else {
-        return Err(SetOriginatorError::AlreadyInitialized);
-    };
-    if guard.is_some() {
-        return Err(SetOriginatorError::AlreadyInitialized);
+    let override_value = std::env::var_os(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR);
+    let user_agent_suffix = user_agent_suffix.filter(|_| override_value.is_none());
+    let originator = originator_from_value(
+        override_value
+            .and_then(|value| value.into_string().ok())
+            .unwrap_or(value),
+    );
+
+    if let Some(user_agent_suffix) = user_agent_suffix
+        && let Ok(mut suffix) = USER_AGENT_SUFFIX.lock()
+    {
+        let mut published = false;
+        ORIGINATOR.get_or_init(|| {
+            *suffix = Some(user_agent_suffix);
+            published = true;
+            originator
+        });
+        return if published {
+            Ok(())
+        } else {
+            Err(SetOriginatorError::AlreadyInitialized)
+        };
     }
-    *guard = Some(originator);
-    Ok(())
+
+    ORIGINATOR
+        .set(originator)
+        .map_err(|_| SetOriginatorError::AlreadyInitialized)
 }
 
 pub fn set_default_client_residency_requirement(enforce_residency: Option<ResidencyRequirement>) {
@@ -116,24 +151,31 @@ pub fn set_default_client_residency_requirement(enforce_residency: Option<Reside
 }
 
 pub fn originator() -> Originator {
-    if let Ok(guard) = ORIGINATOR.read()
-        && let Some(originator) = guard.as_ref()
-    {
-        return originator.clone();
-    }
+    current_originator().clone()
+}
 
-    if std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).is_ok() {
-        let originator = get_originator_value(/*provided*/ None);
-        if let Ok(mut guard) = ORIGINATOR.write() {
-            match guard.as_ref() {
-                Some(originator) => return originator.clone(),
-                None => *guard = Some(originator.clone()),
-            }
-        }
+fn current_originator() -> &'static Originator {
+    if let Some(originator) = ORIGINATOR.get() {
         return originator;
     }
 
-    get_originator_value(/*provided*/ None)
+    if let Ok(value) = std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR) {
+        let originator = originator_from_value(value);
+        return ORIGINATOR.get_or_init(|| originator);
+    }
+
+    &FALLBACK_ORIGINATOR
+}
+
+fn client_identity_snapshot() -> (&'static Originator, Option<String>) {
+    // Resolve the environment (including any diagnostics) outside the suffix lock.
+    let initial_originator = current_originator();
+    if let Ok(suffix) = USER_AGENT_SUFFIX.lock() {
+        // The first initializer could have published while we waited for the suffix lock.
+        return (ORIGINATOR.get().unwrap_or(initial_originator), suffix.clone());
+    }
+
+    (initial_originator, None)
 }
 
 /// Adds a valid, non-default thread originator override to request headers.
@@ -173,25 +215,24 @@ pub fn get_codex_user_agent() -> String {
 
 /// Format a transport-specific version without changing the default client identity.
 pub fn get_codex_user_agent_with_version(build_version: &str) -> String {
-    let originator = originator();
+    let (originator, suffix) = client_identity_snapshot();
+    format_user_agent(build_version, originator, suffix.as_deref())
+}
+
+fn format_user_agent(build_version: &str, originator: &Originator, suffix: Option<&str>) -> String {
     let prefix = format!(
         "{}/{build_version} ({}) {}",
         originator.value.as_str(),
         platform_user_agent(),
         user_agent()
     );
-    let suffix = USER_AGENT_SUFFIX
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone());
     let suffix = suffix
-        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map_or_else(String::new, |value| format!(" ({value})"));
 
     let candidate = format!("{prefix}{suffix}");
-    sanitize_user_agent(candidate, &prefix)
+    sanitize_user_agent(candidate, &prefix, originator.value.as_str())
 }
 
 fn platform_user_agent() -> &'static str {
@@ -202,8 +243,8 @@ fn platform_user_agent() -> &'static str {
 ///
 /// Invalid characters are replaced with an underscore.
 ///
-/// If the user agent fails to parse, it falls back to fallback and then to ORIGINATOR.
-fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
+/// If the user agent fails to parse, it falls back to the base and then to the snapshot's originator.
+fn sanitize_user_agent(candidate: String, fallback: &str, originator: &str) -> String {
     if HeaderValue::from_str(candidate.as_str()).is_ok() {
         return candidate;
     }
@@ -226,7 +267,7 @@ fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
         tracing::warn!(
             "Falling back to default Codex originator because base user agent string is invalid"
         );
-        originator().value
+        originator.to_string()
     }
 }
 
@@ -451,8 +492,10 @@ pub(crate) async fn create_default_auth_client(
 
 pub fn default_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("originator", originator().header_value);
-    if let Ok(user_agent) = HeaderValue::from_str(&get_codex_user_agent()) {
+    let (originator, suffix) = client_identity_snapshot();
+    headers.insert("originator", originator.header_value.clone());
+    let user_agent = format_user_agent(env!("CARGO_PKG_VERSION"), originator, suffix.as_deref());
+    if let Ok(user_agent) = HeaderValue::from_str(&user_agent) {
         headers.insert(USER_AGENT, user_agent);
     }
     if let Ok(guard) = REQUIREMENTS_RESIDENCY.read()
