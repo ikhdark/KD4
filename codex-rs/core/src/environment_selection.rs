@@ -127,6 +127,7 @@ pub(crate) struct ThreadEnvironments {
     update_lock: Mutex<()>,
     shutdown: std::sync::atomic::AtomicBool,
     owned_lifecycles: Mutex<Vec<Weak<TurnEnvironmentLifecycle>>>,
+    resolution_tasks: tokio_util::task::TaskTracker,
     snapshot_tasks: Vec<tokio_util::task::TaskTracker>,
 }
 
@@ -216,6 +217,7 @@ impl ThreadEnvironments {
                 environments,
             }),
             owned_lifecycles: Mutex::new(Vec::new()),
+            resolution_tasks: tokio_util::task::TaskTracker::new(),
             update_lock: Mutex::new(()),
             shutdown: std::sync::atomic::AtomicBool::new(false),
             snapshot_tasks,
@@ -367,7 +369,13 @@ impl ThreadEnvironments {
             )
             .shared();
             if resolution.clone().now_or_never().is_none() {
-                drop(tokio::spawn(resolution.clone()));
+                // Register while selection updates are still admitted. The task
+                // stays tracked if this selection is replaced, without keeping
+                // the selection's lifecycle alive.
+                let pending = resolution.clone();
+                drop(self.resolution_tasks.spawn(async move {
+                    drop(pending.await);
+                }));
             }
             replaced_resolution = true;
             next.push(SelectedTurnEnvironment {
@@ -465,7 +473,10 @@ impl ThreadEnvironments {
             }
             .boxed()
             .shared();
-            drop(builder_tasks.spawn(task.clone()));
+            let pending = task.clone();
+            drop(builder_tasks.spawn(async move {
+                drop(pending.await);
+            }));
             turn_environment.shell_snapshot = task;
             Ok(turn_environment)
         }
@@ -606,8 +617,12 @@ impl ThreadEnvironments {
                 environments: Vec::new(),
             }));
         drop(current);
-        // Owned builders include accepted remote writes, which retain cleanup
-        // ownership until the write is acknowledged even after cancellation.
+        // A replaced owned resolution can still register a builder. Settle
+        // those producers first; inherited resolutions are never tracked here.
+        self.resolution_tasks.close();
+        self.resolution_tasks.wait().await;
+        // Owned builders include accepted writes, which retain cleanup
+        // ownership until the write settles even after cancellation.
         let builders = self.shell_snapshot.builder_tasks();
         builders.close();
         builders.wait().await;

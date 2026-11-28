@@ -321,12 +321,16 @@ impl ThreadHistoryBuilder {
         {
             return;
         }
-        // Keep pending assistant and reasoning parts across exec output only.
+        // Keep these canonical item mirrors across background exec output only.
         // Other events still end the window unless they are the expected mirror.
         let keep_item_mirror = is_exec_output_delta
             && matches!(
                 &self.pending_legacy_item_mirror,
-                Some(LegacyItemMirror::AgentMessage { .. } | LegacyItemMirror::Reasoning { .. })
+                Some(
+                    LegacyItemMirror::AgentMessage { .. }
+                        | LegacyItemMirror::Reasoning { .. }
+                        | LegacyItemMirror::ContextCompaction
+                )
             );
         if !keep_item_mirror && let Some(mut item) = self.pending_legacy_item_mirror.take() {
             let is_mirror = match (&mut item, event) {

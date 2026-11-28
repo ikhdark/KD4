@@ -72,9 +72,8 @@ type NotificationRoute<S> =
 enum RpcCallTimeout {
     None,
     After(Duration),
-    // The outer cleanup caller owns the full deadline. Keep its cutoff here
-    // too, to prevent a late poll from publishing a new request.
-    Cleanup { deadline: Instant, budget: Duration },
+    // Carry the caller's original cutoff through registration and publication.
+    Before { deadline: Instant, budget: Duration },
 }
 
 fn rpc_timeout(method: &str, timeout: Duration) -> RpcCallError {
@@ -557,7 +556,7 @@ impl RpcClient {
             self.call_inner(
                 method,
                 params,
-                RpcCallTimeout::Cleanup { deadline, budget },
+                RpcCallTimeout::Before { deadline, budget },
                 None,
             )
             .await
@@ -595,7 +594,7 @@ impl RpcClient {
         let (response_tx, response_rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            if let RpcCallTimeout::Cleanup { deadline, budget } = call_timeout
+            if let RpcCallTimeout::Before { deadline, budget } = call_timeout
                 && Instant::now() >= deadline
             {
                 return Err(rpc_timeout(method, budget));
@@ -650,7 +649,7 @@ impl RpcClient {
                 trace: codex_otel::current_span_w3c_trace_context(),
                 capability_revision,
             });
-            if let RpcCallTimeout::Cleanup { deadline, budget } = call_timeout {
+            if let RpcCallTimeout::Before { deadline, budget } = call_timeout {
                 if Instant::now() >= deadline {
                     return Err(rpc_timeout(method, budget));
                 }
@@ -688,7 +687,7 @@ impl RpcClient {
         // timer even starts. Dropping a pending send also keeps an expired request
         // from being queued later when the transport recovers.
         let response = match call_timeout {
-            RpcCallTimeout::None | RpcCallTimeout::Cleanup { .. } => exchange.await,
+            RpcCallTimeout::None | RpcCallTimeout::Before { .. } => exchange.await,
             RpcCallTimeout::After(call_timeout) => match timeout(call_timeout, exchange).await {
                 Ok(response) => response,
                 Err(_) => Err(RpcCallError::TimedOut {
@@ -707,21 +706,37 @@ impl RpcClient {
         serde_json::from_value(response).map_err(RpcCallError::Json)
     }
 
-    pub(crate) async fn call_tracked<P: Serialize, T: DeserializeOwned>(
+    pub(crate) async fn call_tracked_before<P: Serialize, T: DeserializeOwned>(
         &self,
         method: &str,
         params: &P,
-        call_timeout: Duration,
+        deadline: Instant,
         submitted: &AtomicBool,
     ) -> Result<T, RpcCallError> {
-        let _call_slot = self.acquire_regular_call_slot()?;
-        self.call_inner(
-            method,
-            params,
-            RpcCallTimeout::After(call_timeout),
-            Some(submitted),
-        )
-        .await
+        let budget = deadline.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            return Err(rpc_timeout(method, budget));
+        }
+        let call = async {
+            let _call_slot = self.acquire_regular_call_slot()?;
+            self.call_inner(
+                method,
+                params,
+                RpcCallTimeout::Before { deadline, budget },
+                Some(submitted),
+            )
+            .await
+        };
+        tokio::select! {
+            biased;
+            // Preserve a ready refusal for cleanup classification. Publication
+            // has its own cutoff check and a late success must not be accepted.
+            result = call => match result {
+                Ok(_) if Instant::now() >= deadline => Err(rpc_timeout(method, budget)),
+                result => result,
+            },
+            _ = tokio::time::sleep_until(deadline) => Err(rpc_timeout(method, budget)),
+        }
     }
 
 }

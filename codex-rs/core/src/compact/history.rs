@@ -293,19 +293,31 @@ fn retain_latest_task_state_fragment(part: &ContentItem, seen: &mut bool) -> boo
     true
 }
 
-fn unpaired_compaction_outputs<'a>(
-    items: &'a [ResponseItem],
+fn ambiguous_compaction_calls(
+    items: &[ResponseItem],
     pairs: &[Option<usize>],
-    start: usize,
-) -> std::collections::HashSet<(u8, &'a str)> {
-    items[start..]
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, item)| {
-            let (kind, call, id) = crate::tool_occurrence::history_identity(item)?;
-            (!call && pairs[start + offset].is_none()).then_some((kind, id))
-        })
-        .collect()
+    output_start: usize,
+) -> std::collections::HashSet<usize> {
+    let mut next_ambiguous_outputs = std::collections::HashSet::new();
+    let mut calls = std::collections::HashSet::new();
+    for (index, item) in items.iter().enumerate().rev() {
+        let Some((kind, call, id)) = crate::tool_occurrence::history_identity(item) else {
+            continue;
+        };
+        let key = (kind, id);
+        if call {
+            if pairs[index].is_none() && next_ambiguous_outputs.contains(&key) {
+                calls.insert(index);
+            }
+        } else if index >= output_start && pairs[index].is_none() {
+            next_ambiguous_outputs.insert(key);
+        } else {
+            next_ambiguous_outputs.remove(&key);
+        }
+    }
+    // An unpaired call can only belong to the next same-kind result, not a
+    // later reuse of the ID. Preserve all ambiguous candidates, not a guessed pair.
+    calls
 }
 
 pub(super) fn compaction_summary_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
@@ -317,7 +329,7 @@ pub(super) fn compaction_summary_items(items: &[ResponseItem]) -> Vec<ResponseIt
         .rposition(is_compaction_model_generated_item)
         .map_or(0, |index| index + 1);
     let pairs = crate::tool_occurrence::pairs(items);
-    let unpaired = unpaired_compaction_outputs(items, &pairs, end);
+    let ambiguous_calls = ambiguous_compaction_calls(items, &pairs, end);
     crate::context_manager::current_turn_advice_items(items)
         .filter(|(index, item)| {
             // A tail phase checkpoint still retires consumed outputs above it;
@@ -326,8 +338,7 @@ pub(super) fn compaction_summary_items(items: &[ResponseItem]) -> Vec<ResponseIt
                 || is_compaction_summary_item(item)
                 || crate::tool_history::phase_checkpoint_ids(item).is_some())
                 && !pairs[*index].is_some_and(|paired| *index < end && paired >= end)
-                && !crate::tool_occurrence::history_identity(item)
-                    .is_some_and(|(kind, call, id)| call && unpaired.contains(&(kind, id)))
+                && !ambiguous_calls.contains(index)
         })
         .map(|(_, item)| item.clone())
         .collect()
@@ -339,41 +350,19 @@ fn unresolved_compaction_start(items: &[ResponseItem]) -> usize {
         .rposition(is_compaction_model_generated_item)
         .map_or(0, |index| index.saturating_add(1));
     let pairs = crate::tool_occurrence::pairs(items);
-    let unpaired = unpaired_compaction_outputs(items, &pairs, base_start);
+    let ambiguous_calls = ambiguous_compaction_calls(items, &pairs, base_start);
     pairs[base_start..]
         .iter()
         .filter_map(|paired| *paired)
         .filter(|&index| index < base_start)
-        // Ambiguous outstanding legacy calls have no authenticated pair. Keep
-        // all possible calls rather than treating the output as consumed.
-        .chain(
-            items[..base_start]
-                .iter()
-                .enumerate()
-                .filter_map(|(index, item)| {
-                    let (kind, call, id) = crate::tool_occurrence::history_identity(item)?;
-                    (call && unpaired.contains(&(kind, id))).then_some(index)
-                }),
-        )
+        .chain(ambiguous_calls)
         .min()
         .unwrap_or(base_start)
 }
 
-fn compaction_call_id(item: &ResponseItem) -> Option<&str> {
-    let (_, is_call, call_id) = crate::tool_occurrence::history_identity(item)?;
-    is_call.then_some(call_id)
-}
-
 pub(super) fn compaction_output_call_id(item: &ResponseItem) -> Option<&str> {
-    match item {
-        ResponseItem::FunctionCallOutput { call_id, .. }
-        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id),
-        ResponseItem::ToolSearchOutput {
-            call_id: Some(call_id),
-            ..
-        } => Some(call_id),
-        _ => None,
-    }
+    let (_, call, id) = crate::tool_occurrence::history_identity(item)?;
+    (!call).then_some(id)
 }
 
 fn append_bounded_agent_messages_with_indices(
@@ -813,17 +802,14 @@ pub(super) fn build_bounded_input_history(
             ),
         ));
     }
-    let pending_output_ids = unresolved
-        .iter()
-        .filter_map(compaction_output_call_id)
-        .collect::<std::collections::HashSet<_>>();
+    let pairs = crate::tool_occurrence::pairs(unresolved);
+    let ambiguous_calls = ambiguous_compaction_calls(unresolved, &pairs, 0);
     for (source_index, item) in unresolved.iter().enumerate() {
-        let Some(call_id) = compaction_call_id(item).or_else(|| compaction_output_call_id(item))
-        else {
+        let Some((_, call, _)) = crate::tool_occurrence::history_identity(item) else {
             continue;
         };
-        let has_pending_output = pending_output_ids.contains(call_id);
-        if has_pending_output {
+        // Preserve orphan results too; only calls need a corresponding output.
+        if !call || pairs[source_index].is_some() || ambiguous_calls.contains(&source_index) {
             indexed_items.push((source_index, item.clone()));
         }
     }

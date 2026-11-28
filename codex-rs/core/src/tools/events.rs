@@ -943,6 +943,25 @@ async fn emit_patch_end(
             .unwrap_or(codex_exec_server::LOCAL_ENVIRONMENT_ID);
         ctx.turn.full_suite_budget.record_compilation_input_changes(environment, &changed_paths);
     }
+    let local_delta = match &tracker_update {
+        TurnDiffTrackerUpdate::Track { delta, .. }
+            if ctx
+                .patch_environment
+                .is_some_and(|environment| !environment.environment.is_remote()) =>
+        {
+            Some(*delta)
+        }
+        _ => None,
+    };
+    // Prepare only immutable payload identities on the blocking pool. Publish
+    // the journal entry at the existing completion boundary, without another
+    // suspension between the completed item and the history update.
+    let prepared_provenance = if let Some(delta) = local_delta.filter(|delta| !delta.is_empty()) {
+        let delta = AppliedPatchDelta::clone(delta);
+        Some(tokio::task::spawn_blocking(move || delta.prepare_change_provenance()).await)
+    } else {
+        None
+    };
     ctx.session
         .emit_turn_item_completed(
             ctx.turn,
@@ -961,15 +980,17 @@ async fn emit_patch_end(
         )
         .await;
 
-    match &tracker_update {
-        TurnDiffTrackerUpdate::Track { delta, .. }
-            if ctx.patch_environment.is_some_and(|environment| !environment.environment.is_remote()) => {
-                codex_apply_patch::record_change_provenance(
-                    Some(&ctx.session.thread_id().to_string()), Some(ctx.call_id), delta,
-                );
-            }
-        TurnDiffTrackerUpdate::Invalidate => codex_apply_patch::invalidate_change_ownership_hints(),
-        _ => {}
+    match prepared_provenance {
+        Some(Ok(record)) => record(Some(&ctx.session.thread_id().to_string()), Some(ctx.call_id)),
+        Some(Err(error)) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Some(Err(_)) => codex_apply_patch::invalidate_change_ownership_hints(),
+        None
+            if matches!(&tracker_update, TurnDiffTrackerUpdate::Invalidate)
+                || local_delta.is_some_and(|delta| !delta.is_exact()) =>
+        {
+            codex_apply_patch::invalidate_change_ownership_hints();
+        }
+        None => {}
     }
     if let Some(tracker) = ctx.turn_diff_tracker {
         let (unified_diff, invalidation_warning) = {

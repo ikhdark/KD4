@@ -35,11 +35,17 @@ impl Default for MailboxSnapshot {
     }
 }
 
+pub(super) enum MailboxSaveOutcome {
+    Durable,
+    InstalledWithoutParentSync(io::Error),
+}
+
 pub(super) struct MailboxStorage {
     home: PathBuf,
     id: ThreadId,
     owner: Weak<SessionStorageOwnership>,
     unmaterialized_rollout: Option<LiveThread>,
+    parent_sync_pending: bool,
     pub(super) snapshot: MailboxSnapshot,
 }
 
@@ -60,6 +66,9 @@ impl MailboxStorage {
             id,
             owner: Arc::downgrade(owner),
             unmaterialized_rollout: needs_materialization.then(|| rollout.clone()),
+            // The installed name may have survived a process exit after an
+            // unconfirmed parent sync. Fence the first duplicate ACK, too.
+            parent_sync_pending: !snapshot.generation.is_nil(),
             snapshot,
         })
     }
@@ -103,20 +112,29 @@ impl MailboxStorage {
         Ok(recorded)
     }
 
-    pub(super) async fn confirm_current(&self) -> io::Result<()> {
+    pub(super) async fn confirm_current(&mut self) -> io::Result<()> {
         let expected = self.snapshot.generation;
+        let parent_sync_pending = self.parent_sync_pending;
         let owner = self.owner.upgrade();
         let home = self.home.clone();
         let id = self.id;
         tokio::task::spawn_blocking(move || {
             let _lease = confirm_current(&home, id, owner.as_ref(), expected)?;
-            Ok(())
+            if parent_sync_pending {
+                sync_mailbox_parent(&codex_thread_store::thread_mailbox_path(&home, id))?;
+            }
+            Ok::<(), io::Error>(())
         })
         .await
-        .map_err(io::Error::other)?
+        .map_err(io::Error::other)??;
+        self.parent_sync_pending = false;
+        Ok(())
     }
 
-    pub(super) async fn save(&mut self, mut next: MailboxSnapshot) -> io::Result<()> {
+    pub(super) async fn save(
+        &mut self,
+        mut next: MailboxSnapshot,
+    ) -> io::Result<MailboxSaveOutcome> {
         // A freshly created receiver may still have a lazy rollout. Do not
         // acknowledge mail for a receiver whose identity cannot be reopened.
         let owner = self.owner.upgrade();
@@ -138,20 +156,60 @@ impl MailboxStorage {
         next.generation = Uuid::now_v7();
         let home = self.home.clone();
         let id = self.id;
-        self.snapshot = tokio::task::spawn_blocking(move || {
+        let (next, parent_sync) = tokio::task::spawn_blocking(move || {
             let _lease = confirm_current(&home, id, owner.as_ref(), expected)?;
             let path = codex_thread_store::thread_mailbox_path(&home, id);
             let bytes = serde_json::to_vec(&next)?;
             if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SNAPSHOT_BYTES {
                 return Err(io::Error::other("durable mailbox storage is full"));
             }
-            // Same-directory, sync-before-publish replacement; no torn
-            // acceptance/supersession state. KD4's Windows helper syncs the
-            // parent where the filesystem allows it.
-            codex_file_system::write_bytes_atomically(&path, &bytes)?;
-            Ok(next)
+            // This write API can only fail before rename. Retain the installed
+            // generation even if the separate parent durability barrier fails.
+            codex_file_system::write_bytes_atomically_with_file_sync(&path, &bytes)?;
+            let parent_sync = sync_mailbox_parent(&path);
+            Ok((next, parent_sync))
         }).await.map_err(io::Error::other)??;
-        Ok(())
+        self.snapshot = next;
+        self.parent_sync_pending = parent_sync.is_err();
+        Ok(match parent_sync {
+            Ok(()) => MailboxSaveOutcome::Durable,
+            Err(error) => MailboxSaveOutcome::InstalledWithoutParentSync(error),
+        })
+    }
+}
+
+// Match the Windows atomic writer's best-effort directory sync policy. A
+// mailbox retry only repeats this barrier; it must not replace the envelope.
+fn sync_mailbox_parent(path: &Path) -> io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let parent = path.parent().ok_or_else(|| io::Error::other("mailbox path has no parent"))?;
+    let result = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)
+        .and_then(|directory| directory.sync_all());
+    match result {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Unsupported
+                    | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "{} was replaced, but synchronizing its parent directory failed: {error}",
+                path.display()
+            ),
+        )),
     }
 }
 

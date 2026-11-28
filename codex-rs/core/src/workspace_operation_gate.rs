@@ -95,6 +95,7 @@ pub(crate) async fn acquire_patch_additions_with_timeout(
     additions: Option<&[PathBuf]>,
 ) -> Result<WorkspaceLease, String> {
     let record = GateWaitRecord::begin("patch_gate", Some(PATCH_GATE_TIMEOUT));
+    let mut resolved_gate = None;
     let acquired = tokio::time::timeout(PATCH_GATE_TIMEOUT, async {
         if !environment.is_remote()
             && let Ok(native_cwd) = cwd.to_abs_path()
@@ -103,10 +104,13 @@ pub(crate) async fn acquire_patch_additions_with_timeout(
             let root = codex_git_utils::get_git_repo_root(&native_cwd)
                 .unwrap_or_else(|| native_cwd.to_path_buf());
             if let Some(footprint) = NativeAdditions::resolve(&root, &native_cwd, paths).await {
-                return footprint.acquire(patch_gate(local_identity(&root).await)).await;
+                let gate = resolved_gate.insert(patch_gate(local_identity(&root).await));
+                return footprint.acquire(Arc::clone(gate)).await;
             }
         }
-        acquire_patch_operation(environment, cwd).await
+        let gate =
+            resolved_gate.insert(patch_gate(patch_workspace_identity(environment, cwd).await));
+        Arc::clone(gate).write_owned().await
     })
     .await;
     match acquired {
@@ -116,18 +120,22 @@ pub(crate) async fn acquire_patch_additions_with_timeout(
         }
         Err(_) => {
             record.finish(ToolLifecycleWakeReason::Timeout);
-            // The expired wait already withdrew its own claim, so this names
-            // only operations that still hold the workspace.
-            let gate = patch_gate(patch_workspace_identity(environment, cwd).await);
-            Err(patch_busy_message(&gate, PATCH_GATE_TIMEOUT))
+            // The expired future already withdrew any claim. Use only the gate
+            // it reached, without repeating workspace discovery after timeout.
+            Err(patch_busy_message(
+                resolved_gate.as_deref(),
+                PATCH_GATE_TIMEOUT,
+            ))
         }
     }
 }
 
 /// Names the attributed holders: a peer session's call cannot be resumed
 /// from here, but its tool, age and access mode explain the refusal.
-fn patch_busy_message(gate: &ScopedWorkspaceGate, waited: Duration) -> String {
-    let (count, holders) = gate.holders(PATCH_GATE_HOLDER_LIMIT);
+fn patch_busy_message(gate: Option<&ScopedWorkspaceGate>, waited: Duration) -> String {
+    let (count, holders) = gate
+        .map(|gate| gate.holders(PATCH_GATE_HOLDER_LIMIT))
+        .unwrap_or_default();
     let mut message = format!(
         "apply_patch: workspace is busy with another patch (waited {} seconds). No files were changed by this attempt.",
         waited.as_secs(),
@@ -157,7 +165,8 @@ fn patch_busy_message(gate: &ScopedWorkspaceGate, waited: Duration) -> String {
     message
 }
 
-/// The gate identity `acquire_patch_operation` serializes on.
+/// Identity for opaque patch admission. Remote paths are never resolved on the
+/// host; all working directories in the same environment share its gate.
 async fn patch_workspace_identity(
     environment: &codex_exec_server::Environment,
     cwd: &codex_utils_path_uri::PathUri,
@@ -170,30 +179,6 @@ async fn patch_workspace_identity(
         return local_identity(&root).await;
     }
     WorkspaceIdentity::Environment(environment.coordination_resource_id())
-}
-
-pub(crate) async fn acquire_patch_operation(
-    environment: &codex_exec_server::Environment,
-    cwd: &codex_utils_path_uri::PathUri,
-) -> WorkspaceLease {
-    if !environment.is_remote()
-        && let Ok(native_cwd) = cwd.to_abs_path()
-    {
-        let root = codex_git_utils::get_git_repo_root(&native_cwd)
-            .unwrap_or_else(|| native_cwd.to_path_buf());
-        return acquire_workspace_operation(&root).await;
-    }
-    // Remote paths must never be resolved on the host. Serialize the concrete
-    // environment conservatively, including calls from different working dirs.
-    patch_gate(WorkspaceIdentity::Environment(
-        environment.coordination_resource_id(),
-    ))
-    .write_owned()
-    .await
-}
-
-pub(crate) async fn acquire_workspace_operation(root: &Path) -> WorkspaceLease {
-    patch_gate(local_identity(root).await).write_owned().await
 }
 
 fn patch_gate(identity: WorkspaceIdentity) -> Arc<ScopedWorkspaceGate> {

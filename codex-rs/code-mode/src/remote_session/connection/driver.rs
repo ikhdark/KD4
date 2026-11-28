@@ -202,6 +202,7 @@ impl ConnectionDriver {
             StallTick,
             Event(Option<DriverEvent>),
             Claim(RequestId),
+            AbandonedShutdownRetry(mpsc::OwnedPermit<EncodedFrame>),
             Command(Option<DriverCommand>),
         }
         let mut ticks = tokio::time::interval(super::BACKEND_STALL_TICK);
@@ -212,6 +213,11 @@ impl ConnectionDriver {
         loop {
             let deadline = self.requests.next_control_deadline();
             let probing = stall_probe.is_some();
+            let close_retry_at = if self.alive.load(Ordering::Acquire) {
+                self.requests.next_abandoned_shutdown_retry()
+            } else {
+                None
+            };
             let ready = tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => {
@@ -238,6 +244,17 @@ impl ConnectionDriver {
                         event = self.event_rx.recv() => Ready::Event(event),
                         claim = tokio::task::coop::cooperative(self.execute_claims.recv()) => Ready::Claim(claim),
                         command = self.command_rx.recv() => Ready::Command(command),
+                        permit = async {
+                            if let Some(at) = close_retry_at {
+                                tokio::time::sleep_until(at).await;
+                                if let Ok(permit) = self.outgoing_tx.clone().reserve_owned().await {
+                                    return permit;
+                                }
+                            }
+                            // Writer loss is retired by the supervisor after
+                            // the reader drains, not by a newly due retry.
+                            std::future::pending().await
+                        } => Ready::AbandonedShutdownRetry(permit),
                     }
                 } => ready,
             };
@@ -281,6 +298,11 @@ impl ConnectionDriver {
                     }
                 }
                 Ready::Claim(request_id) => self.requests.claim_execute(request_id),
+                Ready::AbandonedShutdownRetry(permit) => {
+                    if self.alive.load(Ordering::Acquire) && !self.retry_abandoned_shutdown(permit) {
+                        return;
+                    }
+                }
                 Ready::Command(command) => {
                     let Some(command) = command else {
                         self.fail("code-mode host command stream closed".to_string());

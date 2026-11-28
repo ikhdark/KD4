@@ -399,9 +399,11 @@ async fn read_snapshot_note(
         if mismatch.edits_result_of_hunk.is_none() && !targets.iter().any(|(seen, _)| *seen == path)
         {
             targets.push((path, mismatch.current_content_sha256.as_str()));
+            if targets.len() == 4 {
+                break;
+            }
         }
     }
-    targets.truncate(4);
     if targets.is_empty() {
         return String::new();
     }

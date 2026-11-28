@@ -869,12 +869,15 @@ impl Session {
                     codex.turn.token_usage.reasoning_output_tokens = field::Empty,
                     codex.turn.token_usage.total_tokens = field::Empty,
                 );
+                // Capture the notifier before spawn: abort can drop the future
+                // before it has ever been polled.
+                let done_notifier = WorkerDoneNotifier {
+                    notify: done_clone,
+                    worker_done: worker_done_clone,
+                };
                 let worker_handle = tokio::spawn(
                     async move {
-                        let _done_notifier = WorkerDoneNotifier {
-                            notify: done_clone,
-                            worker_done: worker_done_clone,
-                        };
+                        let _done_notifier = done_notifier;
                         // Do not let a fast worker finish before its RunningTask and terminal
                         // coordinator are visible under the active-turn lock.
                         let _ = start_rx.await;
@@ -2289,7 +2292,7 @@ impl Session {
                 crate::session::turn_execution::bounded_path_list(&queued)
             ));
         }
-        self.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
+        self.send_terminal_record_warning(&turn_context.sub_id, message)
             .await;
     }
 
@@ -2359,11 +2362,7 @@ impl Session {
         claim.needs_retry = needs_retry;
         drop(claim);
         if let Some(message) = message {
-            self.send_event_raw(codex_protocol::protocol::Event {
-                id: turn_id,
-                msg: EventMsg::Warning(WarningEvent { message }),
-            })
-            .await;
+            self.send_terminal_record_warning(&turn_id, message).await;
         }
         true
     }
@@ -2389,7 +2388,7 @@ impl Session {
             self.remember_failed_turn_stop_target(turn_context);
         }
         if let Some(message) = message {
-            self.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
+            self.send_terminal_record_warning(&turn_context.sub_id, message)
                 .await;
         }
         interrupted
@@ -2575,7 +2574,7 @@ impl Session {
         {
             warn!(turn_id = %turn_context.sub_id, "turn lifecycle observer panicked during fail-safe cleanup");
         }
-        turn_context.turn_timing_state.begin_finalization();
+        turn_context.turn_timing_state.resume_finalization();
         let timing_snapshot = turn_context
             .turn_timing_state
             .complete_snapshot(&self.thread_id.to_string(), &turn_context.sub_id);

@@ -3,7 +3,8 @@ use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
 use codex_core::config::Config;
-use codex_core::config::find_codex_home;
+use codex_core::config::find_codex_home_async;
+use codex_core_plugins::ConfiguredMarketplaceRootObservation;
 use codex_core_plugins::OPENAI_BUNDLED_MARKETPLACE_NAME;
 use codex_core_plugins::PluginMarketplaceUpgradeOutcome;
 use codex_core_plugins::PluginsConfigInput;
@@ -24,6 +25,7 @@ use codex_login::CodexAuth;
 use codex_login::auth::read_codex_api_key_from_env;
 use codex_plugin::validate_plugin_segment;
 use codex_protocol::auth::AuthMode;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -217,32 +219,47 @@ async fn run_list(overrides: Vec<(String, toml::Value)>, args: ListMarketplaceAr
     let manager = PluginsManager::new(config.codex_home.to_path_buf());
     manager.set_auth_mode(load_cli_auth_mode(&config).await?);
     let plugins_input = config.plugins_config_input();
-    let marketplace_listing = {
-        let plugins_input = plugins_input.clone();
-        tokio::task::spawn_blocking(move || manager.discover_marketplaces_for_config(&plugins_input, &[]))
-            .await
-            .context("plugin marketplace discovery worker failed")?
-            .context("failed to list plugin marketplaces")?
-    };
-    let mut load_issues = configured_marketplace_snapshot_issues(
-        config.codex_home.as_path(),
-        &plugins_input,
-        &marketplace_listing.errors,
-        /*marketplace_name*/ None,
-    );
-    let mut issue_paths = load_issues
-        .iter()
-        .map(|issue| issue.path.clone())
-        .collect::<HashSet<_>>();
-    for error in &marketplace_listing.errors {
-        if issue_paths.insert(error.path.to_path_buf()) {
-            load_issues.push(ConfiguredMarketplaceSnapshotIssue {
-                marketplace_name: error.path.display().to_string(),
-                path: error.path.to_path_buf(),
-                message: error.message.clone(),
-            });
+    let codex_home = config.codex_home.to_path_buf();
+    let ListMarketplaceArgs { json } = args;
+    let (marketplaces, load_issues, marketplace_sources) = tokio::task::spawn_blocking(move || {
+        let (listing, observations) = manager
+            .discover_marketplaces_for_config_with_observations(&plugins_input)
+            .context("failed to list plugin marketplaces")?;
+        let mut load_issues = configured_marketplace_snapshot_issues_with(
+            &codex_home,
+            &plugins_input,
+            &listing.errors,
+            /*marketplace_name*/ None,
+            |_, _, root, is_git| {
+                let Ok(root) = AbsolutePathBuf::try_from(root) else {
+                    // A relative local root cannot yield an absolute manifest.
+                    return (!is_git).then_some(None);
+                };
+                let observation = observations.get(&root)?;
+                (!is_git || observation.git_source_matches)
+                    .then(|| observation.manifest_path.clone())
+            },
+        );
+        for error in listing.errors {
+            if !load_issues.iter().any(|issue| {
+                issue.path.as_path() == error.path.as_path() && issue.message == error.message
+            }) {
+                load_issues.push(ConfiguredMarketplaceSnapshotIssue {
+                    marketplace_name: error.path.display().to_string(),
+                    path: error.path.to_path_buf(),
+                    message: error.message,
+                });
+            }
         }
-    }
+        let marketplace_sources = if json && load_issues.is_empty() {
+            configured_marketplace_sources_by_root(&codex_home, &plugins_input, &observations)
+        } else {
+            HashMap::new()
+        };
+        Ok::<_, anyhow::Error>((listing.marketplaces, load_issues, marketplace_sources))
+    })
+    .await
+    .context("plugin marketplace discovery worker failed")??;
     if !load_issues.is_empty() {
         let issue_lines = load_issues
             .iter()
@@ -251,10 +268,7 @@ async fn run_list(overrides: Vec<(String, toml::Value)>, args: ListMarketplaceAr
             .join("\n");
         bail!("failed to load marketplace(s):\n{issue_lines}");
     }
-    let marketplaces = marketplace_listing.marketplaces;
-    if args.json {
-        let marketplace_sources =
-            configured_marketplace_sources_by_root(config.codex_home.as_path(), &plugins_input);
+    if json {
         let output =
             JsonMarketplaceListOutput::from_marketplaces(marketplaces, &marketplace_sources);
         out_println!("{}", serde_json::to_string_pretty(&output)?)?;
@@ -340,6 +354,7 @@ struct JsonMarketplaceListEntry {
 fn configured_marketplace_sources_by_root(
     codex_home: &Path,
     plugins_input: &PluginsConfigInput,
+    observations: &HashMap<AbsolutePathBuf, ConfiguredMarketplaceRootObservation>,
 ) -> HashMap<PathBuf, JsonMarketplaceSource> {
     let marketplace_sources = configured_marketplace_sources(plugins_input, codex_home);
     let user_config = plugins_input.config_layer_stack.effective_config();
@@ -355,12 +370,15 @@ fn configured_marketplace_sources_by_root(
         .iter()
         .filter_map(|(marketplace_name, marketplace)| {
             let marketplace_source = marketplace_sources.get(marketplace_name)?;
-            let root = resolve_configured_marketplace_root(
+            let is_git = marketplace_source.source_type == "git";
+            let root = configured_marketplace_candidate_root(
                 marketplace_name,
                 marketplace,
                 &default_install_root,
             )?;
-            Some((root, marketplace_source.clone()))
+            let candidate_root = AbsolutePathBuf::try_from(root.as_path()).ok()?;
+            let observation = observations.get(&candidate_root)?;
+            (!is_git || observation.git_source_matches).then(|| (root, marketplace_source.clone()))
         })
         .collect()
 }
@@ -386,7 +404,9 @@ async fn run_upgrade(
     let config = Config::load_with_cli_overrides(overrides.clone())
         .await
         .context("failed to load configuration")?;
-    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let codex_home = find_codex_home_async()
+        .await
+        .context("failed to resolve CODEX_HOME")?;
     let manager = PluginsManager::new(codex_home.to_path_buf());
     let plugins_input = config.plugins_config_input();
     let reload_config = marketplace_config_reload(overrides);
@@ -412,7 +432,9 @@ async fn run_remove(
         marketplace_name,
         json,
     } = args;
-    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let codex_home = find_codex_home_async()
+        .await
+        .context("failed to resolve CODEX_HOME")?;
     let outcome = remove_marketplace(
         codex_home.to_path_buf(),
         marketplace_config_reload(overrides),
@@ -637,6 +659,49 @@ pub(crate) fn configured_marketplace_snapshot_issues(
     load_errors: &[MarketplaceListError],
     marketplace_name: Option<&str>,
 ) -> Vec<ConfiguredMarketplaceSnapshotIssue> {
+    let default_install_root = marketplace_install_root(codex_home);
+    configured_marketplace_snapshot_issues_with(
+        codex_home,
+        plugins_input,
+        load_errors,
+        marketplace_name,
+        |configured_name, marketplace, root, is_git| {
+            if is_git {
+                resolve_configured_marketplace_root(
+                    configured_name,
+                    marketplace,
+                    &default_install_root,
+                )?;
+            }
+            Some(find_marketplace_manifest_path(root))
+        },
+    )
+}
+
+fn configured_marketplace_candidate_root(
+    configured_name: &str,
+    marketplace: &toml::Value,
+    default_install_root: &Path,
+) -> Option<PathBuf> {
+    // This is a config-only projection, not a filesystem resolution.
+    match marketplace.get("source_type").and_then(toml::Value::as_str) {
+        Some("git") => Some(default_install_root.join(configured_name)),
+        Some("local") => marketplace
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .filter(|source| !source.is_empty())
+            .map(PathBuf::from),
+        _ => None,
+    }
+}
+
+fn configured_marketplace_snapshot_issues_with(
+    codex_home: &Path,
+    plugins_input: &PluginsConfigInput,
+    load_errors: &[MarketplaceListError],
+    marketplace_name: Option<&str>,
+    mut observed_manifest: impl FnMut(&str, &toml::Value, &Path, bool) -> Option<Option<AbsolutePathBuf>>,
+) -> Vec<ConfiguredMarketplaceSnapshotIssue> {
     let user_config = plugins_input.config_layer_stack.effective_config();
     let Some(configured_marketplaces) = user_config
         .get("marketplaces")
@@ -648,7 +713,7 @@ pub(crate) fn configured_marketplace_snapshot_issues(
         allowed_configured_marketplace_names(&plugins_input.config_layer_stack, codex_home);
 
     let default_install_root = marketplace_install_root(codex_home);
-    let mut manifest_paths = Vec::new();
+    let mut listing_paths = Vec::new();
     let mut issues = Vec::new();
     for (configured_name, marketplace) in configured_marketplaces {
         if !allowed_marketplace_names.contains(configured_name) {
@@ -686,22 +751,36 @@ pub(crate) fn configured_marketplace_snapshot_issues(
             });
             continue;
         }
-        let Some(root) = resolve_configured_marketplace_root(
+        let is_git = marketplace.get("source_type").and_then(toml::Value::as_str) == Some("git");
+        let Some(candidate_root) = configured_marketplace_candidate_root(
             configured_name,
             marketplace,
             &default_install_root,
         ) else {
             continue;
         };
-        match find_marketplace_manifest_path(&root) {
-            Some(path) => manifest_paths.push((configured_name.clone(), path)),
+        // A publication error is keyed by the candidate root and happens before
+        // discovery can read the checkout identity or select a manifest.
+        if let Ok(root) = AbsolutePathBuf::try_from(candidate_root.as_path())
+            && load_errors.iter().any(|error| error.path == root)
+        {
+            listing_paths.push((configured_name.clone(), root));
+            continue;
+        }
+        let Some(manifest_path) =
+            observed_manifest(configured_name, marketplace, &candidate_root, is_git)
+        else {
+            continue;
+        };
+        match manifest_path {
+            Some(path) => listing_paths.push((configured_name.clone(), path)),
             None => {
-                if is_implicit_system_marketplace_root(configured_name, &root) {
+                if is_implicit_system_marketplace_root(configured_name, &candidate_root) {
                     continue;
                 }
                 issues.push(ConfiguredMarketplaceSnapshotIssue {
                     marketplace_name: configured_name.clone(),
-                    path: root,
+                    path: candidate_root,
                     message: "marketplace root does not contain a supported manifest".to_string(),
                 });
             }
@@ -709,7 +788,7 @@ pub(crate) fn configured_marketplace_snapshot_issues(
     }
 
     for error in load_errors {
-        if let Some((configured_name, _)) = manifest_paths
+        if let Some((configured_name, _)) = listing_paths
             .iter()
             .find(|(_, path)| path.as_path() == error.path.as_path())
         {

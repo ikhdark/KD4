@@ -199,10 +199,8 @@ impl ToolOrchestrator {
 
     async fn reject_if_not_approved(decision: ReviewDecision) -> Result<(), ToolError> {
         match decision {
-            ReviewDecision::Denied | ReviewDecision::Abort => {
-                let reason = "rejected by user".to_string();
-                Err(ToolError::Denied(reason))
-            }
+            ReviewDecision::Denied => Err(ToolError::Denied("rejected by user".to_string())),
+            ReviewDecision::Abort => Err(ToolError::Denied("approval was aborted".to_string())),
             ReviewDecision::Approved
             | ReviewDecision::ApprovedExecpolicyAmendment { .. }
             | ReviewDecision::ApprovedForSession => Ok(()),

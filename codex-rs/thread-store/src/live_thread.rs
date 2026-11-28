@@ -539,17 +539,28 @@ impl LiveThread {
             .await
     }
 
+    pub async fn flush(&self) -> ThreadStoreResult<()> {
+        self.flush_with_metadata_result().await?
+    }
+
+    /// An outer success confirms the store flushed the canonical history. An inner
+    /// error is from metadata settlement after that barrier: retry settlement with
+    /// a later barrier, not by appending the same items again.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
     )]
-    pub async fn flush(&self) -> ThreadStoreResult<()> {
+    pub async fn flush_with_metadata_result(&self) -> ThreadStoreResult<ThreadStoreResult<()>> {
         let mut metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.flush_thread(self.thread_id).await?;
-        self.recover_uncertain_metadata(&mut metadata_sync).await?;
-        let update = metadata_sync.take_pending_update_for_existing_history();
-        self.apply_pending_metadata_update(&mut metadata_sync, update)
-            .await
+        let metadata_result = async {
+            self.recover_uncertain_metadata(&mut metadata_sync).await?;
+            let update = metadata_sync.take_pending_update_for_existing_history();
+            self.apply_pending_metadata_update(&mut metadata_sync, update)
+                .await
+        }
+        .await;
+        Ok(metadata_result)
     }
 
     /// [`Self::flush`] with the store's stable-storage barrier, for terminal checkpoints.

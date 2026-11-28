@@ -229,14 +229,15 @@ impl ViewImageHandler {
             // Validate before reporting success, while preserving source bytes;
             // direct output already decodes once in the history insertion path.
             let validation_path = model_visible_path.clone();
-            file_bytes = tokio::task::spawn_blocking(move || {
+            let validation = tokio::task::spawn_blocking(move || {
                 load_for_prompt_bytes(
                     std::path::Path::new(&validation_path),
                     file_bytes.clone(),
                     PromptImageMode::Original,
                 )
                 .map(|_| file_bytes)
-            })
+            });
+            file_bytes = tokio_util::task::AbortOnDropHandle::new(validation)
             .await
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(

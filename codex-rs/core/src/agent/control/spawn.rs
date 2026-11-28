@@ -26,6 +26,7 @@ pub(crate) struct PreparedTypedSpawn {
     session_source: SessionSource,
     agent_metadata: AgentMetadata,
     residency_slot: Option<super::residency::V2ResidencySlot>,
+    cleanup_admission: PendingSpawnCleanupAdmission,
 }
 
 impl std::fmt::Debug for PreparedTypedSpawn {
@@ -42,6 +43,7 @@ pub(crate) struct ConsumedTypedSpawn {
     session_source: SessionSource,
     agent_metadata: AgentMetadata,
     residency_slot: Option<super::residency::V2ResidencySlot>,
+    cleanup_admission: PendingSpawnCleanupAdmission,
 }
 
 impl PreparedTypedSpawn {
@@ -91,6 +93,7 @@ impl PreparedTypedSpawn {
             session_source: self.session_source,
             agent_metadata: self.agent_metadata,
             residency_slot: self.residency_slot,
+            cleanup_admission: self.cleanup_admission,
         })
     }
 }
@@ -160,12 +163,6 @@ struct PendingSpawnCapacity {
 }
 
 impl PendingSpawnCapacity {
-    fn retain_until_drained(self, child_thread: Arc<crate::CodexThread>) {
-        if self.reservation.is_some() || self.residency_slot.is_some() {
-            tokio::spawn(self.release_after_drain(child_thread));
-        }
-    }
-
     fn retain_until_confirmed_detach(self, child_thread: Arc<crate::CodexThread>) {
         tokio::spawn(async move {
             let result = child_thread
@@ -178,66 +175,47 @@ impl PendingSpawnCapacity {
             }
         });
     }
+}
 
-    async fn release_after_drain(self, child_thread: Arc<crate::CodexThread>) {
-        if let Err(error) = child_thread.wait_until_drained().await {
-            warn!(%error, "retaining pending spawn capacity after unconfirmed session retirement");
-            // A failed observer does not prove accepted owners or their storage
-            // ownership retired. Fail closed rather than admit a replacement.
-            std::mem::forget(self);
-        }
+// Bound process-wide custody, including admitted spawns that have not yet
+// exposed a child, queued rollback, and cleanup still waiting for retirement.
+const MAX_ADMITTED_SPAWN_CLEANUPS: usize = 64;
+static SPAWN_CLEANUP_ADMISSION: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_ADMITTED_SPAWN_CLEANUPS);
+static SPAWN_CLEANUP_ROLLBACKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+static SPAWN_CLEANUP_RUNTIME: std::sync::Mutex<Option<tokio::runtime::Handle>> =
+    std::sync::Mutex::new(None);
+
+struct PendingSpawnCleanupAdmission {
+    runtime: tokio::runtime::Handle,
+    permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl PendingSpawnCleanupAdmission {
+    fn try_reserve() -> CodexResult<Self> {
+        let permit = SPAWN_CLEANUP_ADMISSION.try_acquire().map_err(|_| {
+            CodexErr::AgentLimitReached {
+                max_threads: MAX_ADMITTED_SPAWN_CLEANUPS,
+            }
+        })?;
+        let mut runtime = SPAWN_CLEANUP_RUNTIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let runtime = match runtime.as_ref() {
+            Some(handle) => handle.clone(),
+            None => {
+                let handle = start_pending_spawn_cleanup_runtime()?;
+                *runtime = Some(handle.clone());
+                handle
+            }
+        };
+        Ok(Self { runtime, permit })
     }
 }
 
-struct PendingSpawnCleanup {
-    control: AgentControl,
-    child_thread: Arc<crate::CodexThread>,
-    child_thread_id: ThreadId,
-    armed: bool,
-    capacity: PendingSpawnCapacity,
-}
-
-struct PendingSpawnCleanupJob {
-    control: AgentControl,
-    child_thread: Arc<crate::CodexThread>,
-    child_thread_id: ThreadId,
-    capacity: PendingSpawnCapacity,
-}
-
-impl PendingSpawnCleanupJob {
-    async fn run(self) {
-        let error = self
-            .control
-            .rollback_failed_initial_submission(
-                self.child_thread.as_ref(),
-                self.child_thread_id,
-                CodexErr::TurnAborted,
-            )
-            .await;
-        self.capacity
-            .retain_until_drained(Arc::clone(&self.child_thread));
-        // Successful rollback returns the original cancellation error.
-        if !matches!(error, CodexErr::TurnAborted) {
-            warn!(child_thread_id = %self.child_thread_id, %error,
-                "cancelled agent spawn cleanup was incomplete");
-        }
-    }
-}
-
-type PendingSpawnCleanupSender = tokio::sync::mpsc::UnboundedSender<PendingSpawnCleanupJob>;
-type PendingSpawnCleanupSenderState = std::sync::Mutex<Option<PendingSpawnCleanupSender>>;
-
-static PENDING_SPAWN_CLEANUP_SENDER: std::sync::OnceLock<PendingSpawnCleanupSenderState> =
-    std::sync::OnceLock::new();
-
-fn pending_spawn_cleanup_sender_state() -> &'static PendingSpawnCleanupSenderState {
-    PENDING_SPAWN_CLEANUP_SENDER.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-fn start_pending_spawn_cleanup_worker() -> Option<PendingSpawnCleanupSender> {
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<PendingSpawnCleanupJob>();
+fn start_pending_spawn_cleanup_runtime() -> CodexResult<tokio::runtime::Handle> {
     let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
-    let worker = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("codex-spawn-cleanup".to_string())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -246,91 +224,132 @@ fn start_pending_spawn_cleanup_worker() -> Option<PendingSpawnCleanupSender> {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = ready_sender.send(Err(error.to_string()));
+                    let _ = ready_sender.send(Err(error));
                     return;
                 }
             };
-            if ready_sender.send(Ok(())).is_err() {
-                return;
+            if ready_sender.send(Ok(runtime.handle().clone())).is_ok() {
+                // Process-owned, not tied to the runtime that admitted the child.
+                // Keep driving drains and closing-guard tasks even when idle.
+                runtime.block_on(std::future::pending::<()>());
             }
-            // Drive delayed cleanup and closing-guard tasks even while the queue is idle.
-            runtime.block_on(async move {
-                let mut jobs = tokio::task::JoinSet::new();
-                let mut receiving = true;
-                const MAX_CONCURRENT_CLEANUPS: usize = 32;
-                while receiving || !jobs.is_empty() {
-                    tokio::select! {
-                        job = receiver.recv(), if receiving && jobs.len() < MAX_CONCURRENT_CLEANUPS => {
-                            match job {
-                                Some(job) => { jobs.spawn(job.run()); }
-                                None => receiving = false,
-                            }
-                        }
-                        result = jobs.join_next(), if !jobs.is_empty() => {
-                            if let Some(Err(error)) = result {
-                                warn!(%error, "agent spawn cleanup task failed");
-                            }
+        })
+        .map_err(|error| CodexErr::Fatal(format!("failed to start agent spawn cleanup: {error}")))?;
+    ready_receiver
+        .recv()
+        .map_err(|error| CodexErr::Fatal(format!("spawn cleanup startup was interrupted: {error}")))?
+        .map_err(|error| CodexErr::Fatal(format!("failed to create spawn cleanup runtime: {error}")))
+}
+
+struct PendingSpawnCleanup {
+    control: AgentControl,
+    child_thread: Arc<crate::CodexThread>,
+    child_thread_id: ThreadId,
+    admission: Option<PendingSpawnCleanupAdmission>,
+    capacity: PendingSpawnCapacity,
+}
+
+struct PendingSpawnCleanupJob {
+    control: AgentControl,
+    child_thread: Arc<crate::CodexThread>,
+    child_thread_id: ThreadId,
+    _capacity: PendingSpawnCapacity,
+    _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+enum PendingSpawnCleanupAction {
+    Rollback {
+        error: CodexErr,
+        result: Option<tokio::sync::oneshot::Sender<CodexErr>>,
+    },
+    ConfirmDetach,
+}
+
+// Dropped tasks and failed retirement observers cannot release admission or
+// child capacity. Keep the exact generation and its charges in that case.
+struct PendingSpawnCleanupCustody(Option<PendingSpawnCleanupJob>);
+
+impl Drop for PendingSpawnCleanupCustody {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            warn!(child_thread_id = %job.child_thread_id,
+                "retaining spawn cleanup custody without confirmed retirement");
+            std::mem::forget(job);
+        }
+    }
+}
+
+impl PendingSpawnCleanupCustody {
+    async fn run(mut self, action: PendingSpawnCleanupAction) {
+        let Some(job) = self.0.as_ref() else {
+            return;
+        };
+        let confirm_detach = match action {
+            PendingSpawnCleanupAction::Rollback { error, result } => {
+                // Keep subtree rollback concurrency separate from retirement:
+                // a child draining accepted work must not occupy a rollback slot.
+                let Ok(rollback) = SPAWN_CLEANUP_ROLLBACKS.acquire().await else {
+                    return;
+                };
+                let (error, confirm_detach) = match job.control.upgrade() {
+                    Ok(state) => {
+                        let is_current = state
+                            .with_current_thread_generation(
+                                job.child_thread_id,
+                                &job.child_thread,
+                                |_| (),
+                            )
+                            .await
+                            .is_some();
+                        if is_current {
+                            let error = job
+                                .control
+                                .rollback_failed_initial_submission(
+                                    job.child_thread.as_ref(),
+                                    job.child_thread_id,
+                                    error,
+                                )
+                                .await;
+                            (error, false)
+                        } else {
+                            // Do not start ID-keyed rollback for an already
+                            // superseded generation.
+                            (error, true)
                         }
                     }
+                    Err(manager_error) => (
+                        CodexErr::Fatal(format!(
+                            "initial submission to spawned agent {} failed ({error}); cleanup was incomplete: failed to access thread manager for spawn rollback: {manager_error}",
+                            job.child_thread_id,
+                        )),
+                        true,
+                    ),
+                };
+                drop(rollback);
+                if let Some(result) = result {
+                    let _ = result.send(error);
+                } else if !matches!(error, CodexErr::TurnAborted) {
+                    warn!(child_thread_id = %job.child_thread_id, %error,
+                        "cancelled agent spawn cleanup was incomplete");
                 }
-            });
-        });
-    match worker {
-        Ok(_) => match ready_receiver.recv() {
-            Ok(Ok(())) => Some(sender),
-            Ok(Err(error)) => {
-                warn!(%error, "failed to create agent spawn cleanup runtime");
-                None
+                confirm_detach
             }
-            Err(error) => {
-                warn!(%error, "agent spawn cleanup worker stopped during startup");
-                None
-            }
-        },
-        Err(error) => {
-            warn!(%error, "failed to start agent spawn cleanup worker");
-            None
-        }
-    }
-}
-
-fn send_with_restarting_worker<T>(
-    state: &std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<T>>>,
-    mut start_worker: impl FnMut() -> Option<tokio::sync::mpsc::UnboundedSender<T>>,
-    mut job: T,
-) -> Result<(), T> {
-    let mut worker = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for _ in 0..2 {
-        if worker.is_none() {
-            *worker = start_worker();
-        }
-        let Some(sender) = worker.as_ref().cloned() else {
-            return Err(job);
+            PendingSpawnCleanupAction::ConfirmDetach => true,
         };
-        match sender.send(job) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                job = error.0;
-                *worker = None;
-            }
+        let retirement = if confirm_detach {
+            job.child_thread
+                .retire_stopped_generation()
+                .await
+                .and_then(|_| AgentControl::confirm_stopped_v2_residency(&job.child_thread))
+        } else {
+            job.child_thread.wait_until_drained().await
+        };
+        match retirement {
+            Ok(()) => drop(self.0.take()),
+            Err(error) => warn!(child_thread_id = %job.child_thread_id, %error,
+                "could not confirm retirement of a pending agent spawn"),
         }
     }
-    Err(job)
-}
-
-/// Returns the job when no cleanup worker accepts it. Only that rare fallback
-/// allocates; the common result stays pointer-sized instead of carrying the job.
-fn schedule_pending_spawn_cleanup(
-    job: PendingSpawnCleanupJob,
-) -> Result<(), Box<PendingSpawnCleanupJob>> {
-    send_with_restarting_worker(
-        pending_spawn_cleanup_sender_state(),
-        start_pending_spawn_cleanup_worker,
-        job,
-    )
-    .map_err(Box::new)
 }
 
 impl PendingSpawnCleanup {
@@ -340,12 +359,13 @@ impl PendingSpawnCleanup {
         child_thread_id: ThreadId,
         reservation: crate::agent::registry::SpawnReservation,
         residency_slot: Option<super::residency::V2ResidencySlot>,
+        admission: PendingSpawnCleanupAdmission,
     ) -> Self {
         Self {
             control,
             child_thread,
             child_thread_id,
-            armed: true,
+            admission: Some(admission),
             capacity: PendingSpawnCapacity {
                 reservation: Some(reservation),
                 residency_slot,
@@ -353,55 +373,50 @@ impl PendingSpawnCleanup {
         }
     }
 
-    async fn rollback(mut self, submission_error: CodexErr) -> CodexErr {
-        let error = self
-            .control
-            .rollback_failed_initial_submission(
-                self.child_thread.as_ref(),
+    async fn rollback(mut self, error: CodexErr) -> CodexErr {
+        let (result, completion) = tokio::sync::oneshot::channel();
+        self.dispatch(PendingSpawnCleanupAction::Rollback {
+            error,
+            result: Some(result),
+        });
+        completion.await.unwrap_or_else(|error| {
+            CodexErr::Fatal(format!(
+                "spawn rollback for {} did not report its result: {error}",
                 self.child_thread_id,
-                submission_error,
-            )
-            .await;
-        self.armed = false;
-        self.take_capacity()
-            .retain_until_drained(Arc::clone(&self.child_thread));
-        error
+            ))
+        })
     }
 
-    fn take_capacity(&mut self) -> PendingSpawnCapacity {
-        PendingSpawnCapacity {
-            reservation: self.capacity.reservation.take(),
-            residency_slot: self.capacity.residency_slot.take(),
-        }
+    fn dispatch(&mut self, action: PendingSpawnCleanupAction) {
+        let Some(PendingSpawnCleanupAdmission { runtime, permit }) = self.admission.take() else {
+            return;
+        };
+        let custody = PendingSpawnCleanupCustody(Some(PendingSpawnCleanupJob {
+            control: self.control.clone(),
+            child_thread: Arc::clone(&self.child_thread),
+            child_thread_id: self.child_thread_id,
+            _capacity: PendingSpawnCapacity {
+                reservation: self.capacity.reservation.take(),
+                residency_slot: self.capacity.residency_slot.take(),
+            },
+            _permit: permit,
+        }));
+        // Spawn uses the process-owned runtime and does not depend on the
+        // caller's runtime during Drop. Every submitted future is precharged.
+        runtime.spawn(custody.run(action));
     }
 
     fn disarm(&mut self) {
-        self.armed = false;
+        self.admission = None;
     }
 }
 
 impl Drop for PendingSpawnCleanup {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Err(job) = schedule_pending_spawn_cleanup(PendingSpawnCleanupJob {
-            control: self.control.clone(),
-            child_thread: Arc::clone(&self.child_thread),
-            child_thread_id: self.child_thread_id,
-            capacity: self.take_capacity(),
-        }) {
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                // A native cleanup worker may fail to start while this runtime is
-                // still healthy. Keep the job and its capacity on that runtime.
-                runtime.spawn(job.run());
-            } else {
-                warn!(
-                    child_thread_id = %self.child_thread_id,
-                    "unable to schedule cleanup for cancelled agent spawn: no cleanup worker or current runtime"
-                );
-            }
-        }
+        self.dispatch(PendingSpawnCleanupAction::Rollback {
+            error: CodexErr::TurnAborted,
+            result: None,
+        });
     }
 }
 
@@ -637,6 +652,7 @@ impl AgentControl {
                 "durable typed assignments require MultiAgentV2 residency".to_string(),
             ));
         }
+        let cleanup_admission = PendingSpawnCleanupAdmission::try_reserve()?;
         let execution_guard =
             self.reserve_execution_capacity(multi_agent_version, &requested_source)?;
         // V2 residency owns the configured resident limit. The registry token still reserves
@@ -671,6 +687,7 @@ impl AgentControl {
             session_source: prepared_source,
             agent_metadata,
             residency_slot,
+            cleanup_admission,
         })
     }
 
@@ -1156,6 +1173,7 @@ impl AgentControl {
             session_source,
             mut agent_metadata,
             residency_slot,
+            cleanup_admission,
         ) = if let Some(consumed) = consumed_typed_spawn {
             validate_typed_binding_path(&options, &consumed.agent_metadata)?;
             (
@@ -1165,6 +1183,7 @@ impl AgentControl {
                 Some(consumed.session_source),
                 consumed.agent_metadata,
                 consumed.residency_slot,
+                Some(consumed.cleanup_admission),
             )
         } else {
             let multi_agent_version = state
@@ -1238,6 +1257,7 @@ impl AgentControl {
                 session_source,
                 agent_metadata,
                 residency_slot,
+                None,
             )
         };
         let notification_source = session_source.clone();
@@ -1254,6 +1274,10 @@ impl AgentControl {
                 .await,
         };
 
+        let cleanup_admission = match cleanup_admission {
+            Some(admission) => admission,
+            None => PendingSpawnCleanupAdmission::try_reserve()?,
+        };
         // The same `AgentControl` is sent to spawn the thread.
         let new_thread = match (session_source, options.fork_mode.as_ref(), inheritance) {
             (Some(session_source), Some(_), inheritance) => {
@@ -1295,6 +1319,7 @@ impl AgentControl {
             new_thread.thread_id,
             reservation,
             residency_slot,
+            cleanup_admission,
         );
         agent_metadata.agent_id = Some(new_thread.thread_id);
 
@@ -1513,10 +1538,7 @@ impl AgentControl {
                 None => {
                     // The old generation may have been replaced under the same
                     // ID. Do not run ID-keyed rollback against the replacement.
-                    pending_cleanup.disarm();
-                    pending_cleanup
-                        .take_capacity()
-                        .retain_until_confirmed_detach(Arc::clone(&new_thread.thread));
+                    pending_cleanup.dispatch(PendingSpawnCleanupAction::ConfirmDetach);
                     return Err(CodexErr::InvalidRequest(format!(
                         "agent {} stopped before spawn publication",
                         new_thread.thread_id

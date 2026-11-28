@@ -67,6 +67,8 @@ use crate::unified_exec::process::OutputBuffer;
 use crate::unified_exec::process::OutputHandles;
 use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
+use crate::unified_exec::speculative_shell::SPECULATIVE_COMMIT_UNCERTAIN_MESSAGE;
+use crate::unified_exec::speculative_shell::SpeculativeCommitWatch;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_protocol::error::CodexErr;
@@ -1552,6 +1554,7 @@ impl UnifiedExecProcessManager {
         // Finish an accepted event and its legacy dispatch before cancellation
         // takes ownership of the command's terminal transition.
         let event_delivery = tokio::sync::Mutex::new(());
+        let speculative_commit = SpeculativeCommitWatch::current_or_new();
         let mut result = tokio::select! {
             biased;
             _ = async {
@@ -1559,17 +1562,20 @@ impl UnifiedExecProcessManager {
                 let _event_delivery = event_delivery.lock().await;
             } => {
                 cancelled = true;
-                Err(UnifiedExecError::process_failed(
-                    "unified exec cancelled".to_string(),
-                ))
+                let message = if speculative_commit.is_uncertain() {
+                    SPECULATIVE_COMMIT_UNCERTAIN_MESSAGE
+                } else {
+                    "unified exec cancelled"
+                };
+                Err(UnifiedExecError::process_failed(message.to_string()))
             }
-            result = self.exec_command_inner(
+            result = speculative_commit.clone().scope(self.exec_command_inner(
                 &mut request,
                 &mut process_id_reservation,
                 context,
                 &mut registration,
                 &event_delivery,
-            ) => result,
+            )) => result,
         };
         let failure_bound = failure_handback_bound(context.source.nested_deadline());
         if let Err(error) = &result
@@ -3975,17 +3981,39 @@ impl UnifiedExecProcessManager {
         &self,
         call_ids: &[String],
     ) -> Result<usize, String> {
+        match self.begin_unpublished_process_retirement(call_ids).await? {
+            Some((_, accounting)) => accounting
+                .await
+                .map_err(|error| format!("unpublished process accounting owner failed: {error}")),
+            None => Ok(0),
+        }
+    }
+
+    /// The caller may bound native confirmation and the accounting observation
+    /// independently. Once all targets confirm, dropping the returned handle
+    /// detaches observation, not the owner of exact command accounting.
+    pub(crate) async fn begin_unpublished_process_retirement(
+        &self,
+        call_ids: &[String],
+    ) -> Result<Option<(usize, tokio::task::JoinHandle<usize>)>, String> {
         if call_ids.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
-        let mut targets = {
+        let (mut targets, terminal_tasks) = {
             let store = self.process_store.lock().await;
-            store
+            let mut terminal_tasks = None;
+            let targets = store
                 .processes
                 .iter()
                 .filter(|(_, entry)| call_ids.iter().any(|call_id| call_id == &entry.call_id))
                 .map(|(process_id, entry)| {
+                    if terminal_tasks.is_none() {
+                        terminal_tasks = entry
+                            .session
+                            .upgrade()
+                            .map(|session| session.terminal_tasks.clone());
+                    }
                     entry.process.request_cancellation();
                     (
                         *process_id,
@@ -3993,8 +4021,12 @@ impl UnifiedExecProcessManager {
                         Arc::clone(&entry.process),
                     )
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (targets, terminal_tasks)
         };
+        if targets.is_empty() {
+            return Ok(None);
+        }
         targets.sort_by_key(|(process_id, _, _)| *process_id);
 
         let results = futures::future::join_all(targets.iter().map(
@@ -4008,38 +4040,71 @@ impl UnifiedExecProcessManager {
             return Err(error);
         }
 
-        let removed_entries = {
-            let mut store = self.process_store.lock().await;
-            targets
-                .iter()
-                .filter_map(|(process_id, call_id, process)| {
-                    let is_same_owner = store.processes.get(process_id).is_some_and(|entry| {
-                        entry.call_id == *call_id && Arc::ptr_eq(&entry.process, process)
-                    });
-                    is_same_owner.then(|| store.remove(*process_id)).flatten()
-                })
-                .collect::<Vec<_>>()
-        };
+        // Transfer custody before the next await (including store reacquisition).
+        let confirmed = targets.len();
+        let process_store = Arc::clone(&self.process_store);
+        let finish_accounting = async move {
+            let entries = {
+                let store = process_store.lock().await;
+                targets
+                    .iter()
+                    .filter_map(|(process_id, call_id, process)| {
+                        store
+                            .processes
+                            .get(process_id)
+                            .filter(|entry| {
+                                entry.call_id == *call_id && Arc::ptr_eq(&entry.process, process)
+                            })
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>()
+            };
 
-        for entry in &removed_entries {
-            entry
-                .initial_exec_command_active
-                .store(false, Ordering::Release);
-            if let Some(session) = entry.session.upgrade() {
-                session
-                    .services
-                    .command_execution
-                    .finish_running_process_with_execution_id(
-                        entry.process_id,
-                        entry.command_execution_id,
-                        &entry.parent_tool_execution_id,
-                        entry.process.exit_code(),
-                    )
-                    .await;
+            // Do not release the process ID or hide the entry from another
+            // abort drain before the exact command's ledger has been settled.
+            for entry in &entries {
+                if let Some(session) = entry.session.upgrade() {
+                    session
+                        .services
+                        .command_execution
+                        .finish_running_process_with_execution_id(
+                            entry.process_id,
+                            entry.command_execution_id,
+                            &entry.parent_tool_execution_id,
+                            entry.process.exit_code(),
+                        )
+                        .await;
+                }
             }
-        }
 
-        Ok(removed_entries.len())
+            let removed_entries = {
+                let mut store = process_store.lock().await;
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let is_same_owner =
+                            store.processes.get(&entry.process_id).is_some_and(|current| {
+                                current.call_id == entry.call_id
+                                    && Arc::ptr_eq(&current.process, &entry.process)
+                            });
+                        is_same_owner
+                            .then(|| store.remove(entry.process_id))
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for entry in &removed_entries {
+                entry
+                    .initial_exec_command_active
+                    .store(false, Ordering::Release);
+            }
+            removed_entries.len()
+        };
+        let accounting = match terminal_tasks {
+            Some(tasks) => tasks.spawn(finish_accounting),
+            None => tokio::spawn(finish_accounting),
+        };
+        Ok(Some((confirmed, accounting)))
     }
 
     fn background_completion_ready(entry: &ProcessEntry) -> bool {

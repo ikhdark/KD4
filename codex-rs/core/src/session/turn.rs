@@ -343,7 +343,7 @@ pub(crate) fn run_turn<'a>(
             .services
             .agent_control
             .task_coordinator()
-            .prepare_legacy_agent_turn(&turn_context.session_source, sess.thread_id)
+            .prepare_legacy_agent_turn(&turn_context, sess.thread_id, &cancellation_token)
             .await;
         if cancellation_token.is_cancelled() {
             return Err(CodexErr::TurnAborted);
@@ -362,15 +362,6 @@ pub(crate) fn run_turn<'a>(
             .await;
             return Err(err);
         }
-        turn_context.agent_task_binding.get_or_init(|| {
-            sess.services
-                .agent_control
-                .task_coordinator()
-                .binding_for_source(&turn_context.session_source)
-                .filter(|binding| {
-                    binding.thread_id.as_deref() == Some(sess.thread_id.to_string().as_str())
-                })
-        });
         let mut finalized_mutation_revision = None;
         let mut seen_stop_repairs = Vec::new();
         let mut validation_stop_recovery_attempted = false;
@@ -1768,13 +1759,15 @@ pub(crate) fn run_turn<'a>(
                                         tracker.uncertain_content_paths(),
                                     )
                                 };
-                                // Parsing is CPU work bounded by its own deadline.
+                                // One scan budget includes queueing and the conventional fallback.
+                                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+                                let analysis_cancellation = cancellation_token.clone();
                                 let unavailable = changed_existing
                                     .iter()
                                     .map(|(path, ..)| (path.clone(), "analysis_worker_unavailable"))
                                     .collect();
                                 let mut changed_tests = tokio::task::spawn_blocking(move || {
-                                    changed_existing_tests(changed_existing)
+                                    changed_existing_tests(changed_existing, &analysis_cancellation, deadline)
                                 })
                                 .await
                                 .unwrap_or_else(|_| ExistingTestChanges {
@@ -1803,7 +1796,7 @@ pub(crate) fn run_turn<'a>(
                             &turn_diff_tracker,
                             &cancellation_token,
                         )
-                        .await;
+                        .await?;
                         completion_assessment = Some(completion_stop_report.assessment.clone());
                         if let Some(hook_prompt_message) =
                             completion_stop_report.continuation_prompt
@@ -2340,52 +2333,111 @@ struct ExistingTestChanges {
     incomplete: Vec<(String, &'static str)>,
 }
 
-fn changed_existing_tests(files: Vec<(String, String, Option<String>)>) -> ExistingTestChanges {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-    let mut result = ExistingTestChanges::default();
-    for (path, before, after) in files {
-        let conventional = conventional_test_path(&path);
-        match crate::tools::handlers::existing_tests_changed(
-            &path,
-            &before,
-            after.as_deref(),
-            conventional,
-            deadline,
-        ) {
-            Ok(true) => result.changed.push(path),
-            Ok(false) => {}
+fn changed_existing_tests(
+    files: Vec<(String, String, Option<String>)>,
+    cancellation: &CancellationToken,
+    deadline: std::time::Instant,
+) -> ExistingTestChanges {
+    let check = || {
+        if cancellation.is_cancelled() {
+            Err("analysis_cancelled")
+        } else if std::time::Instant::now() >= deadline {
+            Err("shared_analysis_budget_exhausted")
+        } else {
+            Ok(())
+        }
+    };
+    let analyze_file = |path: &str, before: &str, after: Option<&str>| {
+        check()?;
+        let conventional = conventional_test_path(path);
+        check()?;
+        // The outline API observes the deadline inside the parser; check turn
+        // cancellation again before using its result or starting the fallback.
+        let outline =
+            crate::tools::handlers::existing_tests_changed(path, before, after, conventional, deadline);
+        check()?;
+        match outline {
+            Ok(changed) => Ok((changed, None)),
             Err(gap) => {
                 // A failed/unsupported outline is not evidence of unchanged
                 // tests. Keep the conventional-file fallback and expose its
                 // uncertainty separately, without blaming an unproven edit.
-                if conventional && rewrites_original_lines(&before, after.as_deref()) {
+                let changed = conventional && rewrites_original_lines(before, after, check)?;
+                let incomplete =
+                    (conventional || path.ends_with(".rs") || path.ends_with(".py"))
+                        .then(|| gap.label());
+                Ok((changed, incomplete))
+            }
+        }
+    };
+
+    let mut result = ExistingTestChanges::default();
+    let mut files = files.into_iter();
+    while let Some((path, before, after)) = files.next() {
+        match analyze_file(&path, &before, after.as_deref()) {
+            Ok((changed, incomplete)) => {
+                if changed {
                     result.changed.push(path.clone());
                 }
-                if conventional || path.ends_with(".rs") || path.ends_with(".py") {
-                    result.incomplete.push((path, gap.label()));
+                if let Some(gap) = incomplete {
+                    result.incomplete.push((path, gap));
                 }
+            }
+            Err(cutoff) => {
+                // These paths were not fully analyzed, not proved unchanged.
+                result.incomplete.push((path, cutoff));
+                result
+                    .incomplete
+                    .extend(files.map(|(path, ..)| (path, cutoff)));
+                break;
             }
         }
     }
     result
 }
 
-fn rewrites_original_lines(before: &str, after: Option<&str>) -> bool {
-    let Some(after) = after else {
-        return true;
-    };
-    use similar::DiffableStr;
+fn rewrites_original_lines(
+    mut before: &str,
+    after: Option<&str>,
+    check: impl Fn() -> Result<(), &'static str>,
+) -> Result<bool, &'static str> {
+    // Match similar's line tokens (LF, CRLF and lone CR, retaining the
+    // terminator), but walk lazily so we can stop between comparisons.
+    fn next_line<'a>(remaining: &mut &'a str) -> Option<&'a str> {
+        if remaining.is_empty() {
+            return None;
+        }
+        let end = remaining.find(['\r', '\n']).map_or(remaining.len(), |index| {
+            if remaining.as_bytes()[index..].starts_with(b"\r\n") {
+                index + 2
+            } else {
+                index + 1
+            }
+        });
+        let (line, rest) = remaining.split_at(end);
+        *remaining = rest;
+        Some(line)
+    }
 
-    // Only ask whether all original line tokens survive in order. Building a
-    // general edit script adds a fresh timeout for every unsupported file.
-    // Keep similar's tokenizer: CRLF, lone CR and final-newline differences
-    // are significant, and repeated lines must retain their multiplicity.
-    let after_lines = after.tokenize_lines();
-    let mut remaining = after_lines.into_iter();
-    before
-        .tokenize_lines()
-        .into_iter()
-        .any(|line| !remaining.by_ref().any(|candidate| candidate == line))
+    check()?;
+    let Some(mut remaining) = after else {
+        return Ok(true);
+    };
+    // Each original line must survive in order, including repeat occurrences.
+    while let Some(line) = next_line(&mut before) {
+        check()?;
+        loop {
+            let candidate = next_line(&mut remaining);
+            check()?;
+            match candidate {
+                Some(candidate) if candidate == line => break,
+                Some(_) => check()?,
+                None => return Ok(true),
+            }
+        }
+        check()?;
+    }
+    Ok(false)
 }
 
 /// An edited or removed existing test can change what the suite asserts, and
@@ -2756,11 +2808,18 @@ async fn run_completion_stop_hook<
     make_assessment: impl FnOnce() -> F,
     tracker: &SharedTurnDiffTracker,
     cancellation: &CancellationToken,
-) -> CompletionStopHookReport {
+) -> CodexResult<CompletionStopHookReport> {
     // Completion is a separate, cold phase. Construct and poll its analysis
     // here rather than reserving those temporaries while HTTP is being polled.
-    // The same caller still owns the work, cancellation, and persistence guards.
-    let mut assessment = Box::pin(make_assessment()).await;
+    // The blocking worker retains the turn token if this waiter is dropped.
+    let mut assessment = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
+        assessment = Box::pin(async { make_assessment().await }) => assessment,
+    };
+    if cancellation.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
     let mut mutation_receipt = None;
     let event = match &turn_context.session_source {
         SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
@@ -2847,7 +2906,7 @@ async fn run_completion_stop_hook<
         )
         .await;
     }
-    CompletionStopHookReport {
+    Ok(CompletionStopHookReport {
         assessment,
         mutation_receipt,
         should_block: stop.should_block,
@@ -2859,7 +2918,7 @@ async fn run_completion_stop_hook<
             .collect(),
         should_stop: stop.should_stop,
         stop_reason: stop.stop_reason,
-    }
+    })
 }
 
 #[instrument(level = "trace", skip_all)]

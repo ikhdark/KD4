@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::EncodedFrame;
@@ -6,6 +8,7 @@ use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::WireCellId;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use super::ConnectionDriver;
@@ -274,30 +277,37 @@ impl ConnectionDriver {
             PendingRequest::ShutdownSession {
                 session,
                 response_tx,
-            } => match result {
-                Ok(HostResponse::SessionClosed { session_id }) if session_id == session.id => {
-                    if !self.close_session_locally(&session.id) {
+            } => {
+                let retry_delay = self.requests.finish_abandoned_shutdown(id, &session);
+                match result {
+                    Ok(HostResponse::SessionClosed { session_id }) if session_id == session.id => {
+                        if !self.close_session_locally(&session.id) {
+                            return false;
+                        }
+                        let _ = response_tx.send(Ok(()));
+                    }
+                    Err(err) if err == codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING => {
+                        // The host answered and still owns admitted storage. Keep
+                        // the session fenced, but do not kill its publisher.
+                        if let Some(delay) = retry_delay {
+                            self.requests.defer_abandoned_shutdown(session, delay);
+                        } else {
+                            let _ = response_tx.send(Err(err));
+                        }
+                    }
+                    Ok(_) => {
+                        let err = "code-mode host returned an invalid shutdown response".to_string();
+                        let _ = response_tx.send(Err(err.clone()));
+                        self.fail(err);
                         return false;
                     }
-                    let _ = response_tx.send(Ok(()));
+                    Err(err) => {
+                        let _ = response_tx.send(Err(err.clone()));
+                        self.fail(err);
+                        return false;
+                    }
                 }
-                Err(err) if err == codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING => {
-                    // The host answered and still owns admitted storage. Keep
-                    // the session fenced, but do not kill its publisher.
-                    let _ = response_tx.send(Err(err));
-                }
-                Ok(_) => {
-                    let err = "code-mode host returned an invalid shutdown response".to_string();
-                    let _ = response_tx.send(Err(err.clone()));
-                    self.fail(err);
-                    return false;
-                }
-                Err(err) => {
-                    let _ = response_tx.send(Err(err.clone()));
-                    self.fail(err);
-                    return false;
-                }
-            },
+            }
         }
         true
     }
@@ -357,17 +367,68 @@ impl ConnectionDriver {
             return true;
         }
         self.catalogs.remove(&session.id);
-        let (response_tx, response_rx) = oneshot::channel();
-        drop(response_rx);
-        self.send_request(
-            HostRequest::ShutdownSession {
+        self.send_abandoned_shutdown(session, Duration::from_millis(100), None)
+    }
+
+    pub(super) fn retry_abandoned_shutdown(
+        &mut self,
+        permit: mpsc::OwnedPermit<EncodedFrame>,
+    ) -> bool {
+        let Some((session, delay)) = self.requests.take_due_abandoned_shutdown() else {
+            return true;
+        };
+        // Never send an old cleanup against a replacement session. The
+        // generation check also keeps the live record fenced while observing it.
+        if self.sessions.begin_shutdown(&session).is_err() {
+            return true;
+        }
+        self.send_abandoned_shutdown(session, delay, Some(permit))
+    }
+
+    fn send_abandoned_shutdown(
+        &mut self,
+        session: RemoteSession,
+        delay: Duration,
+        permit: Option<mpsc::OwnedPermit<EncodedFrame>>,
+    ) -> bool {
+        let id = match self.requests.allocate_id() {
+            Ok(id) => id,
+            Err(err) => {
+                self.fail(err);
+                return false;
+            }
+        };
+        let frame = match EncodedFrame::encode(&ClientToHost::Request {
+            id,
+            request: HostRequest::ShutdownSession {
                 session_id: session.id.clone(),
             },
+        }) {
+            Ok(frame) => frame,
+            Err(err) => {
+                self.fail(format!(
+                    "failed to encode code-mode abandoned-session shutdown: {err}"
+                ));
+                return false;
+            }
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        drop(response_rx);
+        self.requests.track_abandoned_shutdown(id, session.clone(), delay);
+        self.requests.insert_pending(
+            id,
             PendingRequest::ShutdownSession {
                 session,
                 response_tx,
             },
-        )
+            &self.event_tx,
+        );
+        if let Some(permit) = permit {
+            permit.send(frame);
+            true
+        } else {
+            self.queue_frame(frame)
+        }
     }
 
     fn terminate_abandoned_cell(&mut self, session: RemoteSession, cell_id: WireCellId) -> bool {

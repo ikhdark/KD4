@@ -1049,6 +1049,16 @@ impl EventPreviewBudget {
         self.nodes -= 1;
         match value {
             JsonValue::String(text) => JsonValue::String(self.text(text)),
+            JsonValue::Number(number) => {
+                // With arbitrary_precision, a number can own a long string.
+                let bytes = number.as_str().len();
+                if bytes > self.bytes {
+                    self.truncated = true;
+                    return JsonValue::Null;
+                }
+                self.bytes -= bytes;
+                JsonValue::Number(number.clone())
+            }
             JsonValue::Array(values) => {
                 let mut output = Vec::new();
                 for value in values {

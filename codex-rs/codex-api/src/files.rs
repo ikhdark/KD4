@@ -321,6 +321,7 @@ async fn upload_openai_file_contents_with_pool(
             .request(Method::PUT, &create_payload.upload_url)
             .redirect_filter(|_| false)
             .timeout(timeout)
+            .deadline(upload_deadline)
             .header("x-ms-blob-type", "BlockBlob")
             .header(CONTENT_LENGTH, file_size_bytes);
         let request = blob_request(upload_timeout);
@@ -404,7 +405,9 @@ async fn upload_openai_file_contents_with_pool(
                 let mut request = codex_client::Request::new(Method::POST, finalize_url.clone())
                     .with_json(&serde_json::json!({}));
                 request.timeout = Some(remaining);
-                let request = authorized_request(http_clients, auth, request).await?;
+                let request = authorized_request(http_clients, auth, request)
+                    .await?
+                    .deadline(finalize_deadline);
                 if Instant::now() >= finalize_deadline {
                     return Err(finalize_timed_out());
                 }

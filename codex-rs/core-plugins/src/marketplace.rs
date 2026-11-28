@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -469,6 +470,13 @@ pub fn list_marketplaces_with_home(
     Ok(outcome)
 }
 
+/// The configured-root facts captured by the listing's publication read.
+#[derive(Debug)]
+pub struct ConfiguredMarketplaceRootObservation {
+    pub git_source_matches: bool,
+    pub manifest_path: Option<AbsolutePathBuf>,
+}
+
 #[derive(Default)]
 struct MarketplaceListingRoot {
     additional: bool,
@@ -482,6 +490,8 @@ pub(crate) fn list_configured_marketplaces_with_home(
     additional_roots: impl IntoIterator<Item = AbsolutePathBuf>,
     home_dir: Option<&Path>,
     include: impl Fn(&Marketplace) -> bool,
+    mut observations: Option<&mut HashMap<AbsolutePathBuf, ConfiguredMarketplaceRootObservation>>,
+    discover: bool,
 ) -> MarketplaceListOutcome {
     let mut outcome = MarketplaceListOutcome::default();
     let mut seen = HashSet::new();
@@ -507,59 +517,103 @@ pub(crate) fn list_configured_marketplaces_with_home(
 
     // Home precedes the sorted roots; duplicate manifest paths still use their
     // first occurrence, before applying the existing policy filter.
-    let mut list_root = |root: &AbsolutePathBuf, options: Option<MarketplaceListingRoot>| {
+    let collect_observations = observations.is_some();
+    let mut list_root = |root: &AbsolutePathBuf,
+                         options: Option<&MarketplaceListingRoot>,
+                         home: bool,
+                         skip_root_manifest: bool| {
+        let observe_configured = collect_observations && !skip_root_manifest;
         let read = || {
-            let path = match &options {
-                None => find_marketplace_manifest_path(root.as_path()),
-                Some(options) if options.additional => discover_marketplace_path_from_root(root),
-                Some(options) => {
-                    if !options.configured_local
-                        && !options
-                            .configured_git
-                            .as_ref()
-                            .is_some_and(|(name, marketplace)| {
-                                resolve_configured_marketplace_root(name, marketplace, &install_root)
-                                    .is_some()
-                            })
-                    {
-                        return None;
-                    }
-                    find_marketplace_manifest_path(root.as_path())
+            let configured_local = options.is_some_and(|options| options.configured_local);
+            let additional = options.is_some_and(|options| options.additional);
+            let configured_git = options.and_then(|options| options.configured_git.as_ref());
+            let check_git_source = observe_configured || (!home && !additional && !configured_local);
+            let git_source_matches = check_git_source
+                && configured_git.is_some_and(|(name, marketplace)| {
+                    resolve_configured_marketplace_root(name, marketplace, &install_root).is_some()
+                });
+            let configured = configured_local || git_source_matches;
+            let root_manifest = || find_marketplace_manifest_path(root.as_path());
+            let observation = (observe_configured && configured).then(|| {
+                ConfiguredMarketplaceRootObservation {
+                    git_source_matches,
+                    manifest_path: root_manifest(),
                 }
-            }?;
-            if seen.contains(&path) {
-                return None;
-            }
-            let result = load_marketplace(&path)
-                .map(|marketplace| include(&marketplace).then_some(marketplace));
-            Some((path, result))
+            });
+            let listing_path = if !discover {
+                None
+            } else if home || (configured && !additional) {
+                observation.as_ref().map_or_else(root_manifest, |observation| {
+                    observation.manifest_path.clone()
+                })
+            } else if additional {
+                discover_marketplace_path_from_root_with_manifest(root, skip_root_manifest, || {
+                    observation
+                        .as_ref()
+                        .map_or_else(root_manifest, |observation| observation.manifest_path.clone())
+                })
+            } else {
+                None
+            };
+            let found_path = listing_path.is_some();
+            let listing = listing_path.filter(|path| !seen.contains(path)).map(|path| {
+                let result = load_marketplace(&path)
+                    .map(|marketplace| include(&marketplace).then_some(marketplace));
+                (path, result)
+            });
+            (observation, found_path, listing)
         };
         let result = match marketplace_publication_name(root.as_path(), &install_root) {
             Some(name) => with_marketplace_publication_read(&install_root, name, read),
             None => Ok(read()),
         };
+        // Commit only the final returned observation: lock-file creation can
+        // cause the publication reader to discard and rerun its first read.
         match result {
-            Ok(Some((path, result))) => {
-                seen.insert(path.clone());
-                add_marketplace_listing_result(&mut outcome, path, result);
+            Ok((observation, found_path, listing)) => {
+                if let Some(observation) = observation
+                    && let Some(observations) = observations.as_deref_mut()
+                {
+                    observations.insert(root.clone(), observation);
+                }
+                if let Some((path, result)) = listing {
+                    seen.insert(path.clone());
+                    add_marketplace_listing_result(&mut outcome, path, result);
+                }
+                found_path
             }
-            Ok(None) => {}
-            Err(message) => outcome.errors.push(MarketplaceListError {
-                path: root.clone(),
-                message,
-            }),
+            Err(message) => {
+                outcome.errors.push(MarketplaceListError {
+                    path: root.clone(),
+                    message,
+                });
+                true // Do not reprobe the same contended root through a second role.
+            }
         }
         // Release before returning any listing to callers that may acquire an
         // operation lease (for example, installed-plugin cache refresh).
     };
 
-    if let Some(home) = home_dir
-        && let Ok(home) = AbsolutePathBuf::try_from(home.to_path_buf())
-    {
-        list_root(&home, None);
-    }
+    let pending_home_fallback = home_dir
+        .and_then(|home| AbsolutePathBuf::try_from(home).ok())
+        .and_then(|home| {
+            let configured_home = collect_observations
+                .then(|| roots.get(&home))
+                .flatten()
+                .filter(|options| options.configured_local || options.configured_git.is_some());
+            let handled =
+                list_root(&home, configured_home, /*home*/ true, /*skip_root_manifest*/ false);
+            if configured_home.is_some_and(|options| !options.additional || handled) {
+                roots.remove(&home);
+                None
+            } else {
+                configured_home.is_some().then_some(home)
+            }
+        });
     for (root, options) in roots {
-        list_root(&root, Some(options));
+        // Keep additional-root fallbacks at their original sorted position.
+        let skip_root_manifest = pending_home_fallback.as_ref() == Some(&root);
+        list_root(&root, Some(&options), /*home*/ false, skip_root_manifest);
     }
     outcome
 }
@@ -619,12 +673,25 @@ fn discover_marketplace_paths_from_roots(
 }
 
 fn discover_marketplace_path_from_root(root: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
+    discover_marketplace_path_from_root_with_manifest(root, /*skip_root_manifest*/ false, || {
+        find_marketplace_manifest_path(root.as_path())
+    })
+}
+
+fn discover_marketplace_path_from_root_with_manifest(
+    root: &AbsolutePathBuf,
+    skip_root_manifest: bool,
+    root_manifest: impl FnOnce() -> Option<AbsolutePathBuf>,
+) -> Option<AbsolutePathBuf> {
     supported_marketplace_manifest_path(root.as_path())
         // Curated marketplaces can be downloaded over HTTP, not just via Git.
-        .or_else(|| find_marketplace_manifest_path(root.as_path()))
+        .or_else(|| (!skip_root_manifest).then(root_manifest).flatten())
         .or_else(|| {
             let repo_root = get_git_repo_root(root.as_path())?;
             let repo_root = AbsolutePathBuf::try_from(repo_root).ok()?;
+            if skip_root_manifest && &repo_root == root {
+                return None;
+            }
             find_marketplace_manifest_path(repo_root.as_path())
         })
 }

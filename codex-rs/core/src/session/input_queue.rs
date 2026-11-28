@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use tokio::sync::watch;
 
 use super::input_receipts::UserInputIdentity;
+use super::mailbox_storage::MailboxSaveOutcome;
 use super::mailbox_storage::MailboxStorage;
 
 const MAX_PENDING_MAILBOX_COMMUNICATIONS: usize = 1_024;
@@ -62,6 +63,7 @@ pub(crate) enum TurnInput {
 pub(crate) struct MailboxInput {
     pub(super) communication: InterAgentCommunication,
     may_start_turn: bool,
+    awaiting_admission_ack: bool,
     followup_wake: Option<Arc<FollowupWake>>,
     recorded: Arc<AtomicBool>,
 }
@@ -70,6 +72,7 @@ impl MailboxInput {
     fn new(communication: InterAgentCommunication) -> Self {
         Self {
             may_start_turn: communication.trigger_turn,
+            awaiting_admission_ack: false,
             communication,
             followup_wake: None,
             recorded: Arc::default(),
@@ -399,8 +402,20 @@ impl InputQueue {
             .as_ref()
             .is_some_and(|id| mailbox.seen_communication_ids.contains_key(id))
         {
-            if let Some(storage) = &mailbox.storage {
+            if let Some(storage) = &mut mailbox.storage {
                 storage.confirm_current().await?;
+            }
+            if let Some((mail, _)) = mailbox.pending_mails.iter_mut().find(|(mail, _)| {
+                mail.awaiting_admission_ack && mail.id == communication.id
+            }) {
+                // Complete the original admission, not the retry's payload,
+                // preview, provenance or follow-up wake.
+                mail.awaiting_admission_ack = false;
+                mail.may_start_turn = mail.communication.trigger_turn;
+                let can_start_turn = mail.can_start_turn();
+                drop(mailbox);
+                self.notify_mailbox_admission(can_start_turn);
+                return Ok(true);
             }
             return Ok(false);
         }
@@ -425,7 +440,7 @@ impl InputQueue {
                 communication.progress.as_ref().is_some_and(|progress| progress.revision <= *revision))
         {
             // Admission acknowledgement also covers a snapshot already superseded.
-            if let Some(storage) = &mailbox.storage {
+            if let Some(storage) = &mut mailbox.storage {
                 storage.confirm_current().await?;
             }
             return Ok(false);
@@ -444,6 +459,7 @@ impl InputQueue {
             return Err(full_error());
         }
         let replaced_id = replace.and_then(|index| mailbox.pending_mails[index].0.id.clone());
+        let mut parent_sync_error = None;
         if let Some(storage) = &mut mailbox.storage {
             let mut next = storage.snapshot.clone();
             if let Some(id) = &replaced_id {
@@ -454,7 +470,11 @@ impl InputQueue {
                 }
             }
             next.pending.push(communication.clone());
-            storage.save(next).await?;
+            if let MailboxSaveOutcome::InstalledWithoutParentSync(error) =
+                storage.save(next).await?
+            {
+                parent_sync_error = Some(error);
+            }
         }
         if let Some(index) = replace {
             if mailbox.pending_mails.remove(index).is_some()
@@ -492,16 +512,29 @@ impl InputQueue {
         // before publishing the mail or acknowledging it. Duplicates and
         // superseded progress never reach this commit.
         mail.followup_wake = task_message.and_then(MailboxTaskMessage::accept);
+        if parent_sync_error.is_some() {
+            // The file already owns this envelope and supersession; mirror it
+            // once, but do not grant a scheduling permit or a durable ACK.
+            mail.awaiting_admission_ack = true;
+            mail.may_start_turn = false;
+        }
         let can_start_turn = mail.can_start_turn();
         mailbox.bytes += bytes;
         mailbox.pending_mails.push_back((mail, bytes));
         drop(mailbox);
+        if let Some(error) = parent_sync_error {
+            return Err(error.into());
+        }
+        self.notify_mailbox_admission(can_start_turn);
+        Ok(true)
+    }
+
+    fn notify_mailbox_admission(&self, can_start_turn: bool) {
         self.agent_activity_tx
             .send_replace(InputQueueActivity::Mailbox);
         if can_start_turn {
             self.activity_tx.send_replace(InputQueueActivity::Mailbox);
         }
-        Ok(true)
     }
 
 
@@ -531,7 +564,13 @@ impl InputQueue {
             // A previous process may have died before its barrier. Make the
             // observed receiver record durable before reclaiming the envelope.
             rollout.flush_durable().await.map_err(io::Error::other)?;
-            storage.save(next).await?;
+            if let MailboxSaveOutcome::InstalledWithoutParentSync(error) =
+                storage.save(next).await?
+            {
+                // The receiver record is already durable. Keep the installed
+                // generation and continue suppressing its recorded envelopes.
+                tracing::warn!(%error, "mailbox reconciliation installed without confirmed parent sync");
+            }
         }
 
         if !same_generation {
@@ -605,12 +644,18 @@ impl InputQueue {
             if let Some(storage) = &mut mailbox.storage {
                 let mut next = storage.snapshot.clone();
                 next.pending.retain(|mail| mail.id.as_ref() != Some(id));
-                if next.pending.len() != storage.snapshot.pending.len()
-                    && let Err(error) = storage.save(next).await
-                {
-                    // The durable receiver item will reconcile this receipt
-                    // on restart. Do not append it again to retry reclamation.
-                    tracing::warn!(%error, "mailbox envelope reclamation deferred");
+                if next.pending.len() != storage.snapshot.pending.len() {
+                    match storage.save(next).await {
+                        Ok(MailboxSaveOutcome::Durable) => {}
+                        Ok(MailboxSaveOutcome::InstalledWithoutParentSync(error)) => {
+                            tracing::warn!(%error, "mailbox reclamation installed without confirmed parent sync");
+                        }
+                        Err(error) => {
+                            // The durable receiver item will reconcile this
+                            // envelope on restart; never append it again.
+                            tracing::warn!(%error, "mailbox envelope reclamation deferred");
+                        }
+                    }
                 }
             }
             if let Some(outstanding) = mailbox.seen_communication_ids.get_mut(id) { *outstanding = false; }

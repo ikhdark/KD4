@@ -26,7 +26,90 @@ pub async fn start_control_socket_acceptor(
     socket_path: AbsolutePathBuf,
     transport_event_tx: ControlReserveSender<TransportEvent>,
     shutdown_token: CancellationToken,
+    startup_deadline: tokio::time::Instant,
+    startup_signal: impl std::future::Future<Output = ()>,
 ) -> IoResult<JoinHandle<()>> {
+    let timed_out = || {
+        std::io::Error::new(ErrorKind::TimedOut, "app-server endpoint admission timed out")
+    };
+    let cutoff = async {
+        tokio::select! {
+            biased;
+            _ = startup_signal => std::io::Error::new(
+                ErrorKind::Interrupted,
+                "app-server startup cancelled",
+            ),
+            _ = tokio::time::sleep_until(startup_deadline) => timed_out(),
+        }
+    };
+    tokio::pin!(cutoff);
+
+    let _endpoint_lock = tokio::select! {
+        biased;
+        error = &mut cutoff => return Err(error),
+        result = prepare_control_socket_endpoint(&socket_path) => result?,
+    };
+    if tokio::time::Instant::now() >= startup_deadline {
+        return Err(timed_out());
+    }
+
+    // The async wrapper delegates to a native blocking bind. Once polled,
+    // dropping it would give up the only path to pin and retire a late bind.
+    // Keep the endpoint lock (and the caller's home lock) until it settles.
+    let bind_started = std::sync::atomic::AtomicBool::new(false);
+    let bind = async {
+        bind_started.store(true, std::sync::atomic::Ordering::Relaxed);
+        let listener = UnixListener::bind(socket_path.as_path()).await?;
+        let endpoint = codex_uds::SocketFile::open(socket_path.as_path())?;
+        Ok::<_, std::io::Error>(ControlSocketCandidate {
+            listener,
+            socket_guard: ControlSocketFileGuard {
+                socket_path,
+                endpoint: Some(endpoint),
+            },
+        })
+    };
+    tokio::pin!(bind);
+    let candidate = tokio::select! {
+        biased;
+        error = &mut cutoff => {
+            if bind_started.load(std::sync::atomic::Ordering::Relaxed) {
+                // Dropping the candidate closes its listener, then removes only
+                // the pinned rendezvous generation. Preserve the cutoff error.
+                drop(bind.await);
+            }
+            return Err(error);
+        }
+        result = &mut bind => result,
+    };
+
+    // A bind/handle-open poll can finish across the deadline. Check admission
+    // again before spawning an acceptor or publishing the listening message.
+    tokio::select! {
+        biased;
+        error = &mut cutoff => return Err(error),
+        _ = std::future::ready(()) => {}
+    }
+    if tokio::time::Instant::now() >= startup_deadline {
+        return Err(timed_out());
+    }
+    let ControlSocketCandidate { listener, socket_guard } = candidate?;
+    info!(
+        socket_path = %socket_guard.socket_path.display(),
+        "app-server control socket listening"
+    );
+
+    Ok(tokio::spawn(run_control_socket_acceptor(
+        listener,
+        transport_event_tx,
+        shutdown_token,
+        socket_guard,
+    )))
+}
+
+async fn prepare_control_socket_endpoint(
+    socket_path: &AbsolutePathBuf,
+) -> IoResult<AppServerStartupLock> {
     // Endpoint admission is independent of CODEX_HOME. Lock ordering is home
     // (caller), then endpoint; no path takes these in the opposite order.
     let parent = socket_path
@@ -41,25 +124,15 @@ pub async fn start_control_socket_acceptor(
     lock_name.push(".startup.lock");
     let endpoint_lock_path =
         AbsolutePathBuf::from_absolute_path(parent.canonicalize()?.join(lock_name))?;
-    let _endpoint_lock = acquire_app_server_startup_lock(endpoint_lock_path).await?;
+    let endpoint_lock = acquire_app_server_startup_lock(endpoint_lock_path).await?;
     prepare_control_socket_path(socket_path.as_path()).await?;
-    let listener = UnixListener::bind(socket_path.as_path()).await?;
-    let endpoint = codex_uds::SocketFile::open(socket_path.as_path())?;
-    let socket_guard = ControlSocketFileGuard {
-        socket_path,
-        endpoint: Some(endpoint),
-    };
-    info!(
-        socket_path = %socket_guard.socket_path.display(),
-        "app-server control socket listening"
-    );
+    Ok(endpoint_lock)
+}
 
-    Ok(tokio::spawn(run_control_socket_acceptor(
-        listener,
-        transport_event_tx,
-        shutdown_token,
-        socket_guard,
-    )))
+struct ControlSocketCandidate {
+    // Field drop order closes the listener before removing the pinned file.
+    listener: UnixListener,
+    socket_guard: ControlSocketFileGuard,
 }
 
 async fn run_control_socket_acceptor(

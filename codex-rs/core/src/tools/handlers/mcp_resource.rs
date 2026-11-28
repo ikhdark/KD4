@@ -334,6 +334,7 @@ impl ListResourcesArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadResourceArgs {
     server: String,
     uri: String,
@@ -1068,27 +1069,28 @@ where
     };
     let terminal_session = Arc::clone(session);
     let terminal_turn = Arc::clone(turn);
-    let call_id = call_id.to_owned();
-    let mut terminal = session.terminal_tasks.spawn(async move {
-        if tokio::time::timeout(
-            Duration::from_secs(30),
-            emit_tool_call_end(
-                &terminal_session,
-                &terminal_turn,
-                &call_id,
-                invocation,
-                start.elapsed(),
-                terminal_result,
-            ),
+    let terminal_call_id = call_id.to_owned();
+    let terminal = session.terminal_tasks.spawn(async move {
+        emit_tool_call_end(
+            &terminal_session,
+            &terminal_turn,
+            &terminal_call_id,
+            invocation,
+            start.elapsed(),
+            terminal_result,
         )
-        .await
-        .is_err()
-        {
-            tracing::warn!(%call_id, "MCP resource completion timed out; publication may be partial");
-        }
+        .await;
     });
+    // Dropping the join handle detaches it; a cancelled or slow observer
+    // does not cancel the tracked owner of this exact terminal item.
     tokio::select! {
-        _ = &mut terminal => {},
+        outcome = tokio::time::timeout(Duration::from_secs(30), terminal) => {
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%call_id, %error, "MCP resource completion task failed"),
+                Err(_) => tracing::warn!(%call_id, "MCP resource completion was not observed within the wait budget"),
+            }
+        }
         _ = cancellation_token.cancelled() => {},
     }
 

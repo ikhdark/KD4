@@ -177,13 +177,44 @@ fn jsonl_row(reader: &mut impl BufRead) -> Option<Result<Value, String>> {
     }
 }
 
+enum Rows<R> {
+    Jsonl(R),
+    Document(Box<dyn Iterator<Item = Result<Value, String>>>),
+}
+
+impl<R: BufRead> Rows<R> {
+    fn next(&mut self) -> Option<Result<Value, String>> {
+        match self {
+            Self::Jsonl(reader) => jsonl_row(reader),
+            Self::Document(rows) => rows.next(),
+        }
+    }
+
+    /// Called only at a page boundary, when this source will be dropped.
+    fn needs_continuation(&mut self) -> bool {
+        match self {
+            // Probe for exact EOF without consuming or parsing the next row.
+            // On I/O failure exhaustion is unknown: the next selector owns
+            // the unread row and will report a read failure if it persists.
+            Self::Jsonl(reader) => loop {
+                match reader.fill_buf() {
+                    Ok(bytes) => break !bytes.is_empty(),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break true,
+                }
+            },
+            Self::Document(rows) => rows.next().is_some(),
+        }
+    }
+}
+
 /// Yields rows numbered from `start_row`; earlier rows are skipped.
-fn rows<'a>(
-    reader: impl BufRead + 'a,
+fn rows<R: BufRead>(
+    reader: R,
     format: Format,
     pointer: &str,
     start_row: usize,
-) -> Result<Box<dyn Iterator<Item = Result<Value, String>> + 'a>, String> {
+) -> Result<Rows<R>, String> {
     let skip = start_row.saturating_sub(1);
     if format == Format::Jsonl {
         let mut reader = reader;
@@ -196,7 +227,7 @@ fn rows<'a>(
                 Err(error) => return Err(format!("row read failed: {error}")),
             }
         }
-        return Ok(Box::new(std::iter::from_fn(move || jsonl_row(&mut reader))));
+        return Ok(Rows::Jsonl(reader));
     }
     // JSON documents and delimited records use a bounded source. JSONL remains
     // streaming, so arbitrarily large retained logs need no whole-log buffer.
@@ -218,8 +249,10 @@ fn rows<'a>(
             .ok_or("JSON rows pointer was not found")?
             .take();
         return match selected {
-            Value::Array(rows) => Ok(Box::new(rows.into_iter().skip(skip).map(Ok))),
-            row @ Value::Object(_) => Ok(Box::new(std::iter::once(row).skip(skip).map(Ok))),
+            Value::Array(rows) => Ok(Rows::Document(Box::new(rows.into_iter().skip(skip).map(Ok)))),
+            row @ Value::Object(_) => {
+                Ok(Rows::Document(Box::new(std::iter::once(row).skip(skip).map(Ok))))
+            }
             _ => Err("JSON rows pointer must select an array or object".into()),
         };
     }
@@ -238,7 +271,7 @@ fn rows<'a>(
     {
         return Err("CSV/TSV requires nonempty, unique column names".into());
     }
-    Ok(Box::new(csv.into_records().skip(skip).map(move |record| {
+    Ok(Rows::Document(Box::new(csv.into_records().skip(skip).map(move |record| {
         let record = record.map_err(|error| error.to_string())?;
         Ok(Value::Object(
             headers
@@ -247,7 +280,7 @@ fn rows<'a>(
                 .map(|(key, value)| (key.to_owned(), Value::String(value.to_owned())))
                 .collect(),
         ))
-    })))
+    }))))
 }
 
 /// Entries admitted to one page and the counters for its scanned input rows.
@@ -343,7 +376,7 @@ pub(crate) fn select(
     {
         return invalid("structured requires 1-based start_row <= end_row, max_rows 1..1000, at most 64 fields/filters, RFC 6901 pointers, and a value for every filter except exists/missing; pointer is JSON-only".into());
     }
-    let source = match rows(reader, *format, pointer, *start_row) {
+    let mut source = match rows(reader, *format, pointer, *start_row) {
         Ok(rows) => rows,
         Err(error) => return invalid(error),
     };
@@ -360,17 +393,19 @@ pub(crate) fn select(
     // Stop before polling the row after the inclusive bound. A poll can read
     // and parse a JSONL row (or fail) even when that row is not selected.
     let input_rows = end_row.map_or(usize::MAX, |end| end - *start_row + 1);
-    for (index, row) in source.take(input_rows).enumerate() {
+    for index in 0..input_rows {
+        if page.entries() >= *max_rows {
+            let cursor = source.needs_continuation().then(|| *start_row + index);
+            return page.result(&selector, coverage_complete, cursor);
+        }
+        let Some(row) = source.next() else {
+            break;
+        };
         let number = *start_row + index;
         if let Err(error) = &row
             && error.starts_with("row read failed:")
         {
             return invalid(error.clone());
-        }
-        // Reserve the actual cursor before admitting a row. No row is dropped
-        // when output, rather than input, reaches its existing delivery budget.
-        if page.entries() >= *max_rows {
-            return page.result(&selector, coverage_complete, Some(number));
         }
         let (error_entry, entry) = match row {
             Ok(row) => {

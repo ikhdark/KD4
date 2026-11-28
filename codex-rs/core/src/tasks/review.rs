@@ -18,6 +18,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::review_format::render_review_output_text;
 use futures::future::BoxFuture;
+use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex_delegate::run_codex_thread_one_shot;
@@ -32,10 +33,19 @@ use super::SessionTaskResult;
 
 #[derive(serde::Deserialize)]
 struct CompletedReviewResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_review_status")]
     status: Option<String>,
     #[serde(flatten)]
     output: ReviewOutputEvent,
+}
+
+// An absent discriminator is the legacy completed shape; explicit null
+// must not be interpreted as absence by Option's default deserializer.
+fn deserialize_review_status<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -139,21 +149,21 @@ impl SessionTask for ReviewTask {
             };
             drop(standalone_work_guard);
             if let Some(scope) = self.source_scope.clone()
-                && let Some(mut review) = output.take()
+                && let Some(review) = output.take()
             {
-                match tokio::task::spawn_blocking(move || {
-                    scope.validate(&mut review).map(|()| review)
-                })
-                .await
-                {
-                    Ok(Ok(review)) => output = Some(review),
-                    result => {
-                        let reason = match result {
-                            Ok(Err(reason)) => reason,
-                            Err(error) => error.to_string(),
-                            Ok(Ok(_)) => unreachable!(),
-                        };
-                        reject_review_source_validation(&session, &ctx, &reason).await;
+                let result = tokio::select! {
+                    biased;
+                    () = cancellation_token.cancelled() => return Ok(super::TurnTaskResult::default()),
+                    result = scope.validate_async(review) => result,
+                };
+                if cancellation_token.is_cancelled() {
+                    return Ok(super::TurnTaskResult::default());
+                }
+                match result {
+                    Ok(review) => output = Some(review),
+                    Err(reason) => {
+                        reject_review_source_validation(&session, &ctx, &reason, &cancellation_token)
+                            .await;
                     }
                 }
             }
@@ -207,7 +217,11 @@ async fn reject_review_source_validation(
     session: &Session,
     ctx: &TurnContext,
     reason: &str,
+    cancellation_token: &CancellationToken,
 ) {
+    if cancellation_token.is_cancelled() {
+        return;
+    }
     let message = format!("Review source validation failed: {reason}");
     // Error events are UI-only on replay. Retain this host rejection as
     // non-verdict history so a resumed review knows why no result was accepted.
@@ -222,7 +236,9 @@ async fn reject_review_source_validation(
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
-    if let Err(error) = session.record_conversation_items(ctx, &[item]).await {
+    if let Err(error) = session.record_conversation_items(ctx, &[item]).await
+        && !cancellation_token.is_cancelled()
+    {
         session
             .send_event(
                 ctx,
@@ -233,15 +249,17 @@ async fn reject_review_source_validation(
             )
             .await;
     }
-    session
-        .send_event(
-            ctx,
-            EventMsg::Error(codex_protocol::protocol::ErrorEvent {
-                message,
-                codex_error_info: None,
-            }),
-        )
-        .await;
+    if !cancellation_token.is_cancelled() {
+        session
+            .send_event(
+                ctx,
+                EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                    message,
+                    codex_error_info: None,
+                }),
+            )
+            .await;
+    }
 }
 
 async fn process_review_events(
@@ -254,7 +272,18 @@ async fn process_review_events(
     let mut mirrored_web_search_ends = HashSet::new();
     let mut mirrored_patch_apply_begins = HashSet::new();
     let mut mirrored_patch_apply_ends = HashSet::new();
+    let mut pending_completion_mirrors = Vec::<(String, serde_json::Value)>::new();
+    let mut forwarded_terminal_error = None;
     while let Ok(event) = receiver.recv().await {
+        if is_review_completion_mirror(&event.msg)
+            && let Ok(payload) = serde_json::to_value(&event.msg)
+            && let Some(index) = pending_completion_mirrors
+                .iter()
+                .position(|(turn, expected)| *turn == event.id && *expected == payload)
+        {
+            pending_completion_mirrors.swap_remove(index);
+            continue;
+        }
         match event.msg {
             EventMsg::AgentMessage(message) => {
                 if let Some(message) = prev_agent_message.take() {
@@ -289,11 +318,23 @@ async fn process_review_events(
             // The reviewer's OwnTask ledger is not a parent plan update. In
             // particular, persisting it here would replace parent scope on resume.
             EventMsg::PlanUpdate(_) => {}
+            EventMsg::Error(error) => {
+                if error.affects_turn_status() {
+                    forwarded_terminal_error = Some(error.clone());
+                }
+                session
+                    .send_event(ctx.as_ref(), EventMsg::Error(error))
+                    .await;
+            }
             EventMsg::TurnComplete(task_complete) => {
                 if let Some(error) = task_complete.error {
-                    session
-                        .send_event(ctx.as_ref(), EventMsg::Error(error))
-                        .await;
+                    // The delegate terminal can carry the exact fatal error
+                    // already dispatched live. Terminal-only errors still surface.
+                    if forwarded_terminal_error.as_ref() != Some(&error) {
+                        session
+                            .send_event(ctx.as_ref(), EventMsg::Error(error))
+                            .await;
+                    }
                     return None;
                 }
                 // Parse review output from the last agent message (if present).
@@ -377,7 +418,19 @@ async fn process_review_events(
                         }
                         _ => {}
                     },
-                    EventMsg::ItemCompleted(event) => match &event.item {
+                    EventMsg::ItemCompleted(completed) => match &completed.item {
+                        TurnItem::Reasoning(_) | TurnItem::UserMessage(_) | TurnItem::ImageView(_) => {
+                            // Compare the full delegate projection before reparenting.
+                            // Each generated parent copy consumes at most one identical
+                            // delegate mirror; unmatched legacy-only events stay visible.
+                            pending_completion_mirrors.extend(
+                                completed.item
+                                    .as_legacy_events(session.services.show_raw_agent_reasoning)
+                                    .into_iter()
+                                    .filter_map(|mirror| serde_json::to_value(mirror).ok())
+                                    .map(|payload| (event.id.clone(), payload)),
+                            );
+                        }
                         TurnItem::WebSearch(item) => {
                             mirrored_web_search_ends.insert(item.id.clone());
                         }
@@ -389,12 +442,39 @@ async fn process_review_events(
                     _ => {}
                 }
                 reparent_review_event(&mut other, session.thread_id, &ctx.sub_id);
-                session.send_event(ctx.as_ref(), other).await;
+                if matches!(
+                    &other,
+                    EventMsg::ItemCompleted(ItemCompletedEvent {
+                        item: TurnItem::ContextCompaction(_),
+                        ..
+                    })
+                ) {
+                    // A completed item closes the attempt even on failure. Only
+                    // the delegate knows whether to emit the legacy success marker.
+                    session
+                        .send_event_raw(Event {
+                            id: ctx.sub_id.clone(),
+                            msg: other,
+                        })
+                        .await;
+                } else {
+                    session.send_event(ctx.as_ref(), other).await;
+                }
             }
         }
     }
     // Channel closed without TurnComplete: treat as interrupted.
     None
+}
+
+fn is_review_completion_mirror(event: &EventMsg) -> bool {
+    matches!(
+        event,
+        EventMsg::AgentReasoning(_)
+            | EventMsg::AgentReasoningRawContent(_)
+            | EventMsg::UserMessage(_)
+            | EventMsg::ViewImageToolCall(_)
+    )
 }
 
 // The parent owns the only announced lifecycle. Namespace provider IDs and

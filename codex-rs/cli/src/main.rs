@@ -82,7 +82,7 @@ use codex_core::build_models_manager;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::edit::ConfigEditsBuilder;
-use codex_core::config::find_codex_home;
+use codex_core::config::find_codex_home_async;
 use codex_core::config::load_config_toml_with_layer_stack;
 use codex_core::config::resolve_oss_provider;
 use codex_core::config::resolve_profile_v2_config_path;
@@ -882,7 +882,8 @@ async fn cli_main(
         Some(Subcommand::Mcp(mut mcp_cli)) => {
             // Propagate any root-level config overrides (e.g. `-c key=value`).
             prepend_config_flags(&mut mcp_cli.config_overrides, root_config_overrides.clone());
-            let loader_overrides = loader_overrides_for_profile(root.config_profile_v2.as_ref())?;
+            let loader_overrides =
+                loader_overrides_for_profile(root.config_profile_v2.as_ref()).await?;
             mcp_cli.run(loader_overrides).await?;
         }
         Some(Subcommand::Plugin(plugin_cli)) => {
@@ -965,7 +966,7 @@ async fn cli_main(
                     let socket_path = match proxy_cli.socket_path {
                         Some(socket_path) => socket_path,
                         None => {
-                            let codex_home = find_codex_home()?;
+                            let codex_home = find_codex_home_async().await?;
                             codex_app_server::app_server_control_socket_path(&codex_home)?
                         }
                     };
@@ -1069,7 +1070,7 @@ async fn cli_main(
                 .config_profile
                 .as_ref()
                 .or(root.config_profile_v2.as_ref());
-            let loader_overrides = loader_overrides_for_profile(config_profile)?;
+            let loader_overrides = loader_overrides_for_profile(config_profile).await?;
             prepend_config_flags(
                 &mut sandbox_cli.config_overrides,
                 root_config_overrides.clone(),
@@ -1363,7 +1364,7 @@ async fn enable_feature_in_config(
     overrides: &CliConfigOverrides,
 ) -> anyhow::Result<()> {
     FeatureToggles::validate_feature(feature)?;
-    let codex_home = find_codex_home()?;
+    let codex_home = find_codex_home_async().await?;
     ConfigEditsBuilder::new(&codex_home)
         .set_feature_enabled(feature, /*enabled*/ true)
         .apply()
@@ -1375,7 +1376,7 @@ async fn enable_feature_in_config(
 
 async fn disable_feature_in_config(feature: &str) -> anyhow::Result<()> {
     FeatureToggles::validate_feature(feature)?;
-    let codex_home = find_codex_home()?;
+    let codex_home = find_codex_home_async().await?;
     ConfigEditsBuilder::new(&codex_home)
         .set_feature_enabled(feature, /*enabled*/ false)
         .apply()
@@ -1384,12 +1385,12 @@ async fn disable_feature_in_config(feature: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn loader_overrides_for_profile(
+async fn loader_overrides_for_profile(
     profile_v2: Option<&ProfileV2Name>,
 ) -> anyhow::Result<LoaderOverrides> {
     match profile_v2 {
         Some(profile_v2) => {
-            let codex_home = find_codex_home()?;
+            let codex_home = find_codex_home_async().await?;
             Ok(LoaderOverrides {
                 user_config_path: Some(resolve_profile_v2_config_path(&codex_home, profile_v2)),
                 user_config_profile: Some(profile_v2.clone()),
@@ -1448,7 +1449,8 @@ async fn run_debug_prompt_input_command(
     root: RootOptions,
     arg0_paths: Arg0DispatchPaths,
 ) -> anyhow::Result<()> {
-    let loader_overrides = loader_overrides_for_profile(root.shared.config_profile_v2.as_ref())?;
+    let loader_overrides =
+        loader_overrides_for_profile(root.shared.config_profile_v2.as_ref()).await?;
     let shared = root.shared;
     let mut cli_kv_overrides = root_config_overrides
         .parse_overrides()
@@ -1461,7 +1463,7 @@ async fn run_debug_prompt_input_command(
     }
 
     let resolved_provider = if shared.oss {
-        let codex_home = find_codex_home()?;
+        let codex_home = find_codex_home_async().await?;
         let config_cwd = shared
             .cwd
             .as_deref()

@@ -47,19 +47,31 @@ fn hash(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
+struct PreparedEndpoint {
+    path: PathBuf,
+    before: Option<String>,
+    after: Option<String>,
+}
+
+struct PreparedChange {
+    endpoint: PreparedEndpoint,
+    destination: Option<PreparedEndpoint>,
+}
+
 impl History {
     fn push(
         &mut self,
-        path: PathBuf,
-        before: Option<String>,
-        after: Option<String>,
+        endpoint: PreparedEndpoint,
         agent: Option<&str>,
         operation: Option<&str>,
         exact: bool,
-    ) {
-        let Some(key) = key(&path) else {
-            return;
-        };
+    ) -> Option<&mut Edit> {
+        let PreparedEndpoint {
+            path,
+            before,
+            after,
+        } = endpoint;
+        let key = key(&path)?;
         self.sequence = self.sequence.saturating_add(1);
         let previous = self.edits.iter().rev().find(|edit| edit.key == key);
         let predecessor = previous.map(|edit| edit.sequence);
@@ -85,6 +97,7 @@ impl History {
             source_predecessor: None,
             ambiguous,
         });
+        self.edits.back_mut()
     }
 }
 
@@ -106,88 +119,85 @@ pub fn record_change_provenance(
     operation: Option<&str>,
     delta: &AppliedPatchDelta,
 ) {
-    let mut history = HISTORY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !delta.is_exact() {
-        history.unknown_since = history.sequence;
-    }
-    for applied in delta.changes() {
-        let applied = delta.endpoint_change(applied);
-        let after_hash = |text: &str| {
-            applied
-                .write_receipt
-                .as_ref()
-                .map_or_else(|| hash(text), |receipt| receipt.sha256.clone())
-        };
-        match &applied.change {
-            AppliedPatchFileChange::Add {
-                content,
-                overwritten_content,
-            } => {
-                history.push(
-                    applied.path.clone(),
-                    overwritten_content.as_deref().map(hash),
-                    Some(after_hash(content)),
-                    agent,
-                    operation,
-                    delta.is_exact(),
-                );
-            }
-            AppliedPatchFileChange::Delete { content } => {
-                history.push(
-                    applied.path.clone(),
-                    Some(hash(content)),
-                    None,
-                    agent,
-                    operation,
-                    delta.is_exact(),
-                );
-            }
-            AppliedPatchFileChange::Update {
-                old_content,
-                new_content,
-                move_path,
-                overwritten_move_content,
-            } => {
-                if let Some(destination) = move_path {
-                    history.push(
-                        applied.path.clone(),
-                        Some(hash(old_content)),
+    delta.prepare_change_provenance()(agent, operation);
+}
+
+impl AppliedPatchDelta {
+    /// Prepare digest-only edits without touching the shared history. The
+    /// returned operation synchronously appends the whole delta in commit order.
+    pub fn prepare_change_provenance(&self) -> impl FnOnce(Option<&str>, Option<&str>) + use<> {
+        let exact = self.is_exact();
+        let changes = self
+            .changes()
+            .iter()
+            .map(|change| {
+                let applied = self.endpoint_change(change);
+                let write_receipt = applied.write_receipt;
+                let after_hash = |text: &str| {
+                    write_receipt
+                        .as_ref()
+                        .map_or_else(|| hash(text), |receipt| receipt.sha256.clone())
+                };
+                let path = applied.path;
+                let (before, after, destination) = match applied.change {
+                    AppliedPatchFileChange::Add {
+                        content,
+                        overwritten_content,
+                    } => (
+                        overwritten_content.as_deref().map(hash),
+                        Some(after_hash(&content)),
                         None,
-                        agent,
-                        operation,
-                        delta.is_exact(),
-                    );
-                    let source_predecessor = history
-                        .edits
-                        .back()
-                        .filter(|edit| edit.path == applied.path)
-                        .map(|edit| edit.sequence);
-                    history.push(
-                        destination.clone(),
-                        overwritten_move_content.as_deref().map(hash),
-                        Some(after_hash(new_content)),
-                        agent,
-                        operation,
-                        delta.is_exact(),
-                    );
-                    if let Some(edit) = history
-                        .edits
-                        .back_mut()
-                        .filter(|edit| edit.path == *destination)
-                    {
-                        edit.source_predecessor = source_predecessor;
+                    ),
+                    AppliedPatchFileChange::Delete { content } => (Some(hash(&content)), None, None),
+                    AppliedPatchFileChange::Update {
+                        old_content,
+                        new_content,
+                        move_path,
+                        overwritten_move_content,
+                    } => {
+                        let before = Some(hash(&old_content));
+                        let after = Some(after_hash(&new_content));
+                        if let Some(path) = move_path {
+                            let destination = PreparedEndpoint {
+                                path,
+                                before: overwritten_move_content.as_deref().map(hash),
+                                after,
+                            };
+                            (before, None, Some(destination))
+                        } else {
+                            (before, after, None)
+                        }
                     }
-                } else {
-                    history.push(
-                        applied.path.clone(),
-                        Some(hash(old_content)),
-                        Some(after_hash(new_content)),
-                        agent,
-                        operation,
-                        delta.is_exact(),
-                    );
+                };
+                PreparedChange {
+                    endpoint: PreparedEndpoint {
+                        path,
+                        before,
+                        after,
+                    },
+                    destination,
+                }
+            })
+            .collect::<Vec<_>>();
+        move |agent, operation| {
+            let mut history = HISTORY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !exact {
+                history.unknown_since = history.sequence;
+            }
+            for PreparedChange {
+                endpoint,
+                destination,
+            } in changes
+            {
+                let source_sequence = history
+                    .push(endpoint, agent, operation, exact)
+                    .map(|edit| edit.sequence);
+                if let Some(destination) = destination
+                    && let Some(edit) = history.push(destination, agent, operation, exact)
+                {
+                    edit.source_predecessor = source_sequence;
                 }
             }
         }

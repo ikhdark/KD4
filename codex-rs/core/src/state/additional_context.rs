@@ -178,7 +178,8 @@ impl AdditionalContextStore {
         let mut retained_bytes = 2;
         let mut overflowed = false;
         let mut delivered = self.delivered.clone();
-        if !self.legacy.is_empty() {
+        let needs_legacy_reset = !self.legacy.is_empty();
+        if needs_legacy_reset {
             let reset = render_entry(
                 ADDITIONAL_CONTEXT_RESET_SOURCE,
                 &AdditionalContextEntry {
@@ -187,7 +188,6 @@ impl AdditionalContextStore {
                 },
             );
             push_bounded_item(&mut fragments, &mut retained_bytes, reset);
-            self.legacy.clear();
         }
         for (key, old) in &self.delivered {
             if values.get(key).is_some_and(|new| new.kind == old.kind) {
@@ -227,12 +227,13 @@ impl AdditionalContextStore {
             // An arbitrary set of source names cannot be identified in a bounded
             // omission notice. Reset earlier context explicitly, then replay the
             // admitted portion of the current snapshot, including unchanged values.
-            // A developer-level prior value must also be invalidated at that role
-            // when its replacement has been downgraded to untrusted context.
-            let kind = if self
-                .delivered
-                .values()
-                .any(|entry| entry.kind == AdditionalContextKind::Application)
+            // Retain developer authority when replacing the staged legacy
+            // reset or invalidating a previously delivered application value.
+            let kind = if needs_legacy_reset
+                || self
+                    .delivered
+                    .values()
+                    .any(|entry| entry.kind == AdditionalContextKind::Application)
             {
                 AdditionalContextKind::Application
             } else {
@@ -267,6 +268,7 @@ impl AdditionalContextStore {
 
         // The supplied map remains authoritative even for omitted entries.
         // An unchanged remerge must not restore or repeatedly emit older values.
+        self.legacy.clear();
         self.values = values;
         self.delivered = delivered;
         self.delivery_invalidated = false;

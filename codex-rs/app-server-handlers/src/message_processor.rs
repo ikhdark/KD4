@@ -1118,7 +1118,7 @@ impl MessageProcessor {
             | ClientRequest::SkillsExtraRootsSet { .. } | ClientRequest::SkillsConfigWrite { .. }
             | ClientRequest::PluginInstall { .. } | ClientRequest::PluginUninstall { .. }
             | ClientRequest::PluginShareCheckout { .. } | ClientRequest::PluginShareDelete { .. }
-            | ClientRequest::MarketplaceRemove { .. }
+            | ClientRequest::MarketplaceAdd { .. } | ClientRequest::MarketplaceRemove { .. }
             | ClientRequest::ThreadStart { .. } | ClientRequest::ThreadFork { .. }
             | ClientRequest::ThreadResume { .. } | ClientRequest::ThreadInjectItems { .. })
             // Durable enable must settle live publication after committing.
@@ -1707,7 +1707,7 @@ impl MessageProcessor {
                         .hooks_list(params, mobile_observation_id.as_deref())
                         .await,
                     ClientRequest::MarketplaceAdd { params, .. } => {
-                        self.marketplace_processor.marketplace_add(params).await
+                        self.marketplace_processor.marketplace_add(params, &rpc_gate).await
                     }
                     ClientRequest::MarketplaceRemove { params, .. } => {
                         self.marketplace_processor.marketplace_remove(params).await

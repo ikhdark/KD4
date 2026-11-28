@@ -56,6 +56,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -165,10 +166,13 @@ async fn wait_for_live_spawn_dependency(
     };
     let cwd = cwd.to_path_buf();
     let ready = async {
-        let workspace = tokio::task::spawn_blocking(move || {
+        let workspace = AbortOnDropHandle::new(session.terminal_tasks.spawn_blocking(move || {
             let repo = get_git_repo_root(&cwd).unwrap_or(cwd);
             repository_workspace_id(&repo)
-        }).await.ok()?.ok()?;
+        }))
+        .await
+        .ok()?
+        .ok()?;
         // Subscribe from a cursor observed before reading the attempt. A receipt
         // committed between the read and subscription is therefore not missed.
         let mut cursor = store.current_wake_cursor(&root).await.ok()?;
@@ -362,12 +366,18 @@ async fn handle_spawn_agent(
     // including an unresolvable repository identity, keep the staged path.
     if let Some(assignment) = args.assignment.as_ref() {
         let cwd = admission_cwd.to_path_buf();
-        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
         let draft = assignment
             .clone()
             .into_draft(session.thread_id.to_string(), typed_role);
-        let refusal = tokio::task::spawn_blocking(move || {
-            repository_lineage_id(&repo_root).ok()?;
+        let stop = cancellation_token.clone();
+        let refusal = await_spawn_read_only(&session, &cancellation_token, move || {
+            let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+            if stop.is_cancelled()
+                || repository_lineage_id(&repo_root).is_err()
+                || stop.is_cancelled()
+            {
+                return None;
+            }
             match draft.normalize(&repo_root) {
                 Err(error @ (StoreError::InvalidAssignment(_) | StoreError::InvalidScope(_))) => {
                     Some(error)
@@ -375,9 +385,8 @@ async fn handle_spawn_agent(
                 _ => None,
             }
         })
-        .await
-        .ok()
-        .flatten();
+        .await?
+        .unwrap_or(None);
         if let Some(error) = refusal {
             // Keep the admission rejection count the staged path recorded for
             // this refusal; no reservation was attempted, so no lifecycle count.
@@ -538,8 +547,18 @@ async fn handle_spawn_agent(
             .reconcile_live_typed_actor_heartbeats()
             .await
             .map_err(typed_task_store_error)?;
+        // Resolve again at the durable stage rather than reusing the advisory
+        // probe's root. Both typed and legacy admission use this same result.
         let cwd = admission_cwd.to_path_buf();
-        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+        let repo_root = await_spawn_read_only(&session, &cancellation_token, move || {
+            get_git_repo_root(&cwd).unwrap_or(cwd)
+        })
+        .await?
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "spawn_agent: repository root discovery failed: {error}"
+            ))
+        })?;
         let (mut draft, relevant_handles) = match args.assignment.take() {
             Some(assignment_args) => {
                 let relevant_handles = assignment_args.relevant_handles.clone();
@@ -1057,6 +1076,25 @@ fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: 
 
 
 
+
+// Race only read-only pre-admission work, never reservation consumption or
+// durable admission. Abort queued work on drop; an already-running blocking
+// probe has no commit authority and stays tracked until it actually returns.
+async fn await_spawn_read_only<T: Send + 'static>(
+    session: &crate::session::session::Session,
+    cancellation_token: &CancellationToken,
+    probe: impl FnOnce() -> T + Send + 'static,
+) -> Result<Result<T, tokio::task::JoinError>, FunctionCallError> {
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel(
+            "spawn_agent cancelled".to_string(),
+        )),
+        result = async {
+            AbortOnDropHandle::new(session.terminal_tasks.spawn_blocking(probe)).await
+        } => Ok(result),
+    }
+}
 
 async fn await_spawn_or_cancel<T>(
     cancellation_token: &CancellationToken,

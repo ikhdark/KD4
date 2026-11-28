@@ -341,17 +341,13 @@ pub(crate) async fn acquire_execution_resources(
 }
 
 /// Checkpoint consumption before launch. Only proven nonexecution permits retry.
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "The checkpoint guard serializes the budget transition with its durable publication"
-)]
 pub(crate) async fn begin_policy_attempt(ctx: &ToolCtx) -> Result<(), String> {
     let owner = reservation_owner(&ctx.session, &ctx.turn, &ctx.call_id);
     let budget = &ctx.turn.full_suite_budget;
     if !budget.reserved_for(&owner) && !budget.started_for(&owner) {
         return Ok(());
     }
-    let _checkpoint = budget.checkpoint_guard().await;
+    let checkpoint = budget.owned_checkpoint_guard().await;
     if budget.started_for(&owner) {
         return Err("Validation already crossed the possible-start boundary for this call; retain its result or resume its live process instead of relaunching.".into());
     }
@@ -359,10 +355,33 @@ pub(crate) async fn begin_policy_attempt(ctx: &ToolCtx) -> Result<(), String> {
         return Ok(());
     }
     budget.start(&owner)?;
-    if let Err(error) = persist_policy_checkpoint(&ctx.session, &ctx.turn).await {
-        budget.acknowledge_not_spawned(&owner);
-        return Err(error);
-    }
+    let session = std::sync::Arc::clone(&ctx.session);
+    let turn = std::sync::Arc::clone(&ctx.turn);
+    let call_id = ctx.call_id.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (launch_tx, launch_rx) = tokio::sync::oneshot::channel();
+    // Once started, the checkpoint owner must outlive a cancelled observer.
+    // Finish any accepted writes before publishing the compensating checkpoint.
+    drop(ctx.session.terminal_tasks.spawn(async move {
+        let _checkpoint = checkpoint;
+        match persist_policy_checkpoint(&session, &turn).await {
+            Ok(()) => {
+                if ready_tx.send(Ok(())).is_ok() && launch_rx.await.is_ok() {
+                    return;
+                }
+                settle_policy_attempt_not_spawned(&session, &turn, &owner, &call_id).await;
+            }
+            Err(error) => {
+                settle_policy_attempt_not_spawned(&session, &turn, &owner, &call_id).await;
+                let _ = ready_tx.send(Err(error));
+            }
+        }
+    }));
+    let owner_stopped = || "validation admission checkpoint owner stopped before launch".to_string();
+    ready_rx.await.map_err(|_| owner_stopped())??;
+    // No suspension between accepting launch custody and returning to the
+    // runtime. After this handoff only the launcher can prove nonexecution.
+    launch_tx.send(()).map_err(|_| owner_stopped())?;
     Ok(())
 }
 
@@ -376,13 +395,24 @@ pub(crate) async fn policy_attempt_not_started(ctx: &ToolCtx) {
         return;
     }
     let _checkpoint = ctx.turn.full_suite_budget.checkpoint_guard().await;
-    ctx.turn.full_suite_budget.acknowledge_not_spawned(
-        &owner,
-    );
-    if let Err(error) = persist_policy_checkpoint(&ctx.session, &ctx.turn).await {
+    settle_policy_attempt_not_spawned(&ctx.session, &ctx.turn, &owner, &ctx.call_id).await;
+}
+
+/// The caller holds the shared checkpoint guard and has proved nonexecution.
+async fn settle_policy_attempt_not_spawned(
+    session: &Session,
+    turn: &std::sync::Arc<TurnContext>,
+    owner: &str,
+    call_id: &str,
+) {
+    turn.full_suite_budget.acknowledge_not_spawned(owner);
+    let root_result = session.services.agent_control.persist_root_validation_checkpoint(turn).await;
+    // An unavailable root must not prevent correcting the local recorded copy.
+    let local_result = persist_local_policy_checkpoint(session, turn).await;
+    for error in [root_result, local_result].into_iter().filter_map(Result::err) {
         tracing::warn!(
             %error,
-            call_id = %ctx.call_id,
+            %call_id,
             "failed to persist the validation attempt as not spawned"
         );
     }
@@ -390,6 +420,13 @@ pub(crate) async fn policy_attempt_not_started(ctx: &ToolCtx) {
 
 async fn persist_policy_checkpoint(session: &Session, turn: &std::sync::Arc<TurnContext>) -> Result<(), String> {
     session.services.agent_control.persist_root_validation_checkpoint(turn).await?;
+    persist_local_policy_checkpoint(session, turn).await
+}
+
+async fn persist_local_policy_checkpoint(
+    session: &Session,
+    turn: &std::sync::Arc<TurnContext>,
+) -> Result<(), String> {
     let item = turn.to_turn_context_item_async().await;
     // This checkpoint gates an external effect and is read again on resume.
     // Readable bytes alone are not enough to publish its admission.

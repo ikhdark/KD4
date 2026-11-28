@@ -664,6 +664,31 @@ async fn run_git_command_attempt(
     }
 }
 
+#[cfg(windows)]
+struct GitInspectionRoot {
+    owned: Option<(codex_utils_pty::ManagedRootProcess, tokio::process::Child)>,
+    attached: bool,
+    runtime: tokio::runtime::Handle,
+}
+
+#[cfg(windows)]
+impl Drop for GitInspectionRoot {
+    fn drop(&mut self) {
+        let Some((managed, child)) = self.owned.take() else {
+            return;
+        };
+        // A cancelled observer may drop the guard outside the launch runtime.
+        // Both helpers transfer child and admission before returning the wait
+        // future. Dropping that future never aborts retained cleanup.
+        let _runtime = self.runtime.enter();
+        if self.attached {
+            drop(managed.terminate_and_reap(child));
+        } else {
+            drop(managed.cleanup_after_failed_attach(child));
+        }
+    }
+}
+
 /// Runs the prepared Git child inside a Windows Job so descendants such as
 /// clean filters and remote helpers end with the command on timeout or
 /// cancellation. Other platforms keep the plain kill-on-drop child.
@@ -675,33 +700,49 @@ async fn run_git_child(
 ) -> std::io::Result<std::process::Output> {
     command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
     let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim().await?;
-    managed.require_descendant_containment()?;
-    // Git can launch clean/process filters even when hooks, external diffs,
-    // and text conversion are disabled. Attach the root before it can run,
-    // and retain ownership across both output collection and cancellation.
-    let (managed, mut child, stdout, stderr) = tokio::task::spawn_blocking(move || {
+    let runtime = tokio::runtime::Handle::current();
+    let (caller_closed, setup_interest) = tokio::sync::oneshot::channel::<()>();
+    // Keep the entire native setup under one blocking owner. A timed-out
+    // caller cannot abandon an already-started root without retained cleanup.
+    let (mut root, stdout, stderr) = tokio::task::spawn_blocking(move || {
+        managed.require_descendant_containment()?;
         // Windows child-pipe reads use Tokio's non-cancellable blocking pool.
-        // A cancelled metadata probe can otherwise leave those reads waiting
-        // through runtime shutdown. Anonymous temporary files have no pipe
-        // writers to await, and are discarded with this operation.
+        // Anonymous temporary files have no pipe writers to await on shutdown.
         let stdout = tempfile::tempfile()?;
         let stderr = tempfile::tempfile()?;
         command
             .stdout(stdout.try_clone()?)
             .stderr(stderr.try_clone()?);
+        let check_interest = || {
+            if caller_closed.is_closed() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Git process setup was cancelled",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        check_interest()?;
         let child = command.spawn()?;
-        Ok::<_, std::io::Error>((managed, child, stdout, stderr))
+        let pid = child.id();
+        let mut root = GitInspectionRoot {
+            owned: Some((managed, child)),
+            attached: false,
+            runtime,
+        };
+        check_interest()?;
+        let pid = pid.ok_or_else(|| std::io::Error::other("missing Git process id"))?;
+        let (managed, _) = root.owned.as_ref().expect("Git root still owned");
+        managed.attach_and_resume(pid)?;
+        root.attached = true;
+        Ok::<_, std::io::Error>((root, stdout, stderr))
     })
     .await
     .map_err(std::io::Error::other)??;
-    let pid = child
-        .id()
-        .ok_or_else(|| std::io::Error::other("missing Git process id"))?;
-    if let Err(error) = managed.attach_and_resume(pid) {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        return Err(error);
-    }
+    drop(setup_interest);
+
+    let (managed, child) = root.owned.as_mut().expect("Git root still owned");
     let status = loop {
         tokio::select! {
             status = child.wait() => break status?,
@@ -726,6 +767,9 @@ async fn run_git_child(
         // this transfer of ownership.
         managed.preserve_descendants()?;
     }
+    // A successful collection already reaped the root. Ordinary Job close
+    // still ends descendants unless the completed inspection preserved them.
+    drop(root.owned.take());
     Ok(output)
 }
 

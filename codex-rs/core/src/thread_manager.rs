@@ -1476,7 +1476,7 @@ impl ThreadManager {
                 // One retained owner spans shutdown, accepted work, and exact-
                 // instance registry retirement. The same budget observes all of it.
                 let owner = tokio::spawn(async move {
-                    let observation = codex_protocol::timing::observations::Span::start(
+                    let observation = codex_protocol::timing::observations::Span::start_queued(
                         "shutdown_thread", &thread_id.to_string(), "", "drain_and_retire",
                         serde_json::json!({"scope":"exact_tracked_thread_instance"}));
                     let retirement = thread.confirm_orderly_retirement().await?;

@@ -1147,23 +1147,29 @@ impl ContextManager {
         &self,
         items: &'a Arc<[ResponseItem]>,
     ) -> (Arc<[ResponseItem]>, &'a [ResponseItem]) {
+        // Snapshot only the shared slices needed by the estimate. Prefix checks
+        // and checkpoint projection must not hold the sampling anchor lock.
         let anchor = self
             .sampling_projection_anchor
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|entry| {
+                (
+                    Arc::clone(&entry.anchor.prepared_items),
+                    Arc::clone(&entry.anchor.projection.items),
+                )
+            });
         // A checkpoint after the anchor makes sampling re-project (see
         // project_continuation_with_workspace_cache); estimate that prompt,
         // or the pins that relieve pressure would not count against it.
-        if let Some(anchor) = anchor
-            .as_ref()
-            .map(|entry| &entry.anchor)
-            .filter(|anchor| items.starts_with(&anchor.prepared_items))
-            .filter(|anchor| {
-                !ToolHistoryState::has_phase_checkpoint(&items[anchor.prepared_items.len()..])
-            })
+        if let Some((prepared, projected)) = anchor
+            && items.starts_with(&prepared)
         {
-            let tail = &items[anchor.prepared_items.len()..];
-            return (Arc::clone(&anchor.projection.items), tail);
+            let tail = &items[prepared.len()..];
+            if !ToolHistoryState::has_phase_checkpoint(tail) {
+                return (projected, tail);
+            }
         }
         if ToolHistoryState::has_phase_checkpoint(items) {
             return (self.tool_history.apply_checkpoint_pins(items), &[]);

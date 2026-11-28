@@ -5,6 +5,9 @@ use std::io::Read;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::historical::disabled_filter_config;
 use crate::historical::read_git_command_with;
@@ -14,6 +17,7 @@ use crate::operations::GitCommandControl;
 use crate::operations::resolve_head;
 use crate::operations::resolve_repository_root;
 use crate::operations::run_git_for_stdout_exact_limited;
+use crate::operations::run_git_output;
 use crate::resolve_commit;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::ReviewTarget;
@@ -34,6 +38,56 @@ pub struct ReviewSourceScope {
     staged_diff: Option<String>,
     untracked: Vec<String>,
     custom: bool,
+}
+
+// Keep the existing per-command deadlines while letting an interrupted review
+// stop the active Git subprocess and prevent admission of any later command.
+#[derive(Default)]
+enum ReviewValidationState {
+    #[default]
+    Ready,
+    Git(GitCommandControl),
+    Cancelled,
+}
+
+#[derive(Default)]
+struct ReviewValidationControl(Mutex<ReviewValidationState>);
+
+impl ReviewValidationControl {
+    fn start_git(&self) -> Result<GitCommandControl, String> {
+        let mut state = self.0.lock().map_err(|error| error.to_string())?;
+        if matches!(*state, ReviewValidationState::Cancelled) {
+            return Err("review source validation cancelled".into());
+        }
+        let control = GitCommandControl::new();
+        *state = ReviewValidationState::Git(control.clone());
+        Ok(control)
+    }
+
+    fn check(&self) -> Result<(), String> {
+        let state = self.0.lock().map_err(|error| error.to_string())?;
+        if matches!(*state, ReviewValidationState::Cancelled) {
+            return Err("review source validation cancelled".into());
+        }
+        Ok(())
+    }
+
+    fn cancel(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            if let ReviewValidationState::Git(active) = &*state {
+                active.cancel();
+            }
+            *state = ReviewValidationState::Cancelled;
+        }
+    }
+}
+
+struct CancelReviewValidationOnDrop(Arc<ReviewValidationControl>);
+
+impl Drop for CancelReviewValidationOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl ReviewSourceScope {
@@ -106,7 +160,7 @@ impl ReviewSourceScope {
         let diff = if custom {
             String::new()
         } else {
-            Self::read_diff(&root, &comparison)?
+            Self::read_diff(&root, &comparison, &GitCommandControl::new())?
         };
         let untracked = if matches!(target, ReviewTarget::UncommittedChanges) {
             run_git_for_stdout(
@@ -123,7 +177,11 @@ impl ReviewSourceScope {
             Vec::new()
         };
         let staged_diff = if matches!(target, ReviewTarget::UncommittedChanges) {
-            Some(Self::read_diff(&root, &["diff".into(), "--cached".into()])?)
+            Some(Self::read_diff(
+                &root,
+                &["diff".into(), "--cached".into()],
+                &GitCommandControl::new(),
+            )?)
         } else { None };
         Ok(Self {
             root,
@@ -136,17 +194,20 @@ impl ReviewSourceScope {
         })
     }
 
-    fn read_diff(root: &Path, comparison: &[String]) -> Result<String, String> {
-        let control = GitCommandControl::new();
+    fn read_diff(
+        root: &Path,
+        comparison: &[String],
+        control: &GitCommandControl,
+    ) -> Result<String, String> {
         let worktree = comparison.first().is_some_and(|command| command == "diff")
             && !comparison.iter().any(|arg| arg == "--cached");
         let filters = if worktree {
-            disabled_filter_config(root, &control)?
+            disabled_filter_config(root, control)?
         } else {
             Vec::new()
         };
         let index = if worktree {
-            Some(private_index_copy(root, &control)?)
+            Some(private_index_copy(root, control)?)
         } else {
             None
         };
@@ -171,7 +232,7 @@ impl ReviewSourceScope {
             index.as_ref().map(|(_, path)| path.as_path()),
             &filters,
             8 * 1024 * 1024,
-            &control,
+            control,
         )?;
         if !output.status.success() {
             return Err(format!(
@@ -182,20 +243,50 @@ impl ReviewSourceScope {
         String::from_utf8(output.stdout).map_err(|error| error.to_string())
     }
 
+    /// Validate on the blocking worker. Dropping this future cancels the
+    /// worker's source acquisition rather than merely detaching the join.
+    pub async fn validate_async(
+        self,
+        mut output: ReviewOutputEvent,
+    ) -> Result<ReviewOutputEvent, String> {
+        let control = Arc::new(ReviewValidationControl::default());
+        let _cancel_on_drop = CancelReviewValidationOnDrop(Arc::clone(&control));
+        tokio::task::spawn_blocking(move || {
+            self.validate_with_control(&mut output, &control)?;
+            Ok(output)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
     /// Validate anchors and reject observable target drift. Supporting evidence is
     /// explicitly unverified: shell/prompt reads do not carry host source receipts.
     pub fn validate(&self, output: &mut ReviewOutputEvent) -> Result<(), String> {
+        self.validate_with_control(output, &ReviewValidationControl::default())
+    }
+
+    fn validate_with_control(
+        &self,
+        output: &mut ReviewOutputEvent,
+        control: &ReviewValidationControl,
+    ) -> Result<(), String> {
+        control.check()?;
         let historical = self
             .comparison
             .first()
             .is_some_and(|command| command == "show");
         if !self.custom
             && !historical
-            && (resolve_head(&self.root).map_err(|error| error.to_string())? != self.head
-                || Self::read_diff(&self.root, &self.comparison)? != self.diff
+            && (self.read_validation_head(control)? != self.head
+                || Self::read_diff(&self.root, &self.comparison, &control.start_git()?)? != self.diff
                 || self.staged_diff.as_ref().is_some_and(|diff| {
-                    Self::read_diff(&self.root, &["diff".into(), "--cached".into()])
-                        .as_ref() != Ok(diff)
+                    control
+                        .start_git()
+                        .and_then(|git| {
+                            Self::read_diff(&self.root, &["diff".into(), "--cached".into()], &git)
+                        })
+                        .as_ref()
+                        != Ok(diff)
                 }))
         {
             return Err(
@@ -204,20 +295,28 @@ impl ReviewSourceScope {
             );
         }
         let has_locations = !self.custom && !output.findings.is_empty();
-        let changes = ReviewDiffIndex::new(if has_locations { &self.diff } else { "" });
+        let changes = ReviewDiffIndex::new(if has_locations { &self.diff } else { "" }, control)?;
         let staged_changes = self.staged_diff.as_deref().filter(|_| has_locations)
-            .map(ReviewDiffIndex::new);
+            .map(|diff| ReviewDiffIndex::new(diff, control))
+            .transpose()?;
         // One defined source snapshot per (side/revision, path) in this call.
         // Keep only its empty/line-count facts, not every acquired file body.
         let mut snapshots = HashMap::<(Option<String>, String), (bool, usize)>::new();
         let mut source_lines = |path: &Path, name: &str, revision: Option<&str>| -> Result<(bool, usize), String> {
+            control.check()?;
             let key = (revision.map(str::to_owned), name.to_owned());
             if let Some(snapshot) = snapshots.get(&key) {
                 return Ok(*snapshot);
             }
             let contents = if let Some(revision) = revision {
-                run_git_for_stdout(&self.root, ["show", &format!("{revision}:{name}")], None)
-                    .map_err(|error| error.to_string())?
+                let output = self.read_validation_git(&["show", &format!("{revision}:{name}")], control)?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "Git review location read failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+                String::from_utf8(output.stdout).map_err(|error| error.to_string())?
             } else {
                 // Read only returned locations, never walk the repository.
                 let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
@@ -228,19 +327,30 @@ impl ReviewSourceScope {
                 if !file.metadata().map_err(|error| error.to_string())?.is_file() {
                     return Err("review source was replaced by a nonregular file".into());
                 }
-                let mut contents = String::new();
-                file.take(8 * 1024 * 1024 + 1).read_to_string(&mut contents)
-                    .map_err(|error| error.to_string())?;
+                let mut file = file.take(8 * 1024 * 1024 + 1);
+                let mut contents = Vec::new();
+                let mut chunk = [0; 16 * 1024];
+                loop {
+                    control.check()?;
+                    match file.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(count) => contents.extend_from_slice(&chunk[..count]),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
                 if contents.len() > 8 * 1024 * 1024 {
                     return Err("review source exceeds 8 MiB".into());
                 }
-                contents
+                String::from_utf8(contents).map_err(|error| error.to_string())?
             };
+            control.check()?;
             let snapshot = (contents.is_empty(), contents.lines().count());
             snapshots.insert(key, snapshot);
             Ok(snapshot)
         };
         for finding in &mut output.findings {
+            control.check()?;
             if self.custom {
                 // Custom prompts may embed source from outside the checkout.
                 // With no host-derived scope, never invent validation receipts.
@@ -352,6 +462,7 @@ impl ReviewSourceScope {
                 return Err(format!("review location is beyond source EOF: {name}"));
             }
         }
+        control.check()?;
         if self.custom {
             output.overall_explanation = format!(
                 "Source validation: unverified custom scope; locations and freshness are not established by the host.\n\n{}",
@@ -375,6 +486,43 @@ impl ReviewSourceScope {
         );
         Ok(())
     }
+
+    fn read_validation_head(
+        &self,
+        control: &ReviewValidationControl,
+    ) -> Result<Option<String>, String> {
+        let output = self.read_validation_git(&["rev-parse", "--verify", "--quiet", "HEAD"], control)?;
+        if output.status.success() {
+            return String::from_utf8(output.stdout)
+                .map(|head| Some(head.trim().to_owned()))
+                .map_err(|error| error.to_string());
+        }
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+        Err(format!(
+            "Git review HEAD lookup failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+
+    fn read_validation_git(
+        &self,
+        args: &[&str],
+        control: &ReviewValidationControl,
+    ) -> Result<std::process::Output, String> {
+        // Retain the regular Git environment for HEAD and blob reads. The
+        // admission diff already requires a trusted repository; do not retry
+        // with a safe.directory override if that trust changes mid-review.
+        let git = control.start_git()?;
+        let mut command = Command::new(crate::git_executable());
+        command
+            .current_dir(&self.root)
+            .arg("-c")
+            .arg(format!("core.hooksPath={}", crate::DISABLED_HOOKS_PATH))
+            .args(args);
+        run_git_output(command, 8 * 1024 * 1024, &git).map_err(|error| error.to_string())
+    }
 }
 
 type ReviewLineRange = (u32, u32);
@@ -387,7 +535,7 @@ struct ReviewDiffIndex {
 }
 
 impl ReviewDiffIndex {
-    fn new(diff: &str) -> Self {
+    fn new(diff: &str, control: &ReviewValidationControl) -> Result<Self, String> {
         let mut index = Self::default();
         let mut name = None;
         let mut deleted = false;
@@ -396,7 +544,10 @@ impl ReviewDiffIndex {
         let mut in_header = false;
         let mut old_name = String::new();
         let mut ranges = Ok(Vec::new());
-        for line in diff.lines() {
+        for (i, line) in diff.lines().enumerate() {
+            if i % 256 == 0 {
+                control.check()?;
+            }
             if line.starts_with("diff --git ") {
                 index.record(name.take(), deleted, std::mem::replace(&mut ranges, Ok(Vec::new())));
                 deleted = false;
@@ -433,7 +584,7 @@ impl ReviewDiffIndex {
             }
         }
         index.record(name, deleted, ranges);
-        index
+        Ok(index)
     }
 
     fn record(&mut self, name: Option<String>, deleted: bool, ranges: Result<Vec<(u32, u32)>, String>) {

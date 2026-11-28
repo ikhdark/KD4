@@ -322,16 +322,18 @@ impl CodeModeExecuteHandler {
                 nested_tool_timeout_override(&tool.tool_name, tool_timeouts, terminal_poll_ms)
             })
             .collect::<Vec<_>>();
-        let mut cached = self
-            .timeout_catalog
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(catalog) = cached.as_ref()
-            && catalog.overrides == overrides
         {
-            return Arc::clone(&catalog.tools);
+            let cached = self
+                .timeout_catalog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(catalog) = cached.as_ref()
+                && catalog.overrides == overrides
+            {
+                return Arc::clone(&catalog.tools);
+            }
         }
-        // Publish one immutable catalog per effective timeout overlay. Active
+        // Build the immutable overlay without holding the cache mutex. Active
         // cells retain their old snapshot; a changed timeout cannot mutate it.
         let tools = self
             .enabled_tools
@@ -343,10 +345,22 @@ impl CodeModeExecuteHandler {
                 tool
             })
             .collect::<Arc<[_]>>();
-        *cached = Some(TimeoutCatalog {
-            overrides,
-            tools: Arc::clone(&tools),
-        });
+        let displaced = {
+            let mut cached = self
+                .timeout_catalog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(catalog) = cached.as_ref()
+                && catalog.overrides == overrides
+            {
+                return Arc::clone(&catalog.tools);
+            }
+            cached.replace(TimeoutCatalog {
+                overrides,
+                tools: Arc::clone(&tools),
+            })
+        };
+        drop(displaced);
         tools
     }
 

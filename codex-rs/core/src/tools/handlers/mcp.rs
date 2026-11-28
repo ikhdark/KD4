@@ -154,12 +154,17 @@ impl Drop for McpCallLease {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(sender) = inner.remove(&self.key) {
-            let unfinished = sender.borrow().is_none();
-            if unfinished {
-                sender.send_replace(Some(cancelled_mcp_result(self.input.clone())));
+        let sender = inner.remove(&self.key);
+        let displaced = sender.as_ref().and_then(|sender| {
+            if sender.borrow().is_none() {
+                sender.send_replace(Some(cancelled_mcp_result(std::mem::take(&mut self.input))))
+            } else {
+                None
             }
-        }
+        });
+        drop(inner);
+        drop(displaced);
+        drop(sender);
     }
 }
 

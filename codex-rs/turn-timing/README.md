@@ -181,9 +181,11 @@ paths without terminal storage. The listener's `terminal_queue_pause` span
 and the embedded `runtime_shutdown` span use the prepared runtime-async lane.
 The former brackets the pause call, not proof of a queue change. The latter
 observes the retained owner's result, not delivery of a shutdown response.
-Pair only retained endpoints; queue admission is not an append receipt. Join an
-interrupt's `cancel_ack_ready` to `bounded_response` using the connection and
-request IDs on the same clock; those rows are not a client receipt.
+App-server `cancel_startup`, `cancel_turn`, `cancel_ack_ready` and
+`bounded_response` also use that lane so optional appends do not consume the
+interrupt or response budget. Pair only retained endpoints; queue admission is
+not an append receipt. Join `cancel_ack_ready` to `bounded_response` using the
+connection and request IDs on the same clock; those rows are not a client receipt.
 
 For the ordinary process-output and post-exit drain timers, optional block
 reason attribution does not wait for the timing collector lock. Their wake

@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireCellId;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use super::ExecuteClaims;
 use super::types::DeferredWait;
@@ -33,8 +35,23 @@ struct ControlDeadline {
     stalled: std::time::Duration,
 }
 
+#[derive(Clone, Copy)]
+enum AbandonedShutdownState {
+    InFlight(RequestId),
+    Backoff(Instant),
+}
+
+struct AbandonedShutdown {
+    session: RemoteSession,
+    delay: Duration,
+    state: AbandonedShutdownState,
+}
+
 pub(super) struct RequestTracker {
     pending: HashMap<RequestId, PendingRequest>,
+    // Each late abandoned open owns one close observation, either on the
+    // wire under a control deadline or waiting to retry its exact generation.
+    abandoned_shutdowns: HashMap<SessionId, AbandonedShutdown>,
     control_deadlines: HashMap<RequestId, ControlDeadline>,
     unclaimed_executes: HashMap<RequestId, UnclaimedExecute>,
     execute_claims: Arc<ExecuteClaims>,
@@ -47,6 +64,7 @@ impl RequestTracker {
     pub(super) fn new(execute_claims: Arc<ExecuteClaims>) -> Self {
         Self {
             pending: HashMap::new(),
+            abandoned_shutdowns: HashMap::new(),
             control_deadlines: HashMap::new(),
             unclaimed_executes: HashMap::new(),
             execute_claims,
@@ -121,6 +139,76 @@ impl RequestTracker {
     pub(super) fn remove_pending(&mut self, id: RequestId) -> Option<PendingRequest> {
         self.control_deadlines.remove(&id);
         self.pending.remove(&id)
+    }
+
+    pub(super) fn track_abandoned_shutdown(
+        &mut self,
+        id: RequestId,
+        session: RemoteSession,
+        delay: Duration,
+    ) {
+        let replaced = self.abandoned_shutdowns.insert(
+            session.id.clone(),
+            AbandonedShutdown {
+                session,
+                delay,
+                state: AbandonedShutdownState::InFlight(id),
+            },
+        );
+        debug_assert!(replaced.is_none());
+    }
+
+    pub(super) fn finish_abandoned_shutdown(
+        &mut self,
+        id: RequestId,
+        session: &RemoteSession,
+    ) -> Option<Duration> {
+        let attempt = self.abandoned_shutdowns.get(&session.id)?;
+        if attempt.session != *session
+            || !matches!(attempt.state, AbandonedShutdownState::InFlight(active) if active == id)
+        {
+            return None;
+        }
+        self.abandoned_shutdowns
+            .remove(&session.id)
+            .map(|entry| entry.delay)
+    }
+
+    pub(super) fn defer_abandoned_shutdown(&mut self, session: RemoteSession, delay: Duration) {
+        let replaced = self.abandoned_shutdowns.insert(
+            session.id.clone(),
+            AbandonedShutdown {
+                session,
+                delay: (delay * 2).min(Duration::from_secs(2)),
+                state: AbandonedShutdownState::Backoff(Instant::now() + delay),
+            },
+        );
+        debug_assert!(replaced.is_none());
+    }
+
+    fn next_abandoned_shutdown(&self) -> Option<(&SessionId, Instant)> {
+        self.abandoned_shutdowns
+            .iter()
+            .filter_map(|(id, entry)| match entry.state {
+                AbandonedShutdownState::Backoff(due) => Some((id, due)),
+                AbandonedShutdownState::InFlight(_) => None,
+            })
+            .min_by_key(|(_, due)| *due)
+    }
+
+    pub(super) fn next_abandoned_shutdown_retry(&self) -> Option<Instant> {
+        self.next_abandoned_shutdown().map(|(_, due)| due)
+    }
+
+    pub(super) fn take_due_abandoned_shutdown(&mut self) -> Option<(RemoteSession, Duration)> {
+        let (id, due) = self.next_abandoned_shutdown()?;
+        if due > Instant::now() {
+            return None;
+        }
+        let id = id.clone();
+        self.abandoned_shutdowns
+            .remove(&id)
+            .map(|entry| (entry.session, entry.delay))
     }
 
     pub(super) fn next_control_deadline(&self) -> Option<tokio::time::Instant> {
@@ -304,12 +392,22 @@ impl RequestTracker {
             .keys()
             .filter(|id| !self.initial_responses.contains_key(*id))
             .count();
-        self.pending.len() + self.initial_responses.len() + self.deferred_waits.len() + claim_only
+        let close_backoffs = self
+            .abandoned_shutdowns
+            .values()
+            .filter(|entry| matches!(entry.state, AbandonedShutdownState::Backoff(_)))
+            .count();
+        self.pending.len()
+            + self.initial_responses.len()
+            + self.deferred_waits.len()
+            + claim_only
+            + close_backoffs
     }
 
     pub(super) fn fail_all(&mut self, reason: &str) {
         self.execute_claims.close();
         self.control_deadlines.clear();
+        self.abandoned_shutdowns.clear();
         for (_, pending) in self.pending.drain() {
             pending.fail(reason.to_string());
         }

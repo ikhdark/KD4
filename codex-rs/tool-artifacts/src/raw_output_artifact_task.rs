@@ -255,8 +255,8 @@ impl RawOutputArtifactTask {
         .await
         {
             Ok(owned) => *task = Some(owned),
-            // The worker dropped the task while unwinding, which already
-            // published the capture as ended before finalization.
+            // If the task was dropped, its cleanup owns publication and
+            // readiness; this observer only reports the worker failure.
             Err(error) => tracing::warn!(%error, "command output capture worker failed"),
         }
     }
@@ -317,7 +317,16 @@ impl RawOutputArtifactTask {
         let file = OpenOptions::new().create_new(true).read(true).write(true).open(&self.path)?;
         // Retained receipts only read this plain log. Do not keep write access
         // alive after EOF: it would prevent recovery's immutable read pin.
-        self.handle = Some(Arc::new(command_log_read_handle(&file)?));
+        let read_handle = match command_log_read_handle(&file) {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Err(cleanup_error) = discard_unpublished_command_log(&file) {
+                    tracing::warn!(%cleanup_error, "could not discard unpublished command log");
+                }
+                return Err(error);
+            }
+        };
+        self.handle = Some(Arc::new(read_handle));
         self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
         self._residency = Some(residency);
         Ok(())
@@ -409,39 +418,170 @@ impl RawOutputArtifactTask {
 
 impl Drop for RawOutputArtifactTask {
     fn drop(&mut self) {
-        if !self.finished {
-            // Preserve an explicitly incomplete prefix even when the owner is
-            // cancelled. No cancellation path publishes a complete transcript.
-            // Keep the write handle through status publication so a reader
-            // can distinguish this in-flight finalization from an orphan.
-            let (write_handle, prefix_confirmed) = self.writer.take().map_or((None, false), |mut writer| {
-                let flushed = writer.flush().is_ok();
-                // Do not let BufWriter::drop retry buffered writes after the
-                // terminal status describes the retained prefix.
-                let (file, _) = writer.into_parts();
-                let confirmed =
-                    flushed && file.metadata().is_ok_and(|metadata| metadata.len() == self.bytes);
-                (Some(file), confirmed)
-            });
-            // Producer bytes after this drop are unknown, so a ceiling gap
-            // recorded here is a lower bound, never an exact total.
-            self.incomplete = true;
-            let mut status = self.status(false);
+        if self.finished {
+            return;
+        }
+
+        let failed = self.failed("command output capture ended before finalization".into());
+        if self.handle.is_none()
+            && let Ok(mut state) = self.state.try_lock()
+        {
+            *state = failed;
+            drop(state);
+            self.ready.cancel();
+            return;
+        }
+
+        // Producer bytes after abandonment are unknown. Even a ceiling gap
+        // is only a lower bound, and the terminal status is never complete.
+        self.incomplete = true;
+        let status = self.handle.as_ref().map(|_| self.status(false));
+        let cleanup = AbandonedRawOutput {
+            state: Arc::clone(&self.state),
+            ready: self.ready.clone(),
+            writer: self.writer.take(),
+            _read_handle: self.handle.take(),
+            _residency: self._residency.take(),
+            status,
+            bytes: self.bytes,
+            failed,
+        };
+        let job = AbandonedRawOutputJob(Some(cleanup));
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn_blocking(move || job.run()));
+        } else {
+            drop(job);
+        }
+    }
+}
+
+struct AbandonedRawOutput {
+    state: Arc<Mutex<RawOutputArtifact>>,
+    ready: CancellationToken,
+    writer: Option<BufWriter<File>>,
+    _read_handle: Option<Arc<File>>,
+    _residency: Option<File>,
+    status: Option<serde_json::Value>,
+    bytes: u64,
+    failed: RawOutputArtifact,
+}
+
+impl AbandonedRawOutput {
+    fn finish(mut self) {
+        // Keep the write handle through status publication so a reader
+        // distinguishes in-flight finalization from an orphan.
+        let (write_handle, prefix_confirmed) = self.writer.take().map_or((None, false), |mut writer| {
+            let flushed = writer.flush().is_ok();
+            // Do not let BufWriter retry writes after the prefix is described.
+            let (file, _) = writer.into_parts();
+            let confirmed =
+                flushed && file.metadata().is_ok_and(|metadata| metadata.len() == self.bytes);
+            (Some(file), confirmed)
+        });
+        if let Some(mut status) = self.status {
             if !prefix_confirmed {
                 status["sha256"] = serde_json::Value::Null;
             }
-            if self.handle.is_some()
+            if let RawOutputArtifact::Failed { owned_path: Some(path), .. } = &self.failed
                 && let Ok(bytes) = serde_json::to_vec(&status)
             {
-                let _ = codex_file_system::write_bytes_atomically(&self.path.with_extension("status"), &bytes);
+                let _ = codex_file_system::write_bytes_atomically(&path.with_extension("status"), &bytes);
             }
-            drop(write_handle);
-            if let Ok(mut state) = self.state.try_lock() {
-                *state = self.failed("command output capture ended before finalization".into());
-            }
-            self.ready.cancel();
+        }
+        drop(write_handle);
+        *self.state.blocking_lock() = self.failed;
+        self.ready.cancel();
+    }
+}
+
+// Use an independent blocking thread when no runtime is available, or when
+// shutdown discards an unstarted Tokio job. Dropping the job must not flush
+// BufWriter on the executor.
+struct AbandonedRawOutputJob(Option<AbandonedRawOutput>);
+
+impl AbandonedRawOutputJob {
+    fn run(mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup.finish();
         }
     }
+}
+
+impl Drop for AbandonedRawOutputJob {
+    fn drop(&mut self) {
+        let Some(cleanup) = self.0.take() else { return; };
+        let custody = Arc::new(std::sync::Mutex::new(Some(cleanup)));
+        let worker_custody = Arc::clone(&custody);
+        let worker = std::thread::Builder::new()
+            .name("command-log-cleanup".into())
+            .spawn(move || {
+                let cleanup = worker_custody
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(cleanup) = cleanup {
+                    cleanup.finish();
+                }
+            });
+        if let Err(error) = worker {
+            tracing::warn!(%error, "could not start abandoned command output cleanup");
+            let cleanup = custody
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(mut cleanup) = cleanup {
+                // No blocking worker is available. Do not implicitly flush on
+                // this thread or describe an unconfirmed prefix as complete.
+                if let Some(writer) = cleanup.writer.take() {
+                    drop(writer.into_parts());
+                }
+                if let Ok(mut state) = cleanup.state.try_lock() {
+                    *state = cleanup.failed;
+                }
+                cleanup.ready.cancel();
+            }
+        }
+    }
+}
+
+fn discard_unpublished_command_log(file: &File) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, ReOpenFile, SetFileInformationByHandle,
+    };
+
+    // Acquire delete access only on failure. Do not make a successful log
+    // write depend on delete permissions, or reopen a mutable pathname.
+    // SAFETY: the original disk handle still pins the created object.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: ReOpenFile returned a new owned handle; transfer it once.
+    let rollback = unsafe { File::from_raw_handle(handle) };
+    let mut info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: rollback has DELETE access and the buffer matches the class.
+    let result = unsafe {
+        SetFileInformationByHandle(
+            rollback.as_raw_handle(),
+            FileDispositionInfo,
+            (&mut info as *mut FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn command_log_read_handle(file: &File) -> std::io::Result<File> {

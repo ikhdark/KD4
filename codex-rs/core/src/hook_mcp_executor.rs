@@ -20,10 +20,16 @@ impl HookMcpExecutor for CoreHookMcpExecutor {
             // Pin one published generation without holding a session/state lock.
             // The manager retains its configured server and per-tool deny filters.
             let runtime = self.runtime.load_full().context("MCP runtime is unavailable")?;
-            let result = tokio::time::timeout(call.timeout, runtime.manager().call_tool(
-                &call.server, &call.tool, Some(Value::Object(call.input)),
-                Some(serde_json::json!({"threadId": self.thread_id.to_string()})),
-            )).await.context("MCP hook timed out")??;
+            let result = runtime
+                .manager()
+                .call_tool_with_wall_deadline(
+                    &call.server,
+                    &call.tool,
+                    Some(Value::Object(call.input)),
+                    Some(serde_json::json!({"threadId": self.thread_id.to_string()})),
+                    call.wall_deadline,
+                )
+                .await?;
             let mut text = String::new();
             for content in &result.content {
                 if content.get("type").and_then(Value::as_str) == Some("text")

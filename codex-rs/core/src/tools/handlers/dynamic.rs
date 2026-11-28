@@ -249,37 +249,63 @@ async fn request_dynamic_tool(
         error: None,
         duration: None,
     });
-    let delivered = tokio::select! {
+    let start_event = session.turn_item_started_event(turn_context, start_item);
+    let append_session = Arc::clone(session);
+    let append_event = start_event.clone();
+    let append_cancellation = cancellation_token.clone();
+    let mut append = Box::pin(async move {
+        if append_cancellation.is_cancelled() {
+            return false;
+        }
+        append_session.record_dynamic_tool_event(append_event).await
+    });
+    // Cancellation can stop observing the ordered append, but cannot revoke
+    // admission. Keep the unfinished future for the terminal owner below.
+    let recorded = tokio::select! {
         biased;
-        _ = cancellation_token.cancelled() => false,
-        _ = session.emit_turn_item_started(turn_context, &start_item) => true,
+        () = cancellation_token.cancelled() => None,
+        recorded = &mut append => Some(recorded),
     };
-    let response = if !delivered {
-        rx_response.close();
-        originating_turn_state
-            .lock()
-            .await
-            .remove_closed_pending_dynamic_tool(&call_id);
-        None
+    let mut canonical = None;
+    let mut legacy = None;
+    let dispatch_finished = if recorded.is_some() {
+        tokio::select! {
+            biased;
+            () = cancellation_token.cancelled() => false,
+            () = session.dispatch_dynamic_tool_start(
+                turn_context, start_event, &mut canonical, &mut legacy,
+            ) => true,
+        }
     } else {
+        false
+    };
+    let canonical_accepted = canonical.is_some();
+    let legacy_accepted = legacy.is_some();
+    let dispatched = canonical_accepted || legacy_accepted;
+    // A response to an accepted canonical Begin can already be ready while
+    // the compatibility request is backpressured. Keep its existing priority.
+    let response = if dispatched {
         tokio::select! {
             biased;
             response = &mut rx_response => response.ok(),
-            () = cancellation_token.cancelled() => {
-                rx_response.close();
-                originating_turn_state
-                    .lock()
-                    .await
-                    .remove_closed_pending_dynamic_tool(&call_id);
-                None
-            }
+            () = cancellation_token.cancelled() => None,
         }
+    } else {
+        None
     };
 
-    let missing_response = if delivered {
-        "dynamic tool call was cancelled or disconnected after dispatch; completion unknown; inspect before retrying"
-    } else {
-        "dynamic tool call was cancelled before dispatch; not dispatched"
+    let missing_response = match (canonical_accepted, legacy_accepted, dispatch_finished) {
+        (true, true, _) => {
+            "dynamic tool call was cancelled or disconnected after dispatch; completion unknown; inspect before retrying"
+        }
+        (true, false, _) => {
+            "dynamic tool canonical start was accepted but the legacy request was not; completion unknown; inspect before retrying"
+        }
+        (false, true, _) => {
+            "dynamic tool legacy request was accepted but the canonical start was not; completion unknown; inspect before retrying"
+        }
+        (false, false, true) => "dynamic tool start was rejected by the event channel; not dispatched",
+        (false, false, false) => "dynamic tool call was cancelled before dispatch; not dispatched",
     };
     let item = match &response {
         Some(response) => DynamicToolCallItem {
@@ -310,29 +336,45 @@ async fn request_dynamic_tool(
         },
     };
     // The pending owner is retired before event backpressure can delay return.
-    // A tracked, bounded terminal publisher preserves the one terminal outcome.
     rx_response.close();
     originating_turn_state
         .lock()
         .await
         .remove_closed_pending_dynamic_tool(&event_id);
+    if !dispatched && recorded == Some(false) {
+        return Err(missing_response.to_string());
+    }
     let terminal_session = Arc::clone(session);
     let terminal_turn = Arc::clone(turn_context);
     let mut terminal = session.terminal_tasks.spawn(async move {
-        let item_id = item.id.clone();
-        if tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+        let item = TurnItem::DynamicToolCall(item);
+        if dispatched {
             terminal_session
-                .emit_turn_item_completed(&terminal_turn, TurnItem::DynamicToolCall(item)),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!(%item_id, "dynamic tool completion timed out; publication may be partial");
+                .emit_turn_item_completed_with_legacy_events(&terminal_turn, item, legacy_accepted)
+                .await;
+        } else if recorded == Some(true) || (recorded.is_none() && append.await) {
+            // If cancellation won during ordered append, settle that same
+            // future here. It may already own a writer admission. Do not
+            // dispatch a new live start after the response owner has retired.
+            terminal_session
+                .record_dynamic_tool_completion(&terminal_turn, item)
+                .await;
         }
     });
+    // Bound only the observation. Dropping the join handle detaches the one
+    // tracked publisher without interrupting persistence or either event path.
     tokio::select! {
-        _ = &mut terminal => {},
+        result = tokio::time::timeout(std::time::Duration::from_secs(30), &mut terminal) => {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(call_id = %event_id, %error, "dynamic tool completion publisher failed");
+                }
+                Err(_) => {
+                    tracing::warn!(call_id = %event_id, "dynamic tool completion observation timed out; publication remains owned");
+                }
+            }
+        }
         _ = cancellation_token.cancelled() => {},
     }
 

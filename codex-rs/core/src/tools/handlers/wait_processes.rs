@@ -216,17 +216,22 @@ impl ToolExecutor<ToolInvocation> for WaitProcessesHandler {
                             .completed_process_result(handle.session_id, handle.incarnation).await
                         {
                             Some(receipt) => Some(receipt),
-                            None => match durable_records.await {
-                                Ok(Some(records)) => crate::session::Session::durable_process_result(
-                                    &records, handle.session_id, handle.incarnation),
-                                Ok(None) => None,
-                                // Unreadable history is not an absent receipt:
-                                // report it with the fallback observation.
-                                Err(cause) => {
-                                    durable_error = Some(cause);
-                                    None
+                            None => {
+                                let lookup = match durable_records.await {
+                                    Ok(Some(records)) => records.lookup(handle.session_id, handle.incarnation),
+                                    Ok(None) => Ok(None),
+                                    Err(cause) => Err(cause),
+                                };
+                                match lookup {
+                                    Ok(receipt) => receipt,
+                                    // Incomplete or unreadable history cannot prove
+                                    // absence; keep the fallback observation.
+                                    Err(cause) => {
+                                        durable_error = Some(cause);
+                                        None
+                                    }
                                 }
-                            },
+                            }
                         };
                         if let Some(receipt) = receipt {
                             return (index, json!({

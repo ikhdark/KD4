@@ -20,6 +20,7 @@ use crate::loader::refresh_non_curated_plugin_cache_force_reinstall_detailed;
 use crate::loader::remote_installed_plugins_to_config;
 use crate::manifest::PluginManifestInterface;
 use crate::manifest::load_plugin_manifest;
+use crate::marketplace::ConfiguredMarketplaceRootObservation;
 use crate::marketplace::MarketplaceError;
 use crate::marketplace::MarketplaceInterface;
 use crate::marketplace::MarketplaceListError;
@@ -2385,6 +2386,7 @@ impl PluginsManager {
             config,
             additional_roots,
             catalog.and_then(CuratedCatalogListing::available_root),
+            /*observations*/ None,
         );
         let mut seen_plugin_keys = HashSet::new();
         let marketplaces = marketplace_outcome
@@ -2475,20 +2477,48 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         additional_roots: &[AbsolutePathBuf],
     ) -> Result<MarketplaceListOutcome, MarketplaceError> {
-        if !config.plugins_enabled {
+        self.discover_marketplaces_for_config_inner(config, additional_roots, None)
+    }
+
+    /// Blocking discovery with the configured-root facts used by the CLI to
+    /// render diagnostics and source attribution without reading the roots again.
+    pub fn discover_marketplaces_for_config_with_observations(
+        &self,
+        config: &PluginsConfigInput,
+    ) -> Result<
+        (
+            MarketplaceListOutcome,
+            HashMap<AbsolutePathBuf, ConfiguredMarketplaceRootObservation>,
+        ),
+        MarketplaceError,
+    > {
+        let mut observations = HashMap::new();
+        let outcome =
+            self.discover_marketplaces_for_config_inner(config, &[], Some(&mut observations))?;
+        Ok((outcome, observations))
+    }
+
+    fn discover_marketplaces_for_config_inner(
+        &self,
+        config: &PluginsConfigInput,
+        additional_roots: &[AbsolutePathBuf],
+        observations: Option<&mut HashMap<AbsolutePathBuf, ConfiguredMarketplaceRootObservation>>,
+    ) -> Result<MarketplaceListOutcome, MarketplaceError> {
+        if !config.plugins_enabled && observations.is_none() {
             return Ok(MarketplaceListOutcome::default());
         }
 
         let catalog = CuratedCatalogListing::acquire(
             self.codex_home.as_path(),
             self.auth_mode(),
-            /*include_openai_curated*/ true,
+            config.plugins_enabled,
         );
         let mut outcome = Self::list_marketplaces_with_policy(
             self.codex_home.as_path(),
             config,
             additional_roots,
             catalog.as_ref().and_then(CuratedCatalogListing::available_root),
+            observations,
         );
         outcome.errors.extend(catalog.and_then(CuratedCatalogListing::into_error));
         Ok(outcome)
@@ -3422,6 +3452,7 @@ impl PluginsManager {
                         &scope.config,
                         &scope.roots,
                         /*curated_marketplace_path*/ None,
+                        /*observations*/ None,
                     );
                     outcome.errors.extend(discovered.errors);
                     for mut marketplace in discovered.marketplaces {
@@ -3527,6 +3558,7 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         additional_roots: &[AbsolutePathBuf],
         curated_marketplace_path: Option<PathBuf>,
+        observations: Option<&mut HashMap<AbsolutePathBuf, ConfiguredMarketplaceRootObservation>>,
     ) -> MarketplaceListOutcome {
         // The curated catalog remains an additional root in the same sorted order.
         let roots = additional_roots.iter().cloned().chain(
@@ -3534,11 +3566,13 @@ impl PluginsManager {
         );
         let policy = MarketplacePolicy::from_requirements(config.config_layer_stack.requirements());
         let user_config = config.config_layer_stack.effective_config();
+        let discover = config.plugins_enabled || observations.is_none();
+        let home = discover.then(home_dir).flatten();
         list_configured_marketplaces_with_home(
             codex_home,
             &config.config_layer_stack,
             roots,
-            home_dir().as_deref(),
+            home.as_deref(),
             |marketplace| {
                 policy
                     .validate_install_with_user_config(
@@ -3549,6 +3583,8 @@ impl PluginsManager {
                     )
                     .is_ok()
             },
+            observations,
+            discover,
         )
     }
 }

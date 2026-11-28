@@ -3,7 +3,7 @@ use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
 use codex_core::config::Config;
-use codex_core::config::find_codex_home;
+use codex_core::config::find_codex_home_async;
 use codex_core_plugins::ConfiguredMarketplace;
 use codex_core_plugins::PluginInstallOutcome;
 use codex_core_plugins::PluginInstallRequest;
@@ -207,12 +207,23 @@ pub async fn run_plugin_list(
         .list_marketplaces_for_config_async(&plugins_input, /*include_openai_curated*/ true)
         .await
         .context("failed to list marketplace plugins")?;
-    ensure_configured_marketplace_snapshots_loaded(
-        codex_home.as_path(),
-        &plugins_input,
-        &outcome.errors,
-        args.marketplace_name.as_deref(),
-    )?;
+    let marketplace_name = args.marketplace_name.clone();
+    let json = args.json;
+    let marketplace_sources = tokio::task::spawn_blocking(move || {
+        ensure_configured_marketplace_snapshots_loaded(
+            &codex_home,
+            &plugins_input,
+            &outcome.errors,
+            marketplace_name.as_deref(),
+        )?;
+        Ok::<_, anyhow::Error>(if json {
+            configured_marketplace_sources(&plugins_input, &codex_home)
+        } else {
+            HashMap::new()
+        })
+    })
+    .await
+    .context("configured marketplace diagnostics worker failed")??;
 
     let marketplaces = outcome
         .marketplaces
@@ -223,11 +234,6 @@ pub async fn run_plugin_list(
                 .is_none_or(|name| marketplace.name == *name)
         })
         .collect::<Vec<_>>();
-    let marketplace_sources = if args.json {
-        configured_marketplace_sources(&plugins_input, codex_home.as_path())
-    } else {
-        HashMap::new()
-    };
     write_plugin_list(
         &mut std::io::stdout().lock(),
         marketplaces,
@@ -582,7 +588,9 @@ struct PluginCommandContext {
 async fn load_plugin_command_context(
     overrides: Vec<(String, toml::Value)>,
 ) -> Result<PluginCommandContext> {
-    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let codex_home = find_codex_home_async()
+        .await
+        .context("failed to resolve CODEX_HOME")?;
     let config = Config::load_with_cli_overrides(overrides)
         .await
         .context("failed to load configuration")?;
@@ -652,12 +660,19 @@ async fn find_marketplace_for_plugin(
         .list_marketplaces_for_config_async(plugins_input, /*include_openai_curated*/ true)
         .await
         .context("failed to list marketplace plugins")?;
-    ensure_configured_marketplace_snapshots_loaded(
-        codex_home,
-        plugins_input,
-        &outcome.errors,
-        Some(marketplace_name),
-    )?;
+    let diagnostic_home = codex_home.to_path_buf();
+    let diagnostic_input = plugins_input.clone();
+    let diagnostic_name = marketplace_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        ensure_configured_marketplace_snapshots_loaded(
+            &diagnostic_home,
+            &diagnostic_input,
+            &outcome.errors,
+            Some(&diagnostic_name),
+        )
+    })
+    .await
+    .context("configured marketplace diagnostics worker failed")??;
     let mut matches = outcome
         .marketplaces
         .into_iter()

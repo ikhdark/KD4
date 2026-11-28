@@ -5,6 +5,7 @@ use std::sync::Arc;
 use codex_extension_api::ExtensionData;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::items::ImageGenerationItem;
 use codex_protocol::items::TurnItem;
 use tokio_util::sync::CancellationToken;
 
@@ -599,8 +600,26 @@ pub(crate) async fn handle_output_item_done(
                     buffer.items.lock().await.push(finalized_turn_item.turn_item);
                 } else {
                     if previously_active_item.is_none() {
+                        // A done-only image still needs a start, but its result and
+                        // terminal status belong only to the completion.
+                        let image_start;
+                        let started_item = match &finalized_turn_item.turn_item {
+                            TurnItem::ImageGeneration(image) => {
+                                image_start = TurnItem::ImageGeneration(ImageGenerationItem {
+                                    id: image.id.clone(),
+                                    status: "in_progress".to_string(),
+                                    revised_prompt: None,
+                                    result: None,
+                                    error: None,
+                                    saved_path: None,
+                                    provider_usage: None,
+                                });
+                                &image_start
+                            }
+                            item => item,
+                        };
                         ctx.sess
-                            .emit_turn_item_started(&ctx.turn_context, &finalized_turn_item.turn_item)
+                            .emit_turn_item_started(&ctx.turn_context, started_item)
                             .await;
                         // S1: this item never streamed live, either because a turn-item
                         // contributor may rewrite assistant text or because the provider sent no
@@ -721,7 +740,8 @@ pub(crate) async fn handle_non_tool_response_item(
     match item {
         ResponseItem::Message { .. }
         | ResponseItem::Reasoning { .. }
-        | ResponseItem::WebSearchCall { .. } => {
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. } => {
             let mut turn_item = parse_turn_item(item)?;
             finalize_turn_item(sess, contributor_policy, &mut turn_item, plan_mode).await;
             Some(turn_item)

@@ -65,7 +65,7 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigTomlLoadResult;
-use codex_core::config::find_codex_home;
+use codex_core::config::find_codex_home_async;
 use codex_core::config::load_config_toml_with_layer_stack;
 use codex_core::config::resolve_bootstrap_auth_keyring_backend_kind;
 use codex_core::config::resolve_bootstrap_auth_route_config;
@@ -391,7 +391,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 
     // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
-    let codex_home = match find_codex_home() {
+    let codex_home = match find_codex_home_async().await {
         Ok(codex_home) => codex_home,
         Err(err) => {
             eprintln!("Error finding codex home: {err}");

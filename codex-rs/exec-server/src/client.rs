@@ -1136,12 +1136,15 @@ impl ExecServerClient {
                 };
                 let start_result = tokio::select! {
                     biased;
-                    result = rpc_client.call_tracked::<_, ExecResponse>(
+                    result = rpc_client.call_tracked_before::<_, ExecResponse>(
                         crate::protocol::EXEC_OWNED_METHOD,
                         &owned_params,
-                        deadline.saturating_duration_since(Instant::now()),
+                        deadline,
                         &submitted,
-                    ) => Some(map_rpc_call_result(result)),
+                    ) => Some(match result {
+                        Err(RpcCallError::TimedOut { .. }) => Err(ExecServerError::ProcessStartTimedOut),
+                        result => map_rpc_call_result(result),
+                    }),
                     _ = result_tx.closed() => None,
                 };
                 match start_result {
@@ -1217,6 +1220,11 @@ impl ExecServerClient {
                 ExecServerError::Protocol("process start task stopped unexpectedly".to_string())
             })?;
             if result.is_ok() {
+                // A ready result can win the outer timeout even when the caller
+                // was not polled in time. Withhold acceptance so the task cleans up.
+                if Instant::now() >= deadline {
+                    return Err(ExecServerError::ProcessStartTimedOut);
+                }
                 let _ = accepted_tx.send(());
             }
             return result;

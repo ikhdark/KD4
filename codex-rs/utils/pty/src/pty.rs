@@ -235,8 +235,9 @@ pub async fn spawn_process_with_inherited_fds(
         anyhow::bail!("missing program for PTY spawn");
     }
 
+    // Portable PTYs do not support Unix argv[0] overrides or inherited FDs.
     #[cfg(not(unix))]
-    let _ = inherited_fds;
+    let _ = (arg0, inherited_fds);
 
     #[cfg(unix)]
     {
@@ -244,19 +245,18 @@ pub async fn spawn_process_with_inherited_fds(
     }
     #[cfg(not(unix))]
     {
-        let (program, args, cwd, env, arg0) = (
+        let (program, args, cwd, env) = (
             program.to_owned(),
             args.to_vec(),
             cwd.to_owned(),
             env.clone(),
-            arg0.clone(),
         );
         // Setup owns admission even if the observing caller is cancelled while
         // the Windows loader is still running. An unclaimed result drops its
         // ProcessHandle; the detached waiter retains the charge until exit.
         let observation_context = crate::process_observation::ProcessObservationContext::current();
         tokio::spawn(async move {
-            let setup = spawn_process_portable(&program, &args, &cwd, &env, &arg0, size);
+            let setup = spawn_process_portable(program, args, cwd, env, size);
             match observation_context {
                 Some(context) => context.scope(setup).await,
                 None => setup.await,
@@ -268,45 +268,40 @@ pub async fn spawn_process_with_inherited_fds(
 
 #[cfg(not(unix))]
 async fn spawn_process_portable(
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-    env: &HashMap<String, String>,
-    arg0: &Option<String>,
+    program: String,
+    args: Vec<String>,
+    cwd: std::path::PathBuf,
+    env: HashMap<String, String>,
     size: TerminalSize,
 ) -> Result<SpawnedProcess> {
-    let admission = crate::ManagedRootProcess::reserve()?;
-    let pty_system = platform_native_pty_system();
-    let pair = pty_system.openpty(size.into())?;
-    let portable_pty::PtyPair { master, slave } = pair;
-    // Complete fallible descriptor setup before starting a child or reader task.
-    let reader = master.try_clone_reader()?;
-    let writer = master.take_writer()?;
-
-    let _ = arg0; // Windows has no distinct Unix argv[0] override.
-    let mut command_builder = CommandBuilder::new(program);
-    command_builder.cwd(cwd);
-    command_builder.env_clear();
-    for arg in args {
-        command_builder.arg(arg);
-    }
-    for (key, value) in env {
-        command_builder.env(key, value);
-    }
-
-    #[cfg(windows)]
     let observation_context = crate::process_observation::ProcessObservationContext::current();
-    #[cfg(windows)]
-    let (slave, mut child, admission) = tokio::task::spawn_blocking(move || {
-        let child = crate::process_observation::ProcessObservationContext::scope_sync(
-            observation_context,
-            || slave.spawn_command(command_builder),
-        )?;
-        Ok::<_, anyhow::Error>((slave, child, admission))
-    })
-    .await??;
-    #[cfg(not(windows))]
-    let mut child = slave.spawn_command(command_builder)?;
+    let (admission, master, slave, reader, writer, mut child) =
+        tokio::task::spawn_blocking(move || {
+            crate::process_observation::ProcessObservationContext::scope_sync(
+                observation_context,
+                || {
+                    let admission = crate::ManagedRootProcess::reserve()?;
+                    let pty_system = platform_native_pty_system();
+                    let portable_pty::PtyPair { master, slave } = pty_system.openpty(size.into())?;
+                    // Finish all fallible descriptor setup before starting the child.
+                    let reader = master.try_clone_reader()?;
+                    let writer = master.take_writer()?;
+
+                    let mut command_builder = CommandBuilder::new(program);
+                    command_builder.cwd(cwd);
+                    command_builder.env_clear();
+                    for arg in args {
+                        command_builder.arg(arg);
+                    }
+                    for (key, value) in env {
+                        command_builder.env(key, value);
+                    }
+                    let child = slave.spawn_command(command_builder)?;
+                    Ok::<_, anyhow::Error>((admission, master, slave, reader, writer, child))
+                },
+            )
+        })
+        .await??;
 
     #[cfg(windows)]
     let job = (child.as_mut() as &mut dyn portable_pty::Child)

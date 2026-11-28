@@ -602,7 +602,19 @@ impl ManagedRootProcess {
         self,
         child: tokio::process::Child,
     ) -> impl Future<Output = io::Result<()>> {
-        self.cleanup_child(child, /*always_terminate_root*/ true, None)
+        self.cleanup_child(child, /*always_terminate_root*/ true, None, |_| {})
+    }
+
+    /// Like failed-attachment cleanup, with a root exit observer owned by the
+    /// cleanup task. The observer runs only on a native exit status, even if
+    /// the caller timed out or tree termination failed.
+    #[cfg(windows)]
+    pub fn cleanup_after_failed_attach_with_exit_observer(
+        self,
+        child: tokio::process::Child,
+        on_root_exit: impl FnOnce(std::process::ExitStatus) + Send + 'static,
+    ) -> impl Future<Output = io::Result<()>> {
+        self.cleanup_child(child, /*always_terminate_root*/ true, None, on_root_exit)
     }
 
     /// Terminate a contained process tree and retain its admission until reaped.
@@ -612,7 +624,7 @@ impl ManagedRootProcess {
         self,
         child: tokio::process::Child,
     ) -> impl Future<Output = io::Result<()>> {
-        self.cleanup_child(child, /*always_terminate_root*/ false, None)
+        self.cleanup_child(child, /*always_terminate_root*/ false, None, |_| {})
     }
 
     /// Transfer an observed child to retained cleanup. Pass `attached = true`
@@ -625,7 +637,7 @@ impl ManagedRootProcess {
         observation: crate::process_observation::ObservedProcess,
         attached: bool,
     ) -> impl Future<Output = io::Result<()>> {
-        self.cleanup_child(child, !attached, Some(observation))
+        self.cleanup_child(child, !attached, Some(observation), |_| {})
     }
 
     #[cfg(windows)]
@@ -634,6 +646,7 @@ impl ManagedRootProcess {
         mut child: tokio::process::Child,
         always_terminate_root: bool,
         observation: Option<crate::process_observation::ObservedProcess>,
+        on_root_exit: impl FnOnce(std::process::ExitStatus) + Send + 'static,
     ) -> impl Future<Output = io::Result<()>> {
         self.admission.observe(RootCustody::CleanupWait, "cleanup_wait");
         // Spawn before returning the future: dropping an unpolled caller must
@@ -656,20 +669,22 @@ impl ManagedRootProcess {
                 if let Some(error) = &kill_error {
                     log::warn!("failed to terminate managed root process: {error}");
                 }
-                if let Err(error) = child.wait().await {
-                    log::warn!(
-                        "failed to wait for managed root process; retaining admission and polling for exit: {error}"
-                    );
-                    // Windows can fail to register its native wait while the child
-                    // is alive. Neither that error nor a failed status query proves
-                    // exit, so retain ownership until a real status is observed.
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        if let Ok(Some(_)) = child.try_wait() {
-                            break;
+                let root_status = match child.wait().await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        log::warn!(
+                            "failed to wait for managed root process; retaining admission and polling for exit: {error}"
+                        );
+                        // A failed Windows wait or status query does not prove exit.
+                        // Keep ownership until the child returns a real status.
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            if let Ok(Some(status)) = child.try_wait() {
+                                break status;
+                            }
                         }
                     }
-                }
+                };
                 self.admission.observe(RootCustody::RootExited, "root_exited");
                 if let Some(observation) = observation {
                     observation.cleanup_observed("root_reaped; descendants_unknown");
@@ -677,13 +692,16 @@ impl ManagedRootProcess {
                 // Reaping the root cannot settle a failed tree termination.
                 // Reuse the runtime-independent reconciler: an indefinitely
                 // failing job must not pin Tokio's blocking pool at shutdown.
-                if let Some(error) = job_error {
+                let cleanup_result = if let Some(error) = job_error {
                     self.admission.observe(RootCustody::CleanupReconciliation, "cleanup_reconciliation");
                     crate::process::retain_terminator(Box::new(self));
-                    return Err(error);
-                }
-                drop(self);
-                Ok(())
+                    Err(error)
+                } else {
+                    drop(self);
+                    Ok(())
+                };
+                on_root_exit(root_status);
+                cleanup_result
             })
         });
         async move {

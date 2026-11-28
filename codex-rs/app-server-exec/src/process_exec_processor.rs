@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -392,34 +391,33 @@ impl ProcessExecRequestProcessor {
             let mut sessions = self.sessions.lock().await;
             rpc_gate
                 .try_commit(|| {
-                    // Live sessions (including ones whose process already exited
-                    // but whose terminal cleanup has not run) count against the
-                    // bounds; exit, kill and connection close release capacity.
-                    let limit = sessions.admission_limit(
+                    if sessions.get(&process_key).is_some() {
+                        return Err(invalid_request(format!(
+                            "duplicate active process handle: {process_handle:?}",
+                        )));
+                    }
+                    // Count retained sessions, including exited processes whose
+                    // terminal cleanup is pending. Refuse before creating a bucket.
+                    if let Some(scope) = sessions.admission_limit(
                         process_key.connection_id,
                         PROCESS_SESSIONS_PER_CONNECTION,
                         PROCESS_SESSIONS_PER_SERVER,
-                    );
-                    match sessions.entry(process_key.clone()) {
-                        Entry::Occupied(_) => Err(invalid_request(format!(
-                            "duplicate active process handle: {process_handle:?}",
-                        ))),
-                        Entry::Vacant(entry) => {
-                            if let Some(scope) = limit {
-                                return Err(capacity_error(
-                                    "processSpawnCapacity",
-                                    scope,
-                                    "process capacity reached; wait for a process to exit or kill one before retrying",
-                                ));
-                            }
-                            entry.insert(ProcessSession {
-                                control_tx,
-                                write_tx,
-                                write_slots,
-                            });
-                            Ok(())
-                        }
+                    ) {
+                        return Err(capacity_error(
+                            "processSpawnCapacity",
+                            scope,
+                            "process capacity reached; wait for a process to exit or kill one before retrying",
+                        ));
                     }
+                    sessions.insert(
+                        process_key.clone(),
+                        ProcessSession {
+                            control_tx,
+                            write_tx,
+                            write_slots,
+                        },
+                    );
+                    Ok(())
                 })
                 .ok_or_else(|| invalid_request("connection is closed"))??;
         }

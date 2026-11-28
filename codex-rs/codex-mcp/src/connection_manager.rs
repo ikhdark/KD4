@@ -1915,6 +1915,44 @@ impl McpConnectionManager {
         arguments: Option<serde_json::Value>,
         meta: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
+        self.call_tool_inner(server, tool, arguments, meta, None).await
+    }
+
+    /// Bound a hook's call without losing transport custody at the wall cutoff.
+    pub async fn call_tool_with_wall_deadline(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+        deadline: tokio::time::Instant,
+    ) -> Result<CallToolResult> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("MCP hook timed out; remote effects may be unknown"));
+        }
+        let wall_timed_out = AtomicBool::new(false);
+        let operation = self.call_tool_inner(server, tool, arguments, meta, Some(&wall_timed_out));
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                // Publish the cause before dropping the call. Ordinary callers
+                // dropping this future never set the flag.
+                wall_timed_out.store(true, Ordering::Relaxed);
+                Err(anyhow!("MCP hook timed out; remote effects may be unknown"))
+            }
+            result = &mut operation => result,
+        }
+    }
+
+    async fn call_tool_inner(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+        wall_timed_out: Option<&AtomicBool>,
+    ) -> Result<CallToolResult> {
         let client = self.client_by_name(server).await?;
         if !client.tool_filter.allows(tool) {
             return Err(anyhow!(
@@ -1937,12 +1975,13 @@ impl McpConnectionManager {
             .transpose()?;
         let result: rmcp::model::CallToolResult = client
             .client
-            .call_tool_for_generation(
+            .call_tool_for_generation_with_wall_timeout(
                 tool.to_string(),
                 arguments,
                 meta,
                 Some(client.tool_timeout),
                 generation,
+                wall_timed_out,
             )
             .await
             .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;

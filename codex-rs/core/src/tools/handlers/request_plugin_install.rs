@@ -31,6 +31,7 @@ use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
 use codex_tools::verified_connector_install_completed;
 use rmcp::model::RequestId;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
 
@@ -56,6 +57,14 @@ struct RecommendedPluginInstallArgs {
     #[serde(alias = "tool_id")]
     plugin_id: String,
     suggest_reason: String,
+}
+
+#[derive(Serialize)]
+struct RequestPluginInstallOutput {
+    #[serde(flatten)]
+    result: RequestPluginInstallResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_verification_error: Option<&'static str>,
 }
 
 pub struct RequestPluginInstallHandler {
@@ -261,12 +270,34 @@ impl RequestPluginInstallHandler {
             .as_ref()
             .is_some_and(|response| response.action == ElicitationAction::Accept);
 
-        let completed = if user_confirmed {
+        let (completed, completion_verification_error) = if user_confirmed {
             let auth = session.services.auth_manager.auth().await;
-            verify_request_plugin_install_completed(&session, &turn, manager, &tool, auth.as_ref())
-                .await
+            match verify_request_plugin_install_completed(
+                &session,
+                &turn,
+                manager,
+                &tool,
+                auth.as_ref(),
+            )
+            .await
+            {
+                Ok(completed) => (completed, None),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        tool_id = tool.id(),
+                        "could not verify installation against the local plugin catalog"
+                    );
+                    (
+                        false,
+                        Some(
+                            "Could not verify installation against the local plugin catalog. The user accepted the request, but its outcome is unknown. Do not repeat the installation request based on this result.",
+                        ),
+                    )
+                }
+            }
         } else {
-            false
+            (false, None)
         };
 
         if completed && let DiscoverableTool::Connector(connector) = &tool {
@@ -297,14 +328,17 @@ impl RequestPluginInstallHandler {
             );
         }
 
-        let content = serde_json::to_string(&RequestPluginInstallResult {
-            completed,
-            user_confirmed,
-            tool_type,
-            action_type: DiscoverableToolAction::Install,
-            tool_id: tool.id().to_string(),
-            tool_name: tool.name().to_string(),
-            suggest_reason: suggest_reason.to_string(),
+        let content = serde_json::to_string(&RequestPluginInstallOutput {
+            result: RequestPluginInstallResult {
+                completed,
+                user_confirmed,
+                tool_type,
+                action_type: DiscoverableToolAction::Install,
+                tool_id: tool.id().to_string(),
+                tool_name: tool.name().to_string(),
+                suggest_reason: suggest_reason.to_string(),
+            },
+            completion_verification_error,
         })
         .map_err(|err| {
             FunctionCallError::Fatal(format!(
@@ -461,9 +495,9 @@ async fn verify_request_plugin_install_completed(
     manager: &codex_mcp::McpConnectionManager,
     tool: &DiscoverableTool,
     auth: Option<&codex_login::CodexAuth>,
-) -> bool {
+) -> anyhow::Result<bool> {
     match tool {
-        DiscoverableTool::Connector(connector) => refresh_missing_requested_connectors(
+        DiscoverableTool::Connector(connector) => Ok(refresh_missing_requested_connectors(
             turn,
             manager,
             std::slice::from_ref(&connector.id),
@@ -472,7 +506,7 @@ async fn verify_request_plugin_install_completed(
         .await
         .is_some_and(|accessible_connectors| {
             verified_connector_install_completed(connector.id.as_str(), &accessible_connectors)
-        }),
+        })),
         DiscoverableTool::Plugin(plugin) => {
             if is_remote_plugin_install_suggestion(&plugin.id) {
                 let (remote_marketplaces, accessible_connectors) = tokio::join!(
@@ -496,12 +530,12 @@ async fn verify_request_plugin_install_completed(
                             &accessible_connectors,
                         )
                     });
-                return verified_remote_plugin_install_completed(
+                return Ok(verified_remote_plugin_install_completed(
                     remote_marketplaces.as_deref(),
                     plugin.id.as_str(),
                     plugin.remote_plugin_id.as_deref(),
                     connectors_completed,
-                );
+                ));
             }
 
             session.reload_user_config_layer().await;
@@ -512,7 +546,7 @@ async fn verify_request_plugin_install_completed(
                 Arc::clone(&session.services.plugins_manager),
             )
             .await;
-            let mcp_servers_completed = if plugin_installed {
+            let mcp_servers_completed = if matches!(&plugin_installed, Ok(true)) {
                 refresh_requested_mcp_servers_after_install(
                     session,
                     turn,
@@ -532,12 +566,12 @@ async fn verify_request_plugin_install_completed(
                 plugin.id.as_str(),
             )
             .await;
-            verified_local_plugin_install_completed(
-                plugin_installed,
+            Ok(verified_local_plugin_install_completed(
+                plugin_installed?,
                 mcp_servers_completed,
                 &plugin.app_connector_ids,
                 accessible_connectors.as_deref(),
-            )
+            ))
         }
     }
 }
@@ -685,22 +719,26 @@ async fn verified_plugin_install_completed(
     tool_id: &str,
     config: &crate::config::Config,
     plugins_manager: Arc<codex_core_plugins::PluginsManager>,
-) -> bool {
+) -> anyhow::Result<bool> {
     let plugins_input = config.plugins_config_input();
     let tool_id = tool_id.to_string();
     tokio::task::spawn_blocking(move || {
-        plugins_manager
-            .list_marketplaces_for_config(&plugins_input, &[], /*include_openai_curated*/ true)
-            .ok()
+        let outcome = plugins_manager.list_marketplaces_for_config(
+            &plugins_input,
+            &[],
+            /*include_openai_curated*/ true,
+        )?;
+        let installed = outcome
+            .marketplaces
             .into_iter()
-            .flat_map(|outcome| outcome.marketplaces)
-            .flat_map(|marketplace| marketplace.plugins.into_iter())
-            .any(|plugin| plugin.id == tool_id && plugin.installed)
+            .flat_map(|marketplace| marketplace.plugins)
+            .any(|plugin| plugin.id == tool_id && plugin.installed);
+        // An installed match is conclusive even if a sibling marketplace could not be read.
+        if !installed && !outcome.errors.is_empty() {
+            anyhow::bail!("incomplete plugin marketplace listing: {:?}", outcome.errors);
+        }
+        Ok(installed)
     })
-    .await
-    .unwrap_or_else(|error| {
-        tracing::warn!(%error, "plugin install verification worker failed");
-        false
-    })
+    .await?
 }
 

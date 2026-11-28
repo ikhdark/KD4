@@ -41,6 +41,7 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
+use codex_core::config::find_codex_home_async;
 use codex_features::FEATURES;
 use codex_install_context::CodexPackageLayout;
 use codex_install_context::InstallContext;
@@ -340,7 +341,8 @@ async fn build_report(
     }
     checks.push(run_sync_check("runtime", progress.clone(), runtime_check));
     if let Some(local_target) = runtime::local_publish_target_path() {
-        let expected_codex_home = find_codex_home()
+        let expected_codex_home = find_codex_home_async()
+            .await
             .ok()
             .map(codex_utils_absolute_path::AbsolutePathBuf::into_path_buf);
         // Both checks verify the same payload; the publish script polls this report while
@@ -543,7 +545,7 @@ async fn load_config(
         root_config_overrides,
         interactive,
         arg0_paths,
-        find_codex_home()?.to_path_buf(),
+        find_codex_home_async().await?.to_path_buf(),
     )
     .await
 }

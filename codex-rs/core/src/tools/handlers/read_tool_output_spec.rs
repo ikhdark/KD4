@@ -365,7 +365,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                     "exact_bytes": {"type": "integer", "minimum": 0},
                     "canonical_range": {"$ref": "#/$defs/range"},
                     "text": {"type": "string"},
-                    "value": {"description": "Exact selected JSON value, search_result, tail metadata (lines_returned, first_line_partial, last_line_unterminated, requested_lines_complete, window_bytes), or a structured page: rows [{row,value}], errors [{row,message}], malformed_rows and rows_scanned counts, rows_exhausted, coverage_complete. Structured values are projections, not exact source-byte acquisition; continuation resumes the same selection at the next unconsumed input row."},
+                    "value": {"description": "Exact selected JSON value, search_result, tail metadata (lines_returned, first_line_partial, last_line_unterminated, requested_lines_complete, window_bytes), or a structured page: rows [{row,value}], errors [{row,message}], malformed_rows and rows_scanned counts, rows_exhausted, coverage_complete. Structured values are projections, not exact source-byte acquisition; continuation resumes the same selection at the next unconsumed input row. A full JSONL page can carry a continuation when an EOF probe cannot confirm exhaustion; reading that row may still fail on the continuation."},
                     "data_base64": {"type": "string"},
                     "subdivision_plan": {
                         "type": "object",

@@ -2404,8 +2404,12 @@ impl ToolCallRuntime {
         let measurement_turn = Arc::clone(&turn);
         let measurement_call_id = call.call_id.clone();
         let measurement_tool_name = call.tool_name.to_string();
+        let speculative_commit = crate::unified_exec::speculative_shell::SpeculativeCommitWatch::new(
+            owns_unified_exec_processes,
+        );
+        let dispatch_commit_watch = speculative_commit.clone();
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
-            AbortOnDropHandle::new(tokio::spawn(crate::tools::tool_dispatch_trace::scope_tool_blocking_timing(Arc::clone(&timing), Box::pin(async move {
+            AbortOnDropHandle::new(tokio::spawn(crate::tools::tool_dispatch_trace::scope_tool_blocking_timing(Arc::clone(&timing), dispatch_commit_watch.scope(Box::pin(async move {
                 // Reserve before hooks or any workspace gate; cancellation drops the permit.
                 drop(session.services.elicitations.reserve_dispatch().await);
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
@@ -2980,7 +2984,7 @@ impl ToolCallRuntime {
                     }
                 }
                 result
-            }))));
+            })))));
 
         let cancellation_owner = terminal_tasks.spawn(
             async move {
@@ -3033,6 +3037,7 @@ impl ToolCallRuntime {
                                     owns_unified_exec_processes,
                                     requires_commit_barrier,
                                     cleanup_deadline,
+                                    speculative_commit,
                                 },
                                 abort_invocation.clone(),
                                 Arc::clone(&cancellation_timing),
@@ -3041,8 +3046,9 @@ impl ToolCallRuntime {
                                 || retains_cancelled_cell_output || journal_nested_cancellation
                             {
                                 // A retained exec process is part of the turn's terminal
-                                // ownership barrier. Do not publish TurnAborted until the
-                                // originating handler and its process registry entry close.
+                                // ownership barrier. Observe the handler and process
+                                // retirement before publishing TurnAborted, within the
+                                // supervised cleanup budget.
                                 // State commits likewise publish their update before the response.
                                 // A cancelled finite nested call
                                 // must account for that invocation before releasing it.
@@ -3155,6 +3161,7 @@ struct CancelledDispatchCleanupPolicy {
     owns_unified_exec_processes: bool,
     requires_commit_barrier: bool,
     cleanup_deadline: Duration,
+    speculative_commit: crate::unified_exec::speculative_shell::SpeculativeCommitWatch,
 }
 
 // Handler settlement and external-effect certainty are independent facts.
@@ -3190,6 +3197,7 @@ async fn supervise_cancelled_dispatch_cleanup(
         owns_unified_exec_processes,
         requires_commit_barrier,
         cleanup_deadline,
+        speculative_commit,
     } = policy;
     let ToolInvocation {
         session,
@@ -3294,7 +3302,7 @@ async fn supervise_cancelled_dispatch_cleanup(
             "process termination exceeded the runtime cleanup deadline; processes may survive";
         let result = if TokioInstant::now() < cleanup_until {
             let cleanup =
-                manager.terminate_unpublished_processes_for_call_ids(std::slice::from_ref(&call_id));
+                manager.begin_unpublished_process_retirement(std::slice::from_ref(&call_id));
             tokio::time::timeout_at(cleanup_until, cleanup)
                 .await
                 .unwrap_or_else(|_| Err(timeout_error.into()))
@@ -3302,9 +3310,30 @@ async fn supervise_cancelled_dispatch_cleanup(
             Err(timeout_error.into())
         };
         match result {
-            Ok(terminated_processes) => {
-                if terminated_processes > 0 {
-                    timing.mark_exec_process_exited();
+            Ok(retirement) => {
+                if let Some((confirmed, accounting)) = retirement {
+                    if confirmed > 0 {
+                        timing.mark_exec_process_exited();
+                    }
+                    // The owner already holds all confirmed entries. Timing
+                    // out here cannot drop their retirement or accounting.
+                    match tokio::time::timeout_at(cleanup_until, accounting).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            let detail = format!("unpublished process accounting owner failed: {error}");
+                            effects.uncertain_effects.push(detail.clone());
+                            recovery.push(serde_json::json!({
+                                "kind": "process_cleanup_accounting_failed",
+                                "detail": detail,
+                                "call_id": call_id,
+                            }));
+                        }
+                        Err(_) => recovery.push(serde_json::json!({
+                            "kind": "process_cleanup_accounting_pending",
+                            "confirmed_terminations": confirmed,
+                            "call_id": call_id,
+                        })),
+                    }
                 }
                 timing.record_exec_cleanup_state(
                     /*background_process_expected*/ false,
@@ -3362,11 +3391,20 @@ async fn supervise_cancelled_dispatch_cleanup(
             }
         }
     }
+    if speculative_commit.is_uncertain() {
+        let detail = crate::unified_exec::speculative_shell::SPECULATIVE_COMMIT_UNCERTAIN_MESSAGE;
+        effects.uncertain_effects.push(detail.to_string());
+        recovery.push(serde_json::json!({
+            "kind": "speculative_shell_commit_uncertain",
+            "detail": detail,
+            "call_id": call_id,
+        }));
+    }
     // The ordinary handler marker is dropped with an aborted dispatch. Close
     // it only after the supervised process cleanup has reached a terminal
-    // state so ProcessExit remains ordered before HandlerReturn.
+    // disposition so a confirmed ProcessExit remains ordered before HandlerReturn.
     timing.mark_handler_exit_if_entered();
-    // The handler has joined and any required process cleanup has been awaited.
+    // The handler has joined and required cleanup has either settled or reached its observation cutoff.
     // Commit-barrier handlers finish their state commit before answering, so a
     // joined result or error states the committed effects. Processes and
     // external calls can still have unreported effects.

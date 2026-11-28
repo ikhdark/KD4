@@ -2593,10 +2593,16 @@ impl Session {
             if persist {
                 let event =
                     Self::thread_settings_event_from_snapshot(updated.thread_config_snapshot());
-                self.persist_rollout_items_durable(&[RolloutItem::EventMsg(event)])
+                let metadata_result = self
+                    .persist_rollout_items_with_metadata_result(&[RolloutItem::EventMsg(event)])
                     .await?;
+                if let Err(error) = metadata_result {
+                    // The exact settings event was flushed. A later barrier can recover
+                    // pending metadata; do not reject or resubmit the settings event.
+                    warn!(%error, thread_id = %self.thread_id, "thread settings flushed but metadata settlement failed");
+                }
             }
-            // Publish the new configuration after its configured write barrier succeeds.
+            // Publish the new configuration after its rollout write barrier succeeds.
             state.session_configuration = updated.clone();
             if updates.service_tier.is_some()
                 && self.session_id() == SessionId::from(self.thread_id)
@@ -3548,11 +3554,24 @@ impl Session {
             Ok(None) => return true,
             Err(error) => {
                 warn!(%error, "child result remains pending; complete report retention/delivery failed");
-                if let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref) {
-                    let _ = self.services.agent_control.task_coordinator().record_host_completion_observation(
-                        binding, self.thread_id, &format!("{}:parent-delivery", turn_context.sub_id),
-                        error, None,
-                    ).await;
+                if let Some(binding) = turn_context
+                    .agent_task_binding
+                    .get()
+                    .and_then(Option::as_ref)
+                    && let Err(recovery_error) = self
+                        .services
+                        .agent_control
+                        .task_coordinator()
+                        .record_host_completion_observation(
+                            binding,
+                            self.thread_id,
+                            &format!("{}:parent-delivery", turn_context.sub_id),
+                            error,
+                            None,
+                        )
+                        .await
+                {
+                    warn!(%recovery_error, "failed to retain parent completion delivery recovery state");
                 }
                 return false;
             }
@@ -3814,14 +3833,72 @@ impl Session {
     pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {
         self.send_event(
             turn_context,
-            EventMsg::ItemStarted(ItemStartedEvent {
-                thread_id: self.thread_id,
-                turn_id: turn_context.sub_id.clone(),
-                item: item.clone(),
-                started_at_ms: now_unix_timestamp_ms(),
-            }),
+            self.turn_item_started_event(turn_context, item.clone()),
         )
         .await;
+    }
+
+    pub(crate) fn turn_item_started_event(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+    ) -> EventMsg {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            thread_id: self.thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            item,
+            started_at_ms: now_unix_timestamp_ms(),
+        })
+    }
+
+    /// The canonical dynamic item is ordered rollout history; its compatibility
+    /// request/response is live-only. Return ordered acceptance, not durability.
+    pub(crate) async fn record_dynamic_tool_event(&self, event: EventMsg) -> bool {
+        let Some(thread) = self
+            .live_thread()
+            .filter(|thread| thread.should_persist_event(&event))
+        else {
+            return false;
+        };
+        match thread.append_items_ordered(&[RolloutItem::EventMsg(event)]).await {
+            Ok(()) => true,
+            Err(error) => {
+                error!("failed to record dynamic tool event: {error:#}");
+                false
+            }
+        }
+    }
+
+    /// Offer the already-prepared start to both protocol consumers, recording
+    /// each acceptance before a later await can be interrupted.
+    pub(crate) async fn dispatch_dynamic_tool_start(
+        &self,
+        turn_context: &TurnContext,
+        event: EventMsg,
+        canonical: &mut Option<EventMsg>,
+        legacy: &mut Option<EventMsg>,
+    ) {
+        let dispatch = self
+            .send_event_before_post_dispatch(turn_context, event, false, Some(canonical))
+            .await;
+        debug_assert!(dispatch.terminal_source.is_none());
+        for msg in dispatch.legacy_events {
+            let event = Event {
+                id: turn_context.sub_id.clone(),
+                msg,
+            };
+            self.deliver_event_raw_with_receipt(event, Some(&mut *legacy)).await;
+        }
+    }
+
+    /// Close a recorded-only Begin in history without publishing an unmatched live End.
+    pub(crate) async fn record_dynamic_tool_completion(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+    ) {
+        let event = self.turn_item_completed_event(turn_context, item);
+        self.record_dynamic_tool_event(event).await;
     }
 
     /// Start the ordered append independently of the command caller. The caller
@@ -3900,6 +3977,16 @@ impl Session {
             .await;
     }
 
+    fn turn_item_completed_event(&self, turn_context: &TurnContext, item: TurnItem) -> EventMsg {
+        record_turn_ttfm_metric(turn_context, &item);
+        EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: self.thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            item,
+            completed_at_ms: now_unix_timestamp_ms(),
+        })
+    }
+
     async fn emit_turn_item_completed_inner(
         &self,
         turn_context: &TurnContext,
@@ -3907,13 +3994,7 @@ impl Session {
         emit_legacy: bool,
         record_append: Option<&(dyn Fn(BackgroundCommandAppendReceipt) + Sync)>,
     ) {
-        record_turn_ttfm_metric(turn_context, &item);
-        let event = EventMsg::ItemCompleted(ItemCompletedEvent {
-            thread_id: self.thread_id,
-            turn_id: turn_context.sub_id.clone(),
-            item,
-            completed_at_ms: now_unix_timestamp_ms(),
-        });
+        let event = self.turn_item_completed_event(turn_context, item);
         let persist = if let Some(record_append) = record_append {
             let receipt = if self
                 .live_thread()
@@ -6778,16 +6859,28 @@ impl Session {
         &self,
         items: &[RolloutItem],
     ) -> std::io::Result<()> {
-        if let Some(live_thread) = self.live_thread() {
-            live_thread
-                .append_items_ordered(items)
-                .await
-                .map_err(std::io::Error::other)?;
-            // Settings persistence may hold the session-state lock. Flush this
-            // event's writer directly; the terminal barrier syncs tool artifacts.
-            live_thread.flush().await.map_err(std::io::Error::other)?;
-        }
-        Ok(())
+        self.persist_rollout_items_with_metadata_result(items).await?
+    }
+
+    /// Separate the rollout write outcome from the subsequent metadata settlement.
+    async fn persist_rollout_items_with_metadata_result(
+        &self,
+        items: &[RolloutItem],
+    ) -> std::io::Result<std::io::Result<()>> {
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(Ok(()));
+        };
+        live_thread
+            .append_items_ordered(items)
+            .await
+            .map_err(std::io::Error::other)?;
+        // Settings persistence may hold the session-state lock. Flush this
+        // event's writer directly; the terminal barrier syncs tool artifacts.
+        live_thread
+            .flush_with_metadata_result()
+            .await
+            .map(|metadata_result| metadata_result.map_err(std::io::Error::other))
+            .map_err(std::io::Error::other)
     }
 
     /// Append items before acknowledging stable-storage publication to the caller.

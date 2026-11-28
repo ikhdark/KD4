@@ -5,6 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -378,6 +379,27 @@ enum ClientOperationError {
 const LIVENESS_PROBE_MAX: Duration = Duration::from_secs(10);
 // The low bit records suspicion; the other bits track the timeout generation.
 const LIVENESS_SUSPECT: u64 = 1;
+
+fn mark_liveness_timeout(state: &AtomicU64) {
+    let _ = state.try_update(Ordering::Release, Ordering::Relaxed, |state| {
+        Some(state.wrapping_add(2) | LIVENESS_SUSPECT)
+    });
+}
+
+/// Only an incomplete transport attempt is evidence of a wall timeout.
+struct WallTimeoutGuard<'a> {
+    expired: &'a AtomicBool,
+    liveness_state: &'a AtomicU64,
+    pending: bool,
+}
+
+impl Drop for WallTimeoutGuard<'_> {
+    fn drop(&mut self) {
+        if self.pending && self.expired.load(Ordering::Relaxed) {
+            mark_liveness_timeout(self.liveness_state);
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("timed out handshaking with MCP server after {duration:?}")]
@@ -1142,7 +1164,7 @@ impl RmcpClient {
         meta: Option<serde_json::Value>,
         timeout: Option<Duration>,
     ) -> Result<CallToolResult> {
-        self.call_tool_with_generation(name, arguments, meta, timeout, None)
+        self.call_tool_with_generation(name, arguments, meta, timeout, None, None)
             .await
     }
 
@@ -1155,8 +1177,26 @@ impl RmcpClient {
         timeout: Option<Duration>,
         generation: u64,
     ) -> Result<CallToolResult> {
-        self.call_tool_with_generation(name, arguments, meta, timeout, Some(generation))
-            .await
+        self.call_tool_for_generation_with_wall_timeout(
+            name, arguments, meta, timeout, generation, None,
+        )
+        .await
+    }
+
+    /// The wall timeout owner sets the flag before dropping its in-flight call.
+    pub async fn call_tool_for_generation_with_wall_timeout(
+        &self,
+        name: String,
+        arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+        timeout: Option<Duration>,
+        generation: u64,
+        wall_timed_out: Option<&AtomicBool>,
+    ) -> Result<CallToolResult> {
+        self.call_tool_with_generation(
+            name, arguments, meta, timeout, Some(generation), wall_timed_out,
+        )
+        .await
     }
 
     async fn call_tool_with_generation(
@@ -1166,6 +1206,7 @@ impl RmcpClient {
         meta: Option<serde_json::Value>,
         timeout: Option<Duration>,
         expected_generation: Option<u64>,
+        wall_timed_out: Option<&AtomicBool>,
     ) -> Result<CallToolResult> {
         let arguments = match arguments {
             Some(Value::Object(map)) => Some(map),
@@ -1190,6 +1231,7 @@ impl RmcpClient {
         rmcp_params.arguments = arguments;
         let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let operation_attempted = Arc::clone(&attempted);
+        let liveness_state = &self.liveness_state;
         let result = self
             .run_service_operation_with_timing(
                 "tools/call",
@@ -1205,6 +1247,11 @@ impl RmcpClient {
                         // Once handed to the transport, a send/response error is
                         // not proof that a possibly effectful call did not run.
                         attempted.store(true, std::sync::atomic::Ordering::Release);
+                        let mut wall_guard = wall_timed_out.map(|expired| WallTimeoutGuard {
+                            expired,
+                            liveness_state,
+                            pending: true,
+                        });
                         let result = send_tracked_request(
                             service,
                             tracker,
@@ -1213,8 +1260,11 @@ impl RmcpClient {
                             )),
                             options,
                         )
-                        .await?;
-                        match result {
+                        .await;
+                        if let Some(guard) = &mut wall_guard {
+                            guard.pending = false;
+                        }
+                        match result? {
                             ServerResult::CallToolResult(result) => Ok(result),
                             _ => Err(rmcp::service::ServiceError::UnexpectedResponse),
                         }
@@ -1837,11 +1887,7 @@ impl RmcpClient {
             {
                 Ok(result) => result,
                 Err(()) => {
-                    let _ = self.liveness_state.try_update(
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                        |state| Some(state.wrapping_add(2) | LIVENESS_SUSPECT),
-                    );
+                    mark_liveness_timeout(&self.liveness_state);
                     let tracker = tracker.clone();
                     tokio::spawn(async move {
                         tracker.cancel_current("request timeout").await;

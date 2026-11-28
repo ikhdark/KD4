@@ -174,7 +174,8 @@ async fn record_ledger_overlap(req: &ApplyPatchRequest, turn: &TurnContext, chan
                         (Some(old), Some(new)) => Some(old != new), (Some(_), None) => Some(true), _ => None,
                     }
                 } else if let Some(text) = scope["text"].as_str() {
-                    Some(change.before.matches(text).count() == 1 && change.after.matches(text).count() != 1)
+                    (change.before.matches(text).take(2).count() == 1)
+                        .then(|| change.after.matches(text).take(2).count() != 1)
                 } else { Some(change.before != change.after || change.before_path != change.path) };
                 overlaps.push(json!({"fix":fix["id"],"condition":condition["id"],"scope":scope,
                     "assessment":match changed { Some(true)=>"changes",Some(false)=>"preserves",None=>"unknown" }}));
@@ -815,10 +816,19 @@ async fn lookup(
         state.budget_exhausted = true;
         return None;
     }
-    state.bytes += text.len();
     reservations.push(path_reservation);
-    state.shown.extend(reservations.iter().cloned());
     Some((text, reservations, id, payload))
+}
+
+fn reserve_notice(state: &mut State, reservations: &[String], bytes: usize) {
+    state.bytes += bytes;
+    state.shown.extend(reservations.iter().cloned());
+}
+
+fn bind_notice(state: &mut State, reservations: &[String], id: &str) {
+    for key in reservations {
+        state.reservation_notices.insert(key.clone(), id.to_owned());
+    }
 }
 
 fn is_availability_only(payload: &Value) -> bool {
@@ -901,14 +911,17 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
             .and_then(|rows| rows[0]["qualified_name"].as_str());
         let found = lookup(&mut state, fs.as_ref(), &PathUri::from_abs_path(&path), &sandbox, symbol, None).await;
         tracing::debug!(present = present_ids.len(), shown = state.shown.len(), reservations = state.reservation_notices.len(), bytes = state.bytes, found = found.is_some(), "evidence advisory source lookup");
-        found
+        let candidate = found?;
+        // Consult accepted current history after lookup. Keep the lookup
+        // serialized, but do not charge or install its keys before this await:
+        // a dropped read must not leave a reservation without a notice.
+        let history = invocation.session.clone_history().await;
+        Some((state, candidate, history))
     }).await.ok().flatten();
-    let (text, reservations, id, payload) = found?;
+    let (mut state, (text, reservations, id, payload), history) = found?;
     let bytes = text.len();
     let availability_only = is_availability_only(&payload);
-    // Consult accepted current history, not a permanent per-thread seen set:
-    // compaction/removal must allow a later turn to deliver the evidence again.
-    let history = invocation.session.clone_history().await;
+    // Reuse only retained history; eviction must permit redelivery.
     let latest = history.raw_items().iter().rev().find_map(|item| {
         let ResponseItem::Message { role, content, .. } = item else { return None; };
         if role != "developer" { return None; }
@@ -932,23 +945,16 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
             && same_evidence_owner_state(previous, &payload)
             && present.lines().nth(1) == text.lines().nth(1))
     });
-    {
-        let mut state = ledger.0.lock().await;
-        // Reuse the retained notice's identity, even if it came from another
-        // source read, so eviction requalifies these reservations.
-        let retained_id = reused.as_ref().map_or(id.as_str(), |(id, _, _)| *id);
-        for key in &reservations {
-            state.reservation_notices.insert(key.clone(), retained_id.to_owned());
-        }
-        if let Some((retained_id, retained_text, retained_payload)) = reused {
-            // Do not spend the injection allowance on a body we did not inject.
-            state.bytes = state.bytes.saturating_sub(bytes);
-            remember_notice(&mut state, retained_id.to_owned(), retained_payload, "context_reused",
-                invocation, &environment.environment_id);
-            return Some(json!({"schema_version":1,"id":retained_id,"status":"context_reused",
-                "bytes":0,"existing_bytes":retained_text.len(),"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
-                "phase":"source_read"}));
-        }
+    if let Some((retained_id, retained_text, retained_payload)) = reused {
+        // Bind to the retained identity so eviction requalifies the keys,
+        // without charging for a body this read did not inject.
+        reserve_notice(&mut state, &reservations, 0);
+        bind_notice(&mut state, &reservations, retained_id);
+        remember_notice(&mut state, retained_id.to_owned(), retained_payload, "context_reused",
+            invocation, &environment.environment_id);
+        return Some(json!({"schema_version":1,"id":retained_id,"status":"context_reused",
+            "bytes":0,"existing_bytes":retained_text.len(),"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
+            "phase":"source_read"}));
     }
     // A genuinely new source-read delivery after compaction must not collide
     // with the same turn's durable append retry key for the evicted notice.
@@ -957,22 +963,35 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
         content:vec![ContentItem::InputText { text }], phase:None,
         internal_chat_message_metadata_passthrough:None };
     let status = if matches!(invocation.source, ToolCallSource::Direct) {
+        // No reservation is visible until the completion queue owns the body.
         turn.queue_post_tool_contexts(&invocation.call_id, vec![item]).await;
+        reserve_notice(&mut state, &reservations, bytes);
+        bind_notice(&mut state, &reservations, &id);
         "context_queued"
-    } else if invocation.session.record_conversation_items_ordered(turn, &[item]).await.is_ok() {
-        "context_recorded"
     } else {
-        let mut state = ledger.0.lock().await;
-        for key in reservations { state.shown.remove(&key); }
-        state.bytes = state.bytes.saturating_sub(bytes);
-        "context_unavailable"
+        reserve_notice(&mut state, &reservations, bytes);
+        bind_notice(&mut state, &reservations, &id);
+        // Ordered append owns its commit independently of the calling future.
+        // Do not hold the ledger lock across it: compaction takes that lock.
+        drop(state);
+        let recorded = invocation.session.record_conversation_items_ordered(turn, &[item]).await.is_ok();
+        state = ledger.0.lock().await;
+        if recorded {
+            "context_recorded"
+        } else {
+            for key in reservations {
+                if state.reservation_notices.get(&key) == Some(&id) {
+                    state.shown.remove(&key);
+                    state.reservation_notices.remove(&key);
+                }
+            }
+            state.bytes = state.bytes.saturating_sub(bytes);
+            "context_unavailable"
+        }
     };
     tracing::debug!(advisory_id = %id, status, call_id = %invocation.call_id, "evidence advisory context publication");
-    {
-        let mut state = ledger.0.lock().await;
-        remember_notice(&mut state, id.clone(), payload, status, invocation,
-            &environment.environment_id);
-    }
+    remember_notice(&mut state, id.clone(), payload, status, invocation,
+        &environment.environment_id);
     Some(json!({"schema_version":1,"id":id,"status":status,"bytes":bytes,
         "elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"phase":"source_read"}))
 }
@@ -1005,8 +1024,9 @@ pub(super) async fn changed_behavior(
         state.budget_exhausted = false;
         for change in &changes {
             if req.cancellation_token.is_cancelled() { break; }
-            if let Some((text, _, id, _)) = lookup(&mut state, fs.as_ref(), &change.before_path,
+            if let Some((text, reservations, id, _)) = lookup(&mut state, fs.as_ref(), &change.before_path,
                 &sandbox, None, Some(change)).await {
+                reserve_notice(&mut state, &reservations, text.len());
                 result.push(json!({"kind":"previous_fix_conflict", "advisory_only":true,
                     "id":id, "context":text, "verification_executed":false}));
             }

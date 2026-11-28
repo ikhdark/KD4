@@ -137,7 +137,23 @@ impl ClientTracker {
     pub(super) async fn close_all_clients(&mut self) {
         self.retire_clients();
         self.drain_join_set().await;
-        let _ = self.wait_for_cleanup().await;
+        // Final shutdown must reap every cleanup, even if one fails.
+        let mut reported_failure = false;
+        while let Some(result) = self.join_next_cleanup().await {
+            if reported_failure {
+                continue;
+            }
+            match result {
+                Ok(Ok(())) => continue,
+                Ok(Err(error)) => {
+                    warn!(?error, "remote control client cleanup failed during shutdown");
+                }
+                Err(error) => {
+                    warn!(%error, "remote control client cleanup task failed during shutdown");
+                }
+            }
+            reported_failure = true;
+        }
     }
 
     // Detach and cancel the entire old set before any reliable delivery can wait.
@@ -154,13 +170,20 @@ impl ClientTracker {
     }
 
     async fn wait_for_cleanup(&mut self) -> Result<(), Stopped> {
-        while let Some(cleanup) = self.cleanup.last_mut() {
-            // Do not remove its owner before awaiting: cancellation must preserve it.
-            let result = cleanup.await;
-            self.cleanup.pop();
+        while let Some(result) = self.join_next_cleanup().await {
             result.map_err(|_| Stopped)??;
         }
         Ok(())
+    }
+
+    async fn join_next_cleanup(
+        &mut self,
+    ) -> Option<Result<Result<(), Stopped>, tokio::task::JoinError>> {
+        let cleanup = self.cleanup.last_mut()?;
+        // Do not remove its owner before awaiting: cancellation must preserve it.
+        let result = cleanup.await;
+        self.cleanup.pop();
+        Some(result)
     }
 
     pub(super) fn contains_client_stream(

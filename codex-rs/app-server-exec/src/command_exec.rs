@@ -142,11 +142,8 @@ impl<K: ConnectionSessionKey, V> ConnectionSessionMap<K, V> {
     pub(crate) fn get(&self, key: &K) -> Option<&V> {
         self.connections.get(&key.connection_id())?.get(key)
     }
-    fn insert(&mut self, key: K, value: V) -> Option<V> {
+    pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.connections.entry(key.connection_id()).or_default().insert(key, value)
-    }
-    pub(crate) fn entry(&mut self, key: K) -> std::collections::hash_map::Entry<'_, K, V> {
-        self.connections.entry(key.connection_id()).or_default().entry(key)
     }
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
         let connection_id = key.connection_id();

@@ -36,13 +36,12 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
-#[cfg(windows)]
 use std::sync::atomic::AtomicBool;
 #[cfg(windows)]
 use std::sync::atomic::AtomicU64;
-#[cfg(windows)]
 use std::sync::atomic::Ordering;
 #[cfg(windows)]
 use std::time::Duration;
@@ -203,6 +202,68 @@ fn retire<T: Send + 'static>(value: T) {
     drop(tokio::task::spawn_blocking(move || drop(value)));
 }
 
+pub(crate) const SPECULATIVE_COMMIT_UNCERTAIN_MESSAGE: &str =
+    "Speculative shell commit was not confirmed; the command may have run. Inspect its effects before retrying.";
+
+/// Kept by the dispatch observer as well as the handoff, so aborting the
+/// latter cannot erase a commit whose acknowledgement was never seen.
+#[derive(Clone)]
+pub(crate) struct SpeculativeCommitWatch(Option<Arc<AtomicBool>>);
+
+tokio::task_local! {
+    static COMMIT_WATCH: SpeculativeCommitWatch;
+}
+
+impl SpeculativeCommitWatch {
+    pub(crate) fn new(observe: bool) -> Self {
+        Self((observe && cfg!(windows) && enabled()).then(Arc::default))
+    }
+
+    pub(crate) fn current_or_new() -> Self {
+        COMMIT_WATCH
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| Self::new(true))
+    }
+
+    pub(crate) async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
+        if self.0.is_some() {
+            COMMIT_WATCH.scope(self, future).await
+        } else {
+            future.await
+        }
+    }
+
+    pub(crate) fn is_uncertain(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|state| state.load(Ordering::Acquire))
+    }
+
+    #[cfg(windows)]
+    fn set_uncertain(uncertain: bool) {
+        let _ = COMMIT_WATCH.try_with(|watch| {
+            if let Some(state) = &watch.0 {
+                state.store(uncertain, Ordering::Release);
+            }
+        });
+    }
+}
+
+/// Once checked out, a host and pipe cannot be put back into the idle pool:
+/// the bootstrap may already have consumed a prefix. Retire them together off
+/// the async worker even when cancellation drops the handoff mid-protocol.
+#[cfg(windows)]
+struct CheckedOutSpare(Option<Prepared>);
+
+#[cfg(windows)]
+impl Drop for CheckedOutSpare {
+    fn drop(&mut self) {
+        if let Some(prepared) = self.0.take() {
+            retire(prepared);
+        }
+    }
+}
+
 /// Per-session lookahead state; spares themselves are process-wide.
 #[derive(Default)]
 pub(crate) struct SpeculativeShellSlot {
@@ -233,15 +294,10 @@ impl SpeculativeShellSlot {
             };
             pool.remove(index)
         };
-        let Prepared {
-            process,
-            pid,
-            observation,
-            mut pipe,
-            started,
-            restore_class,
-            ..
-        } = prepared;
+        let mut checked_out = CheckedOutSpare(Some(prepared));
+        let Prepared { process, pid, pipe, started, restore_class, .. } =
+            checked_out.0.as_mut().expect("checked-out spare");
+        let started = *started;
         let handoff_started = std::time::Instant::now();
         let mut commit_attempted = false;
         let handoff = async {
@@ -256,7 +312,7 @@ impl SpeculativeShellSlot {
                 } => return Err(std::io::Error::other("speculative host exited before handoff")),
             }
             // Only the host itself may receive the script.
-            if !pipe_client_is(&pipe, pid) {
+            if !pipe_client_is(pipe, *pid) {
                 return Err(std::io::Error::other(
                     "handoff pipe client is not the speculative host",
                 ));
@@ -277,6 +333,7 @@ impl SpeculativeShellSlot {
             // The write can reach the host even if the deadline or a later
             // pipe failure prevents us from seeing its acknowledgement.
             commit_attempted = true;
+            SpeculativeCommitWatch::set_uncertain(true);
             pipe.write_all(b"C").await?;
             pipe.flush().await?;
             pipe.read_exact(&mut reply).await?;
@@ -292,6 +349,9 @@ impl SpeculativeShellSlot {
             Ok(Ok(Reply::Accepted)) => {
                 // The host now runs this call's command: record it as this call's
                 // requested root, as an ordinary launch here would be.
+                SpeculativeCommitWatch::set_uncertain(false);
+                let Prepared { observation, process, pipe, .. } =
+                    checked_out.0.take().expect("acknowledged checked-out spare");
                 observation.adopt_into_current_scope();
                 tracing::info!(target: "codex_speculative_shell", outcome = "accepted", handoff_ms, lead_ms, "speculative shell accepted");
                 retire(pipe);
@@ -305,7 +365,7 @@ impl SpeculativeShellSlot {
             Ok(Err(error)) => format!("failed: {error}"),
             Err(_) => "timeout".to_string(),
         };
-        retire((process, pipe));
+        drop(checked_out);
         if commit_attempted {
             tracing::warn!(target: "codex_speculative_shell", outcome = "commit_uncertain", %reason, handoff_ms, lead_ms, "speculative shell commit unconfirmed");
             return Err(std::io::Error::other(format!(

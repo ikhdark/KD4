@@ -6,6 +6,7 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
+use std::io::BufRead;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
@@ -174,12 +175,87 @@ pub(crate) fn named_payload_version(path: &Path, line: &str) -> Vec<PayloadDepen
     versions(&root(path), &r["payload"]).unwrap_or_default()
 }
 
+enum DependencyLine<'a> {
+    End,
+    Ignored,
+    Candidate(&'a str),
+}
+
+fn read_dependency_line<'a>(
+    reader: &mut impl BufRead,
+    line: &'a mut Vec<u8>,
+    strict_utf8: bool,
+) -> io::Result<DependencyLine<'a>> {
+    line.clear();
+    if reader
+        .by_ref()
+        .take(INLINE_BYTES as u64)
+        .read_until(b'\n', line)?
+        == 0
+    {
+        return Ok(DependencyLine::End);
+    }
+    // At the exact size cutoff the existing predicate rejects this record,
+    // even if it is a reference. No shorter header proves that: historical
+    // input can reorder fields or repeat `type`, and the strict scan also
+    // reports malformed short JSON containing KIND anywhere in the line.
+    if line.len() == INLINE_BYTES {
+        if strict_utf8 {
+            validate_oversized_dependency_line(reader, line)?;
+        } else if line.last() != Some(&b'\n') {
+            reader.skip_until(b'\n')?;
+        }
+        return Ok(DependencyLine::Ignored);
+    }
+    match std::str::from_utf8(line) {
+        Ok(text) if may_be_reference(text) => Ok(DependencyLine::Candidate(text)),
+        Err(_) if strict_utf8 => Err(invalid_dependency_utf8()),
+        _ => Ok(DependencyLine::Ignored),
+    }
+}
+
+fn invalid_dependency_utf8() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "stream did not contain valid UTF-8")
+}
+
+fn validate_oversized_dependency_line(
+    reader: &mut impl BufRead,
+    chunk: &mut Vec<u8>,
+) -> io::Result<()> {
+    loop {
+        let terminated = chunk.last() == Some(&b'\n');
+        let complete = terminated || chunk.len() < INLINE_BYTES;
+        let carry = match std::str::from_utf8(chunk) {
+            Ok(_) if complete => return Ok(()),
+            Ok(_) => 0,
+            Err(error) if !complete && error.error_len().is_none() => {
+                // Keep only a split UTF-8 code point across bounded reads.
+                let start = error.valid_up_to();
+                chunk.copy_within(start.., 0);
+                chunk.len() - start
+            }
+            Err(_) => {
+                // As with read_line, an I/O error later in this same line
+                // takes precedence over invalid UTF-8.
+                if !complete {
+                    reader.skip_until(b'\n')?;
+                }
+                return Err(invalid_dependency_utf8());
+            }
+        };
+        chunk.truncate(carry);
+        reader
+            .by_ref()
+            .take((INLINE_BYTES - carry) as u64)
+            .read_until(b'\n', chunk)?;
+    }
+}
+
 /// Cold-cache reference discovery only; verification remains in the canonical
 /// hydrator. Warm pages stat these dependencies without replaying history.
 pub async fn payload_dependency_versions(path: &Path) -> io::Result<Vec<PayloadDependencyVersion>> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        use std::io::BufRead;
         let file = std::fs::File::open(&path)?;
         let input: Box<dyn Read> = if path.extension().is_some_and(|extension| extension == "zst") {
             Box::new(zstd::stream::read::Decoder::new(file)?)
@@ -188,17 +264,15 @@ pub async fn payload_dependency_versions(path: &Path) -> io::Result<Vec<PayloadD
         };
         let mut reader = std::io::BufReader::new(input);
         let mut paths = BTreeMap::new();
-        let mut line = String::new();
+        let mut line = Vec::new();
         loop {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                break;
-            }
-            if !may_be_reference(&line) {
-                continue;
-            }
+            let text = match read_dependency_line(&mut reader, &mut line, true)? {
+                DependencyLine::End => break,
+                DependencyLine::Ignored => continue,
+                DependencyLine::Candidate(text) => text,
+            };
             let record: serde_json::Value =
-                serde_json::from_str(&line).map_err(io::Error::other)?;
+                serde_json::from_str(text).map_err(io::Error::other)?;
             if record["type"] != KIND {
                 continue;
             }
@@ -244,7 +318,6 @@ async fn scan_named_payload_versions(
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         use crate::metadata::BackfillReader;
-        use std::io::BufRead;
         let stop = stop.as_ref();
         if let Some(stop) = stop {
             stop.check()?;
@@ -262,16 +335,11 @@ async fn scan_named_payload_versions(
             if let Some(stop) = stop {
                 stop.check()?;
             }
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            let Ok(text) = std::str::from_utf8(&line) else {
-                continue;
+            let text = match read_dependency_line(&mut reader, &mut line, false)? {
+                DependencyLine::End => break,
+                DependencyLine::Ignored => continue,
+                DependencyLine::Candidate(text) => text,
             };
-            if !may_be_reference(text) {
-                continue;
-            }
             let Ok(record) = serde_json::from_str::<serde_json::Value>(text) else {
                 continue;
             };

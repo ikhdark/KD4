@@ -40,7 +40,7 @@ struct ProposedPlanItemState {
     runtime: tokio::runtime::Handle,
     started: bool,
     completed: bool,
-    /// Text already delivered to clients, retained if the final item never arrives.
+    /// Text accepted by the canonical event queue, retained if the final item never arrives.
     streamed_text: String,
 }
 
@@ -164,9 +164,25 @@ impl ProposedPlanItemState {
             item_id: self.item_id.clone(),
             delta: delta.to_string(),
         };
-        sess.send_event(turn_context, EventMsg::PlanDelta(event))
-            .await;
-        self.streamed_text.push_str(delta);
+        // Use the same dispatch phases as send_event, but account for the
+        // canonical receipt before awaiting any follow-up dispatch.
+        Box::pin(async {
+            let mut published = None;
+            let dispatch = sess
+                .send_event_before_post_dispatch(
+                    turn_context,
+                    EventMsg::PlanDelta(event),
+                    /*persist*/ true,
+                    Some(&mut published),
+                )
+                .await;
+            if published.is_some() {
+                self.streamed_text.push_str(delta);
+            }
+            sess.finish_prepared_event_dispatch(turn_context, dispatch)
+                .await;
+        })
+        .await;
     }
 
     async fn complete_with_text(&mut self, text: String, start_if_missing: bool) {

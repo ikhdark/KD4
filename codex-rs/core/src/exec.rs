@@ -299,7 +299,10 @@ impl ExecExpiration {
 }
 
 async fn wait_for_any_cancellation(cancellations: Vec<CancellationToken>) {
-    debug_assert!(!cancellations.is_empty());
+    if cancellations.is_empty() {
+        std::future::pending::<()>().await;
+        return;
+    }
     let waits = cancellations
         .into_iter()
         .map(|cancellation| Box::pin(async move { cancellation.cancelled().await }))
@@ -743,12 +746,24 @@ async fn exec(
         .ok_or_else(|| io::Error::other("missing child process id"))
         .and_then(|pid| managed_root.attach_and_resume(pid));
     if let Err(err) = attach_result {
-        if let Err(cleanup_error) = managed_root.cleanup_after_failed_attach(child).await {
-            observation.cleanup_observed("attach_failed_cleanup_failed");
+        // Cleanup may outlive this caller and its task-local timing scope.
+        let timing = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing();
+        let root_observation = observation.clone();
+        let lifecycle_id = managed_root.id();
+        let cleanup = managed_root.cleanup_after_failed_attach_with_exit_observer(
+            child,
+            move |root_status| {
+                if let Some(timing) = timing {
+                    timing.mark_exec_process_exited();
+                }
+                root_observation.cleanup_observed("root_reaped; descendants_unknown");
+                tracing::debug!(lifecycle_id, %root_status, "uncontained exec root reaped");
+            },
+        );
+        if let Err(cleanup_error) = cleanup.await {
             tracing::warn!("Failed to clean up uncontained exec child: {cleanup_error}");
         } else {
             observation.cleanup_observed("attach_failed_cleanup_completed");
-            crate::tools::tool_dispatch_trace::mark_exec_process_exited();
         }
         return Err(err.into());
     }

@@ -78,7 +78,11 @@ pub(crate) struct ShellSnapshotOrigin {
 }
 
 enum ShellSnapshotLocation {
-    Local(AbsolutePathBuf),
+    Local {
+        path: AbsolutePathBuf,
+        tasks: tokio_util::task::TaskTracker,
+        runtime: tokio::runtime::Handle,
+    },
     Remote {
         path: PathUri,
         filesystem: Arc<dyn ExecutorFileSystem>,
@@ -94,6 +98,23 @@ const SNAPSHOT_DIR: &str = "shell_snapshots";
 const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
 pub(crate) const CMD_SNAPSHOT_FORMAT_HEADER: &str = "@rem Codex Cmd snapshot format: 1";
 const REMOTE_SNAPSHOT_DIR: &str = ".codex-shell-snapshots";
+
+impl ShellSnapshotConfig {
+    async fn build_file(
+        &self,
+        build: impl Future<Output = std::result::Result<ShellSnapshotFile, &'static str>>
+            + Send
+            + 'static,
+    ) -> std::result::Result<ShellSnapshotFile, &'static str> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        // A cancelled waiter cannot leave a file in a completed task's output.
+        // If the handoff fails, drop the file before this builder is retired.
+        drop(self.builder_tasks.spawn(async move {
+            let _ = sender.send(build.await);
+        }));
+        receiver.await.map_err(|_| "write_failed")?
+    }
+}
 
 impl ShellSnapshot {
     pub(crate) fn new(
@@ -236,20 +257,8 @@ impl ShellSnapshot {
                 .start_timer("codex.shell_snapshot.duration_ms", &[]);
             let owner = Arc::clone(&config);
             let snapshot = config
-                .builder_tasks
-                .spawn(async move {
-                    ShellSnapshot::try_create(
-                        &owner.codex_home,
-                        owner.session_id,
-                        &cwd,
-                        &shell,
-                        &owner.environment_variables,
-                        owner.state_db.clone(),
-                    )
-                    .await
-                })
-                .await
-                .unwrap_or(Err("write_failed"));
+                .build_file(async move { ShellSnapshot::try_create(&owner, &cwd, &shell).await })
+                .await;
             let success_tag = if snapshot.is_ok() { "true" } else { "false" };
             let _ = timer.map(|timer| timer.finish(&[("success", success_tag)]));
             let mut counter_tags = vec![("success", success_tag)];
@@ -266,13 +275,12 @@ impl ShellSnapshot {
     }
 
     async fn try_create(
-        codex_home: &AbsolutePathBuf,
-        session_id: ThreadId,
+        config: &ShellSnapshotConfig,
         session_cwd: &AbsolutePathBuf,
         shell: &Shell,
-        environment_variables: &HashMap<String, String>,
-        state_db: Option<StateDbHandle>,
     ) -> std::result::Result<ShellSnapshotFile, &'static str> {
+        let session_id = config.session_id;
+        let codex_home = &config.codex_home;
         // File to store the snapshot
         let extension = match shell.shell_type {
             ShellType::PowerShell => "ps1",
@@ -293,6 +301,7 @@ impl ShellSnapshot {
         // Clean the (unlikely) leaked snapshot files.
         let codex_home = codex_home.clone();
         let cleanup_session_id = session_id;
+        let state_db = config.state_db.clone();
         tokio::spawn(async move {
             if let Err(err) =
                 cleanup_stale_snapshots(&codex_home, cleanup_session_id, state_db).await
@@ -302,18 +311,24 @@ impl ShellSnapshot {
         });
 
         // Make the new snapshot.
-        let snapshot =
-            match write_shell_snapshot(shell, &temp_path, session_cwd, environment_variables).await
-            {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to create shell snapshot for {}: {err:?}",
-                        shell.name()
-                    );
-                    return Err("write_failed");
-                }
-            };
+        let snapshot = match write_shell_snapshot(
+            shell,
+            &temp_path,
+            session_cwd,
+            &config.environment_variables,
+            config.tasks.clone(),
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to create shell snapshot for {}: {err:?}",
+                    shell.name()
+                );
+                return Err("write_failed");
+            }
+        };
         tracing::info!(
             "Shell snapshot successfully created: {}",
             temp_path.display()
@@ -330,8 +345,14 @@ impl ShellSnapshot {
         // cleanup guard for the old path after the new path has been published.
         match tokio::task::spawn_blocking(move || {
             let mut snapshot = snapshot;
+            let ShellSnapshotLocation::Local {
+                path: owned_path, ..
+            } = &mut snapshot.location
+            else {
+                unreachable!("local snapshot must own a local path");
+            };
             std::fs::rename(&temp_path, &path)?;
-            snapshot.location = ShellSnapshotLocation::Local(path);
+            *owned_path = path;
             Ok::<_, std::io::Error>(snapshot)
         })
         .await
@@ -422,8 +443,7 @@ impl ShellSnapshot {
         };
         let write_path = path.clone();
         let snapshot = config
-            .builder_tasks
-            .spawn(async move {
+            .build_file(async move {
                 if let Err(err) = filesystem
                     .write_file(&write_path, snapshot.contents.as_bytes().to_vec(), None)
                     .await
@@ -433,8 +453,7 @@ impl ShellSnapshot {
                 }
                 Ok(snapshot)
             })
-            .await
-            .map_err(|_| "write_failed")??;
+            .await?;
         if let Err(err) = validate_snapshot_remote(
             shell,
             &path,
@@ -457,7 +476,7 @@ impl ShellSnapshot {
 impl ShellSnapshotFile {
     pub(crate) fn local_path(&self) -> Option<&AbsolutePathBuf> {
         match &self.location {
-            ShellSnapshotLocation::Local(path) => Some(path),
+            ShellSnapshotLocation::Local { path, .. } => Some(path),
             ShellSnapshotLocation::Remote { .. } => None,
         }
     }
@@ -471,10 +490,22 @@ impl ShellSnapshotFile {
 impl Drop for ShellSnapshotFile {
     fn drop(&mut self) {
         match &self.location {
-            ShellSnapshotLocation::Local(path) => {
-                if let Err(err) = std::fs::remove_file(path) {
-                    tracing::warn!("Failed to delete shell snapshot at {:?}: {err:?}", path);
-                }
+            ShellSnapshotLocation::Local {
+                path,
+                tasks,
+                runtime,
+            } => {
+                let path = path.clone();
+                // Register synchronously at final release, but do the unlink
+                // on the blocking pool. The cleanup drain waits for the unlink.
+                drop(tasks.spawn_blocking_on(
+                    move || {
+                        if let Err(err) = std::fs::remove_file(&path) {
+                            tracing::warn!("Failed to delete shell snapshot at {path:?}: {err:?}");
+                        }
+                    },
+                    runtime,
+                ));
             }
             ShellSnapshotLocation::Remote {
                 path,
@@ -516,6 +547,7 @@ async fn write_shell_snapshot(
     output_path: &AbsolutePathBuf,
     cwd: &AbsolutePathBuf,
     environment_variables: &HashMap<String, String>,
+    tasks: tokio_util::task::TaskTracker,
 ) -> Result<ShellSnapshotFile> {
     let raw_snapshot = capture_snapshot(shell, cwd, environment_variables).await?;
     let snapshot = format_snapshot(shell.shell_type, &raw_snapshot)?;
@@ -531,7 +563,8 @@ async fn write_shell_snapshot(
     // Native creation and guard installation have no cancellation boundary.
     // The guard is installed only after create_new succeeds, never for a
     // pre-existing file, and remains with the actual write/sync owner.
-    tokio::task::spawn_blocking(move || write_local_snapshot_file(path, snapshot))
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || write_local_snapshot_file(path, snapshot, tasks, runtime))
         .await?
         .map_err(Into::into)
 }
@@ -539,6 +572,8 @@ async fn write_shell_snapshot(
 fn write_local_snapshot_file(
     path: AbsolutePathBuf,
     contents: String,
+    tasks: tokio_util::task::TaskTracker,
+    runtime: tokio::runtime::Handle,
 ) -> std::io::Result<ShellSnapshotFile> {
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
@@ -546,7 +581,11 @@ fn write_local_snapshot_file(
         .create_new(true)
         .open(&path)?;
     let snapshot = ShellSnapshotFile {
-        location: ShellSnapshotLocation::Local(path),
+        location: ShellSnapshotLocation::Local {
+            path,
+            tasks,
+            runtime,
+        },
         contents,
     };
     let result = file

@@ -107,6 +107,12 @@ impl ToolExecutor<ToolCall> for ListTool {
                     .retry_failed_orchestrator_catalog();
             }
             let authority = args.authority.into_authority();
+            let current_generation = || {
+                self.context.mcp_resources.as_deref().and_then(|resources| {
+                    resources.server_cache_key(super::CODEX_APPS_MCP_SERVER_NAME)
+                })
+            };
+            let snapshot_generation = current_generation();
             let mut catalog = self.context.catalog(&call.turn_id, args.authority).await;
             let mut skills = matching_entries(&catalog, &args, query.as_deref(), &authority);
             let cursor = match args.cursor.as_deref() {
@@ -129,11 +135,20 @@ impl ToolExecutor<ToolCall> for ListTool {
             if catalog.continuation.is_some()
                 && (start == skills.len() || (!search && args.cursor.is_none()))
             {
+                // The continuation can see a replacement cache with no base
+                // snapshot. Its empty result is not completion of this traversal,
+                // even when an offset-zero cursor still matches the empty prefix.
+                if current_generation() != snapshot_generation {
+                    return Err(stale_cursor());
+                }
                 drop(skills);
                 catalog = self
                     .context
                     .continue_catalog(&call.turn_id, catalog.entries.len())
                     .await;
+                if current_generation() != snapshot_generation {
+                    return Err(stale_cursor());
+                }
                 skills = matching_entries(&catalog, &args, query.as_deref(), &authority);
                 if let Some((hash, offset)) = cursor
                     && !cursor_matches(&skills, &args, hash, offset)

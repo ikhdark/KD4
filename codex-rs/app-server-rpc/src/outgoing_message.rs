@@ -701,7 +701,7 @@ impl ThreadScopedOutgoingMessageSender {
     ) where
         T: Into<ClientResponsePayload>,
     {
-        let observation = codex_protocol::timing::observations::Span::start(
+        let observation = codex_protocol::timing::observations::Span::start_queued(
             "bounded_response", &self.thread_id.to_string(), "", "",
             serde_json::json!({"connection_id":request_id.connection_id.0,
                 "request_id":request_id.request_id, "boundary":"server_response_attempt_not_client_receipt"}));
@@ -1165,13 +1165,23 @@ impl OutgoingMessageSender {
                 && !route_failed.is_cancelled() && !self.delivery_shutdown.is_cancelled()
                 && cache.should_publish(*connection_id, notification, &generation, force)
             {
-                // The committed cache and synchronous enqueue share one short
-                // critical section. Cancellation before admission changes neither.
-                permit.send(OutgoingEnvelope::ToConnection {
+                let envelope = OutgoingEnvelope::ToConnection {
                     connection_id: *connection_id,
                     message: OutgoingMessage::AppServerNotification(notification.clone()),
                     write_complete_tx: None,
-                });
+                };
+                // Capacity can become ready on the timeout poll, and acquiring
+                // the publication fence can also consume the remaining budget.
+                if tokio::time::Instant::now() >= deadline {
+                    drop(permit);
+                    drop(cache);
+                    drop(active);
+                    warn!(?connection_id, "component notification delivery failed or exceeded its budget");
+                    self.fail_connection_delivery(*connection_id).await;
+                    continue;
+                }
+                // The committed cache and synchronous enqueue share the fence.
+                permit.send(envelope);
                 cache.record_publication(*connection_id, notification);
                 published = true;
             }
@@ -1434,12 +1444,17 @@ impl OutgoingMessageSender {
             if !entry.connection_ids.contains(&connection_id) {
                 continue;
             }
-            entry.delivered_connection_ids.insert(connection_id);
-            permit.send(OutgoingEnvelope::ToConnection {
+            let envelope = OutgoingEnvelope::ToConnection {
                 connection_id,
                 message: OutgoingMessage::Request(request.clone()),
                 write_complete_tx: None,
-            });
+            };
+            if tokio::time::Instant::now() >= delivery_deadline {
+                send_error = Some("request delivery exceeded the resource delivery budget");
+                break;
+            }
+            entry.delivered_connection_ids.insert(connection_id);
+            permit.send(envelope);
             analytics_connection_id.get_or_insert(connection_id);
         }
         if let Some(connection_id) = analytics_connection_id {
@@ -1572,13 +1587,18 @@ impl OutgoingMessageSender {
             if !active_connections[&connection_id].accepts_request(&entry.request) {
                 continue;
             }
-            entry.connection_ids.insert(connection_id);
-            entry.delivered_connection_ids.insert(connection_id);
-            permit.send(OutgoingEnvelope::ToConnection {
+            let envelope = OutgoingEnvelope::ToConnection {
                 connection_id,
                 message: OutgoingMessage::Request(entry.request.clone()),
                 write_complete_tx: None,
-            });
+            };
+            if tokio::time::Instant::now() >= delivery_deadline {
+                warn!("request replay exceeded the resource delivery budget");
+                return;
+            }
+            entry.connection_ids.insert(connection_id);
+            entry.delivered_connection_ids.insert(connection_id);
+            permit.send(envelope);
             drop(request_id_to_callback);
             drop(active_connections);
             if codex_protocol::timing::observations::enabled() {

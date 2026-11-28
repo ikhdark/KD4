@@ -73,14 +73,31 @@ impl ConfigEditsBuilder {
     }
 
     pub async fn apply(self) -> std::io::Result<()> {
-        task::spawn_blocking(move || self.apply_blocking())
-            .await
-            .map_err(|err| {
-                std::io::Error::other(format!("config persistence task panicked: {err}"))
-            })?
+        self.apply_with_write_status().await.0
     }
 
-    fn apply_blocking(self) -> std::io::Result<()> {
+    /// The second result reports whether config.toml may have been written.
+    /// With success it distinguishes a completed write from a no-op; on error
+    /// it is conservative because the atomic writer can fail after publication.
+    pub async fn apply_with_write_status(self) -> (std::io::Result<()>, bool) {
+        match task::spawn_blocking(move || {
+            let mut write_attempted = false;
+            let result = self.apply_blocking(&mut write_attempted);
+            (result, write_attempted)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => (
+                Err(std::io::Error::other(format!(
+                    "config persistence task panicked: {err}"
+                ))),
+                true,
+            ),
+        }
+    }
+
+    fn apply_blocking(self, write_attempted: &mut bool) -> std::io::Result<()> {
         fs::create_dir_all(&self.codex_home)?;
         let config_path = self.codex_home.join(CONFIG_TOML_FILE);
         let (write_paths, _lock) = acquire_resolved_atomic_write_lock(&config_path)?;
@@ -121,7 +138,9 @@ impl ConfigEditsBuilder {
         if !mutated {
             return Ok(());
         }
-        write_atomically(&write_paths.write_path, &doc.to_string())
+        let contents = doc.to_string();
+        *write_attempted = true;
+        write_atomically(&write_paths.write_path, &contents)
     }
 }
 

@@ -394,10 +394,11 @@ async fn finish_pipe_process_setup(
     };
     #[cfg(windows)]
     let windows_terminator = {
-        let pid = child
+        let attached = child
             .id()
-            .ok_or_else(|| io::Error::other("missing child pid"))?;
-        if let Err(error) = managed.attach_and_resume(pid) {
+            .ok_or_else(|| io::Error::other("missing child pid"))
+            .and_then(|pid| managed.attach_and_resume(pid));
+        if let Err(error) = attached {
             if let Err(cleanup_error) = managed.cleanup_after_failed_attach(child).await {
                 observation.cleanup_observed("attach_failed_cleanup_failed");
                 log::warn!("failed to finish pipe attachment cleanup: {cleanup_error}");
@@ -407,19 +408,24 @@ async fn finish_pipe_process_setup(
             return Err(error.into());
         }
         managed.bind_contained_root(&observation);
-        let process_handle = child
+        let process = child
             .raw_handle()
-            .ok_or_else(|| io::Error::other("missing child process handle"))?;
-        let process = match duplicate_process_handle(process_handle) {
+            .ok_or_else(|| io::Error::other("missing child process handle"))
+            .and_then(duplicate_process_handle);
+        match process {
             Ok(process) => process,
-            Err(err) => {
-                if let Err(cleanup_error) = managed.cleanup_after_failed_attach(child).await {
+            Err(error) => {
+                // The retained cleanup owner records actual root reaping, even if
+                // the launch observer times out before cleanup has completed.
+                if let Err(cleanup_error) = managed
+                    .cleanup_observed_child(child, observation, /*attached*/ true)
+                    .await
+                {
                     log::warn!("failed to finish pipe handle setup cleanup: {cleanup_error}");
                 }
-                return Err(err.into());
+                return Err(error.into());
             }
-        };
-        process
+        }
     };
     #[cfg(unix)]
     let process_group = Arc::new(crate::process::ProcessGroupControl::new(

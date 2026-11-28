@@ -35,20 +35,40 @@ async fn prepare_request(request: Request) -> Result<Request, TransportError> {
 
 /// Opt-in, one-shot KDR observation at the real pre-dispatch auth boundary.
 /// An operator must arm an exact private loopback URL after the seed turn.
-fn kdr_transient_auth_probe(request: &Request, attempt: u64) -> bool {
-    let Some(path) = std::env::var_os("CODEX_KDR_TRANSIENT_AUTH_ARM") else { return false; };
-    let Ok(url) = url::Url::parse(&request.url) else { return false; };
+async fn kdr_transient_auth_probe(request_url: &str, attempt: u64) -> bool {
+    let Some(path) = std::env::var_os("CODEX_KDR_TRANSIENT_AUTH_ARM") else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(request_url) else {
+        return false;
+    };
     if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") {
         return false;
     }
-    let path = std::path::PathBuf::from(path);
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(request.url.as_str()) {
-        return false;
-    }
-    let Ok(mut marker) = std::fs::OpenOptions::new().write(true).create_new(true)
-        .open(path.with_extension("used")) else { return false; };
-    let observation = serde_json::json!({"phase":"transient_auth_before_dispatch", "attempt":attempt}).to_string();
-    std::io::Write::write_all(&mut marker, observation.as_bytes()).is_ok()
+
+    let request_url = request_url.to_owned();
+    // Keep the arm check and one-shot marker write in the same blocking job.
+    let observation = tokio::task::spawn_blocking(move || {
+        let path = std::path::PathBuf::from(path);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(request_url.as_str()) {
+            return false;
+        }
+        let Ok(mut marker) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.with_extension("used"))
+        else {
+            return false;
+        };
+        let observation = serde_json::json!({
+            "phase": "transient_auth_before_dispatch",
+            "attempt": attempt,
+        })
+        .to_string();
+        std::io::Write::write_all(&mut marker, observation.as_bytes()).is_ok()
+    })
+    .await;
+    matches!(observation, Ok(true))
 }
 
 pub(crate) struct EndpointSession<T: HttpTransport> {
@@ -260,11 +280,14 @@ impl<T: HttpTransport> EndpointSession<T> {
                 let header_deadline_elapsed = &header_deadline_elapsed;
                 let request_telemetry = self.request_telemetry.clone();
                 async move {
-                    let req = if kdr_transient_auth_probe(&req, attempt) {
-                        Err(crate::auth::AuthError::Transient("KDR one-shot private auth observation".into()))
+                    let req = if kdr_transient_auth_probe(&req.url, attempt).await {
+                        Err(crate::auth::AuthError::Transient(
+                            "KDR one-shot private auth observation".into(),
+                        ))
                     } else {
                         auth.apply_auth(req).await
-                    }.map_err(TransportError::from)?;
+                    }
+                    .map_err(TransportError::from)?;
                     if let Some(telemetry) = request_telemetry {
                         telemetry.on_request_dispatched_attempt(attempt);
                     }

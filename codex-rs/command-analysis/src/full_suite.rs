@@ -11,7 +11,7 @@ use std::sync::Mutex;
 #[derive(Debug, Default)]
 pub struct FullSuiteBudget(
     Mutex<HashMap<String, SuiteReservation>>,
-    tokio::sync::Mutex<()>,
+    Arc<tokio::sync::Mutex<()>>,
     Mutex<CompilationChanges>,
 );
 
@@ -74,7 +74,8 @@ fn compilation_inputs_changed(previous: &str, current: &str) -> bool {
 
 #[derive(Debug)]
 struct SuiteReservation {
-    generation: Arc<()>,
+    /// None when a started entry no longer has a live handler permit.
+    generation: Option<Arc<()>>,
     started: bool,
     policy: Option<(String, String)>,
     compilation_only: bool,
@@ -220,6 +221,11 @@ impl FullSuiteBudget {
         self.1.lock().await
     }
 
+    /// Move checkpoint custody into the task that settles admission.
+    pub async fn owned_checkpoint_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.1).lock_owned().await
+    }
+
     pub fn reserve(
         self: &Arc<Self>,
         full_suite: bool,
@@ -239,7 +245,7 @@ impl FullSuiteBudget {
         state.insert(
             owner.clone(),
             SuiteReservation {
-                generation: Arc::clone(&generation),
+                generation: Some(Arc::clone(&generation)),
                 started: false,
                 policy: None,
                 compilation_only: false,
@@ -278,7 +284,7 @@ impl FullSuiteBudget {
         }
         let generation = Arc::new(());
         state.insert(owner.clone(), SuiteReservation {
-            generation: Arc::clone(&generation), started: false,
+            generation: Some(Arc::clone(&generation)), started: false,
             policy: Some((selection, source_revision)),
             compilation_only, success: None,
         });
@@ -324,7 +330,7 @@ impl FullSuiteBudget {
                 entry.compilation_only == compilation_only && entry.policy.as_ref() == Some(&policy)
             ) { continue; }
             state.insert(format!("recovered-policy:{}", serde_json::json!(attempt)), SuiteReservation {
-                generation: Arc::new(()), started: true,
+                generation: None, started: true,
                 policy: Some(policy), compilation_only, success: None,
             });
         }
@@ -349,10 +355,15 @@ impl FullSuiteBudget {
 
     /// Only the launch owner may call this after proving no process was created.
     pub fn acknowledge_not_spawned(&self, owner: &str) {
-        if let Some(entry) = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(owner) {
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.get_mut(owner) {
             // Keep the reservation while its handler is alive. A sandbox retry
             // must cross start again, never fall through an absent reservation.
-            entry.started = false;
+            if entry.generation.is_some() {
+                entry.started = false;
+            } else {
+                state.remove(owner);
+            }
         }
     }
 
@@ -376,10 +387,18 @@ impl Drop for FullSuitePermit {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.get(&self.owner).is_some_and(|state| {
-            !state.started && Arc::ptr_eq(&state.generation, &self.generation)
+        if let Some(entry) = state.get_mut(&self.owner).filter(|entry| {
+            entry.generation.as_ref().is_some_and(|generation| {
+                Arc::ptr_eq(generation, &self.generation)
+            })
         }) {
-            state.remove(&self.owner);
+            if entry.started {
+                // Retain a possibly executed attempt. An owner that proves no
+                // spawn later can remove it even though this handler is gone.
+                entry.generation = None;
+            } else {
+                state.remove(&self.owner);
+            }
         }
     }
 }

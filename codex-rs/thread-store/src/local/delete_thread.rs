@@ -72,20 +72,69 @@ fn storage_retired_marker_path(home: &Path, id: codex_protocol::ThreadId) -> Pat
     home.join("tool-history").join(format!("{id}.retired"))
 }
 
-fn mark_storage_retired(home: &Path, id: codex_protocol::ThreadId) -> std::io::Result<()> {
-    std::fs::create_dir_all(home.join("tool-history"))?;
-    let path = storage_retired_marker_path(home, id);
-    match std::fs::File::options()
-        .write(true)
-        .create_new(true)
-        .open(&path)
+fn validate_storage_retired_marker(path: &Path) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let invalid_marker = || std::io::Error::other("invalid retired storage marker; files retained");
+
+    // Validate the opened file, without following a final-component reparse
+    // point or sharing the handle with a writer or deleter during inspection.
+    let file = std::fs::File::options()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() != STORAGE_RETIRED_MARKER.len() as u64
+        || std::fs::canonicalize(path)? != path
     {
-        Ok(mut file) => {
-            std::io::Write::write_all(&mut file, STORAGE_RETIRED_MARKER)?;
-            file.sync_all()
+        return Err(invalid_marker());
+    }
+
+    let mut contents = Vec::new();
+    file.take(STORAGE_RETIRED_MARKER.len() as u64 + 1)
+        .read_to_end(&mut contents)?;
+    if contents != STORAGE_RETIRED_MARKER {
+        return Err(invalid_marker());
+    }
+    Ok(())
+}
+
+fn mark_storage_retired(home: &Path, id: codex_protocol::ThreadId) -> std::io::Result<()> {
+    let directory = home.join("tool-history");
+    std::fs::create_dir_all(&directory)?;
+    let home = std::fs::canonicalize(home)?;
+    let path = storage_retired_marker_path(&home, id);
+    let directory = home.join("tool-history");
+    if std::fs::canonicalize(&directory)? != directory {
+        return Err(std::io::Error::other(
+            "indirect retired storage marker directory; files retained",
+        ));
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return validate_storage_retired_marker(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    // Publish only complete, synced bytes. The temporary file owns cleanup
+    // on failure; no path here overwrites or removes an existing marker.
+    let mut staged = tempfile::NamedTempFile::new_in(&directory)?;
+    std::io::Write::write_all(staged.as_file_mut(), STORAGE_RETIRED_MARKER)?;
+    staged.as_file().sync_all()?;
+    match staged.persist_noclobber(&path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_storage_retired_marker(&path)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
+        Err(error) => Err(error.error),
     }
 }
 
@@ -134,39 +183,21 @@ async fn has_storage_retired_marker(
     home: &Path,
     id: codex_protocol::ThreadId,
 ) -> ThreadStoreResult<bool> {
-    use tokio::io::AsyncReadExt;
-
-    let path = storage_retired_marker_path(home, id);
-    let Some(metadata) = staging_marker_metadata(&path).await? else {
-        return Ok(false);
-    };
-    let canonical_home = tokio::fs::canonicalize(home)
-        .await
-        .map_err(delete_recovery_error)?;
-    if metadata.len() != STORAGE_RETIRED_MARKER.len() as u64
-        || tokio::fs::canonicalize(&path)
-            .await
-            .map_err(delete_recovery_error)?
-            != storage_retired_marker_path(&canonical_home, id)
-    {
-        return Err(delete_recovery_error(
-            "invalid retired storage marker; files retained",
-        ));
-    }
-    let mut contents = Vec::new();
-    tokio::fs::File::open(path)
-        .await
-        .map_err(delete_recovery_error)?
-        .take(STORAGE_RETIRED_MARKER.len() as u64 + 1)
-        .read_to_end(&mut contents)
-        .await
-        .map_err(delete_recovery_error)?;
-    if contents != STORAGE_RETIRED_MARKER {
-        return Err(delete_recovery_error(
-            "invalid retired storage marker; files retained",
-        ));
-    }
-    Ok(true)
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        let path = storage_retired_marker_path(&home, id);
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let home = std::fs::canonicalize(home)?;
+        validate_storage_retired_marker(&storage_retired_marker_path(&home, id))?;
+        Ok(true)
+    })
+    .await
+    .map_err(delete_recovery_error)?
+    .map_err(delete_recovery_error)
 }
 
 async fn require_sqlite_absent(store: &LocalThreadStore) -> ThreadStoreResult<()> {

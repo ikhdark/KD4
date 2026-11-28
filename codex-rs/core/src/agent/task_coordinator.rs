@@ -30,6 +30,7 @@ use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnCompletionAssessment;
 use codex_state::StateRuntime;
@@ -41,6 +42,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::task_metrics::MetricsError;
@@ -716,6 +718,11 @@ impl AgentTaskCoordinator {
         &self,
         turn: &crate::session::turn_context::TurnContext,
     ) -> Option<AgentTaskBinding> {
+        if turn.multi_agent_version == MultiAgentVersion::V2 {
+            // An unprepared or deliberately unbound V2 turn cannot borrow a
+            // path's current binding, including during terminal publication.
+            return turn.agent_task_binding.get().cloned().flatten();
+        }
         turn.agent_task_binding
             .get_or_init(|| self.binding_for_source(&turn.session_source))
             .clone()
@@ -1184,63 +1191,77 @@ impl AgentTaskCoordinator {
     )]
     pub(crate) async fn prepare_legacy_agent_turn(
         &self,
-        source: &SessionSource,
+        turn: &crate::session::turn_context::TurnContext,
         thread_id: ThreadId,
+        cancellation_token: &CancellationToken,
     ) -> StoreResult<()> {
         // Root sources cannot have a binding. Avoid an unrelated sibling's
         // durable binding transaction for this immutable no-op case.
-        if source.get_agent_path().is_none() {
+        if turn.session_source.get_agent_path().is_none() {
+            turn.agent_task_binding.get_or_init(|| None);
             return Ok(());
         }
         let _update = self.binding_updates.lock().await;
-        let Some(binding) = self
-            .binding_for_source(source)
-            .filter(|binding| binding.thread_id.as_deref() == Some(thread_id.to_string().as_str()))
-        else {
+        if cancellation_token.is_cancelled() {
+            return Ok(()); // The worker reports an interrupted turn.
+        }
+        let captured = turn.agent_task_binding.get();
+        let binding = match captured {
+            Some(binding) => binding.clone(),
+            None => self
+                .binding_for_source(&turn.session_source)
+                .filter(|binding| binding.thread_id.as_deref() == Some(thread_id.to_string().as_str())),
+        };
+        let Some(binding) = binding else {
+            turn.agent_task_binding.get_or_init(|| None);
             return Ok(());
         };
         let store = self.required_store()?;
         let authorization = store
             .get_agent_task_authorization(binding.assignment_id)
             .await?;
-        if authorization.current_attempt.attempt_id == binding.attempt_id
-            && authorization.current_attempt.state == AttemptState::Active
-        {
-            if !self.has_task_metric_runtime(binding.assignment_id) {
-                match store.get_agent_task(binding.assignment_id, Some(0)).await {
-                    Ok(task) if task.current_attempt.attempt_id == binding.attempt_id => {
-                        self.activate_task_metric_attempt(&task, true);
-                    }
-                    Ok(_) => {}
-                    Err(error) => warn!(?error, assignment_id = %binding.assignment_id,
-                        "active agent attempt is bound but task metrics could not be restored"),
-                }
-            }
+        if cancellation_token.is_cancelled() {
             return Ok(());
         }
-        // Typed attempts cannot be renewed implicitly. Reject before sampling,
-        // rather than spending a model request whose first tool must be blocked.
-        if !matches!(
-            authorization.admission_origin,
-            AssignmentAdmissionOrigin::LegacyMessage { .. }
-        ) {
-            return Err(StoreError::InvalidAssignment(format!(
-                "typed assignment {} has no active bound attempt; recover its retained receipt with get_agent_task, or explicitly admit new work before requesting another turn",
-                binding.assignment_id
-            )));
-        }
-        let renewed = store.begin_legacy_agent_turn(binding.assignment_id).await?;
-        self.advance_task_metric_attempt(renewed.assignment_id, renewed.attempt_id);
-        let attempt_id = renewed.attempt_id;
-        self.remember_binding(renewed);
+        let active = authorization.current_attempt.attempt_id == binding.attempt_id
+            && authorization.current_attempt.state == AttemptState::Active;
+        let (binding, restored_active_attempt) = if active {
+            turn.agent_task_binding.get_or_init(|| Some(binding.clone()));
+            (binding, true)
+        } else {
+            // Typed attempts cannot be renewed implicitly. Reject before sampling,
+            // rather than spending a model request whose first tool must be blocked.
+            if !matches!(
+                authorization.admission_origin,
+                AssignmentAdmissionOrigin::LegacyMessage { .. }
+            ) {
+                return Err(StoreError::InvalidAssignment(format!(
+                    "typed assignment {} has no active bound attempt; recover its retained receipt with get_agent_task, or explicitly admit new work before requesting another turn",
+                    binding.assignment_id
+                )));
+            }
+            if captured.is_some() {
+                return Err(StoreError::InvalidAssignment(format!(
+                    "plain-message assignment {} no longer owns this turn's admitted attempt",
+                    binding.assignment_id
+                )));
+            }
+            let renewed = store.begin_legacy_agent_turn(binding.assignment_id).await?;
+            // Publish the exact store result to the worker's terminal path in
+            // the same poll, before cancellation can be observed or metrics can await.
+            self.remember_binding(renewed.clone());
+            turn.agent_task_binding.get_or_init(|| Some(renewed.clone()));
+            self.advance_task_metric_attempt(renewed.assignment_id, renewed.attempt_id);
+            (renewed, false)
+        };
         if !self.has_task_metric_runtime(binding.assignment_id) {
             match store.get_agent_task(binding.assignment_id, Some(0)).await {
-                Ok(task) if task.current_attempt.attempt_id == attempt_id => {
-                    self.activate_task_metric_attempt(&task, false);
+                Ok(task) if task.current_attempt.attempt_id == binding.attempt_id => {
+                    self.activate_task_metric_attempt(&task, restored_active_attempt);
                 }
                 Ok(_) => {}
                 Err(error) => warn!(?error, assignment_id = %binding.assignment_id,
-                    "plain-message follow-up committed but task metrics could not be restored"),
+                    "admitted agent turn is bound but task metrics could not be restored"),
             }
         }
         Ok(())

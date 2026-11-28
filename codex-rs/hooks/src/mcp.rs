@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use futures::future::BoxFuture;
 use regex::Regex;
 use serde_json::{Map, Value};
+use tokio::time::Instant as TokioInstant;
 
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
@@ -20,10 +21,12 @@ pub struct HookMcpCall {
     pub server: String,
     pub tool: String,
     pub input: Map<String, Value>,
-    pub timeout: Duration,
+    /// Absolute wall-clock limit, shared with any plugin trust verification.
+    pub wall_deadline: TokioInstant,
 }
 
 /// Host adapter into the already-authorized, session-scoped MCP runtime.
+/// The adapter must enforce the supplied wall deadline while it owns the call.
 pub trait HookMcpExecutor: Send + Sync {
     fn execute(&self, call: HookMcpCall) -> BoxFuture<'_, Result<String>>;
 }
@@ -40,20 +43,22 @@ pub(crate) async fn run_mcp_tool(
         let executor = executor.context("MCP hook executor is unavailable")?;
         let event: Value = serde_json::from_str(event_json)?;
         let input = expand_object(&target.input, &event)?;
-        let mut timeout = Duration::from_secs(handler.timeout_sec);
+        // Let Tokio choose the representable cutoff, including for very large
+        // configured durations. Trust and the call consume this same budget.
+        let wall_deadline = tokio::time::sleep(Duration::from_secs(handler.timeout_sec)).deadline();
         if let Some(trust) = &handler.plugin_trust {
-            // Verify approved plugin contents within the hook's own deadline.
-            let verify_started = Instant::now();
-            tokio::time::timeout(timeout, trust.verify())
+            tokio::time::timeout_at(wall_deadline, trust.verify())
                 .await
                 .context("hook trust verification timed out")??;
-            timeout = timeout.saturating_sub(verify_started.elapsed());
+            if TokioInstant::now() >= wall_deadline {
+                bail!("hook trust verification timed out");
+            }
         }
         // This shares the existing effects ledger; timing out is not rollback.
         crate::mark_command_effects_possible();
-        let text = tokio::time::timeout(timeout, executor.execute(HookMcpCall {
-            server: target.server.clone(), tool: target.tool.clone(), input, timeout,
-        })).await.context("MCP hook timed out; remote effects may be unknown")??;
+        let text = executor.execute(HookMcpCall {
+            server: target.server.clone(), tool: target.tool.clone(), input, wall_deadline,
+        }).await?;
         if text.len() > 1024 * 1024 {
             bail!("MCP hook output exceeds the 1 MiB hook capture bound");
         }

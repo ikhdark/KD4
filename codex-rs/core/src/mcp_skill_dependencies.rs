@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use codex_config::ConfigEditsBuilder;
 use codex_config::McpServerConfig;
@@ -9,6 +10,8 @@ use codex_config::McpServerTransportConfig;
 use codex_config::load_global_mcp_servers;
 use codex_login::default_client::is_first_party_originator;
 use codex_login::default_client::originator;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputDisposition;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
@@ -115,8 +118,8 @@ pub(crate) async fn plan_mcp_dependencies(
 }
 
 pub(crate) async fn apply_mcp_dependency_effect(
-    sess: &Session,
-    turn_context: &TurnContext,
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
     cancellation_token: &CancellationToken,
     effect: &PlannedMcpDependencyEffect,
 ) -> Result<McpDependencyEffectOutcome, String> {
@@ -193,24 +196,25 @@ fn semantic_install_effect_id(missing: &HashMap<String, McpServerConfig>) -> Str
 }
 
 async fn install_planned_mcp_dependencies(
-    sess: &Session,
-    turn_context: &TurnContext,
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
     config: &crate::config::Config,
     missing: &HashMap<String, McpServerConfig>,
     cancellation_token: &CancellationToken,
 ) -> Result<(), String> {
     let codex_home = config.codex_home.clone();
-    let setup = tokio::select! {
-        _ = cancellation_token.cancelled() => {
-            return Err("MCP dependency installation was cancelled".to_string());
-        }
-        result = persist_mcp_dependencies_for_setup(&codex_home, missing) => result.map_err(|err| {
-            format!("failed to persist planned MCP dependencies: {err}")
-        })?,
-    };
+    let setup = persist_mcp_dependencies_for_setup(
+        sess,
+        turn_context,
+        &codex_home,
+        missing,
+        cancellation_token,
+    )
+    .await?;
 
     for (name, server_config) in &setup {
         let oauth_support = tokio::select! {
+            biased;
             _ = cancellation_token.cancelled() => {
                 return Err("MCP dependency installation was cancelled".to_string());
             }
@@ -330,26 +334,94 @@ async fn install_planned_mcp_dependencies(
     Ok(())
 }
 
+const MCP_INSTALL_CANCELLED: &str = "MCP dependency installation was cancelled";
+
 async fn persist_mcp_dependencies_for_setup(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
     codex_home: &std::path::Path,
     missing: &HashMap<String, McpServerConfig>,
-) -> std::io::Result<Vec<(String, McpServerConfig)>> {
+    cancellation_token: &CancellationToken,
+) -> Result<Vec<(String, McpServerConfig)>, String> {
     let additions = missing
         .iter()
         .filter(|(_, config)| config.enabled)
         .map(|(name, config)| (name.clone(), config.clone()))
         .collect::<BTreeMap<_, _>>();
-    // Existing names win under the config lock. Select OAuth work only after
-    // reloading that merge, not from a snapshot that may have lost a race.
-    ConfigEditsBuilder::new(codex_home)
-        .merge_mcp_servers(&additions)
-        .apply()
-        .await?;
-    let persisted = load_global_mcp_servers(codex_home).await?;
+    if cancellation_token.is_cancelled() {
+        return Err(MCP_INSTALL_CANCELLED.to_string());
+    }
+    // Existing names win under the config lock. Keep an owner for the admitted
+    // blocking write even if forced turn interruption drops this join handle.
+    // The owned task does not reload config, contact providers, or refresh MCP.
+    let edit = ConfigEditsBuilder::new(codex_home).merge_mcp_servers(&additions);
+    let merge = tokio::spawn({
+        let sess = Arc::clone(sess);
+        let turn_context = Arc::clone(turn_context);
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            if cancellation_token.is_cancelled() {
+                return None;
+            }
+            let (result, may_have_written) = edit.apply_with_write_status().await;
+            if cancellation_token.is_cancelled() {
+                warn_cancelled_mcp_merge(&sess, &turn_context, may_have_written, result.is_ok())
+                    .await;
+                return None;
+            }
+            Some((result, may_have_written))
+        }
+    });
+    let Some((result, may_have_written)) = merge
+        .await
+        .map_err(|err| format!("failed to observe planned MCP config merge: {err}"))?
+    else {
+        return Err(MCP_INSTALL_CANCELLED.to_string());
+    };
+    if cancellation_token.is_cancelled() {
+        warn_cancelled_mcp_merge(sess, turn_context, may_have_written, result.is_ok()).await;
+        return Err(MCP_INSTALL_CANCELLED.to_string());
+    }
+    result.map_err(|err| format!("failed to persist planned MCP dependencies: {err}"))?;
+
+    // Select OAuth work only after reloading the merge, not from a snapshot
+    // that may have lost a race.
+    let persisted = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => {
+            warn_cancelled_mcp_merge(sess, turn_context, may_have_written, true).await;
+            return Err(MCP_INSTALL_CANCELLED.to_string());
+        }
+        result = load_global_mcp_servers(codex_home) => result
+            .map_err(|err| format!("failed to persist planned MCP dependencies: {err}"))?,
+    };
     Ok(additions
         .into_iter()
         .filter(|(name, approved)| persisted.get(name) == Some(approved))
         .collect())
+}
+
+async fn warn_cancelled_mcp_merge(
+    sess: &Session,
+    turn_context: &TurnContext,
+    may_have_written: bool,
+    succeeded: bool,
+) {
+    if !may_have_written {
+        return;
+    }
+    let message = if succeeded {
+        "MCP dependency installation was cancelled after writing config.toml. The config change remains; setup did not continue."
+    } else {
+        "MCP dependency installation was cancelled and config.toml may have changed. Check the config before retrying."
+    };
+    sess.send_event(
+        turn_context,
+        EventMsg::Warning(WarningEvent {
+            message: message.to_string(),
+        }),
+    )
+    .await;
 }
 
 async fn should_install_planned_mcp_dependencies(

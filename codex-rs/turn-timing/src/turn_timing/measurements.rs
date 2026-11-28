@@ -661,8 +661,8 @@ impl TurnTimingState {
             request.sampling_request_id.clone()
         } else { None };
         drop(state);
-        if codex_protocol::timing::observations::enabled() {
-            self.observe_runtime("model_logical_identity", identity.as_deref().unwrap_or_default(),
+        if self.runtime_async_observations_enabled() {
+            self.observe_runtime_queued("model_logical_identity", identity.as_deref().unwrap_or_default(),
                 json!({"logical_context_sha256":hash, "basis":"full_logical_prompt_v1_before_transport_delta"}));
         }
     }

@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::Future;
+use std::future::poll_fn;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,6 +20,7 @@ use http::header::CONTENT_TYPE;
 use http::header::PROXY_AUTHORIZATION;
 use reqwest::IntoUrl;
 use serde::Serialize;
+use tokio::time::Instant;
 
 use crate::BuildRouteAwareHttpClientError;
 use crate::ClientRouteClass;
@@ -196,6 +200,7 @@ pub struct RouteAwareRequestBuilder {
     pool: RouteAwareClientPool,
     request: Result<reqwest::Request, RouteAwareRequestError>,
     redirect_filter: Option<RedirectFilter>,
+    deadline: Option<Instant>,
 }
 
 type RedirectFilter = Arc<dyn Fn(&reqwest::Url) -> bool + Send + Sync>;
@@ -228,6 +233,7 @@ impl RouteAwareRequestBuilder {
             pool,
             request,
             redirect_filter: None,
+            deadline: None,
         }
     }
 
@@ -290,6 +296,13 @@ impl RouteAwareRequestBuilder {
         if let Ok(request) = &mut self.request {
             *request.timeout_mut() = Some(timeout);
         }
+        self
+    }
+
+    /// Caps this send at a caller-owned absolute cutoff, including route lookup,
+    /// redirects, and transport polling. A shorter relative timeout still applies.
+    pub fn deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -365,6 +378,7 @@ impl RouteAwareRequestBuilder {
             .send(
                 self.request?,
                 self.redirect_filter,
+                self.deadline,
                 initial_request_not_sent,
             )
             .await
@@ -576,6 +590,7 @@ impl RouteAwareClientPool {
         &self,
         mut request: reqwest::Request,
         redirect_filter: Option<RedirectFilter>,
+        absolute_deadline: Option<Instant>,
         initial_request_not_sent: &mut bool,
     ) -> Result<reqwest::Response, RouteAwareRequestError> {
         let request_method = request.method().clone();
@@ -587,7 +602,11 @@ impl RouteAwareClientPool {
             .timeout()
             .copied()
             .or(self.client_builder.configured_timeout())
-            .map(|timeout| tokio::time::Instant::now() + timeout);
+            .map(|timeout| Instant::now() + timeout)
+            .into_iter()
+            .chain(absolute_deadline)
+            .min();
+        let dispatch_deadline = absolute_deadline.and(timeout_deadline);
         let mut redirects = 0;
         let mut refreshed_failed_route = false;
         let mut previous_route = None;
@@ -629,8 +648,22 @@ impl RouteAwareClientPool {
             // them again after a route/redirect removed an origin-bound header.
             // Logging is owned below, independently of default-header projection.
             let execute_request = client.execute_without_request_logging(request);
-            let execute_request = crate::admit_dispatch(execute_request);
-            let response = match match timeout_deadline {
+            let execute_request = crate::admit_dispatch(async move {
+                let Some(deadline) = dispatch_deadline else {
+                    return Ok(execute_request.await);
+                };
+                let mut execute_request = std::pin::pin!(execute_request);
+                // Check inside admission: the guard can wait before invoking its
+                // callback, and timeout_at alone can poll a ready inner future first.
+                poll_fn(|cx| {
+                    if Instant::now() >= deadline {
+                        return Poll::Ready(Err(RouteAwareRequestError::Timeout));
+                    }
+                    execute_request.as_mut().poll(cx).map(Ok)
+                })
+                .await
+            });
+            let response = match timeout_deadline {
                 Some(timeout_deadline) => {
                     tokio::time::timeout_at(timeout_deadline, execute_request)
                         .await
@@ -638,8 +671,8 @@ impl RouteAwareClientPool {
                 }
                 None => execute_request.await,
             }
-            .map_err(RouteAwareRequestError::Build)?
-            {
+            .map_err(RouteAwareRequestError::Build)??;
+            let response = match response {
                 Ok(response) => response,
                 Err(error) => {
                     // is_connect proves this hop failed before HTTP dispatch.

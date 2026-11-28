@@ -783,7 +783,8 @@ async fn run_main_owned(
     codex_core::otel_init::record_process_start(otel.as_ref(), OTEL_SERVICE_NAME);
     codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
     // Admission shares one budget, with signal supervision already active while
-    // waiting. Dropping any wait releases its guards; no native lock wait survives.
+    // waiting. Native control-socket bind is retired under the startup locks
+    // if admission is refused while Winsock is still completing it.
     let startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let startup_cancellation = caller_cancelled.clone();
     let startup_signal = async move {
@@ -951,16 +952,14 @@ async fn run_main_owned(
             );
         }
         AppServerTransport::UnixSocket { socket_path } => {
-            let accept = start_control_socket_acceptor(
+            let accept_handle = start_control_socket_acceptor(
                 socket_path.clone(),
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
-            );
-            let accept_handle = tokio::select! {
-                result = tokio::time::timeout_at(startup_deadline, accept) =>
-                    result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server endpoint admission timed out"))??,
-                _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
-            };
+                startup_deadline,
+                startup_signal.as_mut(),
+            )
+            .await?;
             transport_accept_handles.push(accept_handle);
         }
         AppServerTransport::WebSocket { bind_address } => {
@@ -980,6 +979,22 @@ async fn run_main_owned(
         AppServerTransport::Off => {}
     }
     drop(unix_socket_startup_lock);
+
+    let finish_startup_failure = async |error, outbound, transport_handles| {
+        let result = finish_runtime_task_groups(
+            RuntimeTaskOwners::StartupFailed { error, outbound },
+            transport_shutdown_token.clone(),
+            transport_handles,
+            force_shutdown_token.clone(),
+            Arc::clone(&shutdown_timed_out),
+            std::future::pending(),
+        )
+        .await;
+        if let Some(otel) = otel.as_ref() {
+            otel.shutdown();
+        }
+        result.map(|()| false)
+    };
 
     let remote_control_enabled = remote_control_policy == RemoteControlPolicy::Allowed
         && remote_control_explicitly_requested
@@ -1020,7 +1035,7 @@ async fn run_main_owned(
     )
     .await;
 
-    let (remote_control_accept_handle, remote_control_handle) = start_remote_control(
+    let remote_control_start = start_remote_control(
         RemoteControlStartConfig {
             remote_control_url: config.chatgpt_base_url.clone(),
             installation_id: installation_id.clone(),
@@ -1034,7 +1049,15 @@ async fn run_main_owned(
         app_server_client_name_rx,
         remote_control_startup_mode,
     )
-    .await?;
+    .await;
+    let (remote_control_accept_handle, remote_control_handle) = match remote_control_start {
+        Ok(owners) => owners,
+        Err(error) => {
+            drop(transport_event_rx);
+            return finish_startup_failure(error, None, transport_accept_handles).await;
+        }
+    };
+    transport_accept_handles.push(remote_control_accept_handle);
     if no_local_transport
         && remote_control_startup_mode == RemoteControlStartupMode::ResolvePersisted
     {
@@ -1076,13 +1099,11 @@ async fn run_main_owned(
             }
         };
         if let Err(error) = admission {
-            transport_shutdown_token.cancel();
-            let _ = remote_control_accept_handle.await;
-            return Err(error);
+            drop(transport_event_rx);
+            return finish_startup_failure(error, None, transport_accept_handles).await;
         }
     }
     config_manager.bind_remote_control_handle(remote_control_handle.clone());
-    transport_accept_handles.push(remote_control_accept_handle);
     transport_accept_handles.push(tokio::spawn(
         config_manager
             .clone()
@@ -1185,8 +1206,24 @@ async fn run_main_owned(
             remote_control_handle: Some(remote_control_handle.clone()),
             plugin_startup_tasks: runtime_options.plugin_startup_tasks,
         };
-        let processor = tokio::task::spawn_blocking(move || Arc::new(MessageProcessor::new(processor_args)))
-            .await.map_err(std::io::Error::other)?;
+        let processor = match tokio::task::spawn_blocking(move || {
+            Arc::new(MessageProcessor::new(processor_args))
+        })
+        .await
+        {
+            Ok(processor) => processor,
+            Err(error) => {
+                drop(transport_event_rx);
+                drop(outbound_control_tx);
+                drop(initialize_notification_sender);
+                return finish_startup_failure(
+                    std::io::Error::other(error),
+                    Some(outbound_handle),
+                    transport_accept_handles,
+                )
+                .await;
+            }
+        };
         let mut thread_created_rx = processor.subscribe_thread_created();
         let mut running_turn_count_rx = processor.subscribe_running_turn_count();
         let mut connections = HashMap::<ConnectionId, Arc<ConnectionState>>::new();
@@ -1685,8 +1722,10 @@ async fn run_main_owned(
     drop(transport_event_tx);
 
     let task_result = finish_runtime_task_groups(
-        processor_handle,
-        outbound_handle,
+        RuntimeTaskOwners::Running {
+            processor: processor_handle,
+            outbound: outbound_handle,
+        },
         transport_shutdown_token,
         transport_accept_handles,
         force_shutdown_token,
@@ -1722,9 +1761,21 @@ async fn run_main_owned(
     })
 }
 
+enum RuntimeTaskOwners {
+    Running {
+        processor: JoinHandle<()>,
+        outbound: JoinHandle<()>,
+    },
+    StartupFailed {
+        error: std::io::Error,
+        outbound: Option<JoinHandle<()>>,
+    },
+}
+
+const RUNTIME_FAILURE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn finish_runtime_task_groups(
-    processor: JoinHandle<()>,
-    outbound: JoinHandle<()>,
+    primary: RuntimeTaskOwners,
     transport_shutdown: CancellationToken,
     transport_handles: Vec<JoinHandle<()>>,
     force_shutdown: CancellationToken,
@@ -1736,8 +1787,23 @@ async fn finish_runtime_task_groups(
 
     let mut owners = FuturesUnordered::new();
     let mut abort_handles = Vec::new();
-    for (name, handle) in [("processor", processor), ("outbound router", outbound)]
+    let (processor, outbound, mut first_error) = match primary {
+        RuntimeTaskOwners::Running { processor, outbound } => {
+            (Some(processor), Some(outbound), None)
+        }
+        RuntimeTaskOwners::StartupFailed { error, outbound } => {
+            transport_shutdown.cancel();
+            (None, outbound, Some(error))
+        }
+    };
+    let mut primary_owners = processor.iter().count() + outbound.iter().count();
+    let mut failure_deadline = first_error
+        .as_ref()
+        .map(|_| tokio::time::Instant::now() + RUNTIME_FAILURE_DRAIN_TIMEOUT);
+    for (name, handle) in processor
+        .map(|handle| ("processor", handle))
         .into_iter()
+        .chain(outbound.map(|handle| ("outbound router", handle)))
         .chain(
             transport_handles
                 .into_iter()
@@ -1747,9 +1813,6 @@ async fn finish_runtime_task_groups(
         abort_handles.push(handle.abort_handle());
         owners.push(async move { (name, handle.await) });
     }
-    let mut first_error = None;
-    let mut primary_owners = 2;
-    let mut failure_deadline = None;
     let mut forced = false;
     tokio::pin!(shutdown_observation);
     while !owners.is_empty() {
@@ -1809,7 +1872,7 @@ async fn finish_runtime_task_groups(
                 first_error = Some(std::io::Error::other(format!(
                     "app-server {task} task failed: {error}"
                 )));
-                failure_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(10));
+                failure_deadline = Some(tokio::time::Instant::now() + RUNTIME_FAILURE_DRAIN_TIMEOUT);
             }
             transport_shutdown.cancel();
         } else if primary_owners == 0 {

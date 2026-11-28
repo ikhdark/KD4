@@ -260,6 +260,9 @@ async fn extract_metadata_inner(
 /// are classified in place while the scan stays bounded per concurrent rollout.
 const METADATA_SCAN_BUFFER_BYTES: usize = 256 * 1024;
 
+/// Enough lookahead for ordinary writer envelopes, not a record size limit.
+const METADATA_RECORD_LOOKAHEAD_BYTES: usize = 1024;
+
 struct RolloutMetadataScan {
     accumulator: RolloutMetadataAccumulator,
     parse_errors: usize,
@@ -345,14 +348,34 @@ fn scan_rollout_metadata(
             stop.check()?;
         }
         raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
+        if reader
+            .by_ref()
+            .take(METADATA_RECORD_LOOKAHEAD_BYTES as u64)
+            .read_until(b'\n', &mut raw)?
+            == 0
+        {
             break;
         }
-        let terminated = raw.last() == Some(&b'\n');
+        let mut terminated = raw.last() == Some(&b'\n');
+        let mut needs_parse = metadata_record_needs_parse(&raw);
+        if !terminated && raw.len() == METADATA_RECORD_LOOKAHEAD_BYTES {
+            if needs_parse {
+                // The bounded prefix did not prove irrelevance. Keep the
+                // whole line and classify again in case its header was split.
+                reader.read_until(b'\n', &mut raw)?;
+                terminated = raw.last() == Some(&b'\n');
+                needs_parse = metadata_record_needs_parse(&raw);
+            } else {
+                // The classifier found a complete ignorable header. Drain
+                // through the same reader so decode, I/O and stop errors still
+                // propagate before this record is counted.
+                reader.skip_until(b'\n')?;
+            }
+        }
         if raw.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        if !metadata_record_needs_parse(&raw) {
+        if !needs_parse {
             decoder.note_undecoded_record();
             accumulator.note_undecoded_record(rollout_path, default_provider);
             continue;

@@ -86,6 +86,7 @@ struct SpawnAgentsOnCsvArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReportAgentJobResultArgs {
     job_id: String,
     item_id: String,

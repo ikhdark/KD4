@@ -742,28 +742,35 @@ impl ThreadQueueRequestProcessor {
         .await
         .map_err(queue_error)?
         .map_err(queue_error)?;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match file.try_lock() {
-                    Ok(()) => {
-                        let mut origins = self
-                            .origins
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if origins.retiring.remove(&id) {
-                            origins.clear_thread(id);
-                        }
-                        return Ok((file, publication));
-                    }
-                    Err(TryLockError::WouldBlock) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await
-                    }
-                    Err(TryLockError::Error(error)) => return Err(queue_error(error)),
-                }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let busy = || invalid_request("thread queue is busy; retry the request");
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(busy());
             }
-        })
-        .await
-        .map_err(|_| invalid_request("thread queue is busy; retry the request"))?
+            match file.try_lock() {
+                Ok(()) => {
+                    let mut origins = self
+                        .origins
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // A ready lock can be observed after a delayed wake or
+                    // origins-lock acquisition. Do not admit it or change state.
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(busy());
+                    }
+                    if origins.retiring.remove(&id) {
+                        origins.clear_thread(id);
+                    }
+                    return Ok((file, publication));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let wake = (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline);
+                    tokio::time::sleep_until(wake).await;
+                }
+                Err(TryLockError::Error(error)) => return Err(queue_error(error)),
+            }
+        }
     }
 
     fn publication(&self, id: ThreadId) -> Arc<Mutex<u64>> {

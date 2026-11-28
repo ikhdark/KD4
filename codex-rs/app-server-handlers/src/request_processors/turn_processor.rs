@@ -1754,7 +1754,7 @@ impl TurnRequestProcessor {
                 .background_tasks
                 .spawn(
                     async move {
-                        let observation = codex_protocol::timing::observations::Span::start(
+                        let observation = codex_protocol::timing::observations::Span::start_queued(
                             "cancel_startup", &thread_id, "", &request_id.request_id.to_string(),
                             serde_json::json!({"connection_id":request_id.connection_id.0,
                                 "boundary":"startup_installation_fence_not_unbounded_cleanup"}));
@@ -1830,7 +1830,7 @@ impl TurnRequestProcessor {
         };
         // Core checks identity while claiming terminal ownership. A completed
         // target must never turn this request into an interrupt of its successor.
-        let observation = codex_protocol::timing::observations::Span::start(
+        let observation = codex_protocol::timing::observations::Span::start_queued(
             "cancel_turn", &thread_id, &turn_id, &request_id.request_id.to_string(),
             serde_json::json!({"connection_id":request_id.connection_id.0,
                 "boundary":"core_interrupt_owner_not_client_ack"}));

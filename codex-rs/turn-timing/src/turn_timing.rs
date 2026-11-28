@@ -2427,10 +2427,18 @@ impl TurnTimingState {
         bytes: &[u8],
     ) {
         let hash = hex::encode(Sha256::digest(bytes));
-        if codex_protocol::timing::observations::enabled() {
-        self.observe_runtime("model_request_identity", physical_attempt_id, serde_json::json!({
-            "sampling_request_id":sampling_request_id, "physical_attempt_id":physical_attempt_id,
-            "wire_sha256":hash, "bytes":bytes.len(), "basis":"exact_dispatched_bytes"}));
+        if self.runtime_async_observations_enabled() {
+            self.observe_runtime_queued(
+                "model_request_identity",
+                physical_attempt_id,
+                serde_json::json!({
+                    "sampling_request_id": sampling_request_id,
+                    "physical_attempt_id": physical_attempt_id,
+                    "wire_sha256": hash,
+                    "bytes": bytes.len(),
+                    "basis": "exact_dispatched_bytes",
+                }),
+            );
         }
         let mut state = self.state();
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
@@ -4620,8 +4628,8 @@ impl TurnTimingState {
         backoff: Option<Duration>,
         resolve_source: impl FnOnce(&TurnTimingStateInner) -> Option<retries::RetrySource>,
     ) {
-        if codex_protocol::timing::observations::enabled() {
-            self.observe_runtime("recovery_retry_decision", "", serde_json::json!({
+        if self.runtime_async_observations_enabled() {
+            self.observe_runtime_queued("recovery_retry_decision", "", serde_json::json!({
                 "trigger":trigger, "http_status":http_status, "stream_failure":stream_failure,
                 "action":action,
                 "requested_backoff_ns":backoff.map(|delay| delay.as_nanos())}));
@@ -4751,6 +4759,19 @@ impl TurnTimingState {
         state.validate_activity();
     }
 
+    /// Fail-safe completion can inherit an active phase or an already
+    /// completed snapshot. Neither is a second finalization transition.
+    pub fn resume_finalization(&self) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() || state.activity.finalizing {
+            return;
+        }
+        let sample = self.clock.sample();
+        state.advance(sample.time.monotonic_ns);
+        state.activity.finalizing = true;
+        state.validate_activity();
+    }
+
     pub fn record_direct_final_content(&self) {
         let mut state = self.state();
         state.final_content.direct_ms = state
@@ -4831,7 +4852,7 @@ impl TurnTimingState {
         &self,
         event: &ResponseEvent,
     ) -> Option<Duration> {
-        if codex_protocol::timing::observations::enabled() {
+        if self.runtime_async_observations_enabled() {
             let observed = match event {
                 ResponseEvent::OutputTextDelta(text) => Some(("text_delta", text.len())),
                 ResponseEvent::ToolCallInputDelta { delta, .. } => Some(("tool_input_delta", delta.len())),
@@ -4843,7 +4864,7 @@ impl TurnTimingState {
             };
             if let Some((kind, bytes)) = observed {
                 let identity = self.latest_model_dispatch_identity();
-                self.observe_runtime("model_stream_event", identity.as_ref().map(|id| id.physical_attempt_id.as_str()).unwrap_or_default(),
+                self.observe_runtime_queued("model_stream_event", identity.as_ref().map(|id| id.physical_attempt_id.as_str()).unwrap_or_default(),
                     serde_json::json!({"sampling_request_id":identity.as_ref().map(|id| &id.sampling_request_id),
                         "kind":kind, "bytes":bytes, "boundary":"core_response_event_not_token_or_client_paint"}));
             }
@@ -5271,8 +5292,8 @@ impl TurnTimingState {
         }
         state.counters.model_request_count = state.counters.model_request_count.saturating_add(1);
         drop(state);
-        if codex_protocol::timing::observations::enabled() {
-            self.observe_runtime("model_dispatched", physical_attempt_id, serde_json::json!({
+        if self.runtime_async_observations_enabled() {
+            self.observe_runtime_queued("model_dispatched", physical_attempt_id, serde_json::json!({
                 "sampling_request_id":sampling_request_id, "physical_attempt_id":physical_attempt_id,
                 "generation_id":format!("generation-{generation_index}"), "internal_retry":internal_retry,
                 "owner_at_ns":sample.time.monotonic_ns}));

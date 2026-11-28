@@ -23,6 +23,7 @@ use super::add_marketplace_to_codex_home;
 use super::internal_error;
 use super::invalid_request;
 use super::remove_marketplace;
+use crate::connection_rpc_gate::ConnectionRpcGate;
 
 #[derive(Clone)]
 pub(crate) struct MarketplaceRequestProcessor {
@@ -47,10 +48,11 @@ impl MarketplaceRequestProcessor {
     pub(crate) async fn marketplace_add(
         &self,
         params: MarketplaceAddParams,
+        rpc_gate: &ConnectionRpcGate,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.marketplace_add_inner(params)
+        self.marketplace_add_inner(params, rpc_gate)
             .await
-            .map(|response| Some(response.into()))
+            .map(|response| response.map(Into::into))
     }
 
     pub(crate) async fn marketplace_remove(
@@ -153,31 +155,40 @@ impl MarketplaceRequestProcessor {
     async fn marketplace_add_inner(
         &self,
         params: MarketplaceAddParams,
-    ) -> Result<MarketplaceAddResponse, JSONRPCErrorError> {
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        add_marketplace_to_codex_home(
-            self.config.codex_home.to_path_buf(),
-            config.config_layer_stack.requirements().clone(),
-            MarketplaceAddRequest {
-                source: params.source,
-                ref_name: params.ref_name,
-                sparse_paths: params.sparse_paths.unwrap_or_default(),
-            },
-        )
-        .await
-        .map(|outcome| {
-            // The marketplace edit bypasses ConfigManager; publish it to the next read.
-            self.config_manager.invalidate_load_cache();
-            MarketplaceAddResponse {
-                marketplace_name: outcome.marketplace_name,
-                installed_root: outcome.installed_root,
-                already_added: outcome.already_added,
-            }
-        })
-        .map_err(|err| match err {
+        rpc_gate: &ConnectionRpcGate,
+    ) -> Result<Option<MarketplaceAddResponse>, JSONRPCErrorError> {
+        let cancellation = rpc_gate.cancellation_token();
+        let config = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(None),
+            config = self.load_latest_config(/*fallback_cwd*/ None) => config?,
+        };
+        let codex_home = self.config.codex_home.to_path_buf();
+        let requirements = config.config_layer_stack.requirements().clone();
+        let request = MarketplaceAddRequest {
+            source: params.source,
+            ref_name: params.ref_name,
+            sparse_paths: params.sparse_paths.unwrap_or_default(),
+        };
+        // Close and mutation admission share the gate fence. After admission,
+        // the retained serialized handler must await the blocking add and
+        // publish its success before yielding the config queue to the next RPC.
+        let Some(add) = rpc_gate.try_commit(|| {
+            add_marketplace_to_codex_home(codex_home, requirements, request)
+        }) else {
+            return Ok(None);
+        };
+        let outcome = add.await.map_err(|err| match err {
             MarketplaceAddError::InvalidRequest(message) => invalid_request(message),
             MarketplaceAddError::Internal(message) => internal_error(message),
-        })
+        })?;
+        // The marketplace edit bypasses ConfigManager; publish it to the next read.
+        self.config_manager.invalidate_load_cache();
+        Ok(Some(MarketplaceAddResponse {
+            marketplace_name: outcome.marketplace_name,
+            installed_root: outcome.installed_root,
+            already_added: outcome.already_added,
+        }))
     }
 
     async fn load_latest_config(

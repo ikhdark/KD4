@@ -340,17 +340,18 @@ impl CloudConfigBundleService {
             return Err(err);
         }
 
-        self.publish_if_current(|| {
-            emit_fetch_final_metric(
-                trigger,
-                "success",
-                "none",
-                attempt,
-                /*status_code*/ None,
-                Some(&bundle),
-            );
-            optional_bundle(bundle)
-        })
+        // Accept the bundle at the exact auth epoch without holding the fence
+        // across telemetry. The loader fences publication separately.
+        let bundle = self.publish_if_current(|| bundle)?;
+        emit_fetch_final_metric(
+            trigger,
+            "success",
+            "none",
+            attempt,
+            /*status_code*/ None,
+            Some(&bundle),
+        );
+        Ok(optional_bundle(bundle))
     }
 
     async fn retry_after_request_failure(

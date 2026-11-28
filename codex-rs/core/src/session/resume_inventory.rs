@@ -8,9 +8,53 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 pub(crate) use codex_conversation::RESUME_STATE_LOCATOR as LOCATOR;
+
+// Match the read_file text-snapshot limit. Reject the entire selection rather
+// than publishing a snapshot with missing rows or unresolvable exact pointers.
+const RESUME_INVENTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+struct InventoryWriter<W> {
+    inner: W,
+    remaining: usize,
+}
+
+impl<W: io::Write> InventoryWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, remaining: RESUME_INVENTORY_MAX_BYTES }
+    }
+
+    fn write_json(&mut self, value: &impl serde::Serialize) -> Result<(), String> {
+        serde_json::to_writer_pretty(&mut *self, value).map_err(|error| {
+            if error.io_error_kind() == Some(io::ErrorKind::FileTooLarge) {
+                format!(
+                    "Resume inventory incomplete: selection exceeds the {RESUME_INVENTORY_MAX_BYTES}-byte snapshot budget; no inventory snapshot was produced. Narrow the selection with resume_filter."
+                )
+            } else {
+                error.to_string()
+            }
+        })
+    }
+}
+
+impl<W: io::Write> io::Write for InventoryWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        let written = self.inner.write(bytes)?;
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Selection is read-only and conjunctive; it never creates a control grant.
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -142,10 +186,11 @@ fn recorded_call_arguments(
     filter: &ResumeInventoryFilter,
     operations: &BTreeMap<String, Value>,
     unresolved_invocations: &[Value],
-) -> Vec<Value> {
+    budget: &mut InventoryWriter<io::Sink>,
+) -> Result<Vec<Value>, String> {
     use sha2::Digest;
     let Some(call_id) = filter.call_id.as_deref() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut found = Vec::new();
     let mut turn_id = None;
@@ -203,11 +248,26 @@ fn recorded_call_arguments(
         found.retain(|(index, ..)| selected.contains(index));
     }
 
-    found.into_iter().map(|(index, _, kind, name, text)| json!({
-        "kind": kind, "rollout_item_index": index, "call_id": call_id, "name": name,
-        "bytes": text.len(), "sha256": hex::encode(sha2::Sha256::digest(text.as_bytes())),
-        "arguments": text,
-    })).collect()
+    #[derive(serde::Serialize)]
+    struct RecordedCallArguments<'a> {
+        kind: &'a str,
+        rollout_item_index: usize,
+        call_id: &'a str,
+        name: &'a str,
+        bytes: usize,
+        sha256: String,
+        arguments: &'a str,
+    }
+
+    found.into_iter().map(|(index, _, kind, name, text)| {
+        let record = RecordedCallArguments {
+            kind, rollout_item_index: index, call_id, name, bytes: text.len(),
+            sha256: hex::encode(sha2::Sha256::digest(text.as_bytes())),
+            arguments: text,
+        };
+        budget.write_json(&record)?;
+        serde_json::to_value(record).map_err(|error| error.to_string())
+    }).collect()
 }
 
 fn reconcile(record: &mut Value, owners: &[Value]) {
@@ -248,11 +308,30 @@ fn reconcile(record: &mut Value, owners: &[Value]) {
     .into();
 }
 
+pub(crate) struct DurableProcessRecords {
+    terminal_records: Vec<Value>,
+    incomplete_history: Option<String>,
+}
+
+impl DurableProcessRecords {
+    pub(crate) fn lookup(
+        &self,
+        process_id: u32,
+        incarnation: uuid::Uuid,
+    ) -> Result<Option<Value>, String> {
+        let receipt = Session::durable_process_result(&self.terminal_records, process_id, incarnation);
+        match (&self.incomplete_history, receipt) {
+            (Some(cause), None) => Err(cause.clone()),
+            (_, receipt) => Ok(receipt),
+        }
+    }
+}
+
 impl Session {
     /// Historical facts only; this never reconstructs control rights.
     /// `Ok(None)` means the evidence was readable and holds no receipt for this
-    /// handle; `Err` means the durable evidence itself could not be read, which
-    /// is not the same fact and must not be reported as an absent receipt.
+    /// handle; `Err` means there was no matching receipt and the durable
+    /// evidence could not be read completely.
     pub(crate) async fn retained_process_result(
         &self,
         process_id: u32,
@@ -266,24 +345,24 @@ impl Session {
         let Some(records) = self.durable_process_records().await? else {
             return Ok(None);
         };
-        Ok(Self::durable_process_result(&records, process_id, incarnation))
+        records.lookup(process_id, incarnation)
     }
 
     /// A grouped wait shares this single read/parse instead of reloading the
     /// same durable rollout once for every retired handle. `Ok(None)` means
     /// there is no durable rollout (or none materialized yet); `Err` names the
-    /// path, reader or worker failure so callers do not mistake unreadable
-    /// evidence for a missing receipt.
+    /// path, reader or worker failure. A partially parsed snapshot preserves
+    /// exact positive receipts, but its lookup cannot establish a clean miss.
     pub(crate) async fn durable_process_records(
         &self,
-    ) -> Result<Option<std::sync::Arc<Vec<Value>>>, String> {
+    ) -> Result<Option<Arc<DurableProcessRecords>>, String> {
         let Some(path) = self.current_rollout_path().await
             .map_err(|error| format!("durable rollout path unavailable: {error}"))?
         else {
             return Ok(None);
         };
-        let items = match codex_rollout::RolloutRecorder::load_rollout_items(&path).await {
-            Ok((items, _, _)) => items,
+        let (items, parse_errors) = match codex_rollout::RolloutRecorder::load_rollout_items(&path).await {
+            Ok((items, _, parse_errors)) => (items, parse_errors),
             // A rollout path can be reserved before its file is materialized.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -293,15 +372,20 @@ impl Session {
                 ));
             }
         };
-        tokio::task::spawn_blocking(move || std::sync::Arc::new(
-            command_records(&items).into_values()
-                .filter(|record| record["terminal_receipt"].is_object()).collect()
-        )).await
+        let incomplete_history = (parse_errors != 0).then(|| format!(
+            "durable rollout {} is incomplete ({parse_errors} skipped records); no matching receipt was found in readable evidence",
+            path.display(),
+        ));
+        tokio::task::spawn_blocking(move || Arc::new(DurableProcessRecords {
+            terminal_records: command_records(&items).into_values()
+                .filter(|record| record["terminal_receipt"].is_object()).collect(),
+            incomplete_history,
+        })).await
             .map(Some)
             .map_err(|error| format!("durable receipt reader task failed: {error}"))
     }
 
-    pub(crate) fn durable_process_result(
+    fn durable_process_result(
         records: &[Value],
         process_id: u32,
         incarnation: uuid::Uuid,
@@ -371,18 +455,25 @@ impl Session {
             .await
             .map_err(|error| error.to_string())?;
         let active_turn = active_turn.to_string();
+        let invocation_filter = filter.cloned();
         let recover_arguments = filter.is_some_and(|filter| filter.call_id.is_some());
-        let (mut records, mut unresolved_invocations, argument_items) = tokio::task::spawn_blocking(move || {
+        let (mut records, unresolved_invocations, argument_items, mut budget) = tokio::task::spawn_blocking(move || {
             let records = command_records(&items);
             // In-flight calls in this turn still have their original owner.
             // Do not classify the inventory call itself as a lost result.
             let boundary = items.iter().position(|item| matches!(item,
                 RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some(&active_turn)))
                 .unwrap_or(items.len());
+            let mut budget = InventoryWriter::new(io::sink());
             let unresolved = super::rollout_reconstruction::unsettled_tool_recovery_entries(&items[..boundary])
-                .collect::<Vec<_>>();
-            (records, unresolved, recover_arguments.then_some(items))
-        }).await.map_err(|error| error.to_string())?;
+                .filter(|record| invocation_filter.as_ref().is_none_or(|filter| filter.matches(record)))
+                .map(|record| {
+                    budget.write_json(&record)?;
+                    Ok(record)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok::<_, String>((records, unresolved, recover_arguments.then_some(items), budget))
+        }).await.map_err(|error| error.to_string())??;
 
         // Release each owner before consulting the next. This is explicitly a
         // series of point-in-time observations, not a cross-owner transaction.
@@ -405,7 +496,6 @@ impl Session {
         let total_operations = records.len();
         if let Some(filter) = filter {
             records.retain(|_, record| filter.matches(record));
-            unresolved_invocations.retain(|record| filter.matches(record));
             owners.retain(|owner| {
                 (!filter.unresolved_only || owner["status"] != "exited")
                     && (!filter.has_identity() || filter.matches(owner)
@@ -415,12 +505,18 @@ impl Session {
                             && record["incarnation"] == owner["incarnation"]))
             });
         }
+        // Charge selected rows before auditing their evidence or assembling the
+        // snapshot. Do not charge unrelated rollout history against a narrow filter.
+        for row in records.values().chain(owners.iter()) {
+            budget.write_json(row)?;
+        }
         // S16/AT03: recover the exact original arguments, scoped to the selected rows.
         let call_arguments = filter
             .zip(argument_items)
             .map(|(filter, items)| {
-                recorded_call_arguments(&items, filter, &records, &unresolved_invocations)
+                recorded_call_arguments(&items, filter, &records, &unresolved_invocations, &mut budget)
             })
+            .transpose()?
             .unwrap_or_default();
         let history = self.clone_history().await;
         let mut references = history
@@ -468,6 +564,7 @@ impl Session {
                     )
                 })
                 .unwrap_or(Value::Null);
+            budget.write_json(&audit)?;
             evidence.push(audit);
         }
         let records = records.into_values().collect::<Vec<_>>();
@@ -558,6 +655,10 @@ impl Session {
                 })).collect::<Vec<_>>());
             inventory["call_arguments"] = Value::Array(call_arguments);
         }
-        serde_json::to_string_pretty(&inventory).map_err(|error| error.to_string())
+        // Include the envelope, indentation and duplicated summary fields in
+        // the actual output limit. The writer never emits an oversized string.
+        let mut snapshot = InventoryWriter::new(Vec::new());
+        snapshot.write_json(&inventory)?;
+        String::from_utf8(snapshot.inner).map_err(|error| error.to_string())
     }
 }

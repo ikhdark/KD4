@@ -1478,8 +1478,8 @@ async fn respond_to_pending_interrupts(
 
     let deadline = tokio::time::Instant::now() + crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT;
     for request_id in pending {
-        if codex_protocol::timing::observations::enabled() {
-            let _ = codex_protocol::timing::observations::record("cancel_ack_ready", "", turn_id, turn_id,
+        if codex_protocol::timing::observations::runtime_async_enabled() {
+            let _ = codex_protocol::timing::observations::enqueue_runtime("cancel_ack_ready", "", turn_id, turn_id,
                 serde_json::json!({"connection_id":request_id.connection_id.0,
                     "request_id":request_id.request_id,
                     "boundary":"terminal_side_effects_before_bounded_response"}));

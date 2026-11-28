@@ -631,9 +631,13 @@ impl Session {
             refreshed_manager.shutdown().await;
             return current_runtime;
         }
+        // Take the publication guards before replacing the token. Cancelling
+        // a refresh while it waits for state must leave the old runtime's token intact.
+        let mut state_owner = self.state.lock().await;
         let mut published_token = self.services.mcp_startup_cancellation_token.lock().await;
-        if published_token.is_cancelled() {
+        if published_token.is_cancelled() || mcp_startup_cancellation_token.is_cancelled() {
             drop(published_token);
+            drop(state_owner);
             drop(projection_guard);
             cancellation_forwarding_stop.cancel();
             refreshed_manager.shutdown().await;
@@ -641,10 +645,8 @@ impl Session {
         }
         *published_token = mcp_startup_cancellation_token;
         cancellation_forwarding_stop.cancel();
-        drop(published_token);
         // The previous runtime may still be serving an in-flight step. Connections adopted by
         // this runtime remain live until the final manager lease is released.
-        let mut state_owner = self.state.lock().await;
         let runtime = self.services.publish_mcp_runtime(
             &mut state_owner,
             mcp_config,
